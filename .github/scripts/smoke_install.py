@@ -17,6 +17,8 @@ sim = ph.Simulation(
         )
     ],
 )
-assert ph.Simulation.from_wire_json(sim.to_wire_json()) == sim
-assert ph.estimate_cost(sim).num_cells > 0
+if ph.Simulation.from_wire_json(sim.to_wire_json()) != sim:
+    raise RuntimeError("Simulation wire round trip changed the model")
+if ph.estimate_cost(sim).num_cells <= 0:
+    raise RuntimeError("cost estimate did not count simulation cells")
 print(f"simupod {ph.__version__} / schema {ph.SCHEMA_VERSION} smoke passed")
