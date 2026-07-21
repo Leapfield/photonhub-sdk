@@ -1,0 +1,4 @@
+# Release automation and package policy require review from the repository owner.
+/.github/workflows/release.yml @zhetaoj
+/.github/scripts/ @zhetaoj
+/pyproject.toml @zhetaoj
