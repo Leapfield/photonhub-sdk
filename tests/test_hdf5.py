@@ -1,4 +1,4 @@
-"""HDF5 packing (simupod.hdf5) and the SimulationData HDF5 backend.
+"""HDF5 packing (photonhub.hdf5) and the SimulationData HDF5 backend.
 
 The contract: loading the .h5 is bit-identical to loading the raw output
 directory, because the .h5 carries the same manifest and the same raw monitor
@@ -14,8 +14,8 @@ import xarray as xr
 
 pytest.importorskip("h5py")
 
-from simupod import convert_to_hdf5
-from simupod.data import SimulationData
+from photonhub import convert_to_hdf5
+from photonhub.data import SimulationData
 
 DT = 9.53e-17
 DL_UM = 0.25
@@ -130,7 +130,7 @@ class TestErrors:
 
 
 def _real_solver():
-    import simupod as ph
+    import photonhub as ph
     try:
         return ph.find_solver()
     except ph.SolverRunError:
@@ -142,7 +142,7 @@ def _real_solver():
 def test_integration_real_solver_roundtrip(tmp_path):
     # Real engine output (time + complex DFT + flux) packs to HDF5 and reloads
     # bit-identically — the end-to-end contract, not just hand-built manifests.
-    import simupod as ph
+    import photonhub as ph
 
     sim = ph.Simulation(
         size_um=(0.4, 0.4, 1.2),

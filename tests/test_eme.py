@@ -1,6 +1,6 @@
 """Minimal eigenmode-expansion (EME) propagator — correctness invariants.
 
-Validates ``simupod.plugins.eme`` on the building blocks (star product,
+Validates ``photonhub.plugins.eme`` on the building blocks (star product,
 interface, propagation) and end-to-end on a straight guide and a tapered guide.
 The load-bearing checks are *internal physics invariants* that hold regardless of
 mesh accuracy:
@@ -21,12 +21,14 @@ above it because a guided-mode basis cannot radiate (documented in the module).
 import numpy as np
 import pytest
 
-from simupod.plugins.eme import (
+from photonhub.plugins.eme import (
     EMEResult,
     cascade,
     interface_smatrix,
     propagation_smatrix,
+    rectangular_base_section,
     run_eme,
+    run_eme_band,
     star_product,
     waveguide_section,
 )
@@ -291,3 +293,82 @@ def test_run_eme_rejects_grid_mismatch():
     )
     with pytest.raises(ValueError):
         run_eme([a, bad])
+
+
+# --- band sweep (rectangular_base_section + run_eme_band) -------------------
+
+
+def _base_taper(n_slabs, *, w_in=0.45, w_out=0.80, taper_len=3.0):
+    """Same staircased taper as ``_taper_sections`` but as (solver, length)
+    base sections for :func:`run_eme_band` (rasterized once, no solve yet)."""
+    common = dict(dl_um=DL_UM, core_h_um=CORE_H_UM, n_core=N_CORE,
+                  n_clad=N_CLAD, window_w_um=WIN_W_UM, window_h_um=WIN_H_UM)
+    secs = [rectangular_base_section(core_w_um=w_in, length_um=0.0, **common)]
+    for k in range(n_slabs):
+        wk = w_in + (w_out - w_in) * ((k + 0.5) / n_slabs)
+        secs.append(rectangular_base_section(
+            core_w_um=wk, length_um=taper_len / n_slabs, **common))
+    secs.append(rectangular_base_section(core_w_um=w_out, length_um=0.0, **common))
+    return secs
+
+
+def _max_smatrix_diff(a, b):
+    return max(
+        float(np.max(np.abs(x - y)))
+        for x, y in ((a.s11, b.s11), (a.s12, b.s12),
+                     (a.s21, b.s21), (a.s22, b.s22))
+    )
+
+
+@pytest.mark.parametrize("backend", ["serial", "thread"])
+def test_run_eme_band_matches_per_wavelength(backend):
+    # run_eme_band must reproduce the per-wavelength waveguide_section + run_eme
+    # cascade to machine precision (the only difference is at_wavelength reuse vs
+    # a fresh raster — both give the same wavelength-independent permittivity).
+    lams = [1.27, 1.31, 1.35]
+    common = dict(dl_um=DL_UM, core_h_um=CORE_H_UM, n_core=N_CORE,
+                  n_clad=N_CLAD, window_w_um=WIN_W_UM, window_h_um=WIN_H_UM)
+
+    def ref(wl):
+        secs = [waveguide_section(core_w_um=w, length_um=L, num_modes=2,
+                                  wavelength_um=wl, neff_margin=MARGIN, **common)
+                for w, L in ((0.45, 0.0), (0.60, 1.5), (0.80, 0.0))]
+        return run_eme(secs)
+
+    bases = [rectangular_base_section(core_w_um=w, length_um=L, **common)
+             for w, L in ((0.45, 0.0), (0.60, 1.5), (0.80, 0.0))]
+    band = run_eme_band(bases, lams, num_modes=2, neff_margin=MARGIN,
+                        n_clad=N_CLAD, backend=backend, workers=2)
+
+    assert set(band) == set(lams)
+    for wl in lams:
+        assert _max_smatrix_diff(ref(wl), band[wl]) < 1e-9
+
+
+def test_run_eme_band_is_lossless_and_per_wavelength_keyed():
+    bases = _base_taper(4)
+    lams = [1.28, 1.34]
+    band = run_eme_band(bases, lams, num_modes=2, neff_margin=MARGIN,
+                        n_clad=N_CLAD, backend="serial")
+    for wl in lams:
+        r = band[wl]
+        assert isinstance(r, EMEResult)
+        # guided-basis cascade conserves energy and transmits strongly
+        assert r.energy_balance() == pytest.approx(1.0, abs=1e-6)
+        assert r.transmission > 0.95
+
+
+def test_run_eme_band_guards():
+    bases = _base_taper(2)
+    # needs >= 2 sections
+    with pytest.raises(ValueError):
+        run_eme_band(bases[:1], [1.31], num_modes=2)
+    # wavelengths must be non-empty
+    with pytest.raises(ValueError):
+        run_eme_band(bases, [], num_modes=2)
+    # neff_margin > 0 requires n_clad
+    with pytest.raises(ValueError):
+        run_eme_band(bases, [1.31], num_modes=2, neff_margin=0.05)
+    # unknown backend
+    with pytest.raises(ValueError):
+        run_eme_band(bases, [1.31], num_modes=2, backend="cuda")

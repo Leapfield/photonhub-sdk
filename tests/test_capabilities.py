@@ -1,65 +1,38 @@
-"""Capability gating (simupod.capabilities): representable-but-unsupported
-features fail at MODEL CONSTRUCTION with an "available in <version>" message,
-never at engine submission — and the client's pinned view of the engine's
-``--capabilities`` manifest cannot silently drift from the real binary.
-"""
+"""The client's pinned ``--capabilities`` view stays aligned with the engine."""
 
 import pytest
-from pydantic import ValidationError
 
-import simupod as ph
-from simupod import capabilities as caps
-from simupod.components.grid import GradedAxisCoords, GradedGridSpec
+import photonhub as ph
+from photonhub import capabilities as caps
+from photonhub.components.grid import GradedAxisCoords, GradedGridSpec
 
-from conftest import make_pw_sim, make_sim
+from .helpers import make_pw_sim, make_sim
 
 
 def _graded_z(n=28, dl0=0.025, ratio=1.04):
-    """A strictly-increasing graded coordinate array (origin 0), as §15.1."""
+    """A seam-symmetric graded coordinate array (origin 0), as §15.1/§15.2."""
     q, z = [0.0], 0.0
     for k in range(1, n):
-        z += dl0 * (ratio ** k)
+        ramp = min(k - 1, n - 1 - k)
+        z += dl0 * (ratio ** ramp)
         q.append(round(z, 7))
     return tuple(q)
 
 
-# --- the standardized message --------------------------------------------- #
-
-def test_unavailable_builds_a_clear_value_error():
-    err = caps.unavailable("graded_plane_wave")
-    assert isinstance(err, ValueError)
-    assert isinstance(err, caps.UnavailableFeature)
-    text = str(err)
-    assert "not available in schema v1" in text
-    assert "available in" in text
-    assert "15.9" in text
-    assert err.key == "graded_plane_wave"
+def test_graded_propagation_axis_plane_wave_builds():
+    sim = make_pw_sim(
+        size_um=(0.2, 0.2, 1.0),
+        grid=GradedGridSpec(dl_um=0.05, coords=GradedAxisCoords(z=_graded_z())),
+    )
+    assert isinstance(sim.grid, GradedGridSpec)
 
 
-# --- the construction-time gate ------------------------------------------- #
-
-def test_graded_grid_plus_plane_wave_rejected_at_construction():
-    # Plane wave along z, transverse x/y periodic (required), z graded + PML.
-    with pytest.raises(ValidationError) as exc:
-        make_pw_sim(
-            size_um=(0.2, 0.2, 1.0),
-            grid=GradedGridSpec(dl_um=0.05, coords=GradedAxisCoords(z=_graded_z())),
-        )
-    msg = str(exc.value)
-    assert "not available in schema v1" in msg
-    assert "graded" in msg
-
-
-def test_transverse_only_graded_plane_wave_also_rejected():
-    # Injection axis z stays UNIFORM; only the transverse x grades. §15.9 would
-    # eventually permit this, but the engine rejects any graded+plane-wave combo
-    # today — the client must mirror the engine, not the aspirational rule.
-    with pytest.raises(ValidationError) as exc:
-        make_pw_sim(
-            size_um=(1.0, 0.2, 1.0),
-            grid=GradedGridSpec(dl_um=0.05, coords=GradedAxisCoords(x=_graded_z())),
-        )
-    assert "not available in schema v1" in str(exc.value)
+def test_transverse_only_graded_plane_wave_builds():
+    sim = make_pw_sim(
+        size_um=(1.0, 0.2, 1.0),
+        grid=GradedGridSpec(dl_um=0.05, coords=GradedAxisCoords(x=_graded_z())),
+    )
+    assert isinstance(sim.grid, GradedGridSpec)
 
 
 def test_uniform_plane_wave_still_builds():
@@ -98,3 +71,11 @@ def test_engine_capabilities_reports_schema_major():
     if info is None:
         pytest.skip("no phsolver binary available")
     assert info.get("schema_major") == caps.SCHEMA_MAJOR
+
+
+def test_modal_port_is_an_explicit_negotiated_capability():
+    assert "mode_port" in caps.ENGINE_ADVERTISED_FEATURES
+    info = caps.engine_capabilities()
+    if info is None:
+        pytest.skip("no phsolver binary available")
+    assert "mode_port" in info.get("features", [])

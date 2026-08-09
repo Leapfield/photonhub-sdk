@@ -1,15 +1,15 @@
-"""Symmetry plane API — NUMERICS.md §20 (schema 1.10.0).
+"""Symmetry plane API — NUMERICS.md §20 (schema 1.11.0).
 
 The `symmetry` field places a mirror plane on an axis' MINIMUM face: -1 odd /
-electric (PEC), 0 none, +1 even / magnetic (PMC; x/y, z deferred). Covers the wire
-round-trip (additive-optional: all-zero omitted), and the §20.2/§20.4/§20.5
+electric (PEC), 0 none, +1 even / magnetic (PMC; all three axes). Covers the wire
+round-trip (additive-optional: all-zero omitted), and the §20.2/§20.5
 construction-time rejections that mirror the engine's validate().
 """
 
 import pytest
 
-import simupod as ph
-from conftest import make_sim, make_pw_sim
+import photonhub as ph
+from .helpers import make_pw_sim, make_sim
 
 
 def _sym_sim(symmetry=(0, -1, 0),
@@ -31,7 +31,7 @@ class TestSymmetryWire:
         sim = _sym_sim(symmetry=(0, -1, 0))
         wire = sim.to_wire_dict()
         assert wire["symmetry"] == [0, -1, 0]
-        assert wire["schema_version"] == "1.12.0-alpha.1"
+        assert wire["schema_version"] == ph.SCHEMA_VERSION
         back = ph.Simulation.from_wire_json(sim.to_wire_json())
         assert back.symmetry == (0, -1, 0)
 
@@ -64,15 +64,17 @@ class TestSymmetryAccepts:
         _sym_sim(symmetry=(1, 1, 0),
                  boundaries=ph.Boundaries(x="pml", y="pml", z="pec"))
 
+    def test_even_pmc_on_z_accepted(self):
+        # z-axis PMC is now supported on the CPU reference solver (§20.4) via
+        # the negated k=-1 ghost-plane mirror; construction must succeed.
+        sim = _sym_sim(symmetry=(0, 0, 1),
+                       boundaries=ph.Boundaries(x="periodic", y="periodic",
+                                                z="pml"))
+        assert sim.symmetry == (0, 0, 1)
+        assert sim.to_wire_dict()["symmetry"] == [0, 0, 1]
+
 
 class TestSymmetryRejects:
-    def test_even_pmc_on_z_unsupported(self):
-        # z-axis PMC reads a stored ghost plane (deferred, §20.4) — rejected.
-        with pytest.raises(Exception) as ei:
-            _sym_sim(symmetry=(0, 0, 1),
-                     boundaries=ph.Boundaries(x="periodic", y="periodic",
-                                              z="pml"))
-        assert "magnetic" in str(ei.value) or "PMC" in str(ei.value)
 
     def test_out_of_range_value(self):
         with pytest.raises(Exception) as ei:

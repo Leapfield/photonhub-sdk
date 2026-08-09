@@ -6,7 +6,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-import simupod as ph
+import photonhub as ph
 
 
 def test_example_parses_and_roundtrips(example_spec_path):
@@ -85,7 +85,7 @@ def test_unset_pml_num_layers_is_omitted_on_the_wire(tiny_sim):
     # by schema-1.0 parsers that reject unknown keys.
     assert "pml_num_layers" not in tiny_sim.to_wire_dict()
 
-    from conftest import make_sim
+    from .helpers import make_sim
     explicit = make_sim(pml_num_layers=12)
     assert explicit.to_wire_dict()["pml_num_layers"] == 12
 
@@ -98,7 +98,7 @@ def test_unset_cpml_profile_is_omitted_on_the_wire(tiny_sim):
     for f in ("pml_m", "pml_kappa_max", "pml_alpha_max"):
         assert f not in wire
 
-    from conftest import make_sim
+    from .helpers import make_sim
     explicit = make_sim(pml_m=4.0, pml_kappa_max=7.0, pml_alpha_max=0.05)
     ewire = explicit.to_wire_dict()
     assert ewire["pml_m"] == 4.0
@@ -108,27 +108,27 @@ def test_unset_cpml_profile_is_omitted_on_the_wire(tiny_sim):
 
 def test_with_stabilized_pml_raises_layers_kappa_and_alpha(tiny_sim):
     stable = tiny_sim.with_stabilized_pml()
-    assert stable.pml_num_layers == 20
+    # Defaults reproduce Tidy3D's StablePML (40 layers, kappa 5, alpha 0.9).
+    assert stable.pml_num_layers == 40
     assert stable.pml_kappa_max == 5.0
-    # The lever the old with_stable_pml missed: alpha is RAISED, grid-aware as
-    # 0.02 * sigma_max (= 0.8*(m+1)/(eta0*dl)) — far above the 0.24 S/m default
-    # nudge — so it now rides the wire.
-    eta0 = 1.25663706212e-6 * 2.99792458e8
-    sigma_max = 0.8 * (tiny_sim.pml_m + 1.0) / (eta0 * tiny_sim.grid.dl_um * 1e-6)
-    assert stable.pml_alpha_max == pytest.approx(0.02 * sigma_max)
+    # The lever the old with_stable_pml missed: alpha is RAISED, quoted in
+    # Tidy3D's 2*eps0/dt units (alpha_scale 0.9) and converted to S/m at this
+    # scene's dt — far above the 0.24 S/m default nudge — so it now rides the wire.
+    two_eps0_over_dt = tiny_sim._two_eps0_over_dt()
+    assert stable.pml_alpha_max == pytest.approx(0.9 * two_eps0_over_dt)
     assert stable.pml_alpha_max > 100.0  # >> the 0.24 default
     swire = stable.to_wire_dict()
-    assert swire["pml_num_layers"] == 20
+    assert swire["pml_num_layers"] == 40
     assert swire["pml_kappa_max"] == 5.0
-    assert swire["pml_alpha_max"] == pytest.approx(0.02 * sigma_max)
+    assert swire["pml_alpha_max"] == pytest.approx(0.9 * two_eps0_over_dt)
     assert "pml_m" not in swire
-    # Opt-in only: the original sim is unchanged.
+    # Opt-in only: the original (non-dispersive) sim is unchanged.
     assert tiny_sim.pml_num_layers == 12 and tiny_sim.pml_alpha_max == 0.24
 
     custom = tiny_sim.with_stabilized_pml(num_layers=32, kappa_max=8.0,
-                                          alpha_frac=0.04)
+                                          alpha_scale=0.04)
     assert custom.pml_num_layers == 32 and custom.pml_kappa_max == 8.0
-    assert custom.pml_alpha_max == pytest.approx(0.04 * sigma_max)
+    assert custom.pml_alpha_max == pytest.approx(0.04 * two_eps0_over_dt)
 
 
 def test_unset_shutoff_is_omitted_on_the_wire(tiny_sim):
@@ -137,7 +137,7 @@ def test_unset_shutoff_is_omitted_on_the_wire(tiny_sim):
     # the engine applies its own default (1e-5).
     assert "shutoff" not in tiny_sim.to_wire_dict()["run"]
 
-    from conftest import make_sim
+    from .helpers import make_sim
     explicit = make_sim(run=ph.RunSpec(n_steps=5, shutoff=0.0))
     assert explicit.to_wire_dict()["run"]["shutoff"] == 0.0
 

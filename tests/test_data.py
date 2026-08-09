@@ -5,7 +5,7 @@ import json
 import numpy as np
 import pytest
 
-from simupod.data import SimulationData
+from photonhub.data import SimulationData
 
 DT = 9.53e-17
 DL_UM = 0.25
@@ -107,6 +107,69 @@ def test_size_mismatch_raises(out_dir):
 def test_missing_manifest_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         SimulationData(tmp_path / "empty")
+
+
+def test_manifest_rejects_traversal_filename_before_read(out_dir):
+    manifest_path = out_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["monitors"][0]["file"] = "../outside.bin"
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="unsafe result filename"):
+        SimulationData(out_dir)
+
+
+def test_manifest_rejects_duplicate_monitor_names(out_dir):
+    manifest_path = out_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["monitors"][1]["name"] = manifest["monitors"][0]["name"]
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="duplicate monitor name"):
+        SimulationData(out_dir)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda manifest: manifest["grid"].update({
+            "coords_um": {
+                "x": [0.0, 0.25, "bad", 0.75],
+                "y": [0.0, 0.25, 0.5],
+                "z": [0.0, 0.25],
+            }}), "must contain numbers"),
+        (lambda manifest: manifest["grid"].update({"shape": [5, NY, NZ]}),
+         "does not match grid shape"),
+        (lambda manifest: manifest["monitors"][1].update(
+            {"shape": [1, 2, NZ, NY, 10**100]}), "invalid shape"),
+    ],
+)
+def test_manifest_rejects_unreadable_snapshot_coordinates_and_shapes(
+        out_dir, mutation, message):
+    manifest_path = out_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    mutation(manifest)
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match=message):
+        SimulationData(out_dir)
+
+
+def test_raw_monitor_read_rejects_symlink(out_dir):
+    outside = out_dir.parent / "outside.bin"
+    outside.write_bytes((out_dir / "probe.bin").read_bytes())
+    (out_dir / "probe.bin").unlink()
+    (out_dir / "probe.bin").symlink_to(outside)
+    with pytest.raises(ValueError, match="missing or unsafe"):
+        SimulationData(out_dir)["probe"]
+
+
+def test_manifest_root_and_monitor_table_must_have_expected_types(tmp_path):
+    (tmp_path / "manifest.json").write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="JSON object"):
+        SimulationData(tmp_path)
+
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"monitors": {"probe": {}}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="must be a list"):
+        SimulationData(tmp_path)
 
 
 def test_run_block_and_healthy_flags(out_dir):
@@ -253,8 +316,9 @@ def freq_out_dir(tmp_path):
         ],
         "run": {"n_steps": 10, "dt_s": DT, "wall_seconds": 0.1,
                 "mcells_per_s": 12.0, "aborted": False, "abort_reason": ""},
-        "grid": {"shape": [NX, NY, NZ], "dl_um": DL_UM,
-                 "size_um": [NX * DL_UM, NY * DL_UM, NZ * DL_UM]},
+        # Large enough to contain the DFT fixture's non-zero origin_cells.
+        "grid": {"shape": [12, 12, 12], "dl_um": DL_UM,
+                 "size_um": [12 * DL_UM, 12 * DL_UM, 12 * DL_UM]},
         "provenance": {"solver_version": "0.0.1", "device_name": "cpu_ref"},
     }
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))

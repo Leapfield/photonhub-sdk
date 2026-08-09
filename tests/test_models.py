@@ -3,14 +3,56 @@
 import pytest
 from pydantic import ValidationError
 
-import simupod as ph
+import photonhub as ph
+from photonhub.components.grid import snap_mixed_plane
 
-from conftest import make_pw_sim, make_sim
+from .helpers import make_pw_sim, make_sim
+
+
+F0 = 1.934e14
+
+
+def _modal_source():
+    recipe = ph.ModeSolveProvenance(
+        polarization="TE", mode_index=0, wavelength_um=1.55,
+        center_um=(0.5, 0.5), size_um=(0.6, 0.6), dl_um=0.1,
+        supersample=8, num_modes=2, num_freqs=1,
+        input_sha256="a" * 64,
+    )
+    return ph.ModeSource(
+        axis="x", direction="+", position_um=0.25,
+        polarization="Ey", n_eff=2.4, nu=1, nv=1, profile=(1.0,),
+        source_time=ph.GaussianPulse(freq0_hz=F0, fwidth_hz=4e13),
+        mode_solve=recipe,
+    )
+
+
+def _modal_monitor(name="input", *, source_index=0):
+    return ph.FieldDftMonitor(
+        name=name, center_um=(0.75, 0.5, 0.5), size_um=(0.0, 0.8, 0.8),
+        fields=("Ey", "Ez", "Hy", "Hz"), freqs_hz=(F0,),
+        mode_port=ph.ModePort(
+            out_direction="-", center_um=(0.5, 0.5), size_um=(0.6, 0.6),
+            dl_um=0.1, num_modes=2,
+            modes=(ph.PortMode(polarization="TE", mode_index=0),),
+            source_index=source_index, thickness_axis="z",
+        ),
+    )
+
+
+def _modal_sim(*, monitors=None, sources=None):
+    return ph.Simulation(
+        size_um=(1.0, 1.0, 1.0), grid=ph.UniformGridSpec(dl_um=0.1),
+        run=ph.RunSpec(n_steps=5),
+        boundaries=ph.Boundaries(x="periodic", y="periodic", z="periodic"),
+        sources=tuple(sources) if sources is not None else (_modal_source(),),
+        monitors=tuple(monitors) if monitors is not None else (_modal_monitor(),),
+    )
 
 
 class TestDefaults:
     def test_tiny_sim_builds_with_documented_defaults(self, tiny_sim):
-        assert tiny_sim.schema_version == "1.12.0-alpha.1"
+        assert tiny_sim.schema_version == ph.SCHEMA_VERSION
         assert tiny_sim.run.courant == 0.99
         assert tiny_sim.run.shutoff == 1.0e-5   # NUMERICS.md section 7
         assert tiny_sim.background.permittivity == 1.0
@@ -95,13 +137,17 @@ class TestStrictness:
 
 class TestSources:
     @pytest.mark.parametrize("pol", ["Hx", "Hy", "Hz"])
-    def test_magnetic_polarization_rejected(self, pol):
-        with pytest.raises(ValidationError, match="electric"):
-            ph.PointDipole(
-                center_um=(0, 0, 0),
-                polarization=pol,
-                source_time=ph.GaussianPulse(freq0_hz=1e14, fwidth_hz=1e13),
-            )
+    def test_magnetic_polarization_accepted(self, pol):
+        # Magnetic (Hx/Hy/Hz) point dipoles are supported on the CPU reference
+        # solver (NUMERICS.md section 5); the polarization passes to the wire.
+        d = ph.PointDipole(
+            center_um=(0, 0, 0),
+            polarization=pol,
+            source_time=ph.GaussianPulse(freq0_hz=1e14, fwidth_hz=1e13),
+        )
+        assert d.polarization == pol
+        wire = d.model_dump(mode="json", by_alias=True, exclude_none=True)
+        assert wire["polarization"] == pol
 
     def test_nonsense_polarization_rejected(self):
         with pytest.raises(ValidationError):
@@ -121,6 +167,78 @@ class TestSources:
     def test_gaussian_pulse_bounds(self, bad):
         with pytest.raises(ValidationError):
             ph.GaussianPulse(**bad)
+
+    def test_windowed_carrier_is_valid_for_point_dipole(self):
+        pulse = ph.GaussianPulse(
+            freq0_hz=1.5e14, fwidth_hz=2e13,
+            band_freqs_hz=(1.4e14, 1.6e14), carrier_index=0)
+        source = ph.PointDipole(
+            center_um=(0, 0, 0), polarization="Ex", source_time=pulse)
+        assert source.source_time.carrier_index == 0
+
+    @pytest.mark.parametrize("non_finite", [float("inf"), float("nan")])
+    def test_windowed_carrier_rejects_non_finite_band_frequency(
+            self, non_finite):
+        with pytest.raises(ValidationError):
+            ph.GaussianPulse(
+                freq0_hz=1.5e14, fwidth_hz=2e13,
+                band_freqs_hz=(1.4e14, non_finite), carrier_index=0)
+
+    def test_windowed_carrier_is_rejected_for_plane_wave(self):
+        pulse = ph.GaussianPulse(
+            freq0_hz=1.5e14, fwidth_hz=2e13,
+            band_freqs_hz=(1.4e14, 1.6e14), carrier_index=0)
+        with pytest.raises(ValidationError, match="reserved for PointDipole"):
+            ph.PlaneWave(
+                axis="z", direction="+", position_um=0.1,
+                polarization="Ex", source_time=pulse)
+
+    def test_windowed_carrier_is_rejected_for_mode_source(self):
+        pulse = ph.GaussianPulse(
+            freq0_hz=1.5e14, fwidth_hz=2e13,
+            band_freqs_hz=(1.4e14, 1.6e14), carrier_index=0)
+        with pytest.raises(ValidationError, match="reserved for PointDipole"):
+            ph.ModeSource(
+                axis="z", direction="+", position_um=0.1,
+                polarization="Ex", n_eff=1.5, nu=1, nv=1,
+                profile=(1.0,), source_time=pulse)
+
+    def test_mode_source_solve_provenance_round_trips(self):
+        provenance = ph.ModeSolveProvenance(
+            polarization="TE", mode_index=0, wavelength_um=1.55,
+            center_um=(0.2, 0.3), size_um=(0.4, 0.5), dl_um=0.05,
+            supersample=8, num_modes=6, num_freqs=1,
+            input_sha256="a" * 64,
+        )
+        source = ph.ModeSource(
+            axis="z", direction="+", position_um=0.1,
+            polarization="Ex", n_eff=1.5, nu=1, nv=1,
+            profile=(1.0,), source_time=ph.GaussianPulse(
+                freq0_hz=1e14, fwidth_hz=1e13),
+            mode_solve=provenance,
+        )
+        wire = source.model_dump(mode="json", exclude_none=True)
+        assert wire["mode_solve"]["solver"] == "yee"
+        assert wire["mode_solve"]["input_sha256"] == "a" * 64
+        assert ph.ModeSource.model_validate(wire) == source
+
+    @pytest.mark.parametrize("update,match", [
+        ({"input_sha256": "A" * 64}, "input_sha256"),
+        ({"mode_index": 32}, "mode_index"),
+        ({"num_modes": 1, "mode_index": 1}, "greater than mode_index"),
+        ({"size_um": (0.4, 0.0)}, "size_um"),
+    ])
+    def test_mode_source_solve_provenance_rejects_invalid_values(
+            self, update, match):
+        values = {
+            "polarization": "TE", "mode_index": 0,
+            "wavelength_um": 1.55, "center_um": (0.2, 0.3),
+            "size_um": (0.4, 0.5), "dl_um": 0.05,
+            "supersample": 8, "num_modes": 6, "num_freqs": 1,
+            "input_sha256": "a" * 64,
+        }
+        with pytest.raises(ValidationError, match=match):
+            ph.ModeSolveProvenance(**{**values, **update})
 
 
 class TestMonitors:
@@ -145,6 +263,259 @@ class TestMonitors:
                 ph.FieldSnapshotMonitor(name="dup", fields=["Ez"]),
                 ph.FieldTimeMonitor(name="dup", center_um=(0, 0, 0), fields=["Ex"]),
             ])
+
+    def test_mode_port_defaults_and_wire_roundtrip(self):
+        port = ph.ModePort(
+            out_direction="+", center_um=(0.2, 0.3), size_um=(0.4, 0.5),
+            dl_um=0.05, modes=[ph.PortMode(polarization="TE", mode_index=0)],
+        )
+        assert port.solver == "yee"
+        assert port.supersample == 8
+        assert port.num_modes is None
+        assert port.source_index is None
+        monitor = ph.FieldDftMonitor(
+            name="port", center_um=(0.5, 0.5, 0.5),
+            size_um=(0.0, 0.8, 0.8), fields=("Ey", "Ez", "Hy", "Hz"),
+            freqs_hz=(F0,), mode_port=port,
+        )
+        wire = monitor.model_dump(mode="json", exclude_none=True)
+        assert wire["mode_port"]["solver"] == "yee"
+        assert wire["mode_port"]["modes"] == [
+            {"polarization": "TE", "mode_index": 0}]
+        assert ph.FieldDftMonitor.model_validate(wire) == monitor
+
+    def test_mode_port_auto_trials_cover_highest_single_family_index(self):
+        port = ph.ModePort(
+            out_direction="+", center_um=(0.2, 0.3), size_um=(0.4, 0.5),
+            dl_um=0.05,
+            modes=[ph.PortMode(polarization="TE", mode_index=31)],
+        )
+        assert port.num_modes is None
+
+    @pytest.mark.parametrize("update,match", [
+        ({"modes": []}, "modes"),
+        ({"modes": [
+            {"polarization": "TE", "mode_index": 0},
+            {"polarization": "TE", "mode_index": 0},
+        ]}, "unique"),
+        ({"modes": [{"polarization": "TE", "mode_index": 32}]},
+         "mode_index"),
+        ({"modes": [{"polarization": "TE", "mode_index": 1}],
+          "num_modes": 1}, "at least 2"),
+        ({"modes": [
+            {"polarization": "TE", "mode_index": 0},
+            {"polarization": "TM", "mode_index": 0},
+        ], "num_modes": 1}, "at least 2"),
+        ({"modes": [
+            {"polarization": "TE", "mode_index": 31},
+            {"polarization": "TM", "mode_index": 0},
+        ]}, "require 33 trial modes.*maximum of 32"),
+        ({"size_um": (0.0, 0.5)}, "size_um"),
+        ({"dl_um": 0.0}, "dl_um"),
+        ({"supersample": 17}, "supersample"),
+        ({"source_index": -1}, "source_index"),
+    ])
+    def test_mode_port_rejects_invalid_contract_values(self, update, match):
+        values = {
+            "out_direction": "+", "center_um": (0.2, 0.3),
+            "size_um": (0.4, 0.5), "dl_um": 0.05,
+            "modes": [{"polarization": "TE", "mode_index": 0}],
+        }
+        with pytest.raises(ValidationError, match=match):
+            ph.ModePort(**{**values, **update})
+
+
+class TestModalPortSimulationRules:
+    def test_valid_driven_port_round_trips_in_simulation_wire(self):
+        sim = _modal_sim()
+        wire = sim.to_wire_json()
+        assert '"mode_port"' in wire
+        assert ph.Simulation.from_wire_json(wire) == sim
+
+    @pytest.mark.parametrize("update,match", [
+        ({"size_um": (0.8, 0.8, 0.8)}, "exactly one zero"),
+        ({"fields": ("Ey", "Ez", "Hy")}, "missing.*Hz"),
+        ({"interval_space": (1, 2, 1)}, "does not support.*decimated"),
+        ({"apodization": ph.Apodization(width_s=1e-13)},
+         "does not support time apodization"),
+    ])
+    def test_port_requires_dense_four_field_plane(self, update, match):
+        monitor = _modal_monitor().model_copy(update=update)
+        with pytest.raises(ValidationError, match=match):
+            _modal_sim(monitors=[monitor])
+
+    def test_port_window_must_fit_recorded_plane_and_domain(self):
+        monitor = _modal_monitor()
+        port = monitor.mode_port.model_copy(update={"center_um": (0.9, 0.5)})
+        outside = monitor.model_copy(update={"mode_port": port})
+        with pytest.raises(ValidationError, match="extends outside"):
+            _modal_sim(monitors=[outside])
+
+    @pytest.mark.parametrize("boundary", ["pml", "absorber"])
+    def test_port_plane_and_solve_window_exclude_absorbing_layers(
+            self, boundary):
+        source = _modal_source().model_copy(update={"position_um": 0.5})
+        monitor = _modal_monitor().model_copy(update={
+            "center_um": (1.0, 1.0, 1.0),
+            "size_um": (0.0, 2.0, 2.0),
+        })
+        port = monitor.mode_port.model_copy(update={
+            "center_um": (1.0, 1.0),
+            "size_um": (0.6, 0.6),
+        })
+        monitor = monitor.model_copy(update={"mode_port": port})
+        kwargs = {
+            "size_um": (2.0, 2.0, 2.0),
+            "grid": ph.UniformGridSpec(dl_um=0.1),
+            "run": ph.RunSpec(n_steps=5),
+            "boundaries": ph.Boundaries(
+                x=boundary, y=boundary, z=boundary),
+            "pml_num_layers": 4,
+            "absorber_num_layers": 4,
+            "sources": (source,),
+        }
+        assert ph.Simulation(monitors=(monitor,), **kwargs)
+
+        safe_upper_edge = monitor.model_copy(update={
+            "center_um": (1.55, 1.0, 1.0),
+        })
+        safe = ph.Simulation(monitors=(safe_upper_edge,), **kwargs)
+        assert snap_mixed_plane(safe, 0, 1.55)[0] == pytest.approx(1.525)
+
+        snaps_into_band = monitor.model_copy(update={
+            # Nominally below the 1.6 um nonabsorbing edge, but the nearest
+            # mixed-Yee quarter plane is 1.625 um in the first absorbing cell.
+            "center_um": (1.59, 1.0, 1.0),
+        })
+        with pytest.raises(
+                ValidationError,
+                match=rf"requested 1.59 um but snaps to 1.625 um inside the "
+                      rf"{boundary} band"):
+            ph.Simulation(monitors=(snaps_into_band,), **kwargs)
+
+        inside_band = monitor.model_copy(update={
+            "center_um": (1.7, 1.0, 1.0),
+        })
+        with pytest.raises(
+                ValidationError, match=rf"plane on 'x'.*{boundary} band"):
+            ph.Simulation(monitors=(inside_band,), **kwargs)
+
+        overlapping_port = port.model_copy(update={
+            "center_um": (1.5, 1.0),
+            "size_um": (0.4, 0.6),
+        })
+        overlapping = monitor.model_copy(update={
+            "mode_port": overlapping_port,
+        })
+        with pytest.raises(
+                ValidationError, match=rf"window on 'y'.*{boundary} band"):
+            ph.Simulation(monitors=(overlapping,), **kwargs)
+
+    @pytest.mark.parametrize("boundary", ["pml", "absorber"])
+    def test_port_plane_graded_snap_excludes_upper_absorbing_cell(
+            self, boundary):
+        # Twenty primary cells: ten 0.08 um cells followed by ten 0.12 um
+        # cells. Four upper absorbing cells start at q[16] = 1.52 um.
+        x_coords = tuple(
+            [0.08 * index for index in range(11)]
+            + [0.8 + 0.12 * index for index in range(1, 10)]
+        )
+        grid = ph.GradedGridSpec(
+            dl_um=0.1,
+            coords=ph.GradedAxisCoords(x=x_coords),
+        )
+        source = _modal_source().model_copy(update={"position_um": 0.5})
+        monitor = _modal_monitor().model_copy(update={
+            # Requested 1.51 is inside the nominal nonabsorbing interval, but
+            # the nearest local quarter plane is 1.55 in the first upper layer.
+            "center_um": (1.51, 1.0, 1.0),
+            "size_um": (0.0, 2.0, 2.0),
+        })
+        port = monitor.mode_port.model_copy(update={
+            "center_um": (1.0, 1.0),
+            "size_um": (0.6, 0.6),
+        })
+        monitor = monitor.model_copy(update={"mode_port": port})
+        kwargs = {
+            "size_um": (2.0, 2.0, 2.0),
+            "grid": grid,
+            "run": ph.RunSpec(n_steps=5),
+            "boundaries": ph.Boundaries(
+                x=boundary, y="periodic", z="periodic"),
+            "pml_num_layers": 4,
+            "absorber_num_layers": 4,
+            "sources": (source,),
+        }
+
+        with pytest.raises(
+                ValidationError,
+                match=rf"requested 1.51 um but snaps to 1.55 um inside the "
+                      rf"{boundary} band"):
+            ph.Simulation(monitors=(monitor,), **kwargs)
+
+    def test_port_thickness_axis_cannot_be_plane_normal(self):
+        monitor = _modal_monitor()
+        port = monitor.mode_port.model_copy(update={"thickness_axis": "x"})
+        with pytest.raises(ValidationError, match="cannot equal the plane normal"):
+            _modal_sim(monitors=[monitor.model_copy(update={"mode_port": port})])
+
+    def test_driven_port_source_must_be_reproducible_and_directional(self):
+        point = ph.PointDipole(
+            center_um=(0.25, 0.5, 0.5), polarization="Ey",
+            source_time=ph.GaussianPulse(freq0_hz=F0, fwidth_hz=4e13),
+        )
+        with pytest.raises(ValidationError, match="ModeSource with mode_solve"):
+            _modal_sim(sources=[point])
+
+        wrong_direction = _modal_source().model_copy(update={"direction": "-"})
+        with pytest.raises(ValidationError, match="requires.*direction.*'\\+'"):
+            _modal_sim(sources=[wrong_direction])
+
+        wrong_side = _modal_source().model_copy(update={"position_um": 0.9})
+        with pytest.raises(ValidationError, match="must lie downstream"):
+            _modal_sim(sources=[wrong_side])
+
+    def test_driven_port_must_include_launched_channel(self):
+        monitor = _modal_monitor()
+        port = monitor.mode_port.model_copy(update={
+            "modes": (ph.PortMode(polarization="TM", mode_index=0),),
+        })
+        with pytest.raises(ValidationError, match="include the launched TE0"):
+            _modal_sim(monitors=[monitor.model_copy(update={"mode_port": port})])
+
+    def test_driven_channel_is_relative_to_port_thickness_axis(self):
+        monitor = _modal_monitor()
+        port = monitor.mode_port.model_copy(update={
+            # x-normal natural solve axes are y,z. The saved source's natural
+            # TE family is E_y, which is physical TM when y is slab thickness.
+            "thickness_axis": "y",
+            "modes": (ph.PortMode(polarization="TM", mode_index=0),),
+        })
+        physical = monitor.model_copy(update={"mode_port": port})
+        assert _modal_sim(monitors=[physical]).monitors[0] == physical
+
+        mislabeled = port.model_copy(update={
+            "modes": (ph.PortMode(polarization="TE", mode_index=0),),
+        })
+        with pytest.raises(ValidationError, match="include the launched TM0"):
+            _modal_sim(monitors=[
+                monitor.model_copy(update={"mode_port": mislabeled}),
+            ])
+
+    def test_only_one_port_is_source_linked_in_a_run(self):
+        first = _modal_monitor()
+        second_port = first.mode_port.model_copy(update={
+            "source_index": None, "out_direction": "+",
+        })
+        second = first.model_copy(update={
+            "name": "output", "center_um": (0.85, 0.5, 0.5),
+            "mode_port": second_port,
+        })
+        driven_second = second.model_copy(update={
+            "mode_port": first.mode_port,
+        })
+        with pytest.raises(ValidationError, match="at most one.*driven"):
+            _modal_sim(monitors=[first, driven_second])
 
 
 class TestSimulation:
@@ -178,6 +549,59 @@ class TestSimulation:
             make_sim(pml_kappa_max=0.5)
         with pytest.raises(ValidationError):
             make_sim(pml_alpha_max=-0.1)
+
+
+class TestWithHelpersRevalidate:
+    """Regression (K5): the with_* helpers used model_copy(update=), which
+    skips the cross-field model validators — an invalid combination (graded
+    grid + plane wave, absorber on a plane wave's transverse axes) sailed
+    through and failed only at engine submission, defeating capabilities.py's
+    fail-at-construction contract. They must now raise the same error direct
+    construction gives, while leaving VALID copies byte-identical on the wire
+    (the model_fields_set semantics _wire_exclude keys on are preserved)."""
+
+    def test_with_absorber_plane_wave_raises_like_direct_construction(self):
+        # §13: a plane wave's transverse axes must stay periodic; with_absorber
+        # flips all six faces, so it must fail at the helper call.
+        sim = make_pw_sim()
+        with pytest.raises(ValidationError, match="must be periodic"):
+            sim.with_absorber()
+        # Same error the same field values raise at direct construction.
+        with pytest.raises(ValidationError, match="must be periodic"):
+            make_pw_sim(boundaries=ph.Boundaries(
+                x="absorber", y="absorber", z="absorber"))
+
+    def test_with_absorber_valid_scene_byte_identical_to_plain_copy(self):
+        sim = make_sim()
+        new = sim.with_absorber(num_layers=48)
+        old = sim.model_copy(update={
+            "boundaries": ph.Boundaries(x="absorber", y="absorber",
+                                        z="absorber"),
+            "absorber_num_layers": 48,
+        })
+        # The validated helper returns the plain model_copy result: wire bytes
+        # and fields_set (what _wire_exclude keys unset-field omission on) are
+        # unchanged for a valid scene.
+        assert new.to_wire_json() == old.to_wire_json()
+        assert new.model_fields_set == old.model_fields_set
+        # And the emitted document round-trips through strict wire ingestion.
+        again = ph.Simulation.from_wire_json(new.to_wire_json())
+        assert again.to_wire_json() == new.to_wire_json()
+
+    def test_with_stabilized_pml_valid_scene_unchanged(self):
+        # A valid stabilized-PML copy is untouched by the re-validation
+        # (values, fields_set, wire bytes all match the plain copy path).
+        sim = make_pw_sim()
+        new = sim.with_stabilized_pml(num_layers=20)
+        assert new.pml_num_layers == 20
+        assert new.pml_kappa_max == 5.0
+        old = sim.model_copy(update={
+            "pml_num_layers": new.pml_num_layers,
+            "pml_kappa_max": new.pml_kappa_max,
+            "pml_alpha_max": new.pml_alpha_max,
+        })
+        assert new.to_wire_json() == old.to_wire_json()
+        assert new.model_fields_set == old.model_fields_set
 
 
 class TestSchemaVersionGate:
@@ -422,6 +846,32 @@ class TestGeometry:
 
 
 class TestStructures:
+    @staticmethod
+    def _box(**overrides):
+        kwargs = {
+            "geometry": ph.Box(center_um=(0.1, 0.1, 0.1),
+                               size_um=(0.1, 0.1, 0.1)),
+            "medium": ph.Medium(permittivity=12.0),
+        }
+        kwargs.update(overrides)
+        return ph.Structure(**kwargs)
+
+    def test_optional_name_round_trips_and_unnamed_is_omitted(self):
+        unnamed = make_sim(structures=[self._box()])
+        assert unnamed.structures[0].name is None
+        assert "name" not in unnamed.to_wire_dict()["structures"][0]
+
+        named = make_sim(structures=[self._box(name="Core waveguide")])
+        wire = named.to_wire_dict()
+        assert wire["structures"][0]["name"] == "Core waveguide"
+        back = ph.Simulation.from_wire_json(named.to_wire_json())
+        assert back.structures[0].name == "Core waveguide"
+        assert back.to_wire_dict() == wire
+
+    def test_name_must_be_nonempty_when_present(self):
+        with pytest.raises(ValidationError, match="at least 1 character"):
+            self._box(name="")
+
     def test_simulation_accepts_ordered_structures(self):
         slab = ph.Structure(
             geometry=ph.Box(center_um=(0.1, 0.1, 0.1),
@@ -540,6 +990,34 @@ class TestFieldDftMonitor:
         with pytest.raises(ValidationError, match="outside the domain"):
             make_sim(monitors=[ph.FieldDftMonitor(
                 **self.kwargs(center_um=(0.1, 0.1, 9.0)))])
+
+    def test_apodization_absent_by_default_and_omitted_from_wire(self):
+        m = ph.FieldDftMonitor(**self.kwargs())
+        assert m.apodization is None
+        wire = m.model_dump(mode="json", by_alias=True, exclude_none=True)
+        assert "apodization" not in wire  # back-compat: older engines unaffected
+
+    def test_apodization_round_trips_through_wire(self):
+        ap = ph.Apodization(start_s=3.0e-12, end_s=4.0e-12, width_s=1.0e-12)
+        m = ph.FieldDftMonitor(**self.kwargs(apodization=ap))
+        wire = m.model_dump(mode="json", by_alias=True, exclude_none=True)
+        assert wire["apodization"] == {
+            "start_s": 3.0e-12, "end_s": 4.0e-12, "width_s": 1.0e-12}
+
+    def test_apodization_one_sided_omits_unset_bound(self):
+        # Only a roll-on: end_s stays unset and drops out of the wire.
+        m = ph.FieldDftMonitor(
+            **self.kwargs(apodization=ph.Apodization(start_s=3e-12, width_s=1e-12)))
+        wire = m.model_dump(mode="json", by_alias=True, exclude_none=True)
+        assert wire["apodization"] == {"start_s": 3e-12, "width_s": 1e-12}
+
+    def test_apodization_requires_positive_width(self):
+        with pytest.raises(ValidationError):
+            ph.Apodization(start_s=3e-12, width_s=0.0)
+
+    def test_apodization_rejects_end_before_start(self):
+        with pytest.raises(ValidationError, match="start_s"):
+            ph.Apodization(start_s=4e-12, end_s=3e-12, width_s=1e-12)
 
 
 class TestFluxMonitor:

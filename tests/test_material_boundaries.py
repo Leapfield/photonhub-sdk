@@ -8,8 +8,8 @@ import warnings
 
 import pytest
 
-import simupod as ph
-from simupod.components._bounds import geometry_bounds_um
+import photonhub as ph
+from photonhub.components._bounds import geometry_bounds_um
 
 
 def _disp_medium(eps=2.25):
@@ -25,7 +25,7 @@ def _plain_medium(eps=2.25):
     return ph.Medium(permittivity=eps)
 
 
-def _sim(structures, *, boundaries=None, size_um=(4.0, 4.0, 4.0)):
+def _sim(structures, *, boundaries=None, size_um=(4.0, 4.0, 4.0), **overrides):
     return ph.Simulation(
         size_um=size_um,
         grid=ph.UniformGridSpec(dl_um=0.05),
@@ -40,6 +40,7 @@ def _sim(structures, *, boundaries=None, size_um=(4.0, 4.0, 4.0)):
             )
         ],
         monitors=[ph.FieldSnapshotMonitor(name="final", fields=["Ez"])],
+        **overrides,  # e.g. explicit pml_num_layers / pml_alpha_max
     )
 
 
@@ -95,7 +96,15 @@ def test_dispersive_crossing_pml_warns():
         medium=_disp_medium(),
     )
     with pytest.warns(UserWarning, match="dispersive .* extends into the PML"):
-        _sim([bar])
+        sim = _sim([bar])
+    # The warning is advisory; the gentle auto-alpha still applies on a crossing
+    # scene. 0.1*(2*eps0/dt) — NOT the Tidy3D-parity 0.9, which at the default
+    # 12 layers de-tunes the PML for the propagating guided mode exiting the
+    # face and reflects ~35% of it (measured 2026-07-17, const-n identical to
+    # dispersive => the alpha, not the ADE); 0.1 keeps the trapped-resonance
+    # cure (~3x the measured threshold) with reflection back at ~1e-3.
+    assert sim.pml_alpha_max == pytest.approx(0.1 * sim._two_eps0_over_dt())
+    assert sim.pml_kappa_max == 5.0
 
 
 def test_plain_dielectric_crossing_pml_does_not_warn():
@@ -108,27 +117,139 @@ def test_plain_dielectric_crossing_pml_does_not_warn():
         _sim([bar])
 
 
-def test_dispersive_fully_interior_does_not_warn():
-    # A small dispersive cube far from every face (PML band ~ 0.6 um, 12 layers).
+def test_dispersive_fully_interior_auto_stabilizes():
+    # A small dispersive cube far from every face does NOT trip the crossing
+    # warning; on the default (CFS-inert) PML profile it now AUTO-STABILIZES
+    # silently — kappa 5.0 + the GENTLE alpha 0.1*(2*eps0/dt), applied at
+    # construction (the 2026-07-03 ladder measured divergence with the
+    # dispersive structure 20 cells from the wall, subpixel OFF; the 2026-07-17
+    # dose measurement lowered alpha 0.9 -> 0.1 after the Tidy3D-parity value
+    # was found to reflect ~35% of a propagating guided mode:
+    # engine/docs/subpixel-dispersion-instability.md).
+    cube = ph.Structure(
+        geometry=ph.Box(center_um=(2.0, 2.0, 2.0), size_um=(0.2, 0.2, 0.2)),
+        medium=_disp_medium(),
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")          # auto-apply is silent
+        sim = _sim([cube])
+    assert sim.pml_kappa_max == 5.0
+    assert sim.pml_alpha_max == pytest.approx(0.1 * sim._two_eps0_over_dt())
+    # Fit-safe levers only: the slab thickness and sigma peak are untouched, so
+    # auto-stabilization can never over-thicken a small domain.
+    assert sim.pml_num_layers == 12
+    assert sim.pml_sigma_max == 1.5
+    # The raised knobs ride the wire (the engine field default is CFS-inert);
+    # the untouched layer count stays omitted.
+    wire = sim.to_wire_dict()
+    assert wire["pml_kappa_max"] == 5.0
+    assert "pml_alpha_max" in wire
+    assert "pml_num_layers" not in wire
+
+
+def test_dispersive_interior_stabilized_pml_stays_silent():
+    # The base dispersive scene already auto-stabilizes silently; layering the
+    # explicit with_stabilized_pml() on top (the full StablePML profile, which
+    # ALSO bumps the layer count) is likewise silent — its alpha is not inert.
     cube = ph.Structure(
         geometry=ph.Box(center_um=(2.0, 2.0, 2.0), size_um=(0.2, 0.2, 0.2)),
         medium=_disp_medium(),
     )
     with warnings.catch_warnings():
         warnings.simplefilter("error")
+        sim = _sim([cube])
+        stable = sim.with_stabilized_pml()
+    assert stable.pml_num_layers == 40         # the layer bump the auto path skips
+
+
+def test_dispersive_explicit_pml_tuning_leaves_it_and_warns_if_inert():
+    # If the user has explicitly tuned ANY PML knob, auto-stabilization steps
+    # aside (they own the profile) — but a still-CFS-inert alpha gets the
+    # advisory warning so the divergence lever is not silently unaddressed.
+    cube = ph.Structure(
+        geometry=ph.Box(center_um=(2.0, 2.0, 2.0), size_um=(0.2, 0.2, 0.2)),
+        medium=_disp_medium(),
+    )
+    with pytest.warns(UserWarning, match="CFS-inert"):
+        sim = _sim([cube], pml_num_layers=16)
+    assert sim.pml_num_layers == 16
+    assert sim.pml_alpha_max == 0.24           # left at the inert default
+    assert sim.pml_kappa_max == 3.0            # NOT auto-raised
+
+
+def test_dispersive_explicit_high_alpha_no_warn_no_override():
+    # An explicitly-raised alpha is respected verbatim and silences the advisory.
+    cube = ph.Structure(
+        geometry=ph.Box(center_um=(2.0, 2.0, 2.0), size_um=(0.2, 0.2, 0.2)),
+        medium=_disp_medium(),
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        sim = _sim([cube], pml_alpha_max=5.0e5)
+    assert sim.pml_alpha_max == 5.0e5
+
+
+def test_from_wire_does_not_auto_stabilize_dispersive_default_pml():
+    # A saved dispersive document on the default (inert) PML is the user's
+    # deliberate choice — ingesting it must NOT auto-raise alpha/kappa (that
+    # would break byte-identical round-trip) and must not warn.
+    import json
+
+    cube_geo = ph.Box(center_um=(2.0, 2.0, 2.0), size_um=(0.2, 0.2, 0.2))
+    # A non-dispersive twin serialises with the bare default PML (no alpha/kappa
+    # keys); transplant the REAL serialized dispersive medium into it to forge a
+    # dispersive doc that still carries the bare default PML.
+    twin = _sim([ph.Structure(geometry=cube_geo, medium=_plain_medium())])
+    d = twin.to_wire_dict()
+    assert "pml_alpha_max" not in d and "pml_kappa_max" not in d
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        disp = _sim([ph.Structure(geometry=cube_geo, medium=_disp_medium())])
+    d["structures"][0]["medium"] = disp.to_wire_dict()["structures"][0]["medium"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        back = ph.Simulation.from_wire_json(json.dumps(d))
+    assert back.pml_alpha_max == 0.24 and back.pml_kappa_max == 3.0
+
+
+def test_dispersive_interior_no_pml_faces_does_not_warn():
+    # All-periodic boundaries: no PML anywhere -> no CFS warning.
+    cube = ph.Structure(
+        geometry=ph.Box(center_um=(2.0, 2.0, 2.0), size_um=(0.2, 0.2, 0.2)),
+        medium=_disp_medium(),
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _sim([cube], boundaries=ph.Boundaries(x="periodic", y="periodic",
+                                              z="periodic"))
+
+
+def test_plain_dielectric_interior_default_pml_does_not_warn():
+    cube = ph.Structure(
+        geometry=ph.Box(center_um=(2.0, 2.0, 2.0), size_um=(0.2, 0.2, 0.2)),
+        medium=_plain_medium(),
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         _sim([cube])
 
 
-def test_dispersive_crossing_absorber_axis_does_not_warn():
+def test_dispersive_crossing_absorber_axis_auto_stabilizes_silently():
     bar = ph.Structure(
         geometry=ph.Box(center_um=(2.0, 2.0, 2.0), size_um=(0.5, 0.5, 8.0)),
         medium=_disp_medium(),
     )
-    # z already on the absorber -> nothing to warn about on that axis. (x/y PML
-    # are not crossed by this z-running bar.)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        _sim([bar], boundaries=ph.Boundaries(x="pml", y="pml", z="absorber"))
+    # z already on the absorber -> no CROSSING warning for any axis (x/y PML are
+    # not crossed by this z-running bar). The dispersive scene + surviving x/y
+    # PML faces auto-stabilize silently -> no warning of any kind.
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        sim = _sim([bar], boundaries=ph.Boundaries(x="pml", y="pml", z="absorber"))
+    msgs = [str(w.message) for w in rec]
+    assert not any("extends into the PML" in m for m in msgs)
+    assert not any("CFS-inert" in m for m in msgs)
+    assert sim.pml_kappa_max == 5.0
+    assert sim.pml_alpha_max == pytest.approx(0.1 * sim._two_eps0_over_dt())
 
 
 def test_warning_only_for_the_crossed_axis():
@@ -138,9 +259,10 @@ def test_warning_only_for_the_crossed_axis():
     )
     with pytest.warns(UserWarning) as rec:
         _sim([bar])
-    msg = str(rec[0].message)
+    crossing = [str(w.message) for w in rec if "extends into the PML" in
+                str(w.message)]
     # Only the crossed axis (z) is named; x/y are not flagged.
-    assert "on axis 'z':" in msg
+    assert len(crossing) == 1 and "on axis 'z':" in crossing[0]
 
 
 # --- with_auto_boundaries ---------------------------------------------------

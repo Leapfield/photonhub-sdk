@@ -1,5 +1,5 @@
 """CVCS — continuously-varying-cross-section EME via mode interpolation
-(``simupod.plugins.cvcs``).
+(``photonhub.plugins.cvcs``).
 
 Three things are validated:
 
@@ -19,9 +19,9 @@ from functools import lru_cache
 import numpy as np
 import pytest
 
-from simupod.plugins import eme
-from simupod.plugins.cvcs import cvcs_sections, interpolate_mode, interpolate_plane
-from simupod.plugins.mode_tracking import transverse_overlap
+from photonhub.plugins import eme
+from photonhub.plugins.cvcs import cvcs_sections, interpolate_mode, interpolate_plane
+from photonhub.plugins.mode_tracking import transverse_overlap
 
 WL_UM = 1.31
 DL_UM = 0.05
@@ -110,6 +110,17 @@ def test_interpolate_mode_invalid_s_raises():
     a, b = _modes(0.5)[0], _modes(0.9)[0]
     with pytest.raises(ValueError):
         interpolate_mode(a, b, 1.5)
+
+
+def test_interpolate_mode_spacing_mismatch_raises():
+    """Same point count but a different dl is NOT the same grid — the blend
+    would silently mix fields at different physical locations."""
+    from dataclasses import replace
+
+    a = _modes(0.5)[0]
+    b = replace(a, dl_x_um=a.dl_x_um * 2.0)
+    with pytest.raises(ValueError, match="spacing"):
+        interpolate_mode(a, b, 0.5)
 
 
 def test_interpolate_plane_count_mismatch_raises():

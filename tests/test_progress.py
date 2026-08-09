@@ -9,8 +9,8 @@ import textwrap
 
 import pytest
 
-import simupod as ph
-from simupod.runners.progress import (
+import photonhub as ph
+from photonhub.runners.progress import (
     TerminalRenderer,
     default_renderer,
     format_progress,

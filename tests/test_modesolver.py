@@ -1,6 +1,6 @@
 """FDE mode-solver plugin — SOI strip validation + frozen public API surface.
 
-Validates ``simupod.plugins.ModeSolver`` against the known silicon-on-insulator
+Validates ``photonhub.plugins.ModeSolver`` against the known silicon-on-insulator
 strip waveguide (the same case the benchmark FDTD run cross-checked): a
 450 nm x 220 nm Si core (n = 3.5) in SiO2 (n = 1.444) at lambda = 1310 nm has a
 fundamental quasi-TE (TE0) mode with n_eff ~= 2.7 (the semi-vectorial solver's own
@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from simupod.plugins import Mode, ModeSolver
+from photonhub.plugins import Mode, ModeSolver
 
 # --- SOI strip @ 1310 nm (the validated cross-check case) -------------------
 WL_UM = 1.31
@@ -113,7 +113,7 @@ def test_bent_waveguide_is_refused(soi_solver: ModeSolver):
 def test_bent_mode_exclusion_is_documented():
     """The roadmap requires the straight-only scope to be documented in the
     module/class docstring."""
-    import simupod.plugins.modes as modes_mod
+    import photonhub.plugins.modes as modes_mod
     mod_doc = (modes_mod.__doc__ or "").lower()
     cls_doc = (ModeSolver.__doc__ or "").lower()
     assert "straight" in mod_doc
@@ -201,11 +201,11 @@ def test_frozen_mode_attributes(soi_te0: Mode):
 
 
 def test_frozen_top_level_exports():
-    import simupod.plugins as plugins
+    import photonhub.plugins as plugins
     # The FDE solver (Mode/ModeSolver) is the frozen Phase-1 surface; Phase-2
     # added the mode source/monitor/overlap builders alongside it.
     assert {"Mode", "ModeSolver"} <= set(plugins.__all__)
-    from simupod.plugins import Mode as M, ModeSolver as MS  # noqa: F401
+    from photonhub.plugins import Mode as M, ModeSolver as MS  # noqa: F401
     assert {
         "ModeMonitor",
         "mode_monitor",

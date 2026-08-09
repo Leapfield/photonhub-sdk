@@ -10,8 +10,8 @@ import textwrap
 import numpy as np
 import pytest
 
-import simupod as ph
-from simupod.runners.local import find_solver
+import photonhub as ph
+from photonhub.runners.local import find_solver
 
 FAKE_OK = textwrap.dedent("""\
     #!{python}
@@ -80,6 +80,19 @@ FAKE_HANGS = textwrap.dedent("""\
     time.sleep(30)
 """)
 
+FAKE_REPORT_CLOUD_ENV = textwrap.dedent("""\
+    #!{python}
+    import json, os, sys
+    names = [name for name in (
+        "PHOTONHUB_API_KEY", "PHOTONHUB_URL",
+        "PHOTONHUB_API_KEY", "PHOTONHUB_URL",
+    ) if name in os.environ]
+    print(json.dumps({{"event": "error", "reason":
+                      "cloud env=" + (",".join(names) if names else "NONE")}}),
+          flush=True)
+    sys.exit(1)
+""")
+
 
 def fake_solver(tmp_path, body, name="phsolver-fake"):
     path = tmp_path / name
@@ -103,14 +116,14 @@ class TestDiscovery:
         assert find_solver() == solver
 
     def test_broken_env_var_raises(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("SIMUPOD_SOLVER", str(tmp_path / "missing"))
-        with pytest.raises(ph.SolverRunError, match="SIMUPOD_SOLVER"):
+        monkeypatch.setenv("PHOTONHUB_SOLVER", str(tmp_path / "missing"))
+        with pytest.raises(ph.SolverRunError, match="PHOTONHUB_SOLVER"):
             find_solver()
 
     def test_legacy_env_var_still_honored(self, tmp_path, monkeypatch):
-        # back-compat: $PHOTONHUB_SOLVER is still read when $SIMUPOD_SOLVER is unset
-        monkeypatch.delenv("SIMUPOD_SOLVER", raising=False)
-        monkeypatch.setenv("PHOTONHUB_SOLVER", str(tmp_path / "missing"))
+        # back-compat: $SIMUPOD_SOLVER is still read when $PHOTONHUB_SOLVER is unset
+        monkeypatch.delenv("PHOTONHUB_SOLVER", raising=False)
+        monkeypatch.setenv("SIMUPOD_SOLVER", str(tmp_path / "missing"))
         with pytest.raises(ph.SolverRunError):
             find_solver()
 
@@ -160,6 +173,16 @@ class TestRunLocal:
             ph.run_local(tiny_sim, output_dir=tmp_path / "out",
                          solver_path=solver, timeout=0.5)
 
+    def test_solver_child_does_not_inherit_cloud_credentials(
+            self, tmp_path, tiny_sim, monkeypatch):
+        solver = fake_solver(tmp_path, FAKE_REPORT_CLOUD_ENV)
+        for name in ("PHOTONHUB_API_KEY", "PHOTONHUB_URL",
+                     "PHOTONHUB_API_KEY", "PHOTONHUB_URL"):
+            monkeypatch.setenv(name, "must-not-reach-phsolver")
+        with pytest.raises(ph.SolverRunError, match="cloud env=NONE"):
+            ph.run_local(tiny_sim, output_dir=tmp_path / "out",
+                         solver_path=solver)
+
     def test_clean_exit_without_manifest_raises_solver_run_error(
             self, tmp_path, tiny_sim):
         # Exit 0 + done event but no outputs: still a SolverRunError, not a
@@ -206,18 +229,27 @@ FAKE_REPORT_LOG = textwrap.dedent("""\
 
 class TestDevice:
     def test_device_args_builds_flag(self):
-        from simupod.runners.local import _device_args
-        assert _device_args(None) == []
-        assert _device_args("cpu") == ["--device", "cpu"]
-        assert _device_args("gpu") == ["--device", "gpu"]
-        assert _device_args("gpu:3") == ["--device", "gpu:3"]
-        assert _device_args(" gpu:0 ") == ["--device", "gpu:0"]  # trimmed
+        # device_args is shared between the local runner and the cloud executor
+        # (runners.phsolver), so the device grammar has one definition.
+        from photonhub.runners.phsolver import device_args
+        assert device_args(None) == []
+        assert device_args("cpu") == ["--device", "cpu"]
+        assert device_args("gpu") == ["--device", "gpu"]
+        assert device_args("gpu:3") == ["--device", "gpu:3"]
+        assert device_args(" gpu:0 ") == ["--device", "gpu:0"]  # trimmed
+        # Multi-GPU z-decomposition selectors.
+        assert device_args("gpu:all") == ["--device", "gpu:all"]
+        assert device_args("gpu:0,1") == ["--device", "gpu:0,1"]
+        assert device_args("gpu:0,2,5") == ["--device", "gpu:0,2,5"]
 
-    @pytest.mark.parametrize("bad", ["tpu", "gpu:", "gpu:x", "GPU", "", "cpu:0"])
+    @pytest.mark.parametrize(
+        "bad",
+        ["tpu", "gpu:", "gpu:x", "GPU", "", "cpu:0", "gpu:0,", "gpu:0,x",
+         "gpu:,1", "gpu:All"])
     def test_device_args_rejects_bad(self, bad):
-        from simupod.runners.local import _device_args
+        from photonhub.runners.phsolver import device_args
         with pytest.raises(ph.SolverRunError, match="invalid device"):
-            _device_args(bad)
+            device_args(bad)
 
     def test_run_local_passes_device_through(self, tmp_path, tiny_sim):
         solver = fake_solver(tmp_path, FAKE_REPORT_DEVICE)
@@ -293,7 +325,7 @@ def test_integration_real_solver_nonfinite_abort(tmp_path):
     # dipole overflows the fp32 fields, the solver emits
     # {"event": "error", "reason": "non_finite_energy"}, and run_local
     # surfaces exactly that reason string.
-    from conftest import make_sim
+    from .helpers import make_sim
 
     sim = make_sim(
         run=ph.RunSpec(n_steps=200),
@@ -305,6 +337,57 @@ def test_integration_real_solver_nonfinite_abort(tmp_path):
     )
     with pytest.raises(ph.SolverRunError, match="non_finite_energy"):
         ph.run_local(sim, output_dir=tmp_path / "out", timeout=300)
+
+
+@pytest.mark.skipif(_real_solver() is None,
+                    reason="no phsolver binary found (build the engine first)")
+def test_integration_mesh_override_runs_on_cpu(tmp_path):
+    # End-to-end: a geometry-based MeshOverride refines the mesh around a central
+    # region (a graded GridSpec, NUMERICS §15) and the REAL CPU reference solver
+    # runs that graded mesh to completion with finite fields. The override-
+    # produced graded mesh is what the engine actually consumes; the GPU runs the
+    # same graded path (GpuEquivalence.GradedMeshMatchesCpu, box-verified) for the
+    # periodic/PEC + materials + dipole subset — see GPU_TODO §3.
+    f0 = 1.934e14  # ~1.55 um
+    base = ph.Simulation(
+        size_um=(2.0, 2.0, 2.0),
+        grid=ph.UniformGridSpec(dl_um=0.1),
+        run=ph.RunSpec(n_steps=40),
+        boundaries=ph.Boundaries(x="periodic", y="periodic", z="periodic"),
+        sources=[ph.PointDipole(
+            center_um=(1.0, 1.0, 1.0), polarization="Ez",
+            source_time=ph.GaussianPulse(freq0_hz=f0, fwidth_hz=4.0e13))],
+        monitors=[
+            ph.FieldTimeMonitor(name="probe", center_um=(1.3, 1.0, 1.0),
+                                fields=["Ez"]),
+            ph.FieldSnapshotMonitor(name="final", fields=["Ez", "Hx"]),
+        ],
+    )
+    override = ph.MeshOverride(
+        geometry=ph.Box(center_um=(1.0, 1.0, 1.0), size_um=(0.6, 0.6, 0.6)),
+        dl_um=0.04)
+    sim = base.with_mesh_overrides(override, steps_per_wvl=12.0, max_grading=1.3)
+    # The mesh override produced a genuinely graded grid (per-axis coords).
+    assert sim.grid.type == "graded"
+    assert min(graded := list(  # finest cell is well below the 0.1 um base dl
+        sim.grid.coords.x[i + 1] - sim.grid.coords.x[i]
+        for i in range(len(sim.grid.coords.x) - 1))) <= 0.05
+    # Periodic boundaries on a graded axis require EQUAL first/last primary
+    # spacings (NUMERICS.md §15.2 replicate-closure seam; the engine's
+    # validate hard-rejects otherwise). with_mesh_overrides derived
+    # periodic_axes="xyz" from the boundaries, so the generated mesh closes
+    # seam-symmetrically — this scene end-to-ends that path on the engine.
+    for q in (sim.grid.coords.x, sim.grid.coords.y, sim.grid.coords.z):
+        df, dl_ = q[1] - q[0], q[-1] - q[-2]
+        assert abs(df - dl_) <= 1e-12 * max(df, dl_)
+
+    data = ph.run_local(sim, output_dir=tmp_path / "out", timeout=300)
+    assert "probe" in data and "final" in data
+    snap = data["final"]
+    assert np.isfinite(snap.values).all()
+    # The graded mesh has more cells than the 20-cell uniform base would (the
+    # central refinement), confirming the override reached the solver's grid.
+    assert snap.sizes["x"] > 20
 
 
 @pytest.mark.skipif(_real_solver() is None,

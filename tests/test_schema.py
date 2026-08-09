@@ -6,13 +6,13 @@ import sys
 
 import pytest
 
-from conftest import REPO_ROOT
+from .helpers import REPO_ROOT
 
-import simupod.schema as phs
+import photonhub.schema as phs
 
 
 def _run(args, env):
-    return subprocess.run([sys.executable, "-m", "simupod.schema", *args],
+    return subprocess.run([sys.executable, "-m", "photonhub.schema", *args],
                           capture_output=True, text=True, env=env)
 
 
@@ -31,8 +31,9 @@ def test_emit_writes_valid_json_schema(tmp_path, subprocess_env):
         assert key in schema["properties"], key
     for model in ("UniformGridSpec", "RunSpec", "GaussianPulse", "PointDipole",
                   "PlaneWave", "FieldTimeMonitor", "FieldSnapshotMonitor",
-                  "FieldDftMonitor", "FluxMonitor", "Background", "Boundaries",
-                  "Medium", "Box", "Sphere", "Structure"):
+                  "FieldDftMonitor", "ModePort", "PortMode", "FluxMonitor",
+                  "Background", "Boundaries", "Medium", "Box", "Sphere",
+                  "Structure"):
         assert model in schema["$defs"], model
     # discriminated unions carry the discriminator on the wire 'type' key
     assert schema["properties"]["monitors"]["items"]["discriminator"]["propertyName"] == "type"
@@ -61,7 +62,7 @@ def test_committed_schema_is_in_sync():
     if not committed.is_file():
         pytest.skip("not running from a repo checkout")
     assert committed.read_text(encoding="utf-8") == phs.schema_text(), (
-        "schemas/simulation_v1.json is stale; run 'python -m simupod.schema emit'")
+        "schemas/simulation_v1.json is stale; run 'python -m photonhub.schema emit'")
 
 
 def test_schema_is_as_strict_as_the_implementations():
@@ -70,10 +71,13 @@ def test_schema_is_as_strict_as_the_implementations():
     able to emit specs both implementations reject."""
     schema = json.loads(phs.schema_text())
 
-    # Source polarization: electric components only (both source kinds).
-    for model in ("PointDipole", "PlaneWave"):
-        pol = schema["$defs"][model]["properties"]["polarization"]
-        assert pol["enum"] == ["Ex", "Ey", "Ez"]
+    # Point dipoles support every field component (electric Ex/Ey/Ez inject
+    # onto E; magnetic Hx/Hy/Hz inject onto H — NUMERICS.md section 5).
+    pd_pol = schema["$defs"]["PointDipole"]["properties"]["polarization"]
+    assert pd_pol["enum"] == ["Ex", "Ey", "Ez", "Hx", "Hy", "Hz"]
+    # Plane-wave polarization stays electric-only (a tangential E component).
+    pw_pol = schema["$defs"]["PlaneWave"]["properties"]["polarization"]
+    assert pw_pol["enum"] == ["Ex", "Ey", "Ez"]
 
     # Plane wave: per-axis tangential-polarization restriction is published
     # (NUMERICS.md section 13), so producers cannot emit a longitudinal
@@ -113,6 +117,27 @@ def test_schema_is_as_strict_as_the_implementations():
             "prefixItems"]:
         assert item["minimum"] == 0  # plane/line/point regions are legal
 
+    # Schema 1.16 modal-port authoring metadata is optional on field_dft and
+    # strict within the block. The engine validates then ignores this recipe;
+    # result post-processing owns its numerical interpretation.
+    field_port = schema["$defs"]["FieldDftMonitor"]["properties"]["mode_port"]
+    assert {"$ref": "#/$defs/ModePort"} in field_port["anyOf"]
+    assert {"type": "null"} in field_port["anyOf"]
+    port = schema["$defs"]["ModePort"]
+    assert port["additionalProperties"] is False
+    assert set(port["required"]) == {
+        "out_direction", "center_um", "size_um", "dl_um", "modes"}
+    assert port["properties"]["solver"]["const"] == "yee"
+    assert port["properties"]["out_direction"]["enum"] == ["+", "-"]
+    assert port["properties"]["modes"]["minItems"] == 1
+    assert port["properties"]["supersample"]["minimum"] == 1
+    assert port["properties"]["supersample"]["maximum"] == 16
+    channel = schema["$defs"]["PortMode"]
+    assert channel["additionalProperties"] is False
+    assert channel["properties"]["polarization"]["enum"] == ["TE", "TM"]
+    assert channel["properties"]["mode_index"]["minimum"] == 0
+    assert channel["properties"]["mode_index"]["maximum"] == 31
+
     # run: exactly one of run_time_s / n_steps, with null-as-absent
     # semantics matching both the pydantic runtime and the engine parser.
     one_of = schema["$defs"]["RunSpec"]["oneOf"]
@@ -130,3 +155,11 @@ def test_schema_is_as_strict_as_the_implementations():
         name = schema["$defs"][model]["properties"]["name"]
         assert name["minLength"] == 1
         assert name["pattern"] == "^(?!\\.{1,2}$)[^/\\\\]+$"
+
+    # Structure names (schema 1.15) are optional nonempty display metadata,
+    # without the monitor filename restriction.
+    structure = schema["$defs"]["Structure"]
+    assert "name" not in structure["required"]
+    name_variants = structure["properties"]["name"]["anyOf"]
+    assert {"minLength": 1, "type": "string"} in name_variants
+    assert {"type": "null"} in name_variants

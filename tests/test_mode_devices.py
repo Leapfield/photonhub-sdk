@@ -7,16 +7,16 @@ import math
 
 import pytest
 
-import simupod as ph
-from simupod import auto_grid
-from simupod.components.grid import (
+import photonhub as ph
+from photonhub import auto_grid
+from photonhub.components.grid import (
     GradedAxisCoords,
     GradedGridSpec,
     graded_primary_spacings,
 )
-from simupod.plugins import ModeSolver, mode_monitor, mode_source, transmission
-from simupod.plugins.mode_devices import _axis_cell_centers
-from simupod.runners.local import find_solver
+from photonhub.plugins import ModeSolver, mode_monitor, mode_source, transmission
+from photonhub.plugins.mode_devices import _axis_cell_centers
+from photonhub.runners.local import find_solver
 
 F0 = 1.934e14  # Hz, ~1.55 um
 DL = 0.04  # um
@@ -144,8 +144,10 @@ def test_straight_waveguide_mode_transmission_is_near_one():
     assert math.isfinite(t_fwd)
     # Lossless straight guide: near-unity forward transmission.
     assert 0.8 < t_fwd < 1.1, f"forward transmission not ~1: {t_fwd}"
-    # Low back-reflection into the mode.
-    assert r < 0.1, f"unexpectedly high modal reflection: {r}"
+    # Low back-reflection into the mode. The lower bound is load-bearing: the
+    # backward mode_power is |a_pm|^2/|P_mode| >= 0 (a signed P_mode once made
+    # this reading negative, so `r < 0.1` was vacuous).
+    assert 0 <= r < 0.1, f"unexpectedly high modal reflection: {r}"
 
 
 @pytest.mark.skipif(find_solver() is None, reason="no built phsolver")
@@ -194,7 +196,8 @@ def test_straight_waveguide_transmission_spectrum_is_near_one():
         key = min(t, key=lambda k: abs(k - f))  # tolerate fp on the freq labels
         assert math.isfinite(t[key])
         assert 0.8 < t[key] < 1.1, f"T(f={f:.3e}) not ~1: {t[key]}"
-        assert p_bwd[key] / p_fwd[key] < 0.1, f"high reflection at f={f:.3e}"
+        # lower bound load-bearing: backward mode_power must be >= 0 (see above)
+        assert 0 <= p_bwd[key] / p_fwd[key] < 0.1, f"high reflection at f={f:.3e}"
 
 
 # --------------------------------------------------------------------------- #
@@ -296,12 +299,8 @@ def test_transverse_graded_straight_guide_transmission_near_one():
 
 
 @pytest.mark.skipif(find_solver() is None, reason="no built phsolver")
-def test_mode_source_graded_propagation_axis_is_rejected():
-    """The §18 aux line is 1-D along the propagation axis at the scalar dl, so a
-    GRADED propagation axis is rejected by the engine (only the transverse plane
-    may grade)."""
-    from simupod.runners.local import SolverRunError
-
+def test_mode_source_graded_propagation_axis_runs():
+    """The §18 auxiliary line follows the local propagation-axis spacing."""
     base = _waveguide_sim()
     lz = base["size_um"][2]
     grid = GradedGridSpec(dl_um=DL,
@@ -313,5 +312,60 @@ def test_mode_source_graded_propagation_axis_is_rejected():
         center_um=(0.8, 0.8, 0.8), polarization="Ex", source_time=pulse)])
     src = mode_source(shell, mode, axis="z", position_um=0.8, source_time=pulse)
     sim = ph.Simulation(**base, sources=[src])
-    with pytest.raises(SolverRunError, match="propagation axis"):
-        ph.run_local(sim)
+    data = ph.run_local(sim)
+    assert data.manifest["run"]["steps_run"] == 50
+
+
+# --------------------------------------------------------------------------- #
+# transmission() direction handling — synthetic planes, no engine needed.
+# --------------------------------------------------------------------------- #
+
+
+def test_transmission_defaults_to_each_monitors_stored_direction():
+    """Regression: ``transmission(...)`` used to default ``direction="+"``,
+    which SILENTLY overrode each monitor's stored direction — an out-monitor
+    built with ``direction="-"`` (a port facing the source) was read forward
+    (~0). The default is now ``None`` = per-monitor fallback; an explicit
+    direction still applies to ALL planes (documented)."""
+    import numpy as np
+    import xarray as xr
+
+    from photonhub.components.monitors import FieldDftMonitor
+    from photonhub.plugins.mode_devices import ModeMonitor
+    from photonhub.plugins.mode_overlap import modal_fields
+
+    mode = _te0_mode()
+    ny, nx = mode.field.shape
+    x = (np.arange(nx + 12) - (nx + 11) / 2.0) * DL
+    y = (np.arange(ny + 12) - (ny + 11) / 2.0) * DL
+    tang = ("Ex", "Ey", "Hx", "Hy")
+
+    def plane(amp, direction):
+        m = modal_fields(mode, x, y, axis="z", direction=direction,
+                         center_um=(0.0, 0.0))
+        comp = np.stack([amp * m[k] for k in ("e1", "e2", "h1", "h2")])
+        return xr.DataArray(
+            comp[None, :, None, :, :].astype(np.complex128),
+            dims=("f", "component", "z", "y", "x"),
+            coords={"f": [F0], "component": list(tang), "z": [0.0],
+                    "y": y, "x": x})
+
+    def monitor(name, direction):
+        fm = FieldDftMonitor(name=name, center_um=(0.0, 0.0, 0.0),
+                             size_um=(2.0, 2.0, 0.0), fields=tang,
+                             freqs_hz=(F0,))
+        return ModeMonitor(field_monitor=fm, mode=mode, axis="z",
+                           center_um=(0.0, 0.0), direction=direction)
+
+    # in-port: forward wave amp 1; out-port FACING BACKWARD: backward wave 0.6.
+    data = {"in": plane(1.0, "+"), "out": plane(0.6, "-")}
+    mm_in = monitor("in", "+")
+    mm_out = monitor("out", "-")
+
+    t = transmission(mm_out, mm_in, data, colocate=False)[F0]
+    assert t == pytest.approx(0.36, rel=1e-3)  # read in ITS stored direction
+
+    # explicit direction still overrides BOTH planes: forward read of the
+    # backward-only out plane ~ 0.
+    t_fwd = transmission(mm_out, mm_in, data, direction="+", colocate=False)[F0]
+    assert t_fwd == pytest.approx(0.0, abs=1e-9)

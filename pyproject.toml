@@ -3,25 +3,50 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "simupod"
+name = "photonhub"
 version = "0.0.1"
 description = "Python client for the PhotonHub GPU FDTD photonics solver"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 dependencies = [
     "pydantic>=2.6",
     "numpy",
     "scipy",
     "xarray",
     "matplotlib",
+    # CA fallback for interpreters whose default SSL context has no roots
+    # (photonhub.web._https_context); never used when the OS store works.
+    "certifi",
 ]
 
 [project.optional-dependencies]
-test = ["pytest", "plotly", "ipywidgets"]   # so the full viz suite runs in CI, not skips
+test = [
+    "pytest",
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "plotly",
+    "ipywidgets",
+    "pyyaml",
+    "gdstk",
+    "h5py",
+    "nbformat",
+]  # complete offline package suite used by CI
 viz = ["plotly", "ipywidgets"]              # plotly = 3D; ipywidgets = interactive_preview
+app = ["plotly", "fastapi", "uvicorn", "mcp", "h5py", "gdstk"]  # desktop opens bundles + HDF5 results and imports GDSII layouts
+replicate = ["pyyaml"]                       # PaperSpec.from_yaml parses the YAML paper specs
+gds = ["gdstk"]                              # import/export GDSII
+hdf5 = ["h5py"]                              # SimulationData HDF5 export
+notebook = ["nbformat"]                       # paper-replication tutorials
+
+[project.scripts]
+photonhub-serve-viz = "photonhub.viz.server:_main"
+photonhub-mcp = "photonhub.mcp_server:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["simupod"]
+packages = ["photonhub"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

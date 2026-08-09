@@ -6,9 +6,9 @@ import numpy as np
 import pytest
 import xarray as xr
 
-import simupod as ph
-from simupod import inverse_design as idz
-from simupod.runners.local import find_solver
+import photonhub as ph
+from photonhub import inverse_design as idz
+from photonhub.runners.local import find_solver
 
 C0 = 2.99792458e8
 
@@ -239,7 +239,7 @@ def test_optimize_increases_objective():
 # ModePower objective (mode solve is pure-Python; FDTD pieces are solver-gated)
 # ---------------------------------------------------------------------------
 
-from simupod.plugins import ModeSolver, mode_source  # noqa: E402
+from photonhub.plugins import ModeSolver, mode_source  # noqa: E402
 
 F0_WG = 1.934e14   # ~1.55 um
 N_CORE, N_CLAD = 3.5, 1.444

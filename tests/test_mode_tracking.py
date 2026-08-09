@@ -1,4 +1,4 @@
-"""Mode tracking (``simupod.plugins.mode_tracking``) — overlap matching and
+"""Mode tracking (``photonhub.plugins.mode_tracking``) — overlap matching and
 crossing-aware labeling.
 
 The load-bearing test is a controllable **n_eff crossing**: two weakly-coupled
@@ -13,14 +13,14 @@ the easy case.
 import numpy as np
 import pytest
 
-from simupod.plugins import eme
-from simupod.plugins.mode_tracking import (
+from photonhub.plugins import eme
+from photonhub.plugins.mode_tracking import (
     match_modes,
     reorder_to_tracks,
     track_modes,
     transverse_overlap,
 )
-from simupod.plugins.vector_modes import VectorModeSolver
+from photonhub.plugins.vector_modes import VectorModeSolver
 
 WL_UM = 1.31
 DL_UM = 0.05
@@ -93,6 +93,17 @@ def test_transverse_overlap_self_is_orthonormal(crossing_planes):
 def test_transverse_overlap_grid_mismatch_raises(crossing_planes, taper_planes):
     with pytest.raises(ValueError):
         transverse_overlap(crossing_planes[0], taper_planes[0])
+
+
+def test_transverse_overlap_spacing_mismatch_raises(crossing_planes):
+    """Same point count but different dl is a different grid — the point-wise
+    correlation would compare fields at different physical locations."""
+    from dataclasses import replace
+
+    modes = crossing_planes[0]
+    rescaled = [replace(m, dl_x_um=m.dl_x_um * 2.0) for m in modes]
+    with pytest.raises(ValueError, match="spacing"):
+        transverse_overlap(modes, rescaled)
 
 
 def test_match_modes_identity(crossing_planes):

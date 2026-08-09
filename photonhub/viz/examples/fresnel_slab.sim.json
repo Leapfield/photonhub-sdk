@@ -1,0 +1,105 @@
+{
+  "schema_version": "1.16.0-alpha.1",
+  "size_um": [
+    0.05,
+    0.05,
+    4.0
+  ],
+  "grid": {
+    "type": "uniform",
+    "dl_um": 0.0125
+  },
+  "run": {
+    "run_time_s": 3e-13,
+    "courant": 0.99
+  },
+  "background": {
+    "permittivity": 1.0
+  },
+  "pml_num_layers": 12,
+  "subpixel": true,
+  "subpixel_method": "contour",
+  "structures": [
+    {
+      "geometry": {
+        "type": "box",
+        "center_um": [
+          0.0,
+          0.0,
+          2.21875
+        ],
+        "size_um": [
+          10.0,
+          10.0,
+          0.25
+        ]
+      },
+      "medium": {
+        "permittivity": 4.0,
+        "conductivity_s_per_m": 0.0
+      }
+    }
+  ],
+  "boundaries": {
+    "x": "periodic",
+    "y": "periodic",
+    "z": "pml"
+  },
+  "sources": [
+    {
+      "type": "plane_wave",
+      "axis": "z",
+      "direction": "+",
+      "position_um": 0.8,
+      "polarization": "Ex",
+      "amplitude": 1.0,
+      "source_time": {
+        "type": "gaussian_pulse",
+        "freq0_hz": 193400000000000.0,
+        "fwidth_hz": 30000000000000.0,
+        "offset": 5.0,
+        "phase": 0.0
+      }
+    }
+  ],
+  "monitors": [
+    {
+      "type": "flux",
+      "name": "up",
+      "axis": "z",
+      "position_um": 1.25,
+      "freqs_hz": [
+        163400000000000.0,
+        169400000000000.0,
+        175400000000000.0,
+        181400000000000.0,
+        187400000000000.0,
+        193400000000000.0,
+        199400000000000.0,
+        205400000000000.0,
+        211400000000000.0,
+        217400000000000.0,
+        223400000000000.0
+      ]
+    },
+    {
+      "type": "flux",
+      "name": "down",
+      "axis": "z",
+      "position_um": 3.25,
+      "freqs_hz": [
+        163400000000000.0,
+        169400000000000.0,
+        175400000000000.0,
+        181400000000000.0,
+        187400000000000.0,
+        193400000000000.0,
+        199400000000000.0,
+        205400000000000.0,
+        211400000000000.0,
+        217400000000000.0,
+        223400000000000.0
+      ]
+    }
+  ]
+}

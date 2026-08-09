@@ -1,6 +1,6 @@
 """Near-to-far-field (NTFF) projection — physics pins.
 
-Validates ``simupod.plugins.near_field.far_field`` on SYNTHETIC near-field
+Validates ``photonhub.plugins.near_field.far_field`` on SYNTHETIC near-field
 surfaces (no FDTD run): the near fields are built analytically as xarray
 DataArrays shaped like a real ``field_dft`` monitor slice (dims
 ``f/component/z/y/x``), projected, and the far-field pattern is asserted against
@@ -48,12 +48,20 @@ All coordinates are in MICRONS (the PhotonHub convention); the plugin converts
 to metres internally. Time convention ``e^{-i omega t}`` (matching mode_overlap).
 """
 
+import functools
+
 import numpy as np
 import pytest
 import xarray as xr
 
-from simupod.plugins import FarField, far_field
-from simupod.plugins.near_field import C0, ETA0, _TANGENTIAL, _TRANSVERSE
+from photonhub.plugins import FarField, far_field as _far_field
+from photonhub.plugins.near_field import C0, ETA0, _TANGENTIAL, _TRANSVERSE
+
+# These tests feed SYNTHETIC, already-co-located analytic planes (E and H built
+# at the SAME grid points), so the Yee co-location — correct only for the
+# engine's STAGGERED DFT output — must be OFF here (same convention as
+# test_mode_overlap / test_smatrix). Real runs default colocate=True.
+far_field = functools.partial(_far_field, colocate=False)
 
 WL_UM = 1.0
 F0 = C0 / (WL_UM * 1e-6)        # Hz
@@ -125,6 +133,37 @@ def test_uniform_aperture_matches_sinc_pattern(phi):
     assert theta[np.argmax(U)] == pytest.approx(0.0, abs=1e-9)
 
 
+def test_on_axis_absolute_sign_matches_rayleigh_sommerfeld():
+    """The ABSOLUTE sign/phase of the returned far field, not just its magnitude.
+
+    Every other test here reads ``intensity``/power/lobe position, all invariant
+    under a global sign — which is exactly how a constant pi absolute-phase error
+    survived: Balanis' e^{+j omega t} formulas were adapted to e^{-i omega t} by
+    flipping the exponential but NOT the leading ``j k``, leaving E_theta/E_phi
+    globally negated.
+
+    On-axis (theta=0) a Huygens patch carrying Ex=g with the paired plane-wave
+    Hy=g/eta0 must reproduce the Rayleigh-Sommerfeld amplitude in this same
+    convention (Goodman): F = -i k / (2 pi) * Int g dS. Derivation: at theta=0,
+    theta_hat = x_hat, so L_phi = -Int g dS and N_theta = -(1/eta0) Int g dS, and
+    F_theta = pref*(L_phi + eta0*N_theta) = -(i k / 2 pi) Int g dS.
+    """
+    a, b, dl = 4.0, 4.0, 0.05
+    data, x, y = _aperture_plane(a, b, dl)
+    ff = far_field(data, "ap", theta=np.array([0.0]), phi=0.0, axis="z")
+
+    # Int g dS over the SAME discrete aperture, in m^2 (uniform grid -> dA = dl^2).
+    Ex = data["ap"].sel(component="Ex").isel(f=0).squeeze(drop=True).values
+    integral = np.sum(Ex) * (dl * 1e-6) ** 2
+    expected = -1j * K / (2.0 * np.pi) * integral
+
+    got = complex(ff.e_theta[0, 0])
+    # Ratio == +1 (not -1): pins magnitude AND the absolute sign together.
+    ratio = got / expected
+    assert ratio.real == pytest.approx(1.0, rel=2e-2), f"got {got}, expected {expected}"
+    assert abs(ratio.imag) < 2e-2, f"unexpected phase: ratio={ratio}"
+
+
 def test_uniform_aperture_first_null_location():
     """The first null of the E-plane (phi=0) pattern sits at the analytic
     ``sin(theta_null) = wavelength / a`` (the sinc's first zero)."""
@@ -151,6 +190,24 @@ def test_uniform_aperture_tight_against_obliquity_model():
     ana = (_sinc(u)) ** 2 * ((1.0 + np.cos(theta)) / 2.0) ** 2
     ana = ana / ana.max()
     assert np.max(np.abs(U - ana)) < 2e-4
+
+
+def test_colocate_path_keeps_aperture_pattern():
+    """The default colocate=True path (correct for real staggered DFT data):
+    on an already-co-located synthetic plane the node-averaging amounts to a
+    half-cell translation plus mild edge smoothing, so the normalized intensity
+    pattern must stay close to the analytic sinc^2 form (|FT| is translation-
+    invariant) — a loose pin that the co-location path is wired correctly."""
+    a, b, dl = 4.0, 6.0, 0.05
+    data, _, _ = _aperture_plane(a, b, dl)
+    theta = np.linspace(0.0, np.pi / 2 * 0.95, 60)
+    U = _far_field(data, "ap", theta=theta, phi=0.0, axis="z",
+                   colocate=True).intensity[0]
+    U = U / U.max()
+    u = K * (a * 1e-6) * np.sin(theta) / 2.0
+    ana = (_sinc(u)) ** 2 * ((1.0 + np.cos(theta)) / 2.0) ** 2
+    ana = ana / ana.max()
+    assert np.max(np.abs(U - ana)) < 5e-3
 
 
 # --- beam steering (Fourier shift -> kernel sign / time convention) ---------

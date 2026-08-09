@@ -11,7 +11,7 @@ import math
 
 import pytest
 
-import simupod as ph
+import photonhub as ph
 
 # Spec constant (engine kC0 / grid.py / cost.py); the client must match it.
 _C0 = 2.99792458e8
@@ -53,13 +53,43 @@ class TestSettlingDiagnostics:
         assert p.spectral_amplitude(f0 + 2 * fwidth) == pytest.approx(math.exp(-2.0))
 
     def test_dc_amplitude_is_the_instability_tell(self):
+        # |S(0)|/|S(f0)| = 2|cos(phase)| * exp(-(f0/fw)^2/2): at f=0 BOTH
+        # sidebands of the analytic spectrum (engine gaussian_pulse_spectrum)
+        # contribute equally — the +f0 envelope alone under-reports DC by
+        # 2|cos(phase)| (2x at the default phase=0).
         # freq0/fwidth = 10 sigma to DC -> utterly negligible (stable)
         safe = ph.GaussianPulse(freq0_hz=2.0e14, fwidth_hz=2.0e13)
-        assert safe.dc_amplitude == pytest.approx(math.exp(-0.5 * 10.0**2))
+        assert safe.dc_amplitude == pytest.approx(2.0 * math.exp(-0.5 * 10.0**2))
         assert safe.dc_amplitude < 1e-20
-        # freq0/fwidth = 2 sigma to DC -> ~13.5% on DC (the documented blow-up)
+        # freq0/fwidth = 2 sigma to DC -> ~27% on DC (the documented blow-up)
         risky = ph.GaussianPulse(freq0_hz=2.0e14, fwidth_hz=1.0e14)
-        assert risky.dc_amplitude == pytest.approx(math.exp(-2.0))
+        assert risky.dc_amplitude == pytest.approx(2.0 * math.exp(-2.0))
+
+    def test_dc_amplitude_matches_engine_spectrum_ratio(self):
+        # Pin dc_amplitude to |S(0)|/|S(f0)| of the engine's closed-form
+        # two-sideband spectrum (source_time.h gaussian_pulse_spectrum),
+        # re-derived here independently, across carrier phases.
+        def spectrum_abs(p, f):
+            tau = 1.0 / (2.0 * math.pi * p.fwidth_hz)
+            dm, dp = f - p.freq0_hz, f + p.freq0_hz
+            g = lambda d: math.exp(-2.0 * math.pi**2 * tau**2 * d * d)
+            # |e^{-i phase} g(dm) + e^{+i phase} g(dp)| (prefactor/phase ramp
+            # cancel in the ratio)
+            re = math.cos(p.phase) * (g(dm) + g(dp))
+            im = math.sin(p.phase) * (g(dp) - g(dm))
+            return math.hypot(re, im)
+
+        # f0/fw = 4: the neglected -f0 sideband AT +f0 is exp(-2*(f0/fw)^2)
+        # ~ 1.3e-14 of the denominator, far inside the rel tolerance (the
+        # diagnostic's closed form drops it deliberately).
+        for phase in (0.0, 0.25, math.pi / 3, 2.0):
+            p = ph.GaussianPulse(freq0_hz=2.0e14, fwidth_hz=0.5e14, phase=phase)
+            expected = spectrum_abs(p, 0.0) / spectrum_abs(p, p.freq0_hz)
+            assert p.dc_amplitude == pytest.approx(expected, rel=1e-10), phase
+        # phase = pi/2: the two sidebands cancel exactly at DC.
+        quad = ph.GaussianPulse(freq0_hz=2.0e14, fwidth_hz=1.0e14,
+                                phase=math.pi / 2)
+        assert quad.dc_amplitude == pytest.approx(0.0, abs=1e-16)
 
 
 class TestForBandFromFreqs:
@@ -138,9 +168,10 @@ class TestForBandStability:
         # an octave-spanning band wants fwidth = half-band = 1e14 (DC at 2 sigma)
         with pytest.warns(UserWarning, match="clamping"):
             p = ph.GaussianPulse.for_band(freqs_hz=[1.0e14, 3.0e14])
-        # clamped to freq0 / min_dc_sigmas = 2e14 / 4
+        # clamped to freq0 / min_dc_sigmas = 2e14 / 4; DC weight is the
+        # two-sideband 2*exp(-8) ~ 6.7e-4 (phase=0), still comfortably small.
         assert p.fwidth_hz == pytest.approx(2.0e14 / 4.0)
-        assert p.dc_amplitude == pytest.approx(math.exp(-0.5 * 4.0**2))
+        assert p.dc_amplitude == pytest.approx(2.0 * math.exp(-0.5 * 4.0**2))
 
     def test_min_dc_sigmas_controls_the_cap(self):
         with pytest.warns(UserWarning):

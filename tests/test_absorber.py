@@ -5,15 +5,31 @@ import json
 import pytest
 from pydantic import ValidationError
 
-import simupod as ph
+import photonhub as ph
 
-from conftest import make_sim
+from .helpers import make_sim
 
 
 def test_default_boundary_is_pml_on_all_faces():
     # Schema 1.12 flipped the user-facing default from periodic to PML.
     b = ph.Boundaries()
     assert (b.x, b.y, b.z) == ("pml", "pml", "pml")
+
+
+def test_default_pml_sigma_max_is_tidy3d_parity():
+    # The PML peak conductivity defaults to Tidy3D's 1.5 (2*eps0/dt units) — the
+    # resolution-consistent, dt-based profile that drains grazing/trapped modes.
+    # 0.0 is the legacy dl-heuristic escape hatch.
+    sim = make_sim()
+    assert sim.pml_sigma_max == 1.5
+    # Unset -> omitted from the wire (docs stay byte-identical); the engine
+    # default (also 1.5) applies on ingest, so a round-trip preserves 1.5.
+    assert "pml_sigma_max" not in json.loads(sim.to_wire_json())
+    back = ph.Simulation.from_wire_json(sim.to_wire_json())
+    assert back.pml_sigma_max == 1.5
+    # The legacy escape hatch is explicit and survives the wire.
+    legacy = make_sim(pml_sigma_max=0.0)
+    assert json.loads(legacy.to_wire_json())["pml_sigma_max"] == 0.0
 
 
 def test_absorber_is_a_valid_boundary_kind_and_round_trips():

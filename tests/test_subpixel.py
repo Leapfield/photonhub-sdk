@@ -6,22 +6,22 @@ C++ test_subpixel.cpp; here we only pin the client/wire surface.
 
 import json
 
-import simupod as ph
+import photonhub as ph
 
-from conftest import make_sim
+from .helpers import make_sim
 
 
 def test_default_is_tensor_on_for_nondispersive():
-    # D2 (NUMERICS.md §16): a non-dispersive sim with no explicit subpixel choice
-    # defaults to subpixel-ON with the diagonal-KFJ "tensor" average (Tidy3D's
-    # subpixel-on posture), and the resolved value is serialized explicitly on
-    # the wire (the engine field default is off).
+    # D2 (NUMERICS.md §16/§16.11): a non-dispersive sim with no explicit subpixel
+    # choice defaults to subpixel-ON with "contour" (diagonal KFJ fed the exact
+    # §16.10 PolySlab fill == Tidy3D's default PolarizedAveraging; reduces to the
+    # diagonal tensor on axis-aligned interfaces), serialized explicitly on the wire.
     sim = make_sim()
     assert sim.subpixel is True
-    assert sim.subpixel_method == "tensor"
+    assert sim.subpixel_method == "contour"
     wire = sim.to_wire_dict()
     assert wire["subpixel"] is True
-    assert wire["subpixel_method"] == "tensor"
+    assert wire["subpixel_method"] == "contour"
 
 
 def test_default_falls_back_to_off_for_dispersive():
@@ -35,6 +35,30 @@ def test_default_falls_back_to_off_for_dispersive():
     sim = make_sim(structures=[box])
     assert sim.subpixel is False
     assert "subpixel" not in sim.to_wire_dict()
+
+
+def test_explicit_subpixel_on_dispersive_still_states_its_method_on_the_wire():
+    # Regression: an EXPLICIT subpixel=True on a dispersive (Lorentz) scene used
+    # to skip the method fill (it was gated on `not dispersive`), so the model
+    # REPORTED subpixel_method="contour" (the field default) while the wire OMITTED
+    # it and the engine silently applied ITS default, "volume" — an isotropic
+    # linear average instead of the diagonal KFJ advertised, a first-order operator
+    # error on every partially-filled interface cell. What the model reports and
+    # what the engine runs must agree; the divergence warning is separate.
+    import pytest
+
+    pole = ph.LorentzPole(resonance_frequency_hz=2.0e14, delta_eps=1.5)
+    box = ph.Structure(
+        geometry=ph.Box(center_um=(0.1, 0.1, 0.1), size_um=(0.1, 0.1, 0.1)),
+        medium=ph.Medium(permittivity=2.0, lorentz=pole),
+    )
+    with pytest.warns(UserWarning, match="dispersive"):
+        sim = make_sim(structures=[box], subpixel=True)
+    assert sim.subpixel is True
+    assert sim.subpixel_method == "contour"
+    wire = sim.to_wire_dict()
+    assert wire["subpixel"] is True
+    assert wire["subpixel_method"] == "contour"  # was: omitted -> engine ran "volume"
 
 
 def test_explicit_subpixel_false_is_respected_when_unset_default_would_enable():
@@ -77,7 +101,7 @@ def test_from_wire_parses_subpixel():
     sim = make_sim(subpixel=True)
     back = ph.Simulation.from_wire_json(sim.to_wire_json())
     assert back.subpixel is True
-    assert back.schema_version == "1.12.0-alpha.1"
+    assert back.schema_version == ph.SCHEMA_VERSION
 
 
 def test_wire_ingestion_is_strict_about_bool():
@@ -98,11 +122,21 @@ def test_wire_ingestion_is_strict_about_bool():
 
 
 def test_subpixel_method_default_is_tensor_when_auto_enabled():
-    # D2: when the construction default enables subpixel (non-dispersive), the
-    # method it selects is the diagonal-KFJ "tensor" (not the isotropic volume).
+    # D2/§16.11: when the construction default enables subpixel (non-dispersive),
+    # the method it selects is "contour" (Tidy3D's default PolarizedAveraging fed
+    # the exact §16.10 fill; not the isotropic volume, not the CP-EP contour_diag).
     sim = make_sim()
-    assert sim.subpixel_method == "tensor"
-    assert sim.to_wire_dict()["subpixel_method"] == "tensor"
+    assert sim.subpixel_method == "contour"
+    assert sim.to_wire_dict()["subpixel_method"] == "contour"
+
+
+def test_explicit_subpixel_true_fills_contour_like_the_auto_default():
+    # An explicit subpixel=True with the method UNSET must resolve to the SAME
+    # operator as the auto-default (contour) — the two subpixel-on paths stay
+    # in lockstep, not tensor-vs-contour.
+    sim = make_sim(subpixel=True)
+    assert sim.subpixel_method == "contour"
+    assert sim.to_wire_dict()["subpixel_method"] == "contour"
 
 
 def test_subpixel_method_tensor_appears_on_the_wire():

@@ -26,10 +26,10 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from simupod.plugins import Mode, ModeSolver
-from simupod.plugins.mode_devices import ModeMonitor
-from simupod.plugins.mode_overlap import modal_fields
-from simupod.plugins.smatrix import (
+from photonhub.plugins import Mode, ModeSolver
+from photonhub.plugins.mode_devices import ModeMonitor
+from photonhub.plugins.mode_overlap import modal_fields
+from photonhub.plugins.smatrix import (
     SPort,
     assemble_smatrix,
     assert_passive,
@@ -113,7 +113,7 @@ def _stacked_plane(mode: Mode, x, y, waves, *, freqs=(F0,)):
 def _monitor(mode: Mode, name: str, *, out_direction: str) -> ModeMonitor:
     """A bare ModeMonitor for a z-normal port (no Simulation needed — only its
     name/mode/axis are used by the overlap)."""
-    from simupod.components.monitors import FieldDftMonitor
+    from photonhub.components.monitors import FieldDftMonitor
     fm = FieldDftMonitor(
         name=name, center_um=(0.0, 0.0, 0.0), size_um=(2.0, 2.0, 0.0),
         fields=_TANGENTIAL_Z, freqs_hz=(F0,))
@@ -210,6 +210,71 @@ def test_full_two_port_matrix_reciprocal_passive(te0: Mode):
     assert is_passive(S, atol=5e-3)
     assert_reciprocal(S, atol=5e-3)
     assert_passive(S, atol=5e-3)
+
+
+# ---------------------------------------------------------------------------
+# Unequal-mode ports (taper-like): power normalization + reciprocity
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def te0_wide() -> Mode:
+    """TE0 of a wider (0.80 µm) strip — a DIFFERENT mode (different n_eff and
+    P_mode) than ``te0``, for the unequal-port normalization regression."""
+    solver = ModeSolver.from_rectangular_core(
+        wavelength_um=WL_UM, dl_um=DL_UM,
+        core_w_um=0.80, core_h_um=CORE_H_UM,
+        n_core=N_SI, n_clad=N_SIO2)
+    return solver.solve(num_modes=1, polarization="TE")[0]
+
+
+def _mode_plane_power(mode: Mode, x, y) -> float:
+    """P_mode of ``mode`` on the (x, y) plane — the power its unit-amplitude
+    field carries (via the same overlap kernel the assembler uses)."""
+    from photonhub.plugins.mode_overlap import _overlap_terms
+    plane = _stacked_plane(mode, x, y, [(1.0 + 0j, "+")])
+    planes = {c: plane.sel(component=c) for c in _TANGENTIAL_Z}
+    ((_, p_mode),) = [v for v in _overlap_terms(
+        planes, mode, axis="z", direction="+", center_um=(0.0, 0.0),
+        colocate=False).values()]
+    return float(p_mode)
+
+
+def test_unequal_mode_ports_power_ratio_and_reciprocity(te0: Mode, te0_wide: Mode):
+    """Regression: with ports carrying DIFFERENT modes (a w1→w2 taper), |S21|^2
+    must be the TRUE power ratio and S must stay reciprocal.
+
+    A lossless full-power transition is synthesized: the output plane carries
+    the wide mode at the amplitude that makes its modal power EQUAL the input
+    power. The pre-fix ``c = a_pm/P_mode`` normalization biased |S21|^2 by
+    P_mode1/P_mode2 (≈ n_eff1/n_eff2) and gave S21/S12 = P1/P2 ≠ 1."""
+    # A common plane covering both modes.
+    x, y = _plane_axes(te0_wide)
+    p1_mon = _monitor(te0, "p1", out_direction="-")
+    p2_mon = _monitor(te0_wide, "p2", out_direction="+")
+    p1 = SPort("p1", p1_mon)
+    p2 = SPort("p2", p2_mon)
+
+    P1 = _mode_plane_power(te0, x, y)
+    P2 = _mode_plane_power(te0_wide, x, y)
+    assert abs(P1 - P2) / P1 > 0.02, "modes chosen so P_mode really differs"
+
+    # Lossless, reflectionless full-power transfer: |amp_out|^2 * P2 == 1^2 * P1.
+    amp_out = np.sqrt(P1 / P2)
+    d1 = _Data(p1=_stacked_plane(te0, x, y, [(1.0 + 0j, "+")]),
+               p2=_stacked_plane(te0_wide, x, y, [(amp_out + 0j, "+")]))
+    col1 = smatrix([p1, p2], "p1", d1)
+    S21 = col1[("p2", "p1")][F0]
+    assert abs(S21) ** 2 == pytest.approx(1.0, rel=2e-3)   # true power ratio
+    assert abs(col1[("p1", "p1")][F0]) == pytest.approx(0.0, abs=1e-6)
+
+    # Reverse drive (wide side, incident travelling -z): reciprocity S12 == S21.
+    amp_back = np.sqrt(P2 / P1)
+    d2 = _Data(p2=_stacked_plane(te0_wide, x, y, [(1.0 + 0j, "-")]),
+               p1=_stacked_plane(te0, x, y, [(amp_back + 0j, "-")]))
+    col2 = smatrix([p1, p2], "p2", d2)
+    S = assemble_smatrix([col1, col2])
+    assert reciprocity_error(S) < 5e-3
+    assert passivity_violation(S) < 5e-3
 
 
 # ---------------------------------------------------------------------------
@@ -379,3 +444,33 @@ def test_bad_out_direction_raises(te0: Mode):
     mon = _monitor(te0, "p", out_direction="+")
     with pytest.raises(ValueError, match="out_direction"):
         SPort("p", mon, out_direction="?")
+
+
+def test_sport_amplitude_uses_folded_quadrature_like_mode_power(te0: Mode):
+    """F09 regression: on a simulation with a §20 symmetry plane, SPort._amplitude
+    must apply the folded-domain quadrature (fold_low) EXACTLY as
+    ModeMonitor.mode_power / mode_decomposition do — half-weighting the sample row
+    that sits ON the symmetry plane. Here the monitor's t2 (y) axis is folded and
+    the plane is a half-domain ladder starting at y=0, so the on-plane row's weight
+    matters. |SPort.outgoing|² must equal ModeMonitor.mode_power; before the fix
+    SPort ignored fold_low and the two readouts diverged by the on-plane row's
+    (fold-antinode) power."""
+    from photonhub.components.monitors import FieldDftMonitor
+
+    class _SymSim:
+        symmetry = (0, 1, 0)          # y (= t2 for a z-normal plane) symmetry fold
+
+    ny, nx = te0.field.shape
+    x = (np.arange(nx + 12) - (nx + 11) / 2.0) * DL_UM
+    y = np.arange(ny // 2 + 8) * DL_UM        # HALF-domain: first sample ON the plane
+    fm = FieldDftMonitor(name="p", center_um=(0.0, 0.0, 0.0),
+                         size_um=(2.0, 2.0, 0.0), fields=_TANGENTIAL_Z, freqs_hz=(F0,))
+    mon = ModeMonitor(field_monitor=fm, mode=te0, axis="z", center_um=(0.0, 0.0),
+                      direction="+", simulation=_SymSim(), per_freq_modes=False)
+    assert mon._fold_low() == (False, True)   # t2 (y) is folded
+
+    plane = _stacked_plane(te0, x, y, [(1.0, "+")])
+    data = _Data({"p": plane})
+    b = SPort("p", mon).outgoing(data, colocate=False)[F0]
+    p_power = mon.mode_power(data, direction="+", colocate=False)[F0]
+    assert abs(b) ** 2 == pytest.approx(p_power, rel=1e-9)

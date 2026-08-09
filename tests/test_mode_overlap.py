@@ -1,6 +1,6 @@
 """Directional-power mode-overlap (mode-monitor transmission) — physics pins.
 
-Validates ``simupod.plugins.mode_overlap.mode_transmission`` on SYNTHETIC
+Validates ``photonhub.plugins.mode_overlap.mode_transmission`` on SYNTHETIC
 field planes (no FDTD run): a plane that *is* the mode -> forward T==1, the
 opposite-direction plane -> forward T==0 / backward T==1, an orthogonal profile
 -> T<1, amplitude scaling -> T scales by |c|^2, and a graded (non-uniform)
@@ -20,14 +20,17 @@ import functools
 import pytest
 import xarray as xr
 
-from simupod.plugins import Mode, ModeSolver
-from simupod.plugins.mode_overlap import (
+from photonhub.plugins import Mode, ModeSolver
+from photonhub.plugins.mode_overlap import (
     ETA0,
+    _cell_widths,
     _colocate_to_node,
     mode_transmission as _mode_transmission,
     modal_fields,
     resample_profile,
+    vector_modal_fields,
 )
+from photonhub.plugins.vector_modes import VectorMode
 
 # These tests feed SYNTHETIC, already-collocated analytic fields (E and H built
 # at the SAME grid points), so the Yee co-location — which averages adjacent
@@ -173,6 +176,30 @@ def test_destagger_clean_forward_is_unity(te0: Mode):
     assert T == pytest.approx(1.0, rel=2e-3)
 
 
+def test_destagger_near_nyquist_raises(te0: Mode):
+    """The de-stagger's 2x2 solve divides by 2*cos(phi); at dl near
+    lambda/(2 n_eff) (phi -> pi/2) it is singular and must refuse loudly
+    instead of amplifying noise."""
+    x, y = _plane_axes(te0)
+    dl_nyq = WL_UM / (2.0 * te0.n_eff)   # phi == pi/2 exactly
+    plane = _build_plane(te0, x, y, direction="+", as_dft=True)
+    with pytest.raises(ValueError, match="singular"):
+        mode_transmission(plane, te0, axis="z", direction="+",
+                          destagger_dl=dl_nyq)
+
+
+def test_destagger_frequencyless_plane_warns(te0: Mode):
+    """An explicitly requested de-stagger on a plane with NO frequency axis
+    (beta cannot be formed) is skipped — but says so instead of silently
+    ignoring the argument."""
+    x, y = _plane_axes(te0)
+    plane = _build_plane(te0, x, y, direction="+")   # plain 2-D, no f dim
+    with pytest.warns(UserWarning, match="SKIPPED"):
+        T = mode_transmission(plane, te0, axis="z", direction="+",
+                              destagger_dl=DL_UM)
+    assert next(iter(T.values())) == pytest.approx(1.0, rel=1e-3)
+
+
 # --- self-overlap = 1 -------------------------------------------------------
 
 def test_self_overlap_is_one(te0: Mode):
@@ -253,6 +280,23 @@ def test_forward_wave_backward_T_zero(te0: Mode):
     Tb = next(iter(mode_transmission(plane, te0, axis="z",
                                      direction="-").values()))
     assert Tb == pytest.approx(0.0, abs=1e-9)
+
+
+def test_backward_power_is_nonnegative(te0: Mode):
+    """Regression: ``power=True`` with ``direction="-"`` is a POWER (>= 0), not
+    the signed flux. A clean backward wave used to read a NEGATIVE backward
+    "power" (division by the signed P_mode < 0), which made every reflection
+    ratio negative and the ``r < 0.1`` reflection assertions vacuous."""
+    x, y = _plane_axes(te0)
+    plane_b = _build_plane(te0, x, y, direction="-")
+    p_bwd = next(iter(mode_transmission(plane_b, te0, axis="z", direction="-",
+                                        power=True).values()))
+    plane_f = _build_plane(te0, x, y, direction="+")
+    p_fwd = next(iter(mode_transmission(plane_f, te0, axis="z", direction="+",
+                                        power=True).values()))
+    assert p_bwd > 0.0
+    # Same mode, same unit amplitude: backward power == forward power.
+    assert p_bwd == pytest.approx(p_fwd, rel=1e-9)
 
 
 # --- orthogonality ----------------------------------------------------------
@@ -420,6 +464,55 @@ def test_y_normal_plane_orientation_needs_thickness_axis(te0: Mode):
     assert T_legacy < 0.5
 
 
+def _forward_vector_mode(nx=9, ny=7, dl=DL_UM, n_eff=2.4):
+    """A synthetic VectorMode whose transverse H obeys the FORWARD relation
+    hx = -(n_eff/ETA0)*ey, hy = +(n_eff/ETA0)*ex — so its own +propagation
+    Poynting (ex*hy* - ey*hx*) is strictly positive."""
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    ex = np.exp(-(((xx - (nx - 1) / 2) / 2.0) ** 2 + ((yy - (ny - 1) / 2) / 1.2) ** 2))
+    ey = 0.3 * ex * (xx - (nx - 1) / 2) / nx        # a nonzero minor-E so the swap matters
+    ex = ex.astype(np.complex128); ey = ey.astype(np.complex128)
+    s = n_eff / ETA0
+    hx, hy = -s * ey, s * ex
+    z = np.zeros_like(ex)
+    return VectorMode(n_eff=n_eff, n_group=None, ex=ex, ey=ey, ez=z,
+                      hx=hx, hy=hy, hz=z, wavelength_um=WL_UM,
+                      dl_x_um=dl, dl_y_um=dl)
+
+
+def _plane_poynting(fv, t1c, t2c):
+    dA = np.outer(_cell_widths(t2c), _cell_widths(t1c))
+    s = 0.5 * np.real(fv["e1"] * np.conj(fv["h2"]) - fv["e2"] * np.conj(fv["h1"]))
+    return float(np.sum(s * dA))
+
+
+@pytest.mark.parametrize("axis,thickness_axis", [
+    ("y", "z"),   # swap branch (t1,t2)=(z,x), thickness on t1 — the z-slab y-port
+    ("x", "y"),   # swap branch (t1,t2)=(y,z), thickness on t1
+    ("z", "y"),   # non-swap control
+    ("y", "x"),   # non-swap control
+])
+def test_vector_readout_direction_is_consistent(axis, thickness_axis):
+    """Regression: on a swap-branch plane (thickness on the FIRST transverse
+    axis) the assembled full-vector mode had its transverse H unnegated after a
+    handedness-flipping reflection, so a direction="+" readout carried −axis
+    Poynting — the returned "forward" mode was the BACKWARD traveler (the crossing
+    XT / y-port through-power read the wrong direction). A forward mode must give
+    POSITIVE plane Poynting for "+" and NEGATIVE for "-", on every orientation."""
+    mode = _forward_vector_mode()
+    ny, nx = mode.ex.shape
+    t1c = (np.arange(nx + 6) - (nx + 5) / 2.0) * DL_UM
+    t2c = (np.arange(ny + 6) - (ny + 5) / 2.0) * DL_UM
+    fwd = vector_modal_fields(mode, t1c, t2c, axis=axis, direction="+",
+                              center_um=(0.0, 0.0), thickness_axis=thickness_axis)
+    bwd = vector_modal_fields(mode, t1c, t2c, axis=axis, direction="-",
+                              center_um=(0.0, 0.0), thickness_axis=thickness_axis)
+    p_fwd = _plane_poynting(fwd, t1c, t2c)
+    p_bwd = _plane_poynting(bwd, t1c, t2c)
+    assert p_fwd > 0, f"direction='+' must carry +axis power (got {p_fwd:.3e})"
+    assert p_bwd < 0, f"direction='-' must carry -axis power (got {p_bwd:.3e})"
+
+
 # --- per-frequency n_eff override threads through ---------------------------
 
 def test_n_eff_override_is_consistent(te0: Mode):
@@ -489,8 +582,8 @@ def test_resample_zero_fills_outside_window():
 # (n_eff/eta0)·z_hat x e), _overlap_terms projects with vector_modal_fields.
 # These pin that dispatch on SYNTHETIC planes built from the vector mode itself.
 
-from simupod.plugins.vector_modes import VectorModeSolver  # noqa: E402
-from simupod.plugins.mode_overlap import vector_modal_fields  # noqa: E402
+from photonhub.plugins.vector_modes import VectorModeSolver  # noqa: E402
+from photonhub.plugins.mode_overlap import vector_modal_fields  # noqa: E402
 
 
 @pytest.fixture(scope="module")

@@ -27,7 +27,7 @@ _RA_PATH = REPO_ROOT / "benchmarks" / "acceptance" / "run_acceptance.py"
 def _load_run_acceptance():
     if not _RA_PATH.is_file():
         pytest.skip(f"run_acceptance.py not found at {_RA_PATH}")
-    # Make the acceptance dir importable (it imports simupod.* at module load).
+    # Make the acceptance dir importable (it imports photonhub.* at module load).
     sys.path.insert(0, str(_RA_PATH.parent))
     spec = importlib.util.spec_from_file_location("run_acceptance", _RA_PATH)
     mod = importlib.util.module_from_spec(spec)

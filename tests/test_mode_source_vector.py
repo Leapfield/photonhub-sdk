@@ -1,7 +1,7 @@
 """Full-vector, 1 W power-normalized mode source (NUMERICS.md §18, WS2).
 
 Covers the Python pipeline that turns a full-vector ``VectorMode`` into a
-power-normalized :class:`~simupod.components.sources.ModeSource` carrying BOTH
+power-normalized :class:`~photonhub.components.sources.ModeSource` carrying BOTH
 transverse-E components:
 
 * 1 W power normalization (the injected modal Poynting flux integrates to the
@@ -19,14 +19,14 @@ import math
 import numpy as np
 import pytest
 
-import simupod as ph
-from simupod.plugins import (
+import photonhub as ph
+from photonhub.plugins import (
     ModeSolver,
     VectorModeSolver,
     mode_source,
     mode_source_vector,
 )
-from simupod.plugins.mode_overlap import ETA0, _cell_widths, vector_modal_fields
+from photonhub.plugins.mode_overlap import ETA0, _cell_widths, vector_modal_fields
 
 F0 = 1.934e14  # Hz, ~1.55 um
 DL = 0.04  # um
@@ -338,3 +338,40 @@ def test_valid_full_vector_modesource_constructs():
     src = _mk(minor_polarization="Ey", profile_minor=(0.0, 0.1, 0.1, 0.0))
     assert src.minor_polarization == "Ey"
     assert src.profile_minor == (0.0, 0.1, 0.1, 0.0)
+
+
+# --------------------------------------------------------------------------
+# Phase-1 default: mode_source ships the discrete true-H for a full-vector mode
+# (benchmarks/launch_fidelity/ shows true-H cuts the launch shed several-fold).
+# --------------------------------------------------------------------------
+
+
+def test_mode_source_full_vector_mode_ships_true_h_by_default():
+    """A full-vector mode passed to the plain `mode_source` launches via the
+    discrete true-H vector source by default (profile_h shipped), equivalent to
+    calling mode_source_vector — NOT the scalar-limit (profile_h omitted)."""
+    _, shell, pulse = _waveguide_shell()
+    m = _te0_vector_mode()
+    kw = dict(axis="z", position_um=2.0, source_time=pulse,
+              center_um=(0.8, 0.8), thickness_axis="y")
+    src = mode_source(shell, m, **kw)                       # default paired_h=True
+    ref = mode_source_vector(shell, m, **kw)                # explicit vector launch
+    assert src.profile_h is not None and src.profile_h_minor is not None
+    assert src.profile_h == pytest.approx(ref.profile_h)
+    assert src.profile == pytest.approx(ref.profile)
+
+
+def test_mode_source_paired_h_false_is_scalar_limit():
+    """paired_h=False forces the legacy scalar-impedance-H launch (no profile_h)
+    of the same full-vector E, and amplitude scales the launched power as a
+    peak-field would (power ∝ amplitude²)."""
+    _, shell, pulse = _waveguide_shell()
+    m = _te0_vector_mode()
+    kw = dict(axis="z", position_um=2.0, source_time=pulse,
+              center_um=(0.8, 0.8), thickness_axis="y")
+    scalar = mode_source(shell, m, **kw, paired_h=False)
+    assert scalar.profile_h is None and scalar.profile_h_minor is None
+    assert scalar.profile is not None                       # E profile still launched
+    p1 = _injected_power(mode_source(shell, m, **kw))
+    p2 = _injected_power(mode_source(shell, m, **kw, amplitude=2.0))
+    assert p2 == pytest.approx(4.0 * p1, rel=1e-6)

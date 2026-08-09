@@ -1,7 +1,7 @@
 """Full-vectorial FDE solver (VectorModeSolver / VectorMode) — physics + frozen
 API surface.
 
-Validates ``simupod.plugins.VectorModeSolver`` on the canonical SOI strip: the
+Validates ``photonhub.plugins.VectorModeSolver`` on the canonical SOI strip: the
 full-vector fundamental quasi-TE ``n_eff ~= 2.71`` (the design-doc FDTD cross-check
 was 2.70; the semi-vec self-value 2.72 slightly over-confines), a quasi-TM mode
 below it, the group index, and the six-component field surface. The load-bearing
@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from simupod.plugins import VectorMode, VectorModeSolver
+from photonhub.plugins import VectorMode, VectorModeSolver
 
 WL_UM = 1.31
 DL_UM = 0.025
@@ -139,6 +139,45 @@ def test_field_dataarray(strip_modes):
     assert {"n_eff", "wavelength_um", "polarization", "te_fraction"} <= set(da.attrs)
     with pytest.raises(ValueError):
         te0.field_dataarray("Qz")
+
+
+def test_reported_coords_honour_center_offset_and_graded_ladders():
+    """Regression: field_dataarray / core_fraction rebuilt a uniform ladder from
+    dl_x_um and IGNORED both center_offset_um (the window-placement shift a
+    grid-snapped cross-section solve applies) and the graded x_coords_um/y_coords_um
+    ladders — so a dispatcher-solved mode reported coordinates displaced from where
+    mode_overlap.vector_modal_fields actually places it, and core_fraction measured
+    a box offset from the real core. Both must use the same reconstruction."""
+    n = 9
+    z = np.zeros((n, n), dtype=np.complex128)
+    e = np.ones((n, n), dtype=np.complex128)
+
+    def mk(**kw):
+        return VectorMode(n_eff=2.0, n_group=None, ex=e, ey=z, ez=z,
+                          hx=z, hy=e, hz=z, wavelength_um=1.55,
+                          dl_x_um=0.1, dl_y_um=0.1, **kw)
+
+    # (a) center_offset_um shifts the reported ladder by exactly the offset.
+    base = mk()
+    off = mk(center_offset_um=(0.25, -0.15))
+    x0 = base.field_dataarray("Ex").coords["x"].values
+    y0 = base.field_dataarray("Ex").coords["y"].values
+    x1 = off.field_dataarray("Ex").coords["x"].values
+    y1 = off.field_dataarray("Ex").coords["y"].values
+    assert np.allclose(x1 - x0, 0.25)
+    assert np.allclose(y1 - y0, -0.15)
+
+    # (b) a GRADED mode reports its true node ladder, not the dl_x_um pitch.
+    xc = np.linspace(-0.8, 0.8, n)      # pitch 0.2 != dl_x_um 0.1
+    yc = np.linspace(-0.6, 0.6, n)
+    grad = mk(x_coords_um=xc, y_coords_um=yc)
+    assert np.allclose(grad.field_dataarray("Ex").coords["x"].values, xc)
+    assert np.allclose(grad.field_dataarray("Ex").coords["y"].values, yc)
+
+    # (c) core_fraction's box follows the same coordinates: with the mode shifted
+    # +0.25 um in x, a narrow box on the requested centre captures strictly less
+    # energy than it does for the unshifted mode (uniform |E| here).
+    assert off.core_fraction(0.4, 10.0) < base.core_fraction(0.4, 10.0)
 
 
 def test_vectormode_is_frozen(strip_modes):
@@ -357,8 +396,8 @@ def test_bend_rejects_zero_radius(bend_solver):
 # --- exports (additive; the frozen semi-vec surface is untouched) ----------
 
 def test_exports_are_additive():
-    import simupod.plugins as plugins
+    import photonhub.plugins as plugins
     assert {"VectorMode", "VectorModeSolver", "Mode", "ModeSolver"} <= set(
         plugins.__all__)
-    from simupod.plugins import Mode, ModeSolver  # the frozen surface still works
+    from photonhub.plugins import Mode, ModeSolver  # the frozen surface still works
     assert Mode is not None and ModeSolver is not None

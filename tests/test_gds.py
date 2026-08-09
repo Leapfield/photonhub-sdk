@@ -1,4 +1,4 @@
-"""GDS import (:mod:`simupod.gds`): polygons -> extruded PolySlab structures.
+"""GDS import (:mod:`photonhub.gds`): polygons -> extruded PolySlab structures.
 
 Each test authors a tiny GDSII file in a tmp dir with ``gdstk`` (the same reader
 :func:`import_gds` uses), so no external fixtures are needed. Skipped wholesale
@@ -8,8 +8,8 @@ import math
 
 import pytest
 
-import simupod as ph
-from simupod.gds import GdsLayer, import_gds, read_gds_cell_names
+import photonhub as ph
+from photonhub.gds import GdsLayer, import_gds, read_gds_cell_names
 
 gdstk = pytest.importorskip("gdstk")
 
@@ -224,6 +224,35 @@ class TestCleaning:
     def test_missing_file_raises(self):
         with pytest.raises(FileNotFoundError):
             import_gds("/no/such/file.gds", [_strip()])
+
+    def test_non_micron_user_unit_converted_to_um(self, tmp_path):
+        # Regression (K4): a bare gdstk.read_gds returns coordinates in the
+        # file's OWN user unit — an nm-authored file came back 1000x too large.
+        # import_gds must convert to microns (unit=1e-6) regardless of how the
+        # file was authored.
+        nm_lib = gdstk.Library(name="nmlib", unit=1e-9, precision=1e-12)
+        cell = nm_lib.new_cell("top")
+        # 2000 x 500 in nm-units = 2.0 x 0.5 um physically.
+        cell.add(gdstk.rectangle((0, 0), (2000, 500), layer=1, datatype=0))
+        gds = str(tmp_path / "nm.gds")
+        nm_lib.write_gds(gds)
+        # The raw reader really does hand back nm-unit coordinates (the trap).
+        raw = gdstk.read_gds(gds).top_level()[0].polygons[0].points
+        assert raw.max() == pytest.approx(2000.0)
+        (structure,) = import_gds(gds, [_strip()])
+        xs = sorted({v[0] for v in structure.geometry.vertices_um})
+        ys = sorted({v[1] for v in structure.geometry.vertices_um})
+        assert xs == pytest.approx([0.0, 2.0])
+        assert ys == pytest.approx([0.0, 0.5])
+
+    def test_micron_user_unit_unchanged(self, tmp_path):
+        # The unit conversion is a no-op for the common um-authored file: the
+        # same rectangle round-trips with identical coordinates.
+        gds = _write(tmp_path / "um.gds", [_rect_cell("top", 0.0, 0.0, 2.0, 0.5)])
+        (structure,) = import_gds(gds, [_strip()])
+        xs = sorted({v[0] for v in structure.geometry.vertices_um})
+        ys = sorted({v[1] for v in structure.geometry.vertices_um})
+        assert xs == [0.0, 2.0] and ys == [0.0, 0.5]
 
     def test_bad_thickness_raises(self):
         with pytest.raises(ValueError, match="thickness_um"):

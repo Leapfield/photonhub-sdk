@@ -9,9 +9,9 @@ import time
 
 import pytest
 
-import simupod as ph
-from conftest import make_sim
-from test_run_local import FAKE_DIVERGES, FAKE_OK, fake_solver
+import photonhub as ph
+from .helpers import make_sim
+from .test_run_local import FAKE_DIVERGES, FAKE_OK, fake_solver
 
 # Sleeps briefly, then behaves like FAKE_OK — lets us observe a not-yet-done
 # job and a result(timeout) that fires while the run is still going.

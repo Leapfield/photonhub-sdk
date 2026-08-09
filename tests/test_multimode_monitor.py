@@ -2,12 +2,12 @@
 
 Covers the multi-mode generalization of the single-mode readout:
 
-* :func:`simupod.plugins.mode_devices.solve_mode_bank` — solve N modes at M
+* :func:`photonhub.plugins.mode_devices.solve_mode_bank` — solve N modes at M
   frequencies into ``{freq_hz: {mode_index: Mode}}`` (the readout-side analogue
   of Tidy3D ``ModeMonitor(ModeSpec(num_modes=N), num_freqs=M)``);
-* :func:`simupod.plugins.mode_overlap.mode_decomposition` — project a recorded
+* :func:`photonhub.plugins.mode_overlap.mode_decomposition` — project a recorded
   plane onto EACH mode in the bank → ``{mode_index: {freq_hz: value}}``;
-* :meth:`simupod.plugins.mode_devices.ModeMonitor.mode_decomposition`.
+* :meth:`photonhub.plugins.mode_devices.ModeMonitor.mode_decomposition`.
 
 The synthetic planes are built with the SAME scalar-limit reconstruction the
 overlap uses (E = e_mode, H = ±h_mode), so a clean single-mode plane reads
@@ -24,8 +24,8 @@ import numpy as np
 import pytest
 import xarray as xr
 
-import simupod as ph
-from simupod.plugins import (
+import photonhub as ph
+from photonhub.plugins import (
     Mode,
     ModeSolver,
     VectorModeSolver,
@@ -34,8 +34,8 @@ from simupod.plugins import (
     mode_transmission as _mode_transmission,
     solve_mode_bank,
 )
-from simupod.plugins.mode_devices import C0
-from simupod.plugins.mode_overlap import modal_fields, vector_modal_fields
+from photonhub.plugins.mode_devices import C0
+from photonhub.plugins.mode_overlap import modal_fields, vector_modal_fields
 
 # Synthetic, already-collocated analytic fields -> co-location off (see module doc).
 mode_decomposition = functools.partial(_mode_decomposition, colocate=False)

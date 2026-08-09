@@ -7,8 +7,8 @@ coordinate-striding readback is covered in test_data.py."""
 import pytest
 from pydantic import ValidationError
 
-import simupod as ph
-from simupod.components.monitors import FieldDftMonitor
+import photonhub as ph
+from photonhub.components.monitors import FieldDftMonitor
 
 F0 = 1.934e14
 

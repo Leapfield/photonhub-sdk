@@ -13,16 +13,16 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
-import simupod as ph
-from simupod.components.sources import ModeSource
-from simupod.plugins import (
+import photonhub as ph
+from photonhub.components.sources import ModeSource
+from photonhub.plugins import (
     ModeSolver,
     VectorModeSolver,
     mode_source,
     mode_source_vector,
     solve_modes_by_freq,
 )
-from simupod.plugins.mode_devices import C0
+from photonhub.plugins.mode_devices import C0
 
 DL = 0.04
 N_CORE = 3.5

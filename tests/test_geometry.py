@@ -6,8 +6,8 @@ import math
 
 import pytest
 
-import simupod as ph
-from simupod.runners.local import find_solver
+import photonhub as ph
+from photonhub.runners.local import find_solver
 
 
 def _cyl(**kw):
@@ -141,3 +141,71 @@ def test_geometry_runs_through_real_solver(tmp_path):
     )
     data = ph.run_local(sim, output_dir=tmp_path / "out")
     assert "final" in data
+
+
+@pytest.mark.parametrize("ref_plane", ["bottom", "middle", "top"])
+def test_client_paint_applies_polyslab_sidewall_taper(ref_plane):
+    """The CLIENT cross-section paint (viz.eps -> the mode solver's eps) must apply
+    the §17.6 sidewall taper, like the engine's polyslab_contains.
+
+    Regression: it painted the UN-tapered reference polygon, so launch/readout
+    reference modes were solved on a rectangle while the engine propagated the
+    trapezoid. GpuEquivalence is blind to this class by construction — it compares
+    GPU vs CPU *engine*, and both are correct; the divergence is client-vs-spec.
+
+    Checks the painted half-width against the analytic §17.6 profile
+    ``w(z) = w0 - (z - z_ref) * tan(angle)`` at every z inside the slab, and pins
+    the zero-angle no-op.
+    """
+    import numpy as np
+
+    from photonhub.viz.eps import sample_eps_plane
+
+    W0, ZLO, ZHI, XC = 0.25, 1.0, 1.22, 1.0
+    dl = 0.005
+
+    def _sim(angle):
+        ps = ph.PolySlab(
+            axis="z",
+            vertices_um=((XC - W0, 0.05), (XC + W0, 0.05),
+                         (XC + W0, 1.95), (XC - W0, 1.95)),
+            slab_bounds_um=(ZLO, ZHI), sidewall_angle=angle,
+            reference_plane=ref_plane)
+        return ph.Simulation(
+            size_um=(2.0, 2.0, 2.4), grid=ph.UniformGridSpec(dl_um=dl),
+            run=ph.RunSpec(n_steps=1), background=ph.Background(permittivity=1.0),
+            structures=[ph.Structure(geometry=ps,
+                                     medium=ph.Medium(permittivity=12.0))],
+            boundaries=ph.Boundaries(x="pml", y="pml", z="pml"),
+            sources=[ph.PointDipole(
+                center_um=(1.0, 1.0, 1.2), polarization="Ex",
+                source_time=ph.GaussianPulse(freq0_hz=2e14, fwidth_hz=2e13))])
+
+    z_ref = {"bottom": ZLO, "middle": (ZLO + ZHI) / 2.0, "top": ZHI}[ref_plane]
+
+    def half_widths(angle):
+        # y-normal cut -> in_plane_axes("y") = (x, z): h = x, v = z.
+        h, v, eps = sample_eps_plane(_sim(angle), "y", 1.0)
+        hc = 0.5 * (h[:-1] + h[1:])
+        vc = 0.5 * (v[:-1] + v[1:])
+        out = {}
+        for iz, z in enumerate(vc):
+            if not (ZLO < z < ZHI):
+                continue
+            row = eps[iz] > 6.0
+            if row.any():
+                out[float(z)] = 0.5 * (hc[row].max() - hc[row].min())
+        return out
+
+    tapered = half_widths(0.2)
+    assert tapered, "no painted slab rows found"
+    for z, half in tapered.items():
+        want = W0 - (z - z_ref) * math.tan(0.2)
+        assert half == pytest.approx(want, abs=1.5 * dl), (
+            f"{ref_plane} z={z:.3f}: painted half-width {half:.4f} != §17.6 {want:.4f}")
+    # The taper must actually vary the width (else the test is vacuous).
+    assert max(tapered.values()) - min(tapered.values()) > 6 * dl
+
+    # angle == 0 is a bit-exact no-op: a constant half-width == w0.
+    for z, half in half_widths(0.0).items():
+        assert half == pytest.approx(W0, abs=1.5 * dl)
