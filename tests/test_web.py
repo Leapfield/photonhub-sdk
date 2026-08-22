@@ -127,13 +127,12 @@ class FakeHttp:
 @pytest.fixture(autouse=True)
 def _isolated_web_env(monkeypatch):
     """No test here may see the developer's real cloud credentials: ph.web
-    falls back to $PHOTONHUB_*/$PHOTONHUB_* (web/config.py get_config), so a
-    leaked key makes the "unconfigured" tests submit REAL paid cloud jobs.
-    Scrub both prefixes and clear the module-global config around every test;
-    tests that want env values set them explicitly via monkeypatch.setenv."""
-    for prefix in ("SIMUPOD", "PHOTONHUB"):
-        for suffix in ("API_KEY", "URL", "CACHE_DIR"):
-            monkeypatch.delenv(f"{prefix}_{suffix}", raising=False)
+    reads ``$PHOTONHUB_API_KEY`` in ``web/config.py``, so a leaked key makes
+    the "unconfigured" tests submit real paid cloud jobs. Scrub current cloud
+    configuration and clear the module-global config around every test; tests
+    that want environment values set them explicitly via ``monkeypatch``."""
+    for suffix in ("API_KEY", "URL", "CACHE_DIR"):
+        monkeypatch.delenv(f"PHOTONHUB_{suffix}", raising=False)
     ph.web.reset()
     yield
     ph.web.reset()
@@ -169,6 +168,51 @@ def test_unconfigured_raises_weberror():
     ph.web.reset()
     with pytest.raises(ph.web.WebError):
         ph.web.run(_make_sim())
+
+
+def _real_solver():
+    try:
+        return ph.find_solver()
+    except SolverRunError:
+        return None
+
+
+@pytest.mark.skipif(_real_solver() is None,
+                    reason="no phsolver binary found (build the engine first)")
+def test_cloud_path_result_is_bit_identical_to_local_run(monkeypatch,
+                                                         configured, tmp_path):
+    """Save/load fidelity across the wire: an executor-produced bundle (the
+    worker side of a cloud GPU job) served through the full client machinery
+    (poll -> download -> cache -> SimulationData) must reconstruct every
+    monitor bit-identically to a direct run_local of the same spec."""
+    from photonhub.executor import execute
+
+    from .helpers import make_sim
+
+    sim = make_sim()
+    worker = execute(sim.to_wire_dict(), device="cpu")
+    local = ph.run_local(sim, output_dir=tmp_path / "local", quiet=True)
+
+    class _ServesWorkerBundle(FakeHttp):
+        def download_result(self, job_id):
+            return worker.bundle
+
+    monkeypatch.setattr(
+        _runmod, "HttpClient", lambda cfg: _ServesWorkerBundle(cfg))
+    cloud = ph.web.run(sim, name="job-fidelity")
+    assert sorted(cloud.monitor_names) == sorted(local.monitor_names)
+    for name in local.monitor_names:
+        np.testing.assert_array_equal(
+            cloud[name].values, local[name].values,
+            err_msg=f"cloud-vs-local mismatch in monitor {name!r}")
+        for coord in local[name].coords:
+            np.testing.assert_array_equal(
+                cloud[name].coords[coord].values,
+                local[name].coords[coord].values,
+                err_msg=f"coordinate {coord!r} drifted through the bundle")
+    # The bundle also carries the exact executed spec, reloadable as a model.
+    assert ph.Simulation.from_file(
+        Path(cloud.output_dir) / "sim.json") == sim
 
 
 def test_run_returns_simulationdata(monkeypatch, configured):
@@ -574,6 +618,58 @@ def test_timeout_then_resume_same_id_without_duplicate_submit(monkeypatch,
     resumed = ph.web.resume(exc.value.job_id)
     assert isinstance(resumed.result(timeout=5), ph.SimulationData)
     assert state == {"ready": True, "submits": 1, "downloads": 1}
+
+
+def test_resume_loads_downloaded_result_without_service(monkeypatch,
+                                                        configured):
+    """A validated cached bundle keeps loading after the service loses the
+    job (expiry, network down, auth rotated): the paid result is local."""
+    _patch(monkeypatch, "ok")
+    first = ph.web.resume("job-offline-1").result(timeout=5)
+
+    class _ServiceGone(FakeHttp):
+        def submit_job(self, *args, **kwargs):
+            raise AssertionError("offline reload must not submit")
+
+        def get_job(self, job_id, *, deadline=None):
+            raise ph.web.WebError("service unreachable: connection refused")
+
+        def download_result(self, job_id):
+            raise AssertionError("offline reload must not download")
+
+    monkeypatch.setattr(_runmod, "HttpClient", lambda cfg: _ServiceGone(cfg))
+    again = ph.web.resume("job-offline-1").result(timeout=5)
+    assert isinstance(again, ph.SimulationData)
+    np.testing.assert_array_equal(again["probe"].values,
+                                  first["probe"].values)
+
+
+def test_resume_refetches_when_cached_entry_is_reader_rejected(monkeypatch,
+                                                               configured):
+    """A sealed entry the reader rejects (corruption the cheap structural
+    marker cannot see) is dropped and re-fetched, not returned or fatal."""
+    state = {"downloads": 0}
+
+    class _Counting(FakeHttp):
+        def download_result(self, job_id):
+            state["downloads"] += 1
+            return _bundle_bytes()
+
+    monkeypatch.setattr(_runmod, "HttpClient", lambda cfg: _Counting(cfg))
+    data = ph.web.resume("job-heal-1").result(timeout=5)
+    assert state["downloads"] == 1
+
+    # Deep-corrupt the sealed manifest: drop sample_steps but keep every
+    # name/file/shape/byte-size fact the structural validation checks.
+    manifest_path = Path(data.output_dir) / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["monitors"][0]["sample_steps"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    healed = ph.web.resume("job-heal-1").result(timeout=5)
+    assert state["downloads"] == 2
+    assert isinstance(healed, ph.SimulationData)
+    assert healed["probe"].shape == (5, 2)
 
 
 @pytest.mark.parametrize(
@@ -1099,7 +1195,6 @@ def test_configure_requires_url_when_unset(monkeypatch):
     # A key without a URL must fail loudly at configure() time — never fall
     # back to localhost and later die with a raw connection-refused.
     monkeypatch.delenv("PHOTONHUB_URL", raising=False)
-    monkeypatch.delenv("PHOTONHUB_URL", raising=False)
     with pytest.raises(ph.web.WebError, match=r"no service URL.*PHOTONHUB_URL"):
         ph.web.configure(api_key="ph_x")
 
@@ -1109,7 +1204,6 @@ def test_get_config_autoconfigure_requires_url(monkeypatch):
     # (e.g. pasted from the operator) but no $PHOTONHUB_URL. The lazy
     # get_config() path must surface the same actionable message.
     monkeypatch.setenv("PHOTONHUB_API_KEY", "ph_env")
-    monkeypatch.delenv("PHOTONHUB_URL", raising=False)
     monkeypatch.delenv("PHOTONHUB_URL", raising=False)
     ph.web.reset()
     with pytest.raises(ph.web.WebError, match=r"no service URL.*PHOTONHUB_URL"):

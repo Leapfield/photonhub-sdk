@@ -49,6 +49,27 @@ def test_simulation_from_file_preserves_missing_file_error(tmp_path):
         ph.Simulation.from_file(tmp_path / "missing.sim.json")
 
 
+def test_concurrent_to_file_writers_leave_one_complete_document(tmp_path):
+    """to_file's temp-write + os.replace must keep the target a complete,
+    parseable document under concurrent writers (no torn interleaving, no
+    stranded temp files)."""
+    import threading
+
+    from .helpers import make_sim
+
+    target = tmp_path / "case.sim.json"
+    sims = [make_sim(run=ph.RunSpec(n_steps=5 + i)) for i in range(8)]
+    threads = [threading.Thread(target=s.to_file, args=(target,))
+               for s in sims]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert ph.Simulation.from_file(target) in sims
+    assert list(tmp_path.glob(f".{target.name}.*.tmp")) == []
+
+
 def test_simulation_to_file_replace_failure_keeps_old_file_and_cleans_temp(
     tiny_sim, tmp_path, monkeypatch
 ):

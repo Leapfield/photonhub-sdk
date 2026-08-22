@@ -127,6 +127,44 @@ def test_manifest_rejects_duplicate_monitor_names(out_dir):
         SimulationData(out_dir)
 
 
+def test_manifest_rejects_ascii_case_alias_monitor_names(out_dir):
+    manifest_path = out_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["monitors"][1]["name"] = "Probe"
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="duplicate monitor name"):
+        SimulationData(out_dir)
+
+
+@pytest.mark.parametrize("name", ["aux", "con.txt", "bad:name", ".hidden", "µ"])
+def test_manifest_rejects_nonportable_monitor_names(out_dir, name):
+    manifest_path = out_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["monitors"][0]["name"] = name
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="unsafe name"):
+        SimulationData(out_dir)
+
+
+@pytest.mark.parametrize("filename", ["aux.bin", "bad:name.bin", ".hidden"])
+def test_manifest_rejects_nonportable_result_filenames(out_dir, filename):
+    manifest_path = out_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["monitors"][0]["file"] = filename
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="unsafe result filename"):
+        SimulationData(out_dir)
+
+
+def test_manifest_rejects_ascii_case_alias_result_filenames(out_dir):
+    manifest_path = out_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["monitors"][1]["file"] = "PROBE.bin"
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="alias result filename"):
+        SimulationData(out_dir)
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [

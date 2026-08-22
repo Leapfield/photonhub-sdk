@@ -56,6 +56,11 @@ def test_monitor_directions_face_outward(built):
     assert built.out_monitors["through"].direction == "+"
     assert built.out_monitors["y-"].direction == "-"   # -y arm exits toward -y
     assert built.out_monitors["y+"].direction == "+"
+    # Semantic role notation remains in the mapping, while artifact names are
+    # deterministic portable tokens rather than raw labels such as ``out_y+``.
+    assert [m.field_monitor.name for m in built.out_monitors.values()] == [
+        "out_0", "out_1", "out_2"
+    ]
 
 
 def test_arm_auto_extended_for_monitor_room():

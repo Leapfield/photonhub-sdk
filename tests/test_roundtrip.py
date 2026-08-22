@@ -142,6 +142,22 @@ def test_unset_shutoff_is_omitted_on_the_wire(tiny_sim):
     assert explicit.to_wire_dict()["run"]["shutoff"] == 0.0
 
 
+def test_utf8_bom_document_parses_like_the_engine(example_spec_path, tmp_path):
+    """Engine parity: nlohmann skips a UTF-8 BOM, so a hand-edited
+    (Windows-authored) sim.json that ``phsolver validate`` accepts must load
+    through from_wire_json / from_file too."""
+    text = example_spec_path.read_text(encoding="utf-8")
+    plain = ph.Simulation.from_wire_json(text)
+
+    assert ph.Simulation.from_wire_json("\ufeff" + text) == plain
+    assert ph.Simulation.from_wire_json(
+        b"\xef\xbb\xbf" + text.encode("utf-8")) == plain
+
+    bom_file = tmp_path / "bom.sim.json"
+    bom_file.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
+    assert ph.Simulation.from_file(bom_file) == plain
+
+
 def _mutate(text: str, old: str, new: str) -> str:
     assert old in text, f"fixture drift: {old!r} not in the golden example"
     return text.replace(old, new)

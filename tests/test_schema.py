@@ -154,7 +154,13 @@ def test_schema_is_as_strict_as_the_implementations():
                   "FieldDftMonitor", "FluxMonitor"):
         name = schema["$defs"][model]["properties"]["name"]
         assert name["minLength"] == 1
-        assert name["pattern"] == "^(?!\\.{1,2}$)[^/\\\\]+$"
+        assert name["maxLength"] == 251
+        assert name["pattern"] == (
+            r"^(?!\.)(?!.*\.$)"
+            r"(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|"
+            r"[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])"
+            r"(?:\.|$))[A-Za-z0-9_.-]+$"
+        )
 
     # Structure names (schema 1.15) are optional nonempty display metadata,
     # without the monitor filename restriction.

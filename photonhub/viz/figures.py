@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-from . import service
+from . import _style, service
 
 _C = 299_792_458.0
 _MARGIN = {"l": 60, "r": 20, "t": 40, "b": 50}
@@ -23,6 +23,15 @@ _VAL_LABELS = {"real": "Real", "imag": "Imaginary", "abs": "Magnitude",
 
 def _val_label(val: str) -> str:
     return _VAL_LABELS.get(val, val)
+
+
+def _field_label(field: str, val: str) -> str:
+    """Field with its value flavor — except for the derived magnitude-like
+    fields (E, H, intensity), where the forced "(Real)" suffix would only
+    mislead: intensity is not the real part of anything."""
+    if field in ("E", "H", "intensity"):
+        return field
+    return f"{field} ({_val_label(val)})"
 
 
 def _json_safe_numbers(values) -> list:
@@ -49,16 +58,29 @@ def field_figure(data, monitor: str, *, field: str = "Ex", val: str = "real",
     arr, z, row, col, resolved = service.slice_plane(
         data, monitor, field=field, val=val, freq=freq, time=time, axis=axis, pos=pos)
     z = np.asarray(z, dtype=float)
-    diverging = val in ("real", "imag")  # signed -> symmetric RdBu about 0
+    # Signed components -> symmetric RdBu about 0. The derived magnitude-like
+    # fields (E, H, intensity) ride val="real" but are non-negative — a
+    # diverging scale would wash them into uniform gray.
+    diverging = val in ("real", "imag") and field not in ("E", "H", "intensity")
+    # Defaults follow the design-§7 constants the CLI matplotlib path uses:
+    # magma for magnitudes, cyclic twilight for phase, RdBu for signed parts.
+    if cmap:
+        colorscale = _mpl_colorscale(cmap)
+    elif diverging:
+        colorscale = "RdBu"
+    elif val == "phase":
+        colorscale = _mpl_colorscale(_style._PHASE_CMAP)
+    else:
+        colorscale = _mpl_colorscale(_style._MAGNITUDE_CMAP)
     trace: dict[str, Any] = {
         "type": "heatmap",
         "z": _json_safe_numbers(z),
         "x": _json_safe_numbers(arr.coords[col].values),
         "y": _json_safe_numbers(arr.coords[row].values),
-        "colorscale": cmap or ("RdBu" if diverging else "Viridis"),
+        "colorscale": colorscale,
         # DFT phasors are source-normalized (A0·S(f)); raw time snapshots keep
         # solver field units with the source's arbitrary drive amplitude.
-        "colorbar": {"title": f"{field} ({_val_label(val)})<br>{'normalized' if 'freq_hz' in resolved else 'arb. units'}"},
+        "colorbar": {"title": f"{_field_label(field, val)}<br>{'source-normalized' if 'freq_hz' in resolved else 'arb. units'}"},
     }
     if diverging:
         finite = np.abs(z[np.isfinite(z)])
@@ -71,7 +93,7 @@ def field_figure(data, monitor: str, *, field: str = "Ex", val: str = "real",
         outlines = service.structure_outlines(service.sim_for(data), cut["axis"], cut["value_um"])
         traces += _overlay_traces(outlines, col, row)
 
-    title = f"{monitor} · {field} ({_val_label(val)})"
+    title = f"{monitor} · {_field_label(field, val)}"
     if "freq_hz" in resolved:
         title += f" · {_C / resolved['freq_hz'] * 1e9:.0f} nm"
     if "time_s" in resolved:
@@ -130,7 +152,7 @@ def profile_figure(data, monitor: str, *, field: str = "Ex", val: str = "real",
     """A rank-1 field profile versus its one varying spatial coordinate."""
     p = service.line_profile_values(
         data, monitor, field=field, val=val, freq=freq, time=time)
-    title = f"{monitor} · {field} ({_val_label(val)})"
+    title = f"{monitor} · {_field_label(field, val)}"
     if "freq_hz" in p:
         title += f" · {_C / p['freq_hz'] * 1e9:.3f} nm"
     if "time_s" in p:
@@ -141,7 +163,7 @@ def profile_figure(data, monitor: str, *, field: str = "Ex", val: str = "real",
                   "y": _json_safe_numbers(p["value"]), "name": field}],
         "layout": {"title": title,
                    "xaxis": {"title": f"{p['axis']} (µm)"},
-                   "yaxis": {"title": f"{field} ({_val_label(val)})"}, "margin": _MARGIN},
+                   "yaxis": {"title": f"{_field_label(field, val)}"}, "margin": _MARGIN},
     }
 
 
@@ -153,9 +175,9 @@ def field_spectrum_figure(data, monitor: str, *, field: str = "Ex",
         "data": [{"type": "scatter", "mode": "lines+markers",
                   "x": _json_safe_numbers(s["wavelength_nm"]),
                   "y": _json_safe_numbers(s["value"]), "name": field}],
-        "layout": {"title": f"{monitor} · {field} ({_val_label(val)}) spectrum",
+        "layout": {"title": f"{monitor} · {_field_label(field, val)} spectrum",
                    "xaxis": {"title": "wavelength (nm)"},
-                   "yaxis": {"title": f"{field} ({_val_label(val)}) · normalized"}, "margin": _MARGIN},
+                   "yaxis": {"title": f"{_field_label(field, val)} · source-normalized"}, "margin": _MARGIN},
     }
 
 
@@ -215,11 +237,40 @@ def scene_figure(data) -> dict:
     return scene_figure_from_sim(sim)
 
 
+_COLORSCALES: dict = {}
+
+
+def _mpl_colorscale(name: str):
+    """A colormap as explicit plotly stops sampled from matplotlib. Plotly.js
+    ships a small built-in list whose same-named scales can differ (its
+    "Blues" is a legacy gray→indigo ramp, and it has no "Magma"/"Plasma" at
+    all), so naming scales would desync the app from the CLI matplotlib
+    renders that share ``_style``'s constants. Unknown names pass through
+    unchanged for plotly to interpret."""
+    if name in _COLORSCALES:
+        return _COLORSCALES[name]
+    import matplotlib as mpl
+    cmap = mpl.colormaps.get(name) or mpl.colormaps.get(name.lower())
+    if cmap is None:
+        return name
+    stops = []
+    for i in range(9):
+        t = i / 8
+        r, g, b, _a = cmap(t)
+        stops.append([round(t, 3), f"rgb({round(r * 255)},{round(g * 255)},{round(b * 255)})"])
+    _COLORSCALES[name] = stops
+    return stops
+
+
 def _eps_fig(e: dict, axis: str, value: float) -> dict:
     """Shape an ``eps_plane`` result into a plotly heatmap."""
     return {
         "data": [{"type": "heatmap", "z": e["eps"], "x": e["h_um"], "y": e["v_um"],
-                  "colorscale": "Viridis", "colorbar": {"title": "ε"}}],
+                  # Structure drawing, not continuous data: a soft single-hue
+                  # ramp (low ε ≈ paper, high ε = ink) reads as geometry and
+                  # stops competing with the Viridis field maps.
+                  "colorscale": _mpl_colorscale(_style.EPS_CMAP),
+                  "colorbar": {"title": "ε"}}],
         "layout": {
             "title": f"permittivity · {axis} = {value:.2f} µm",
             "xaxis": {"title": f"{e['h_axis']} (µm)", "constrain": "domain"},

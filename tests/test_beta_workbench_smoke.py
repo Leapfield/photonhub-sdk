@@ -137,10 +137,15 @@ def test_installed_env_removes_all_developer_runtime_overrides(tmp_path):
         solver,
         tmp_path / "run-root",
         {
-            "SIMUPOD_SOLVER": "stale",
+            "EXAMPLE_API_KEY": "stale-secret",
+            "EXAMPLE_API_KEY_HINT": "safe-description",
+            "EXAMPLE_SERVICE_URL": "https://stale.example",
             "PYTHONHOME": "stale",
             "PYTHONPATH": "stale",
+            "PHOTONHUB_API_KEY": "stale-secret",
             "PHOTONHUB_PY": "stale",
+            "PHOTONHUB_SOLVER": "stale",
+            "PHOTONHUB_URL": "https://stale.example",
             "VIRTUAL_ENV": "stale",
             "KEEP": "yes",
         },
@@ -149,8 +154,18 @@ def test_installed_env_removes_all_developer_runtime_overrides(tmp_path):
     assert env["PHOTONHUB_SOLVER"] == str(solver)
     assert env["MPLBACKEND"] == "Agg"
     assert env["MPLCONFIGDIR"] == str(tmp_path / "run-root/.matplotlib")
+    assert env["EXAMPLE_API_KEY_HINT"] == "safe-description"
     assert env["KEEP"] == "yes"
-    for name in ("SIMUPOD_SOLVER", "PYTHONHOME", "PYTHONPATH", "PHOTONHUB_PY", "VIRTUAL_ENV"):
+    for name in (
+        "EXAMPLE_API_KEY",
+        "EXAMPLE_SERVICE_URL",
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "PHOTONHUB_API_KEY",
+        "PHOTONHUB_PY",
+        "PHOTONHUB_URL",
+        "VIRTUAL_ENV",
+    ):
         assert name not in env
 
 

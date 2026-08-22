@@ -1000,16 +1000,19 @@ class DesktopBetaGcsPublishTests(unittest.TestCase):
             ambiguous_calls += 1
             if method == "POST":
                 object_name = marker[0].object_name
+                query = urlencode(
+                    {
+                        "uploadType": "resumable",
+                        "upload_id": "ambiguous-session",
+                        "name": object_name,
+                    }
+                )
                 return publish.HttpResponse(
                     200,
                     {
                         "Location": (
                             "https://storage.googleapis.com/upload/storage/v1/"
-                            f"b/{bucket}/o?{urlencode({
-                                'uploadType': 'resumable',
-                                'upload_id': 'ambiguous-session',
-                                'name': object_name,
-                            })}"
+                            f"b/{bucket}/o?{query}"
                         )
                     },
                     b"",

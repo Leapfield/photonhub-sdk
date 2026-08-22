@@ -9,9 +9,10 @@ import textwrap
 
 import numpy as np
 import pytest
+from photonhub.runners.local import find_solver
+from photonhub.runners.phsolver import _solver_subprocess_env
 
 import photonhub as ph
-from photonhub.runners.local import find_solver
 
 FAKE_OK = textwrap.dedent("""\
     #!{python}
@@ -80,15 +81,15 @@ FAKE_HANGS = textwrap.dedent("""\
     time.sleep(30)
 """)
 
-FAKE_REPORT_CLOUD_ENV = textwrap.dedent("""\
+FAKE_REPORT_CREDENTIAL_ENV = textwrap.dedent("""\
     #!{python}
     import json, os, sys
     names = [name for name in (
-        "PHOTONHUB_API_KEY", "PHOTONHUB_URL",
+        "EXAMPLE_API_KEY", "EXAMPLE_SERVICE_URL",
         "PHOTONHUB_API_KEY", "PHOTONHUB_URL",
     ) if name in os.environ]
     print(json.dumps({{"event": "error", "reason":
-                      "cloud env=" + (",".join(names) if names else "NONE")}}),
+                      "credential env=" + (",".join(names) if names else "NONE")}}),
           flush=True)
     sys.exit(1)
 """)
@@ -119,14 +120,6 @@ class TestDiscovery:
         monkeypatch.setenv("PHOTONHUB_SOLVER", str(tmp_path / "missing"))
         with pytest.raises(ph.SolverRunError, match="PHOTONHUB_SOLVER"):
             find_solver()
-
-    def test_legacy_env_var_still_honored(self, tmp_path, monkeypatch):
-        # back-compat: $SIMUPOD_SOLVER is still read when $PHOTONHUB_SOLVER is unset
-        monkeypatch.delenv("PHOTONHUB_SOLVER", raising=False)
-        monkeypatch.setenv("SIMUPOD_SOLVER", str(tmp_path / "missing"))
-        with pytest.raises(ph.SolverRunError):
-            find_solver()
-
 
 class TestRunLocal:
     def test_success_streams_events_and_loads_outputs(self, tmp_path, tiny_sim):
@@ -175,13 +168,24 @@ class TestRunLocal:
 
     def test_solver_child_does_not_inherit_cloud_credentials(
             self, tmp_path, tiny_sim, monkeypatch):
-        solver = fake_solver(tmp_path, FAKE_REPORT_CLOUD_ENV)
-        for name in ("PHOTONHUB_API_KEY", "PHOTONHUB_URL",
+        solver = fake_solver(tmp_path, FAKE_REPORT_CREDENTIAL_ENV)
+        for name in ("EXAMPLE_API_KEY", "EXAMPLE_SERVICE_URL",
                      "PHOTONHUB_API_KEY", "PHOTONHUB_URL"):
             monkeypatch.setenv(name, "must-not-reach-phsolver")
-        with pytest.raises(ph.SolverRunError, match="cloud env=NONE"):
+        with pytest.raises(ph.SolverRunError, match="credential env=NONE"):
             ph.run_local(tiny_sim, output_dir=tmp_path / "out",
                          solver_path=solver)
+
+    def test_solver_credential_scrub_is_suffix_bounded(self, monkeypatch):
+        monkeypatch.setenv("EXAMPLE_API_KEY", "secret")
+        monkeypatch.setenv("EXAMPLE_SERVICE_URL", "https://secret.example")
+        monkeypatch.setenv("EXAMPLE_API_KEY_HINT", "safe-description")
+
+        child_env = _solver_subprocess_env()
+
+        assert "EXAMPLE_API_KEY" not in child_env
+        assert "EXAMPLE_SERVICE_URL" not in child_env
+        assert child_env["EXAMPLE_API_KEY_HINT"] == "safe-description"
 
     def test_clean_exit_without_manifest_raises_solver_run_error(
             self, tmp_path, tiny_sim):

@@ -15,6 +15,7 @@ import shutil
 import tempfile
 import threading
 from pathlib import Path
+from typing import Optional
 
 from ..bundle import (
     BundleError,
@@ -143,6 +144,19 @@ def _remove_path(path: Path) -> None:
 def invalidate(cfg: WebConfig, job_id: str) -> None:
     """Remove an unreadable cached result so a later resume can re-fetch it."""
     _remove_path(job_dir(cfg, job_id))
+
+
+def completed_result(cfg: WebConfig, job_id: str) -> Optional[Path]:
+    """The validated, sealed local result directory for ``job_id``, or None.
+
+    A directory is returned only when a prior download passed the full
+    structural validation and published the private completion marker, so the
+    entry is exactly what :func:`download_bundle` would return without
+    touching the network."""
+    out = job_dir(cfg, job_id)
+    lock = _CACHE_LOCKS[hash(str(out)) % len(_CACHE_LOCKS)]
+    with lock:
+        return out if _is_complete(out) else None
 
 
 def _download_archive(http: HttpClient, cfg: WebConfig, job_id: str,

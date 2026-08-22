@@ -915,32 +915,14 @@ def test_failed_and_cancelled_attempts_receive_terminal_records(
 
 
 class TestPersistentRunRoot:
-    """The default archive location, including the pre-rename fallback."""
+    """The persistent archive uses only current configuration and paths."""
 
     def test_defaults_to_photonhub_archive(self, tmp_path, monkeypatch):
         monkeypatch.delenv("PHOTONHUB_RUN_ROOT", raising=False)
-        monkeypatch.delenv("SIMUPOD_RUN_ROOT", raising=False)
         monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
         assert server._persistent_run_root() == (tmp_path / ".photonhub" / "runs").resolve()
 
-    def test_adopts_legacy_simupod_archive_when_present(self, tmp_path, monkeypatch):
-        # An install predating the rename keeps its run history in ~/.simupod.
-        monkeypatch.delenv("PHOTONHUB_RUN_ROOT", raising=False)
-        monkeypatch.delenv("SIMUPOD_RUN_ROOT", raising=False)
+    def test_explicit_env_override(self, tmp_path, monkeypatch):
         monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
-        (tmp_path / ".simupod" / "runs").mkdir(parents=True)
-        assert server._persistent_run_root() == (tmp_path / ".simupod" / "runs").resolve()
-
-    def test_current_archive_wins_over_legacy(self, tmp_path, monkeypatch):
-        monkeypatch.delenv("PHOTONHUB_RUN_ROOT", raising=False)
-        monkeypatch.delenv("SIMUPOD_RUN_ROOT", raising=False)
-        monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
-        (tmp_path / ".simupod" / "runs").mkdir(parents=True)
-        (tmp_path / ".photonhub" / "runs").mkdir(parents=True)
-        assert server._persistent_run_root() == (tmp_path / ".photonhub" / "runs").resolve()
-
-    def test_explicit_env_override_beats_both(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
-        (tmp_path / ".simupod" / "runs").mkdir(parents=True)
         monkeypatch.setenv("PHOTONHUB_RUN_ROOT", str(tmp_path / "explicit"))
         assert server._persistent_run_root() == (tmp_path / "explicit").resolve()

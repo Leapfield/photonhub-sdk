@@ -32,10 +32,16 @@ deposition-dependent films (PECVD SiN, a-Si:H, ...):
 
 Built-in materials (see ``MATERIALS``): the isotropic scalar engine cannot
 carry birefringence, so uniaxial crystals are split into ``_o`` / ``_e``
-entries (use the ray your polarization sees). Metals are NOT included — they
-need a Drude pole, which the single-Lorentz engine does not have yet
-(NUMERICS.md §19 deferred list) and the wire bound ``permittivity >= 1``
-excludes a negative-eps* constant-index stand-in.
+entries (use the ray your polarization sees). METALS (Au/Ag/Cu Johnson &
+Christy, Al Rakic) are included as tabulated n/k and are DISPERSIVE-ONLY:
+their optical/IR Re eps is negative, which no frozen permittivity >= 1
+medium can carry — build their media through the multi-pole fitter,
+
+>>> gold = ph.materials.Au.pole_fit(band_um=(1.0, 1.6), n_lorentz=1,
+...                                 drude=True).medium
+
+(medium(wavelength_um=...)/medium(band_um=...) raise on a metallic
+band and point here).
 
 All data files were taken from the refractiveindex.info database (public
 domain, CC0 1.0), which transcribes the cited papers; coefficients are
@@ -62,7 +68,8 @@ from typing import Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-from .components.structures import LorentzPole, Medium
+from .components.structures import (MAX_ADE_POLES, DrudePole,
+                                    LorentzPole, Medium)
 
 __all__ = [
     "Material",
@@ -90,6 +97,10 @@ __all__ = [
     "MgF2_e",
     "CaF2",
     "PMMA",
+    "Au",
+    "Ag",
+    "Cu",
+    "Al",
 ]
 
 _C0_M_PER_S = 299792458.0
@@ -290,6 +301,56 @@ class LorentzFit:
         return (2.0 / w0) * _C0_M_PER_S * math.sqrt(3.0) / courant * 1e6
 
 
+@dataclass(frozen=True)
+class PoleFit:
+    """A multi-pole (Lorentz + optional Drude) fit of a material band —
+    the schema-1.17 companion of :class:`LorentzFit`, fitting the COMPLEX
+    permittivity (real dispersion AND absorption ride the poles' damping,
+    no band-centre Ohmic sigma needed).
+
+    ``max_abs_eps_error`` / ``max_rel_eps_error`` are the band maxima of
+    ``|eps_fit - eps_target|`` (absolute / relative to ``|eps_target|``)."""
+
+    material_name: str
+    band_um: Tuple[float, float]
+    eps_inf: float
+    lorentz: Tuple[LorentzPole, ...]
+    drude: Tuple[DrudePole, ...]
+    max_abs_eps_error: float
+    max_rel_eps_error: float
+
+    @property
+    def medium(self) -> Medium:
+        """The dispersive engine :class:`Medium` (poles in fit order)."""
+        return Medium(permittivity=self.eps_inf, poles=self.lorentz,
+                      drude=self.drude)
+
+    def eps_model(self, wavelength_um) -> np.ndarray:
+        """Complex model permittivity at ``wavelength_um`` (µm)."""
+        lam = np.asarray(wavelength_um, dtype=float)
+        w = 2.0 * math.pi * _C0_M_PER_S / (lam * 1e-6)
+        eps = np.full_like(w, self.eps_inf, dtype=np.complex128)
+        for p in self.lorentz:
+            w0 = 2.0 * math.pi * p.resonance_frequency_hz
+            g = 2.0 * math.pi * p.linewidth_hz
+            eps += p.delta_eps * w0 * w0 / (w0 * w0 - w * w - 1j * g * w)
+        for d in self.drude:
+            wp = 2.0 * math.pi * d.plasma_frequency_hz
+            g = 2.0 * math.pi * d.linewidth_hz
+            eps += -(wp * wp) / (w * w + 1j * g * w)
+        return eps
+
+    def omega0_dt(self, dl_um: float, courant: float = 0.99) -> float:
+        """The largest ``omega0 * dt`` over the fitted Lorentz poles at grid
+        spacing ``dl_um`` — must stay < 2 for ADE stability (§19.4; Drude
+        poles impose no resonance bound)."""
+        if not self.lorentz:
+            return 0.0
+        dt = courant * (dl_um * 1e-6) / (_C0_M_PER_S * math.sqrt(3.0))
+        f_max = max(p.resonance_frequency_hz for p in self.lorentz)
+        return 2.0 * math.pi * f_max * dt
+
+
 def _lstsq_pole(
     omega: np.ndarray, eps_target: np.ndarray, omega0: float
 ) -> Tuple[float, float, float]:
@@ -389,7 +450,9 @@ class Material:
             if eps_real < 1.0:
                 raise ValueError(
                     f"{self.name}: Re(eps) = {eps_real:.4f} at {lam} um is "
-                    "below the engine's permittivity >= 1 bound"
+                    "below the engine's permittivity >= 1 bound — a metal "
+                    "needs a dispersive medium: use "
+                    "pole_fit(band_um=..., drude=True)"
                 )
             sigma = 2.0 * math.pi * float(_freq_hz(lam)) * _EPS0_F_PER_M * (
                 2.0 * n_v * k_v
@@ -450,6 +513,13 @@ class Material:
         n_v = np.sqrt(self.model.n2(lam))
         k_v = self.model.k(lam)
         eps_target = n_v**2 - k_v**2
+        if float(np.min(eps_target)) < 1.0:
+            raise ValueError(
+                f"{self.name}: Re eps drops to "
+                f"{float(np.min(eps_target)):.3g} in {tuple(band_um)} "
+                "um — a metallic/near-metallic band cannot be represented by "
+                "the single lossless-Lorentz fit; use "
+                "pole_fit(band_um=..., drude=True) instead")
         n_target = np.sqrt(eps_target)
         n_min = float(np.min(n_target))
 
@@ -564,6 +634,151 @@ class Material:
         return degenerate
 
     # -- user data ----------------------------------------------------------
+
+    def pole_fit(
+        self,
+        band_um: Tuple[float, float],
+        *,
+        n_lorentz: int = 2,
+        drude: bool = False,
+        num_samples: int = 128,
+    ) -> PoleFit:
+        """Fit the material's COMPLEX permittivity over ``band_um`` with
+        ``n_lorentz`` Lorentz poles plus (optionally) one Drude term — the
+        schema-1.17 multi-pole fit for metals and wideband dielectrics.
+
+        Where :meth:`lorentz_fit` fits ``Re eps`` with ONE lossless pole and
+        moves absorption into a band-centre Ohmic sigma, this fits real AND
+        imaginary parts together with damped poles (passivity enforced through
+        the §19.1 bounds: ``delta_eps >= 0``, ``gamma >= 0``, ``wp > 0``).
+        Deterministic multi-start least squares (log-spaced pole ladders on
+        both sides of the band; no RNG). Raises when the request exceeds the
+        engine's pole budget or scipy is unavailable.
+
+        Returns a :class:`PoleFit`; use ``fit.medium`` in structures, check
+        ``fit.max_rel_eps_error`` and ``fit.omega0_dt(dl_um)`` before running.
+        """
+        from scipy.optimize import least_squares
+
+        if n_lorentz < 0 or (n_lorentz == 0 and not drude):
+            raise ValueError("need at least one pole (n_lorentz >= 1 or drude)")
+        n_total = n_lorentz + (1 if drude else 0)
+        if n_total > MAX_ADE_POLES:
+            raise ValueError(
+                f"{n_total} poles exceed the engine budget of "
+                f"{MAX_ADE_POLES} (NUMERICS.md §19)")
+        lo, hi = float(band_um[0]), float(band_um[1])
+        if not (0.0 < lo < hi):
+            raise ValueError(f"invalid band_um {band_um}")
+
+        lam = np.linspace(lo, hi, int(num_samples))
+        w = 2.0 * math.pi * _C0_M_PER_S / (lam * 1e-6)
+        eps_t = np.asarray(self.eps(lam), dtype=np.complex128)
+        scale = float(np.max(np.abs(eps_t)))
+        f_lo, f_hi = float(w.min() / (2 * math.pi)), float(w.max() / (2 * math.pi))
+
+        # parameter vector: [eps_inf, (f0, de, g) * n_lorentz, (fp, g)?]
+        def unpack(x):
+            eps_inf = x[0]
+            lor = [(x[1 + 3 * j], x[2 + 3 * j], x[3 + 3 * j])
+                   for j in range(n_lorentz)]
+            dr = (x[1 + 3 * n_lorentz], x[2 + 3 * n_lorentz]) if drude else None
+            return eps_inf, lor, dr
+
+        def model(x):
+            eps_inf, lor, dr = unpack(x)
+            eps = np.full_like(w, eps_inf, dtype=np.complex128)
+            for (f0, de, g) in lor:
+                w0 = 2.0 * math.pi * f0
+                gg = 2.0 * math.pi * g
+                eps = eps + de * w0 * w0 / (w0 * w0 - w * w - 1j * gg * w)
+            if dr is not None:
+                wp = 2.0 * math.pi * dr[0]
+                gg = 2.0 * math.pi * dr[1]
+                eps = eps + -(wp * wp) / (w * w + 1j * gg * w)
+            return eps
+
+        def resid(x):
+            d = (model(x) - eps_t) / scale
+            return np.concatenate([d.real, d.imag])
+
+        # bounds: passivity + poles anywhere within a decade of the band
+        lo_b = [1.0] + [f_lo / 10.0, 0.0, 0.0] * n_lorentz
+        hi_b = [np.inf] + [f_hi * 10.0, np.inf, f_hi * 10.0] * n_lorentz
+        if drude:
+            # metal plasma frequencies sit far above an IR band (Au: ~2.2e15
+            # Hz vs f_hi ~ 2.9e14 at 1.05 um) — give fp two decades of room
+            lo_b += [f_lo / 10.0, 0.0]
+            hi_b += [f_hi * 100.0, f_hi * 10.0]
+
+        eps_inf0 = float(np.clip(np.min(eps_t.real), 1.0, None)) if             float(np.min(eps_t.real)) > 1.0 else 1.0
+
+        # deterministic multi-start: pole ladders below/above/straddling
+        ladders = []
+        for kind in ("below", "above", "straddle"):
+            f0s = []
+            for j in range(max(n_lorentz, 1)):
+                frac = (j + 1) / (max(n_lorentz, 1) + 1)
+                if kind == "below":
+                    f0s.append(f_lo * (0.2 + 0.6 * frac))
+                elif kind == "above":
+                    f0s.append(f_hi * (1.5 + 3.0 * frac))
+                else:
+                    f0s.append(f_lo + frac * (f_hi - f_lo) * 2.0)
+            ladders.append(f0s)
+
+        best = None
+        last_exc = None
+        for f0s in ladders:
+            x0 = [eps_inf0]
+            for j in range(n_lorentz):
+                x0 += [f0s[j], max(1.0, float(np.ptp(eps_t.real))),
+                       0.05 * f0s[j]]
+            if drude:
+                # seed from the negative band eps if present (Drude limit:
+                # -eps ~ (wp/w)^2), clamped inside the bounds
+                neg = max(0.0, -float(np.min(eps_t.real)))
+                fp0 = min(f_hi * math.sqrt(max(neg + 1.0, 1.0)),
+                          f_hi * 90.0)
+                x0 += [fp0, 0.05 * fp0]
+            try:
+                sol = least_squares(resid, x0, bounds=(lo_b, hi_b),
+                                    max_nfev=4000)
+            except ValueError as exc:
+                last_exc = exc
+                continue
+            if best is None or sol.cost < best.cost:
+                best = sol
+        if best is None:
+            raise ValueError(
+                f"{self.name}: pole_fit failed to converge on "
+                f"[{lo}, {hi}] um — try different n_lorentz/drude "
+                f"(last solver error: {last_exc})")
+
+        eps_inf, lor, dr = unpack(best.x)
+        lorentz = tuple(
+            LorentzPole(resonance_frequency_hz=f0, delta_eps=de,
+                        linewidth_hz=g)
+            for (f0, de, g) in lor if de > 1e-12)
+        drude_poles = ()
+        if dr is not None and dr[0] > 0.0:
+            drude_poles = (DrudePole(plasma_frequency_hz=dr[0],
+                                     linewidth_hz=dr[1]),)
+        fit = PoleFit(
+            material_name=self.name,
+            band_um=(lo, hi),
+            eps_inf=float(max(eps_inf, 1.0)),
+            lorentz=lorentz,
+            drude=drude_poles,
+            max_abs_eps_error=0.0,
+            max_rel_eps_error=0.0,
+        )
+        err = np.abs(fit.eps_model(lam) - eps_t)
+        object.__setattr__(fit, "max_abs_eps_error", float(np.max(err)))
+        object.__setattr__(
+            fit, "max_rel_eps_error",
+            float(np.max(err / np.maximum(np.abs(eps_t), 1e-12))))
+        return fit
 
     @classmethod
     def from_nk_data(
@@ -896,6 +1111,134 @@ PMMA = Material(
 )
 
 
+# ---------------------------------------------------------------------------
+# metals (schema 1.17 multi-pole/Drude engine): tabulated n/k, DISPERSIVE-ONLY
+# ---------------------------------------------------------------------------
+
+Au = Material(
+    name="Au",
+    valid_range_um=(0.1879, 1.937),
+    reference=("P. B. Johnson and R. W. Christy, 'Optical constants of the "
+               "noble metals,' Phys. Rev. B 6, 4370-4379 (1972). Tabulated "
+               'n/k via refractiveindex.info (CC0 1.0).'),
+    comments=('gold (evaporated film); METAL - negative Re eps in the '
+              'optical/IR: build media with pole_fit(band_um=..., '
+              'drude=True), not medium(...).'),
+    model=TabulatedNK(
+        wavelength_um=(0.1879, 0.1916, 0.1953, 0.1993, 0.2033, 0.2073, 0.2119, 0.2164, 0.2214,
+        0.2262, 0.2313, 0.2371, 0.2426, 0.249, 0.2551, 0.2616, 0.2689, 0.2761,
+        0.2844, 0.2924, 0.3009, 0.3107, 0.3204, 0.3315, 0.3425, 0.3542, 0.3679,
+        0.3815, 0.3974, 0.4133, 0.4305, 0.4509, 0.4714, 0.4959, 0.5209, 0.5486,
+        0.5821, 0.6168, 0.6595, 0.7045, 0.756, 0.8211, 0.892, 0.984, 1.088,
+        1.216, 1.393, 1.61, 1.937),
+        n=(1.28, 1.32, 1.34, 1.33, 1.33, 1.3, 1.3, 1.3, 1.3, 1.31, 1.3, 1.32,
+        1.32, 1.33, 1.33, 1.35, 1.38, 1.43, 1.47, 1.49, 1.53, 1.53, 1.54, 1.48,
+        1.48, 1.5, 1.48, 1.46, 1.47, 1.46, 1.45, 1.38, 1.31, 1.04, 0.62, 0.43,
+        0.29, 0.21, 0.14, 0.13, 0.14, 0.16, 0.17, 0.22, 0.27, 0.35, 0.43, 0.56,
+        0.92),
+        k_table=(1.188, 1.203, 1.226, 1.251, 1.277, 1.304, 1.35, 1.387, 1.427, 1.46,
+        1.497, 1.536, 1.577, 1.631, 1.688, 1.749, 1.803, 1.847, 1.869, 1.878,
+        1.889, 1.893, 1.898, 1.883, 1.871, 1.866, 1.895, 1.933, 1.952, 1.958,
+        1.948, 1.914, 1.849, 1.833, 2.081, 2.455, 2.863, 3.272, 3.697, 4.103,
+        4.542, 5.083, 5.663, 6.35, 7.15, 8.145, 9.519, 11.21, 13.78),
+    ),
+)
+
+Ag = Material(
+    name="Ag",
+    valid_range_um=(0.1879, 1.937),
+    reference=("P. B. Johnson and R. W. Christy, 'Optical constants of the "
+               "noble metals,' Phys. Rev. B 6, 4370-4379 (1972). Tabulated "
+               'n/k via refractiveindex.info (CC0 1.0).'),
+    comments=('silver (evaporated film); METAL - negative Re eps in the '
+              'optical/IR: build media with pole_fit(band_um=..., '
+              'drude=True), not medium(...).'),
+    model=TabulatedNK(
+        wavelength_um=(0.1879, 0.1916, 0.1953, 0.1993, 0.2033, 0.2073, 0.2119, 0.2164, 0.2214,
+        0.2262, 0.2313, 0.2371, 0.2426, 0.249, 0.2551, 0.2616, 0.2689, 0.2761,
+        0.2844, 0.2924, 0.3009, 0.3107, 0.3204, 0.3315, 0.3425, 0.3542, 0.3679,
+        0.3815, 0.3974, 0.4133, 0.4305, 0.4509, 0.4714, 0.4959, 0.5209, 0.5486,
+        0.5821, 0.6168, 0.6595, 0.7045, 0.756, 0.8211, 0.892, 0.984, 1.088,
+        1.216, 1.393, 1.61, 1.937),
+        n=(1.07, 1.1, 1.12, 1.14, 1.15, 1.18, 1.2, 1.22, 1.25, 1.26, 1.28, 1.28,
+        1.3, 1.31, 1.33, 1.35, 1.38, 1.41, 1.41, 1.39, 1.34, 1.13, 0.81, 0.17,
+        0.14, 0.1, 0.07, 0.05, 0.05, 0.05, 0.04, 0.04, 0.05, 0.05, 0.05, 0.06,
+        0.05, 0.06, 0.05, 0.04, 0.03, 0.04, 0.04, 0.04, 0.04, 0.09, 0.13, 0.15,
+        0.24),
+        k_table=(1.212, 1.232, 1.255, 1.277, 1.296, 1.312, 1.325, 1.336, 1.342, 1.344,
+        1.357, 1.367, 1.378, 1.389, 1.393, 1.387, 1.372, 1.331, 1.264, 1.161,
+        0.964, 0.616, 0.392, 0.829, 1.142, 1.419, 1.657, 1.864, 2.07, 2.275,
+        2.462, 2.657, 2.869, 3.093, 3.324, 3.586, 3.858, 4.152, 4.483, 4.838,
+        5.242, 5.727, 6.312, 6.992, 7.795, 8.828, 10.1, 11.85, 14.08),
+    ),
+)
+
+Cu = Material(
+    name="Cu",
+    valid_range_um=(0.1879, 1.937),
+    reference=("P. B. Johnson and R. W. Christy, 'Optical constants of the "
+               "noble metals,' Phys. Rev. B 6, 4370-4379 (1972). Tabulated "
+               'n/k via refractiveindex.info (CC0 1.0).'),
+    comments=('copper (evaporated film); METAL - negative Re eps in the '
+              'optical/IR: build media with pole_fit(band_um=..., '
+              'drude=True), not medium(...).'),
+    model=TabulatedNK(
+        wavelength_um=(0.1879, 0.1916, 0.1953, 0.1993, 0.2033, 0.2073, 0.2119, 0.2164, 0.2214,
+        0.2262, 0.2313, 0.2371, 0.2426, 0.249, 0.2551, 0.2616, 0.2689, 0.2761,
+        0.2844, 0.2924, 0.3009, 0.3107, 0.3204, 0.3315, 0.3425, 0.3542, 0.3679,
+        0.3815, 0.3974, 0.4133, 0.4305, 0.4509, 0.4714, 0.4959, 0.5209, 0.5486,
+        0.5821, 0.6168, 0.6595, 0.7045, 0.756, 0.8211, 0.892, 0.984, 1.088,
+        1.216, 1.393, 1.61, 1.937),
+        n=(0.94, 0.95, 0.97, 0.98, 0.99, 1.01, 1.04, 1.08, 1.13, 1.18, 1.23, 1.28,
+        1.34, 1.37, 1.41, 1.41, 1.45, 1.46, 1.45, 1.42, 1.4, 1.38, 1.38, 1.34,
+        1.36, 1.37, 1.36, 1.33, 1.32, 1.28, 1.25, 1.24, 1.25, 1.22, 1.18, 1.02,
+        0.7, 0.3, 0.22, 0.21, 0.24, 0.26, 0.3, 0.32, 0.36, 0.48, 0.6, 0.76,
+        1.09),
+        k_table=(1.337, 1.388, 1.44, 1.493, 1.55, 1.599, 1.651, 1.699, 1.737, 1.768,
+        1.792, 1.802, 1.799, 1.783, 1.741, 1.691, 1.668, 1.646, 1.633, 1.633,
+        1.679, 1.729, 1.783, 1.821, 1.864, 1.916, 1.975, 2.045, 2.116, 2.207,
+        2.305, 2.397, 2.483, 2.564, 2.608, 2.577, 2.704, 3.205, 3.747, 4.205,
+        4.665, 5.18, 5.768, 6.421, 7.217, 8.245, 9.439, 11.12, 13.43),
+    ),
+)
+
+Al = Material(
+    name="Al",
+    valid_range_um=(0.10332, 8.8561),
+    reference=("A. D. Rakic, 'Algorithm for the determination of intrinsic "
+               'optical constants of metal films: application to '
+               "aluminum,' Appl. Opt. 34, 4755-4767 (1995). Tabulated n/k "
+               'via refractiveindex.info (CC0 1.0); rows within 0.1-10 um '
+               'kept.'),
+    comments=('aluminum (intrinsic film; keep fit bands on ONE side of the '
+              '827 nm interband peak, e.g. 1.0-1.6 or 2-5 um); METAL - negative Re eps in the '
+              'optical/IR: build media with pole_fit(band_um=..., '
+              'drude=True), not medium(...).'),
+    model=TabulatedNK(
+        wavelength_um=(0.10332, 0.11271, 0.12399, 0.13776, 0.15498, 0.17712, 0.20664, 0.24797,
+        0.30996, 0.32628, 0.36466, 0.41328, 0.4428, 0.47687, 0.5166, 0.56357,
+        0.61993, 0.65225, 0.68881, 0.72932, 0.77491, 0.79478, 0.81569, 0.83774,
+        0.88561, 0.91166, 0.93928, 0.96863, 0.99988, 1.0332, 1.1271, 1.2399,
+        1.3776, 1.5498, 1.7712, 2.0664, 2.4797, 2.7552, 3.0996, 3.2628, 3.444,
+        3.6466, 3.8745, 4.1328, 4.428, 4.7687, 5.166, 5.6357, 6.1993, 6.8881,
+        7.7491, 8.8561),
+        n=(0.035753, 0.038468, 0.046304, 0.057167, 0.072505, 0.094236, 0.12677,
+        0.18137, 0.28003, 0.31474, 0.39877, 0.52135, 0.6079, 0.7278, 0.8734,
+        1.0728, 1.366, 1.5724, 1.8301, 2.1606, 2.6154, 2.7675, 2.7668, 2.6945,
+        2.2802, 1.9739, 1.6784, 1.4867, 1.4359, 1.3998, 1.3281, 1.3157, 1.3899,
+        1.5782, 1.9205, 2.4738, 3.3372, 3.938, 4.7097, 5.0735, 5.4903, 5.9564,
+        6.4808, 7.0796, 7.7757, 8.5881, 9.558, 10.742, 12.195, 14.088, 16.755,
+        20.837),
+        k_table=(0.77163, 0.95677, 1.1555, 1.3775, 1.6366, 1.9519, 2.3563, 2.9029,
+        3.7081, 3.9165, 4.3957, 5.0008, 5.3676, 5.7781, 6.2418, 6.7839, 7.4052,
+        7.7354, 8.0601, 8.3565, 8.4914, 8.3866, 8.2573, 8.1878, 8.1134, 8.3058,
+        8.597, 9.0655, 9.4939, 9.8914, 10.969, 12.245, 13.784, 15.656, 17.991,
+        20.982, 25.004, 27.58, 30.737, 32.183, 33.814, 35.608, 37.595, 39.826,
+        42.367, 45.257, 48.593, 52.518, 57.156, 62.841, 69.857, 78.274),
+    ),
+)
+
+
 MATERIALS = {
     m.name: m
     for m in (
@@ -915,6 +1258,10 @@ MATERIALS = {
         MgF2_e,
         CaF2,
         PMMA,
+        Au,
+        Ag,
+        Cu,
+        Al,
     )
 }
 

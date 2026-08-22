@@ -88,6 +88,17 @@ class TestEngineFaithfulResolve:
         assert n == 5
         assert sim.cost_estimate().cells_per_axis == (n, n, n)
 
+    def test_cost_estimate_defends_against_unvalidated_oversized_copy(self):
+        # model_copy(update=...) is intentionally unvalidated in pydantic.
+        # Cost estimation still applies the engine envelope before doing its
+        # memory/output arithmetic.
+        sim = make_sim(monitors=[]).model_copy(update={
+            "size_um": (1291.0, 1291.0, 1291.0),
+            "grid": ph.UniformGridSpec(dl_um=1.0),
+        })
+        with pytest.raises(ValueError, match="beta maximum.*logical cells"):
+            estimate_cost(sim)
+
 
 class TestGraded:
     def _graded_sim(self, n_nodes=80, dl=0.05):

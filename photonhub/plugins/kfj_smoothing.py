@@ -102,7 +102,7 @@ def _any_dispersive(sim, eps_of_medium=None) -> bool:
     PER-medium: pinning one medium must not freeze the others at whatever
     frequency a bank happens to evaluate first."""
     return any(
-        getattr(s.medium, "lorentz", None) is not None
+        getattr(s.medium, "is_dispersive", False)
         and not (eps_of_medium is not None and id(s.medium) in eps_of_medium)
         for s in sim.structures)
 

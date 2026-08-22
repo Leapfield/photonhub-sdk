@@ -14,20 +14,24 @@ from pydantic import Field, model_validator
 from .base import AxisName, FrozenModel, NonNegativeUm, PositiveUm, Vec3Um
 
 
-class LorentzPole(FrozenModel):
-    """A single Lorentz pole for a frequency-dependent (dispersive) medium
-    (NUMERICS.md §19). Under the engine's e^{-i omega t} convention the medium
-    permittivity is
+# NUMERICS.md §19 — hard per-medium pole budget (lorentz + poles + drude
+# combined); mirrors the engine's kMaxAdePoles.
+MAX_ADE_POLES = 6
 
-        eps(omega) = eps_inf + delta_eps * omega0^2
+
+class LorentzPole(FrozenModel):
+    """One Lorentz pole of a frequency-dependent (dispersive) medium
+    (NUMERICS.md §19). Under the engine's e^{-i omega t} convention the pole
+    contributes
+
+        chi(omega) = delta_eps * omega0^2
                      / (omega0^2 - omega^2 - i*gamma*omega)
 
     where omega0 = 2*pi*resonance_frequency_hz and gamma = 2*pi*linewidth_hz
     (both stored as ordinary Hz on the wire; the engine multiplies by 2*pi).
     ``delta_eps`` is the oscillator strength (the static contribution of this
-    pole, eps(0) - eps_inf = delta_eps). The MVP supports exactly ONE pole,
-    scalar and isotropic (multi-pole / Drude / anisotropic poles are deferred,
-    NUMERICS.md §19 TODO).
+    pole, delta of eps(0)). A medium carries up to ``MAX_ADE_POLES`` poles
+    combined across ``lorentz``/``poles``/``drude``.
 
     Passivity (Im eps >= 0 for omega > 0) requires delta_eps >= 0 and
     gamma >= 0; the engine validates these. ``gamma = 0`` is a lossless
@@ -39,49 +43,126 @@ class LorentzPole(FrozenModel):
     linewidth_hz: float = Field(default=0.0, ge=0.0)  # gamma / 2pi
 
 
+class DrudePole(FrozenModel):
+    """One Drude (free-carrier) term of a dispersive medium (NUMERICS.md §19)
+    — the metal/plasmonics building block. Under e^{-i omega t} it contributes
+
+        chi(omega) = -wp^2 / (omega^2 + i*gamma*omega)
+
+    with wp = 2*pi*plasma_frequency_hz and gamma = 2*pi*linewidth_hz (the
+    collision rate; 0 = collisionless plasma). Below the plasma frequency the
+    real permittivity goes strongly NEGATIVE — the medium reflects like a
+    metal. The engine realizes it as the omega0 = 0 ADE pole with strength
+    wp^2 (no resonance-Nyquist bound applies)."""
+
+    plasma_frequency_hz: float = Field(gt=0.0)        # wp / 2pi
+    linewidth_hz: float = Field(default=0.0, ge=0.0)  # gamma / 2pi
+
+
 class Medium(FrozenModel):
     """Isotropic nonmagnetic medium: scalar relative permittivity plus an
     electric conductivity entering the lossy Ca/Cb update (NUMERICS.md
     section 10). ``sigma = 0`` reproduces the Phase-0 update bit-exactly.
 
-    A non-dispersive medium leaves ``lorentz`` unset (None) and the field is
-    omitted from the wire entirely (back-compat: schema < 1.9 documents and
-    every existing scene round-trip byte-identically). When a single Lorentz
-    pole is supplied, ``permittivity`` is the high-frequency limit eps_inf
+    A non-dispersive medium leaves ``lorentz``/``poles``/``drude`` unset and
+    the fields are omitted from the wire entirely (back-compat: schema < 1.9
+    documents and every existing scene round-trip byte-identically). With any
+    poles supplied, ``permittivity`` is the high-frequency limit eps_inf
     (NUMERICS.md §19) and the medium is dispersive (the ADE polarization
-    update engages only in cells carrying that pole)."""
+    update engages only in cells carrying poles). The engine consumes the
+    poles in WIRE ORDER — ``lorentz`` first, then ``poles``, then ``drude`` —
+    up to ``MAX_ADE_POLES`` combined."""
 
     permittivity: float = Field(ge=1.0)
     conductivity_s_per_m: float = Field(default=0.0, ge=0.0)
-    # NUMERICS.md §19 — optional single Lorentz pole (additive/back-compat).
-    # When set, ``permittivity`` is eps_inf and the cell is dispersive. The MVP
-    # is a SINGLE scalar isotropic pole; a list (multi-pole) is a later phase.
+    # NUMERICS.md §19 — the legacy single Lorentz pole (additive/back-compat;
+    # kept alongside the lists so schema 1.9-1.16 documents parse unchanged).
     lorentz: Optional[LorentzPole] = None
+    # Schema 1.17 — additional Lorentz poles and Drude terms (additive;
+    # None/empty are equivalent and omitted from the wire, so every existing
+    # document round-trips byte-identically).
+    poles: Optional[Tuple[LorentzPole, ...]] = None
+    drude: Optional[Tuple[DrudePole, ...]] = None
+    # Schema 1.17 — perfect electric conductor STRUCTURE material (NUMERICS.md
+    # §10.1): every E component whose Yee point falls inside is pinned to 0
+    # (staircased hard mirror — the structure analogue of the 'pec' outer
+    # boundary). ``permittivity`` is required by the wire but ignored (write 1);
+    # conductivity and dispersion poles are contradictions and rejected.
+    # None/False are equivalent and omitted from the wire (byte-back-compat).
+    pec: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _pec_excludes_other_response(self) -> "Medium":
+        if self.pec is False:
+            object.__setattr__(self, "pec", None)  # canonical omitted form
+        if self.pec:
+            if self.is_dispersive:
+                raise ValueError(
+                    "a PEC medium cannot carry dispersion poles (it is the "
+                    "infinite-conductivity limit already)")
+            if self.conductivity_s_per_m != 0.0:
+                raise ValueError(
+                    "a PEC medium cannot carry a finite conductivity")
+        return self
+
+    @model_validator(mode="after")
+    def _pole_budget(self) -> "Medium":
+        # canonicalize empty lists to None (the omitted-from-wire form)
+        if self.poles is not None and len(self.poles) == 0:
+            object.__setattr__(self, "poles", None)
+        if self.drude is not None and len(self.drude) == 0:
+            object.__setattr__(self, "drude", None)
+        n = ((1 if self.lorentz is not None else 0)
+             + len(self.poles or ()) + len(self.drude or ()))
+        if n > MAX_ADE_POLES:
+            raise ValueError(
+                f"medium carries {n} dispersion poles (lorentz + poles + "
+                f"drude combined); the engine supports at most "
+                f"{MAX_ADE_POLES} (NUMERICS.md §19)")
+        return self
+
+    @property
+    def is_dispersive(self) -> bool:
+        """True when the medium carries any ADE pole (Lorentz or Drude)."""
+        return (self.lorentz is not None or bool(self.poles)
+                or bool(self.drude))
+
+    def all_lorentz_poles(self) -> Tuple[LorentzPole, ...]:
+        """Every Lorentz pole in wire order (legacy ``lorentz`` first)."""
+        head = (self.lorentz,) if self.lorentz is not None else ()
+        return head + tuple(self.poles or ())
 
     def permittivity_at_hz(self, freq_hz: float) -> float:
-        """Real relative permittivity ``Re eps(omega)`` at ``freq_hz`` under the
-        pole model above — for a non-dispersive medium this is just
-        ``permittivity``; with a Lorentz pole, ``permittivity`` alone is only
-        the high-frequency limit eps_inf and is the WRONG value to hand a mode
+        """Real relative permittivity ``Re eps(omega)`` at ``freq_hz`` under
+        the §19 pole model — for a non-dispersive medium this is just
+        ``permittivity``; with poles, ``permittivity`` alone is only the
+        high-frequency limit eps_inf and is the WRONG value to hand a mode
         solver or any other frequency-anchored consumer (a Si pole fit reads
-        ~9.6 instead of ~12.1 at 1.55 um). Raises at an exactly undamped
-        resonance, where eps diverges."""
-        if self.lorentz is None:
+        ~9.6 instead of ~12.1 at 1.55 um). Sums every Lorentz and Drude term;
+        can go NEGATIVE for a metal below its plasma frequency. Raises at an
+        exactly undamped Lorentz resonance, where eps diverges."""
+        if not self.is_dispersive:
             return float(self.permittivity)
         if not freq_hz > 0.0:
             raise ValueError(f"freq_hz must be > 0, got {freq_hz}")
-        p = self.lorentz
         w = 2.0 * math.pi * float(freq_hz)
-        w0 = 2.0 * math.pi * p.resonance_frequency_hz
-        g = 2.0 * math.pi * p.linewidth_hz
-        det = w0 * w0 - w * w
-        den = det * det + (g * w) ** 2
-        if den == 0.0:
-            raise ValueError(
-                "permittivity_at_hz evaluated exactly ON an undamped Lorentz "
-                f"resonance (freq_hz = {freq_hz:g} = resonance, linewidth 0): "
-                "eps diverges there")
-        return float(self.permittivity + p.delta_eps * w0 * w0 * det / den)
+        eps = float(self.permittivity)
+        for p in self.all_lorentz_poles():
+            w0 = 2.0 * math.pi * p.resonance_frequency_hz
+            g = 2.0 * math.pi * p.linewidth_hz
+            det = w0 * w0 - w * w
+            den = det * det + (g * w) ** 2
+            if den == 0.0:
+                raise ValueError(
+                    "permittivity_at_hz evaluated exactly ON an undamped "
+                    f"Lorentz resonance (freq_hz = {freq_hz:g} = resonance, "
+                    "linewidth 0): eps diverges there")
+            eps += p.delta_eps * w0 * w0 * det / den
+        for d in (self.drude or ()):
+            wp = 2.0 * math.pi * d.plasma_frequency_hz
+            g = 2.0 * math.pi * d.linewidth_hz
+            eps += -(wp * wp) / (w * w + g * g)
+        return float(eps)
 
 
 class Box(FrozenModel):

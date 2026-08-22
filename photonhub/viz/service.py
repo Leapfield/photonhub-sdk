@@ -10,10 +10,11 @@ Design notes (see ``desktop/PLAN.md``):
   reads raw arrays from the ``xarray.DataArray`` and builds plotly in ``figures``.
 - Geometry is not in the manifest; ``run_local`` writes ``sim.json`` next to
   ``manifest.json``, so the scene + overlays are reconstructed from there.
-- The slider *catalog* is manifest-only (no blob load). **Caveat (memmap TODO):**
-  ``SimulationData[name]`` currently reads the whole monitor ``.bin`` into RAM and
-  caches it (see ``data.py``); large volumetric monitors are not yet sliced lazily.
-  PLAN §2/§10 — tracked, not yet implemented.
+- The slider *catalog* is manifest-only (no blob load). Raw ``.bin`` monitor
+  arrays are exposed through a read-only ``numpy.memmap`` by
+  ``SimulationData[name]``, so plane/frequency selections page in only the
+  requested data. HDF5-backed results remain eager because their dataset
+  lifetime is currently scoped to a short-lived file handle.
 """
 
 from __future__ import annotations
@@ -1444,6 +1445,8 @@ def _spec_loops(spec) -> list:
     if kind == "rect":
         h0, v0, w, hh = spec[1]
         return [[(h0, v0), (h0 + w, v0), (h0 + w, v0 + hh), (h0, v0 + hh), (h0, v0)]]
+    if kind == "rects":
+        return [loop for rect in spec[1] for loop in _spec_loops(("rect", rect))]
     if kind == "polygon":
         verts = list(spec[1])
         return [verts + [verts[0]]] if verts else []

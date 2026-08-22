@@ -174,6 +174,28 @@ PhotonHub desktop app, or the dev React UI which proxies to <code>/api</code>.</
 </body>"""
 
 
+def _boot_result_revision(data) -> Optional[str]:
+    """Revision for the bundle opened at process start. Content-derived (path +
+    manifest/sim.json bytes) so a RESTARTED sidecar over the same unchanged
+    bundle keeps the revision the renderer already holds — a sidecar crash
+    must not strand the desktop app on 409 "stale result revision" — while an
+    actually-changed bundle still invalidates stale readers. Results opened at
+    runtime keep random revisions (every open is a new revision on purpose)."""
+    if data is None:
+        return None
+    try:
+        root = Path(data.output_dir).resolve()
+        digest = hashlib.sha256(str(root).encode())
+        for name in ("manifest.json", "sim.json"):
+            candidate = root / name
+            if candidate.exists():
+                digest.update(name.encode())
+                digest.update(candidate.read_bytes())
+        return digest.hexdigest()[:32]
+    except Exception:
+        return uuid.uuid4().hex
+
+
 def create_app(result_dir: Optional[str | Path] = None,
                ui_dir: Optional[str | Path] = None,
                run_root: Optional[str | Path] = None,
@@ -366,7 +388,7 @@ def create_app(result_dir: Optional[str | Path] = None,
         # a new bundle under the previous revision.
         "result": (
             initial_data,
-            uuid.uuid4().hex if initial_data is not None else None,
+            _boot_result_revision(initial_data),
             None,  # stable ledger run id; external/legacy bundles have none
         ),
         "result_seq": 0,
@@ -3504,15 +3526,7 @@ def _persistent_run_root(run_root: Optional[str | Path] = None) -> Path:
     configured = run_root or os.environ.get("PHOTONHUB_RUN_ROOT")
     if configured:
         return Path(configured).expanduser().resolve()
-    default = (Path.home() / ".photonhub" / "runs").resolve()
-    if not default.exists():
-        # Installs that predate the SimuPod → PhotonHub rename keep their run
-        # history here. Adopt it in place rather than moving user data, and only
-        # when the current archive has not been created yet.
-        legacy = (Path.home() / ".simupod" / "runs").resolve()
-        if legacy.is_dir():
-            return legacy
-    return default
+    return (Path.home() / ".photonhub" / "runs").resolve()
 
 
 def _load_desktop_release(path: str | Path) -> dict:

@@ -69,6 +69,12 @@ from typing import Dict, Iterator, List, Optional, Union
 import numpy as np
 import xarray as xr
 
+from .components.base import (
+    _MONITOR_NAME_MAX_LENGTH,
+    _is_portable_filename_token,
+    _monitor_name_key,
+)
+
 _TIME_DIMS = ("t", "component")
 _SNAPSHOT_DIMS = ("t", "component", "z", "y", "x")
 _DFT_DIMS = ("f", "component", "z", "y", "x")
@@ -409,30 +415,35 @@ def validate_result_manifest_contract(
         if not isinstance(entry, dict):
             raise ValueError(f"monitor manifest entry must be an object: {entry!r}")
         name = entry.get("name")
-        if (not isinstance(name, str) or not name or name in {".", ".."}
-                or "/" in name or "\\" in name or "\x00" in name):
+        if (
+            not isinstance(name, str)
+            or not _is_portable_filename_token(
+                name, max_length=_MONITOR_NAME_MAX_LENGTH
+            )
+        ):
             raise ValueError(f"manifest monitor entry has an unsafe name: {name!r}")
-        if name in names:
+        name_key = _monitor_name_key(name)
+        if name_key in names:
             raise ValueError(f"duplicate monitor name in manifest: {name!r}")
-        names.add(name)
+        names.add(name_key)
         if raw_files:
             filename = entry.get("file")
-            if (not isinstance(filename, str) or not filename
-                    or filename in {".", ".."} or "/" in filename
-                    or "\\" in filename or "\x00" in filename
+            if (not isinstance(filename, str)
+                    or not _is_portable_filename_token(filename, max_length=255)
                     or Path(filename).is_absolute()
                     or Path(filename).name != filename
-                    or filename in _RESERVED_RESULT_FILES):
+                    or _monitor_name_key(filename) in _RESERVED_RESULT_FILES):
                 raise ValueError(
                     f"monitor {name!r} has an unsafe result filename: {filename!r}")
-            if filename in files:
+            filename_key = _monitor_name_key(filename)
+            if filename_key in files:
                 raise ValueError(
                     f"multiple monitors alias result filename {filename!r}")
             if strict_engine and filename != f"{name}.bin":
                 raise ValueError(
                     f"monitor {name!r}: engine result filename must be "
                     f"{name + '.bin'!r}, got {filename!r}")
-            files.add(filename)
+            files.add(filename_key)
         validate_monitor_manifest_entry(
             entry, manifest, require_explicit_dims=strict_engine)
     return monitors
@@ -494,16 +505,21 @@ class SimulationData:
                 raise ValueError(
                     f"manifest monitor entry must be an object: {entry!r}")
             name = entry.get("name")
-            if (not isinstance(name, str) or not name or name in (".", "..")
-                    or "/" in name or "\\" in name or "\x00" in name):
+            if (
+                not isinstance(name, str)
+                or not _is_portable_filename_token(
+                    name, max_length=_MONITOR_NAME_MAX_LENGTH
+                )
+            ):
                 raise ValueError(f"manifest monitor entry without a name: {entry}")
             if name in self._entries:
                 raise ValueError(f"duplicate monitor name in manifest: {name!r}")
             if self._h5_path is None:
                 filename = entry.get("file")
-                if (not isinstance(filename, str) or not filename
-                        or filename in (".", "..") or "/" in filename
-                        or "\\" in filename or "\x00" in filename
+                if (not isinstance(filename, str)
+                        or not _is_portable_filename_token(
+                            filename, max_length=255
+                        )
                         or filename == "manifest.json"):
                     raise ValueError(
                         f"monitor {name!r} has an unsafe result filename: "
@@ -712,9 +728,8 @@ class SimulationData:
             source = f"{self._h5_path} [/monitors/{name}]"
         else:
             filename = entry.get("file")
-            if (not isinstance(filename, str) or not filename
-                    or filename in (".", "..") or "/" in filename
-                    or "\\" in filename or "\x00" in filename
+            if (not isinstance(filename, str)
+                    or not _is_portable_filename_token(filename, max_length=255)
                     or filename == "manifest.json"):
                 raise ValueError(
                     f"monitor {name!r} has an unsafe result filename: "

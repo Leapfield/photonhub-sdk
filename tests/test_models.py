@@ -264,6 +264,15 @@ class TestMonitors:
                 ph.FieldTimeMonitor(name="dup", center_um=(0, 0, 0), fields=["Ex"]),
             ])
 
+    def test_ascii_case_only_monitor_names_rejected(self):
+        with pytest.raises(ValidationError, match="ignoring ASCII case"):
+            make_sim(monitors=[
+                ph.FieldSnapshotMonitor(name="Probe", fields=["Ez"]),
+                ph.FieldTimeMonitor(
+                    name="probe", center_um=(0, 0, 0), fields=["Ex"]
+                ),
+            ])
+
     def test_mode_port_defaults_and_wire_roundtrip(self):
         port = ph.ModePort(
             out_direction="+", center_um=(0.2, 0.3), size_um=(0.4, 0.5),
@@ -625,16 +634,68 @@ class TestMonitorNameRules:
     """Engine parity: resolve.cpp check_name rejects names unusable as
     filenames (the engine writes <name>.bin)."""
 
-    @pytest.mark.parametrize("name", ["a/b", "a\\b", ".", ".."])
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "a/b", "a\\b", "a\x00b", "has space", "bad:name", "µprobe",
+            ".", "..", ".hidden", "trailing.", "CON", "con.txt", "Lpt9.log",
+        ],
+    )
     def test_path_unsafe_names_rejected(self, name):
         with pytest.raises(ValidationError, match="filename"):
             ph.FieldSnapshotMonitor(name=name, fields=["Ez"])
         with pytest.raises(ValidationError, match="filename"):
             ph.FieldTimeMonitor(name=name, center_um=(0, 0, 0), fields=["Ez"])
 
-    @pytest.mark.parametrize("name", ["probe", "final_fields", "...", "a.b"])
+    def test_name_length_keeps_bin_filename_within_portable_limit(self):
+        assert ph.FieldSnapshotMonitor(
+            name="x" * 251, fields=["Ez"]
+        ).name == "x" * 251
+        with pytest.raises(ValidationError, match="251"):
+            ph.FieldSnapshotMonitor(name="x" * 252, fields=["Ez"])
+
+    @pytest.mark.parametrize(
+        "name", ["probe", "final_fields", "a.b", "_tmp", "dash-name", "COM0"]
+    )
     def test_filename_safe_names_accepted(self, name):
         assert ph.FieldSnapshotMonitor(name=name, fields=["Ez"]).name == name
+
+
+class TestResolvedGridResourceEnvelope:
+    """Cheap client mirror of the engine's beta field-layout limits."""
+
+    def test_large_grid_inside_both_limits_is_accepted(self):
+        sim = make_sim(
+            size_um=(1280.0, 1280.0, 1280.0),
+            grid=ph.UniformGridSpec(dl_um=1.0),
+            monitors=[],
+        )
+        assert sim.cost_estimate().cells_per_axis == (1280, 1280, 1280)
+
+    def test_logical_cell_limit_is_enforced_at_construction(self):
+        with pytest.raises(ValidationError, match="beta maximum.*logical cells"):
+            make_sim(
+                size_um=(1291.0, 1291.0, 1291.0),
+                grid=ph.UniformGridSpec(dl_um=1.0),
+                monitors=[],
+            )
+
+    def test_padded_halo_limit_is_enforced_at_construction(self):
+        # Logical cells fit by 15; the 32-cell x pitch and two z halos do not.
+        with pytest.raises(ValidationError, match="x-padded grid.*z halos"):
+            make_sim(
+                size_um=(134217727.0, 4.0, 4.0),
+                grid=ph.UniformGridSpec(dl_um=1.0),
+                monitors=[],
+            )
+
+    def test_extreme_finite_ratio_is_an_actionable_validation_error(self):
+        with pytest.raises(ValidationError, match="axis cell count.*maximum"):
+            make_sim(
+                size_um=(1.0, 1.0, 1.0),
+                grid=ph.UniformGridSpec(dl_um=1e-320),
+                monitors=[],
+            )
 
 
 class TestNonFiniteRejection:
@@ -981,7 +1042,7 @@ class TestFieldDftMonitor:
         with pytest.raises(ValidationError):
             ph.FieldDftMonitor(**self.kwargs(size_um=(0.1, -0.1, 0.1)))
 
-    @pytest.mark.parametrize("name", ["a/b", ".."])
+    @pytest.mark.parametrize("name", ["a/b", "a\x00b", "aux.results"])
     def test_path_unsafe_names_rejected(self, name):
         with pytest.raises(ValidationError, match="filename"):
             ph.FieldDftMonitor(**self.kwargs(name=name))
@@ -1044,7 +1105,7 @@ class TestFluxMonitor:
         with pytest.raises(ValidationError):
             ph.FluxMonitor(**self.kwargs(axis="w"))
 
-    @pytest.mark.parametrize("name", ["a\\b", "."])
+    @pytest.mark.parametrize("name", ["a\\b", "a\x00b", "PRN"])
     def test_path_unsafe_names_rejected(self, name):
         with pytest.raises(ValidationError, match="filename"):
             ph.FluxMonitor(**self.kwargs(name=name))

@@ -27,7 +27,12 @@ GRID_ALPHA = 0.35
 GRID_Z = 2.5
 
 # ε heatmap / structure-fill colormap. Sequential, light->dark with ε.
-EPS_CMAP = "viridis"
+# Blues, not viridis: the ε views are structure drawings (a few discrete
+# material levels), so low ε ≈ paper and high ε = ink. The same constant
+# colors the 3D scene meshes via eps_facecolor, keeping "material X looks
+# like Y" identical across the 2D cut, the CLI renders, and the 3D view —
+# and it frees yellow/orange/cyan to mean source, monitor, and selection.
+EPS_CMAP = "Blues"
 
 # Field colormaps by kind (design §7).
 _SIGNED_CMAP = "RdBu_r"       # diverging, centered on 0 (real/imag time-domain)
@@ -151,6 +156,9 @@ def add_structure_patch(ax, kind, params, *, style) -> None:
     if kind == "rect":
         x0, y0, w, h = params
         ax.add_patch(Rectangle((x0, y0), w, h, **style))
+    elif kind == "rects":
+        for x0, y0, w, h in params:
+            ax.add_patch(Rectangle((x0, y0), w, h, **style))
     elif kind == "circle":
         cx, cy, r = params
         ax.add_patch(Circle((cx, cy), r, **style))

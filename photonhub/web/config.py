@@ -1,10 +1,9 @@
 """Configuration for the cloud client (``ph.web``).
 
 ``configure(api_key=..., url=...)`` sets the active config; values fall back to
-``$PHOTONHUB_API_KEY`` / ``$PHOTONHUB_URL`` (legacy ``$SIMUPOD_*`` still accepted;
-mirroring ``find_solver``'s
-explicit→env precedence, where a missing required value is an error, not a
-silent default). ``WebError`` is raised for config/transport/auth/result-transfer
+``$PHOTONHUB_API_KEY`` / ``$PHOTONHUB_URL``, mirroring ``find_solver``'s
+explicit→environment precedence. A missing required value is an error, not a
+silent default. ``WebError`` is raised for config/transport/auth/result-transfer
 problems — distinct from ``SolverRunError``, which is reserved for a simulation
 actually failing, so the two are never confused.
 """

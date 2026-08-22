@@ -454,12 +454,17 @@ def build_simulation(
     role_of = {spec.ports.through: "through"}
     for c in spec.ports.cross:
         role_of[c] = c  # cross ports keyed by their own name
-    for port_name, role in role_of.items():
+    for monitor_index, (port_name, role) in enumerate(role_of.items()):
         p = ports[port_name]
         pos = plane_pos(p, _SRC_CLEARANCE_UM)
+        # ``role`` is semantic metadata and may contain notation such as
+        # ``y+``. Keep it as the public mapping key, but do not turn arbitrary
+        # paper labels into artifact filenames; the ordinal is deterministic
+        # (through first, then cross ports in spec order) and collision-free.
         out_monitors[role] = mode_monitor(
             shell, yee_mode(p, pos), axis=p.axis, position_um=pos,
-            freqs_hz=freqs_hz, name=f"out_{role}", direction="+" if _sign(p) > 0 else "-",
+            freqs_hz=freqs_hz, name=f"out_{monitor_index}",
+            direction="+" if _sign(p) > 0 else "-",
             center_um=monitor_center(p),
         )
 

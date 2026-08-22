@@ -36,7 +36,9 @@ ENGINE_ADVERTISED_FEATURES = frozenset({
     "graded_grid",      # §15 nonuniform coords (schema 1.2)
     "subpixel",         # §16 volume/tensor/tensor_full
     "mode_source",      # §18 incl. broadband modes_by_freq
-    "lorentz_media",    # §19 single-pole ADE dispersion
+    "lorentz_media",
+    "multi_pole_media",  # §19 multi-pole + Drude ADE
+    "pec_media",  # §10.1 PEC structure material    # §19 single-pole ADE dispersion
     "symmetry",         # §20 PEC/PMC symmetry planes
     "absorber",         # §21 adiabatic absorber boundary
     "magnetic_dipole",  # §5 PointDipole polarization Hz

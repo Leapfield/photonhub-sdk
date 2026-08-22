@@ -2,9 +2,30 @@
 
 Python client for the PhotonHub FDTD solver. The pydantic models in
 `photonhub.components` are the single source of truth for the simulation
-JSON wire format ([`../schemas/GOVERNANCE.md`](../schemas/GOVERNANCE.md));
-[`../schemas/simulation_v1.json`](../schemas/simulation_v1.json) is generated
-from them via `python -m photonhub.schema emit`.
+JSON wire format; the published simulation schema is generated from them via
+`python -m photonhub.schema emit`.
+
+## Install
+
+Python 3.11+:
+
+```sh
+python -m pip install "photonhub @ git+https://github.com/Leapfield/photonhub-sdk"
+```
+
+(From a monorepo checkout: `python -m pip install ./photonhub`.)
+
+That installs the full scripting client: build simulations, estimate cost,
+run on the **cloud GPU** (`ph.web.run(sim)` with your beta API key), and read
+results — no compiler, no engine build. **Local** runs (`ph.run_local`) also
+need the `phsolver` engine binary, which pip does not ship: the desktop
+Workbench install bundles one (point `$PHOTONHUB_SOLVER` at it or put it on
+`PATH`), and developers with the monorepo build it with
+`cmake -S engine -B build && cmake --build build`.
+
+Optional extras: `photonhub[viz]` (interactive/3D plots), `[gds]` (GDSII
+import/export), `[hdf5]` (HDF5 result export), `[replicate]`, `[notebook]`,
+and the service extras below.
 
 ```python
 import photonhub as ph
@@ -30,6 +51,19 @@ data = ph.run_local(sim)        # finds phsolver, runs it, parses outputs
 probe = data["probe"]           # xarray.DataArray, dims ('t', 'component')
 ```
 
+Optional command-line services are kept out of the base SDK dependency set:
+
+```sh
+python -m pip install 'photonhub[mcp]'
+photonhub-mcp                    # optionally pass a result directory to preload
+
+python -m pip install 'photonhub[server]'
+photonhub-serve-viz              # local result/preview HTTP service
+```
+
+The `photonhub[app]` extra includes both service dependency sets plus the
+Workbench file-format integrations.
+
 ## See your simulation before you run it
 
 Every `Simulation` plots itself — geometry, sources, monitors, PML, and the
@@ -42,21 +76,20 @@ sim.plot_eps(z=0.11, grid=True)   # rasterized ε + the Yee mesh overlay
 sim.plot_3d()                     # interactive 3D  (pip install photonhub[viz])
 ```
 
-![A microring + bus waveguide — left: sim.plot (scene); right: sim.plot_eps(grid=True), the meshed permittivity the solver samples](docs/img/sim_showcase.png)
-
 ## What you can do today
 
-Shipped surface as of schema **v1.16.0-alpha.1** (validated dispersive solver
-core — single-pole Lorentz ADE, with recorded MI300X CPU↔GPU equivalence under
-the tolerances in [`../engine/NUMERICS.md`](../engine/NUMERICS.md) §8 — plus full-vector mode
+Shipped surface as of schema **v1.17.0-alpha.1** (validated dispersive solver
+core — multi-pole Lorentz + Drude ADE with a fitted metals library (Au/Ag/Cu/Al)
+and PEC structures, with recorded MI300X CPU↔GPU equivalence under
+the numerical contract's tolerances — plus full-vector mode
 injection, GDS import (`ph.import_gds`), adjoint gradients, and the silicon-PIC
-MVP — see [`../docs/quickstart.md`](../docs/quickstart.md) and the notebook
-gallery under [`../examples/notebooks/`](../examples/notebooks/)):
+MVP):
 
 - **Run a simulation:** `ph.run_local(sim)` (subprocess + file protocol;
   `device="cpu"|"gpu"|"gpu:N"`), `ph.run_async(sim)` and `ph.Batch(...)` for many
   sims in flight.
-- **Know the cost first:** `ph.cost_estimate(sim)` returns a dollar estimate
+- **Know the cost first:** `sim.cost_estimate()` (or `ph.estimate_cost(sim)`)
+  returns a dollar estimate
   from an overridable Tcell-step planning rate *before* you press run; the
   default is an estimator input, not a production billing commitment.
 - **Geometry:** `Box`, `Sphere`, `Cylinder` (full, or an annular sector / ring
@@ -87,7 +120,7 @@ gallery under [`../examples/notebooks/`](../examples/notebooks/)):
 - **Mode-resolved transmission:** the recommended `photonhub.plugins` pipeline —
   `solve_yee_mode` → `mode_launch` → `mode_monitor` →
   `transmission(out, in, data)` — returns `{freq_hz: T}`. Use
-  `solve_yee_mode_bank` / `modes_by_freq` for a broadband launch and readout;
+  `solve_yee_mode_bank` / `solve_modes_by_freq` for a broadband launch and readout;
   the legacy `ModeSolver` / `mode_source` path remains for scalar and adjoint
   compatibility. Full complex multiport S-matrices:
   `plugins.smatrix` (`SPort` + `assemble_smatrix`, one run per driven port —
@@ -98,9 +131,7 @@ gallery under [`../examples/notebooks/`](../examples/notebooks/)):
   `sim.with_mesh_overrides(MeshOverride(geometry=Box(...), dl_um=(0.02,0.02,None)))`.
   Graded meshes run on CPU, single GPU, and multi-GPU with PML/absorber,
   dispersive media, DFT/flux monitors, and plane-wave/mode sources. The one
-  unsupported combination is graded + `subpixel_method="tensor_full"`; see the
-  current status in
-  [`../engine/docs/multi-gpu-decomposition.md`](../engine/docs/multi-gpu-decomposition.md).
+  unsupported combination is graded + `subpixel_method="tensor_full"`.
 - **Mode solving:** the FDE plugins provide the lightweight semi-vectorial
   `ModeSolver` and the full-vector `VectorModeSolver`, including bent/leaky
   modes with complex `n_eff` and bend-loss readout.
@@ -120,10 +151,12 @@ gallery under [`../examples/notebooks/`](../examples/notebooks/)):
 
 This is a validated **dispersive** solver core plus the silicon-PIC MVP:
 
-- Dispersion is a **single Lorentz pole** per medium (ADE, included in the
-  recorded MI300X equivalence suite under `engine/NUMERICS.md` §8 tolerances;
-  numerical definition in §19) on top of relative permittivity + Ohmic conductivity;
-  multi-pole / Drude (metals) / anisotropic poles are still open. Explicit
+- Dispersion is **multi-pole ADE** — up to 6 Lorentz + Drude poles per medium
+  (metals/plasmonics; numerical definition in `engine/NUMERICS.md` §19; the
+  single-pole paths are in the recorded MI300X equivalence suite under §8
+  tolerances, the multi-pole/Drude scenes await their first hardware run) on
+  top of relative permittivity + Ohmic conductivity; a passivity-enforced
+  CCPR fitter and anisotropic poles are still open. Explicit
   subpixel + Lorentz runs are supported and equivalence-tested, but the client
   keeps their construction default off and warns callers to use the stabilized
   PML profile.
@@ -136,6 +169,8 @@ eigenmode, inject it with `mode_launch`, ratio two `mode_monitor` planes, and pl
 
 ## Learn more
 
-- [`../docs/quickstart.md`](../docs/quickstart.md) — end-to-end first run.
-- [`../examples/README.md`](../examples/README.md) — examples index and
-  **twelve-notebook** gallery.
+- [PhotonHub product overview](https://leapfield.app/#product)
+- [Request beta access or support](https://leapfield.app/#request)
+
+The project source tree also includes an end-to-end quickstart, examples index,
+and **fifteen-notebook** gallery.

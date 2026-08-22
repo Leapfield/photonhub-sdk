@@ -246,6 +246,10 @@ def _medium_key(m: Medium):
         m.permittivity,
         m.conductivity_s_per_m,
         None if lz is None else (lz.resonance_frequency_hz, lz.delta_eps, lz.linewidth_hz),
+        tuple((p.resonance_frequency_hz, p.delta_eps, p.linewidth_hz)
+              for p in (m.poles or ())),
+        tuple((d.plasma_frequency_hz, d.linewidth_hz)
+              for d in (m.drude or ())),
     )
 
 

@@ -7,9 +7,21 @@ name = "photonhub"
 version = "0.0.1"
 description = "Python client for the PhotonHub GPU FDTD photonics solver"
 readme = "README.md"
-requires-python = ">=3.10"
+# 3.11 floor: the floor CI exercises is 3.12, and on 3.10 the resolver falls
+# back to a year-old xarray (2025.6) — claim only what current deps support.
+requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
+authors = [{ name = "LeapField" }]
+keywords = ["photonics", "FDTD", "electromagnetics", "simulation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Physics",
+]
 dependencies = [
     "pydantic>=2.6",
     "numpy",
@@ -21,9 +33,15 @@ dependencies = [
     "certifi",
 ]
 
+[project.urls]
+Homepage = "https://leapfield.app/"
+Repository = "https://github.com/Leapfield/photonhub-sdk"
+"Beta access and support" = "https://leapfield.app/#request"
+
 [project.optional-dependencies]
 test = [
     "pytest",
+    "ruff",
     "fastapi",
     "uvicorn",
     "httpx",
@@ -32,9 +50,12 @@ test = [
     "pyyaml",
     "gdstk",
     "h5py",
+    "mcp",
     "nbformat",
 ]  # complete offline package suite used by CI
 viz = ["plotly", "ipywidgets"]              # plotly = 3D; ipywidgets = interactive_preview
+mcp = ["mcp"]                                # photonhub-mcp agent-tool server
+server = ["fastapi", "uvicorn"]              # photonhub-serve-viz HTTP facade
 app = ["plotly", "fastapi", "uvicorn", "mcp", "h5py", "gdstk"]  # desktop opens bundles + HDF5 results and imports GDSII layouts
 replicate = ["pyyaml"]                       # PaperSpec.from_yaml parses the YAML paper specs
 gds = ["gdstk"]                              # import/export GDSII
@@ -42,8 +63,8 @@ hdf5 = ["h5py"]                              # SimulationData HDF5 export
 notebook = ["nbformat"]                       # paper-replication tutorials
 
 [project.scripts]
-photonhub-serve-viz = "photonhub.viz.server:_main"
-photonhub-mcp = "photonhub.mcp_server:main"
+photonhub-serve-viz = "photonhub._viz_cli:main"
+photonhub-mcp = "photonhub._mcp_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["photonhub"]

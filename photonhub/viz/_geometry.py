@@ -138,11 +138,11 @@ def polyslab_section(
       (the slanted-wall taper to the cut height is deferred; see the caveat in
       :class:`~photonhub.components.structures.PolySlab`).
     - Cut PARALLEL to the extrusion axis (the cut axis is one of the two
-      transverse axes): an APPROXIMATE bounding rectangle spanning
-      ``[slab_lo, slab_hi]`` along the geometry axis and the polygon's extent
-      along the surviving transverse axis, but only when ``value`` falls inside
-      the polygon's span on the cut axis. The exact (possibly tilted) wall
-      profile is deferred. -> ``("rect", (x0, y0, w, h))``.
+      transverse axes): the EXACT crossing intervals of the reference polygon
+      with the cut line — one rectangle per interval, each spanning
+      ``[slab_lo, slab_hi]`` along the geometry axis (a bent or concave
+      polygon crosses the plane in several disjoint spans). ``sidewall_angle``
+      is NOT applied here either. -> ``("rects", ((x0, y0, w, h), ...))``.
 
     Returns ``None`` when the plane misses the slab."""
     lo, hi = _slab_extent(slab_bounds_um)
@@ -155,26 +155,40 @@ def polyslab_section(
             return None
         return ("polygon", tuple(verts))
 
-    # Parallel cut: bounding-rectangle approximation.
+    # Parallel cut: exact crossing intervals of the reference polygon along
+    # the cut line — a bent or concave polygon (an S-bend guide, a U shape)
+    # crosses the plane in several disjoint spans, and a bounding rectangle
+    # would draw their hull instead of the guides themselves.
     h_ax, v_ax2 = in_plane_axes(cut_axis)
     # Which transverse axis is the cut axis, and which survives in-plane?
     if cut_axis == u_ax:
-        cut_coords = [u for u, _ in verts]      # span tested against the cut
-        keep_coords = [v for _, v in verts]     # surviving transverse extent
-        keep_axis = v_ax
+        cut_i, keep_i, keep_axis = 0, 1, v_ax
     else:  # cut_axis == v_ax
-        cut_coords = [v for _, v in verts]
-        keep_coords = [u for u, _ in verts]
-        keep_axis = u_ax
-    if not (min(cut_coords) <= value <= max(cut_coords)):
-        return None  # plane misses the polygon's transverse span
-    # Build the rect in (h_ax, v_ax2) order. One in-plane axis is the geometry
-    # axis (extent [lo, hi]); the other is the surviving transverse axis.
-    spans = {geom_axis: (lo, hi),
-             keep_axis: (min(keep_coords), max(keep_coords))}
-    h_lo, h_hi = spans[h_ax]
-    v_lo, v_hi = spans[v_ax2]
-    return ("rect", (h_lo, v_lo, h_hi - h_lo, v_hi - v_lo))
+        cut_i, keep_i, keep_axis = 1, 0, u_ax
+    crossings = []
+    for k in range(len(verts)):
+        a = verts[k]
+        b = verts[(k + 1) % len(verts)]
+        ca, cb = a[cut_i], b[cut_i]
+        # Half-open rule: each crossing edge contributes exactly once, and a
+        # vertex on the line is not double-counted by its two edges.
+        if (ca <= value < cb) or (cb <= value < ca):
+            t = (value - ca) / (cb - ca)
+            crossings.append(a[keep_i] + t * (b[keep_i] - a[keep_i]))
+    if len(crossings) < 2:
+        return None  # plane misses (or only grazes) the polygon
+    crossings.sort()
+    # Even-odd pairing of the sorted crossings -> inside intervals. Build each
+    # rect in (h_ax, v_ax2) order: one in-plane axis is the geometry axis
+    # (extent [lo, hi]); the other is the surviving transverse axis.
+    rects = []
+    for j in range(0, len(crossings) - 1, 2):
+        spans = {geom_axis: (lo, hi),
+                 keep_axis: (crossings[j], crossings[j + 1])}
+        h_lo, h_hi = spans[h_ax]
+        v_lo, v_hi = spans[v_ax2]
+        rects.append((h_lo, v_lo, h_hi - h_lo, v_hi - v_lo))
+    return ("rects", tuple(rects))
 
 
 def _arc_polygon(cx, cy, r_outer, r_inner, a0, a1, n=48):
@@ -217,11 +231,11 @@ def cylinder_section(
       partial sweep -> ``("polygon", arc-vertices)`` (a wedge, annular when
       ``inner_radius>0``). Angles use ``atan2(v, u)`` in the (u, v) transverse
       plane, matching the rasterizer.
-    - Cut PARALLEL to the axis: an APPROXIMATE bounding rectangle spanning
-      ``[axial_lo, axial_hi]`` and the cylinder DIAMETER on the surviving
-      transverse axis, when the plane lies within +-radius of the centre on the
-      cut axis. The exact curved-wall profile is deferred. ->
-      ``("rect", (x0, y0, w, h))``.
+    - Cut PARALLEL to the axis: a rectangle spanning ``[axial_lo, axial_hi]``
+      and the EXACT outer-circle chord on the surviving transverse axis at the
+      cut offset. The annular hole and a partial sweep are still ignored here
+      (the rectangle can overdraw those, but never wider than the true chord).
+      -> ``("rect", (x0, y0, w, h))``.
 
     Returns ``None`` when the plane misses the cylinder."""
     a = axis_index(geom_axis)
@@ -245,7 +259,8 @@ def cylinder_section(
                 _arc_polygon(cu, cv, radius_um, inner_radius_um,
                              angle_start, angle_stop))
 
-    # Parallel cut: bounding-box approximation across the full radius.
+    # Parallel cut: exact chord of the outer circle at the cut offset (the
+    # annular hole / partial sweep are still ignored — see the docstring).
     h_ax, v_ax2 = in_plane_axes(cut_axis)
     if cut_axis == u_ax:
         center_on_cut, keep_center, keep_axis = cu, cv, v_ax
@@ -253,8 +268,10 @@ def cylinder_section(
         center_on_cut, keep_center, keep_axis = cv, cu, u_ax
     if abs(value - center_on_cut) > radius_um:
         return None
+    half_chord = math.sqrt(max(radius_um * radius_um
+                               - (value - center_on_cut) ** 2, 0.0))
     spans = {geom_axis: (axial_lo, axial_hi),
-             keep_axis: (keep_center - radius_um, keep_center + radius_um)}
+             keep_axis: (keep_center - half_chord, keep_center + half_chord)}
     h_lo, h_hi = spans[h_ax]
     v_lo, v_hi = spans[v_ax2]
     return ("rect", (h_lo, v_lo, h_hi - h_lo, v_hi - v_lo))

@@ -7,6 +7,7 @@ hand-built raw directory and assert per-monitor xarray identity.
 """
 
 import json
+import os
 
 import numpy as np
 import pytest
@@ -14,8 +15,9 @@ import xarray as xr
 
 pytest.importorskip("h5py")
 
-from photonhub import convert_to_hdf5
 from photonhub.data import SimulationData
+
+from photonhub import convert_to_hdf5
 
 DT = 9.53e-17
 DL_UM = 0.25
@@ -111,6 +113,149 @@ class TestErrors:
         with pytest.raises(FileNotFoundError):
             convert_to_hdf5(tmp_path)
 
+    def test_convert_rejects_traversal_before_creating_destination(self, full_dir):
+        # Make the traversal target real: without preflight validation the
+        # converter would read this parent-directory blob into the HDF5 file.
+        raw_dir = full_dir / "raw"
+        raw_dir.mkdir()
+        manifest = json.loads((full_dir / "manifest.json").read_text())
+        manifest["monitors"] = [manifest["monitors"][0]]
+        manifest["monitors"][0]["file"] = "../probe.bin"
+        (raw_dir / "manifest.json").write_text(json.dumps(manifest))
+        dest = raw_dir / "packed" / "simulation.h5"
+
+        with pytest.raises(ValueError, match="unsafe result filename"):
+            convert_to_hdf5(raw_dir, dest)
+
+        assert not dest.parent.exists()
+
+    def test_convert_rejects_hdf5_path_name_before_creating_destination(
+            self, full_dir):
+        manifest_path = full_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["monitors"][0]["name"] = "nested/probe"
+        manifest_path.write_text(json.dumps(manifest))
+        dest = full_dir / "packed" / "simulation.h5"
+
+        with pytest.raises(ValueError, match="unsafe name"):
+            convert_to_hdf5(full_dir, dest)
+
+        assert not dest.parent.exists()
+
+    def test_convert_rejects_manifest_as_destination_without_replacing_it(
+            self, full_dir):
+        manifest_path = full_dir / "manifest.json"
+        original = manifest_path.read_bytes()
+
+        with pytest.raises(ValueError, match="aliases the manifest source"):
+            convert_to_hdf5(full_dir, manifest_path)
+
+        assert manifest_path.read_bytes() == original
+
+    def test_convert_rejects_monitor_blob_as_destination_without_replacing_it(
+            self, full_dir):
+        blob_path = full_dir / "probe.bin"
+        original = blob_path.read_bytes()
+
+        with pytest.raises(ValueError, match="aliases the monitor 'probe' source"):
+            convert_to_hdf5(full_dir, blob_path)
+
+        assert blob_path.read_bytes() == original
+
+    def test_convert_preflights_every_blob_before_creating_destination(
+            self, full_dir):
+        (full_dir / "slab.bin").unlink()
+        dest = full_dir / "packed" / "simulation.h5"
+
+        with pytest.raises(FileNotFoundError, match="result file not found"):
+            convert_to_hdf5(full_dir, dest)
+
+        assert not dest.parent.exists()
+
+    def test_convert_rejects_symlink_blob_before_creating_destination(
+            self, full_dir):
+        outside = full_dir.parent / f"{full_dir.name}-outside.bin"
+        outside.write_bytes((full_dir / "probe.bin").read_bytes())
+        (full_dir / "probe.bin").unlink()
+        try:
+            (full_dir / "probe.bin").symlink_to(outside)
+        except OSError:
+            pytest.skip("symlinks are unavailable")
+        dest = full_dir / "packed" / "simulation.h5"
+
+        with pytest.raises(ValueError, match="regular non-symlink"):
+            convert_to_hdf5(full_dir, dest)
+
+        assert not dest.parent.exists()
+
+    def test_bad_blob_size_does_not_replace_existing_destination(self, full_dir):
+        np.zeros(3, dtype="<f4").tofile(full_dir / "slab.bin")
+        dest = full_dir / "simulation.h5"
+        original = b"existing destination"
+        dest.write_bytes(original)
+
+        with pytest.raises(ValueError, match="manifest shape requires 16"):
+            convert_to_hdf5(full_dir, dest)
+
+        assert dest.read_bytes() == original
+
+    def test_write_failure_keeps_existing_destination_and_removes_temp(
+            self, full_dir, monkeypatch):
+        import photonhub.hdf5 as hdf5_module
+
+        real_fromfile = hdf5_module.np.fromfile
+        calls = 0
+
+        def fail_second_read(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected read failure")
+            return real_fromfile(*args, **kwargs)
+
+        monkeypatch.setattr(hdf5_module.np, "fromfile", fail_second_read)
+        dest = full_dir / "simulation.h5"
+        original = b"existing destination"
+        dest.write_bytes(original)
+
+        with pytest.raises(RuntimeError, match="injected read failure"):
+            convert_to_hdf5(full_dir, dest)
+
+        assert dest.read_bytes() == original
+        assert list(full_dir.glob(".photonhub-h5-*.tmp")) == []
+
+    def test_temp_descriptor_is_closed_when_fdopen_fails(
+            self, full_dir, monkeypatch):
+        import photonhub.hdf5 as hdf5_module
+
+        real_fdopen = hdf5_module.os.fdopen
+        real_mkstemp = hdf5_module.tempfile.mkstemp
+        created = {}
+
+        def recording_mkstemp(*args, **kwargs):
+            fd, name = real_mkstemp(*args, **kwargs)
+            created.update(fd=fd, path=name)
+            return fd, name
+
+        def fail_output_fdopen(fd, mode="r", *args, **kwargs):
+            if mode == "w+b":
+                raise RuntimeError("injected fdopen failure")
+            return real_fdopen(fd, mode, *args, **kwargs)
+
+        monkeypatch.setattr(hdf5_module.tempfile, "mkstemp", recording_mkstemp)
+        monkeypatch.setattr(hdf5_module.os, "fdopen", fail_output_fdopen)
+        dest = full_dir / "simulation.h5"
+        original = b"existing destination"
+        dest.write_bytes(original)
+
+        with pytest.raises(RuntimeError, match="injected fdopen failure"):
+            convert_to_hdf5(full_dir, dest)
+
+        assert dest.read_bytes() == original
+        assert not os.path.exists(created["path"])
+        with pytest.raises(OSError):
+            os.fstat(created["fd"])
+
     def test_non_photonhub_h5_raises(self, tmp_path):
         import h5py
         bad = tmp_path / "bad.h5"
@@ -168,6 +313,37 @@ def test_integration_real_solver_roundtrip(tmp_path):
     assert from_h5.monitor_names == data.monitor_names
     for name in data.monitor_names:
         xr.testing.assert_identical(from_h5[name], data[name])
+
+
+@pytest.mark.skipif(_real_solver() is None,
+                    reason="no phsolver binary found (build the engine first)")
+def test_integration_graded_grid_coords_survive_hdf5(tmp_path):
+    # Graded axes ride the manifest as coords_um (NUMERICS.md section 15.10) —
+    # a distinct coordinate-reconstruction path from uniform i*dl — and must
+    # come back identically from the raw directory and the packed HDF5.
+    import photonhub as ph
+
+    z = (0.0, 0.05, 0.1, 0.15, 0.2, 0.28, 0.36, 0.44, 0.52, 0.6, 0.65,
+         0.7, 0.75, 0.8)
+    sim = ph.Simulation(
+        size_um=(0.4, 0.4, 0.8),
+        grid=ph.GradedGridSpec(dl_um=0.05,
+                               coords=ph.GradedAxisCoords(z=z)),
+        run=ph.RunSpec(n_steps=20),
+        boundaries=ph.Boundaries(x="periodic", y="periodic", z="pml"),
+        pml_num_layers=4,
+        sources=[ph.PointDipole(
+            center_um=(0.2, 0.2, 0.4), polarization="Ex",
+            source_time=ph.GaussianPulse(freq0_hz=2e14, fwidth_hz=1e14))],
+        monitors=[ph.FieldSnapshotMonitor(name="snap", fields=["Ex"],
+                                          interval_steps=20)],
+    )
+    data = ph.run_local(sim, output_dir=tmp_path / "out", timeout=300)
+    got_z = np.asarray(data["snap"].coords["z"].values)
+    np.testing.assert_allclose(got_z[:len(z)], np.asarray(z))
+
+    from_h5 = SimulationData(convert_to_hdf5(tmp_path / "out"))
+    xr.testing.assert_identical(from_h5["snap"], data["snap"])
 
 
 def test_aborted_run_h5_warns_on_load(tmp_path):

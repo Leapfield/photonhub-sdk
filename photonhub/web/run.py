@@ -157,6 +157,18 @@ def _poll_and_download(http: HttpClient, cfg: WebConfig, job_id: str, *,
 def _finish_cloud_job(http: HttpClient, cfg: WebConfig, job_id: str, *,
                       progress: ProgressCb = None,
                       timeout: Optional[float] = None) -> SimulationData:
+    # A validated, sealed cache entry is exactly what a successful poll +
+    # download would produce, so an already-fetched result loads without the
+    # service round-trip. This keeps a paid, downloaded run loadable through
+    # ph.web.resume(job_id) offline and after service-side job expiry.
+    cached = cache.completed_result(cfg, job_id)
+    if cached is not None:
+        try:
+            return SimulationData(cached)
+        except (OSError, ValueError, KeyError, TypeError):
+            # Corruption the structural seal cannot see: drop the entry and
+            # re-fetch this already-paid job from the service.
+            cache.invalidate(cfg, job_id)
     try:
         bundle_dir = _poll_and_download(
             http, cfg, job_id, progress=progress, timeout=timeout)
@@ -272,7 +284,12 @@ def run_quoted_async(sim, *, max_usd: float = 5.0, name=None,
 
 def resume(job_id: str, *, progress: ProgressCb = None,
            timeout: Optional[float] = None) -> Job:
-    """Return a handle that resumes polling an already-submitted service job."""
+    """Return a handle that resumes an already-submitted service job.
+
+    If the job's result bundle was already downloaded and validated, the
+    handle loads it straight from the local cache — no service round-trip —
+    so a finished run stays loadable offline and after the service ages the
+    job out. Otherwise it resumes polling exactly as before."""
     job_id = validate_job_id(job_id)
     timeout = _poll_timeout(timeout)
     cfg = get_config()

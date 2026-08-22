@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from math import ceil, sqrt
 from typing import TYPE_CHECKING, Optional, Tuple
 
-from .components.grid import graded_primary_spacings, realized_cells
+from .components.grid import graded_primary_spacings, resolved_cell_counts
 
 if TYPE_CHECKING:  # avoid a runtime import cycle (cost <- simulation <- cost)
     from .components.simulation import Simulation
@@ -121,15 +121,13 @@ def _cells_and_min_spacing_um(sim: "Simulation"):
     closing node derives the final cell), a uniform axis has the round-half-away
     cell count and constant spacing ``dl``."""
     dl = sim.grid.dl_um
-    counts = []
+    counts = list(resolved_cell_counts(sim.size_um, sim.grid))
     min_spacing = []
     for i, length_um in enumerate(sim.size_um):
         q = _axis_coords_um(sim.grid, i)
         if q is None:
-            counts.append(realized_cells(length_um, dl))
             min_spacing.append(dl)
         else:
-            counts.append(len(q))
             min_spacing.append(min(graded_primary_spacings(q)))
     return counts, min_spacing
 

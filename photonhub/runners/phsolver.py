@@ -15,20 +15,16 @@ contract: 0 ok, 1 spec error, 2 runtime/solver error.
 
 import json
 import os
-import signal
 import shutil
+import signal
 import subprocess
 import threading
 from pathlib import Path
 from typing import Callable, Optional, Union
 
-from .._env import env
+from .._env import env, without_credentials
 
 _STDERR_TAIL_CHARS = 4000
-_CLOUD_CREDENTIAL_ENV = (
-    "PHOTONHUB_API_KEY", "PHOTONHUB_URL",
-    "PHOTONHUB_API_KEY", "PHOTONHUB_URL",
-)
 
 EventCb = Optional[Callable[[dict], None]]
 
@@ -41,10 +37,7 @@ def _solver_subprocess_env() -> dict:
     prevents API keys from spreading to local CPU/GPU solver processes or
     appearing in their crash diagnostics.
     """
-    child_env = os.environ.copy()
-    for name in _CLOUD_CREDENTIAL_ENV:
-        child_env.pop(name, None)
-    return child_env
+    return without_credentials(os.environ)
 
 
 class _WindowsJob:
@@ -317,18 +310,20 @@ def _repo_build_if_current(repo_root: Path) -> Optional[Path]:
 
 
 def find_solver(solver_path=None) -> Optional[Path]:
-    """Locate the phsolver binary: explicit argument, then $PHOTONHUB_SOLVER
-    (legacy $SIMUPOD_SOLVER still accepted), then PATH, then the in-repo default
-    build directory. An explicit argument or environment override that does not
-    exist is an error, not a fallthrough. Returns None only when nothing is
-    configured and no binary is found."""
+    """Locate the phsolver binary.
+
+    Resolution order is an explicit argument, ``$PHOTONHUB_SOLVER``, ``PATH``,
+    then the in-repository build directory. An explicit argument or environment
+    override that does not exist is an error, not a fallthrough. Returns
+    ``None`` only when nothing is configured and no binary is found.
+    """
     if solver_path is not None:
         p = _as_executable(solver_path)
         if p is None:
             raise SolverRunError(
                 f"solver_path is not an executable file: {solver_path}")
         return p
-    override = env("SOLVER")  # $PHOTONHUB_SOLVER, legacy $SIMUPOD_SOLVER
+    override = env("SOLVER")
     if override:
         p = _as_executable(override)
         if p is None:

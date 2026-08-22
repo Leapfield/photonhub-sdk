@@ -11,13 +11,13 @@ Or point an MCP client's command at it (stdio transport).
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
+from ._env import env
 from .viz import service
 
 mcp = FastMCP("photonhub")
@@ -92,7 +92,7 @@ def run_simulation(spec: str, output_dir: str, device: str = "cpu") -> dict:
 
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    preload = argv[0] if argv else os.environ.get("PHOTONHUB_RESULT_DIR")
+    preload = argv[0] if argv else env("RESULT_DIR")
     if preload:
         try:
             _state["data"] = service.load_result(preload)

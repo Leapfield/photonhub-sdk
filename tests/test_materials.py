@@ -52,7 +52,7 @@ def test_literature_index_pins(name, wl, expected, tol):
 
 
 def test_registry_entries_are_complete():
-    assert len(MATERIALS) == 16
+    assert len(MATERIALS) == 20
     for name, mat in MATERIALS.items():
         assert mat.name == name
         lo, hi = mat.valid_range_um
@@ -62,7 +62,11 @@ def test_registry_entries_are_complete():
         mid = 0.5 * (lo + min(hi, 20.0))
         n = mat.n(np.asarray([mid, mid * 1.01]))
         assert n.shape == (2,)
-        assert np.all(np.isfinite(n)) and np.all(n >= 1.0)
+        # metals (Au/Ag/Cu/Al) have n < 1 in the optical/IR — the
+
+        # invariant is finite positive, not n >= 1
+
+        assert np.all(np.isfinite(n)) and np.all(n > 0.0)
 
 
 def test_get_unknown_material_lists_choices():

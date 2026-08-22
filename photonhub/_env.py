@@ -1,14 +1,46 @@
-"""Environment-variable lookup with the ``PHOTONHUB_`` → legacy ``SIMUPOD_``
-fallback, single-sourced so the back-compat (the old prefix is still honored)
-lives in exactly one place rather than being re-implemented per call site."""
+"""Environment-variable helpers shared by PhotonHub process boundaries."""
 
 from __future__ import annotations
 
 import os
-from typing import Optional
+from collections.abc import Mapping
+
+_CREDENTIAL_ENV_SUFFIXES = (
+    "_ACCESS_KEY",
+    "_API_KEY",
+    "_CREDENTIAL",
+    "_CREDENTIALS",
+    "_PASSWORD",
+    "_PRIVATE_KEY",
+    "_SECRET",
+    "_TOKEN",
+    "_URL",
+)
 
 
-def env(suffix: str) -> Optional[str]:
-    """Read ``PHOTONHUB_<suffix>``, falling back to the legacy ``SIMUPOD_<suffix>``
-    (e.g. ``env("API_KEY")`` → ``$PHOTONHUB_API_KEY`` or ``$SIMUPOD_API_KEY``)."""
-    return os.environ.get(f"PHOTONHUB_{suffix}") or os.environ.get(f"SIMUPOD_{suffix}")
+def env(suffix: str) -> str | None:
+    """Read one ``PHOTONHUB_<suffix>`` environment variable."""
+    return os.environ.get(f"PHOTONHUB_{suffix}")
+
+
+def is_credential_env_name(name: str) -> bool:
+    """Return whether *name* is a conventionally named credential or URL.
+
+    Matching complete underscore-delimited suffixes keeps the policy broad
+    enough to catch credentials from any provider without stripping unrelated
+    variables that merely contain words such as ``TOKEN`` or ``URL``.
+    """
+    normalized = name.upper()
+    return any(
+        len(normalized) > len(suffix) and normalized.endswith(suffix)
+        for suffix in _CREDENTIAL_ENV_SUFFIXES
+    )
+
+
+def without_credentials(environment: Mapping[str, str]) -> dict[str, str]:
+    """Copy *environment* without credential-bearing variables."""
+    return {
+        name: value
+        for name, value in environment.items()
+        if not is_credential_env_name(name)
+    }

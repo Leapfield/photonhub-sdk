@@ -14,7 +14,7 @@ from typing import (
 
 from pydantic import Field, model_validator
 
-from .base import FrozenModel, PositiveUm
+from .base import MAX_INT32, FrozenModel, PositiveUm
 from .structures import GeometryType
 
 if TYPE_CHECKING:  # avoid an import cycle (structures imports nothing from here,
@@ -27,17 +27,96 @@ if TYPE_CHECKING:  # avoid an import cycle (structures imports nothing from here
 # itself be an equivalence failure).
 GRADED_RATIO_GUARD = 10.0
 
+# Engine field-layout ABI/resource envelope (engine/include/phcore/grid.h).
+# The x pitch is stored as an int and rounded to 32 fp32 values (128 bytes).
+MAX_RESOLVED_AXIS_CELLS = MAX_INT32 - (MAX_INT32 % 32)
+MAX_RESOLVED_LAYOUT_CELLS = MAX_INT32
+_FIELD_PITCH = 32
+
 
 def realized_cells(length_um: float, dl_um: float) -> int:
     """NUMERICS.md section 1 cell-count rule, shared by every client-side
     consumer: ``n = max(4, round(L/dl))`` with round-half-AWAY-FROM-ZERO —
     NOT Python's built-in banker's rounding, which would disagree with the
     engine's ``std::llround`` at exact halves."""
+    if (
+        not math.isfinite(length_um)
+        or not math.isfinite(dl_um)
+        or length_um <= 0.0
+        or dl_um <= 0.0
+    ):
+        raise ValueError(
+            "grid resolution requires finite positive domain length and dl"
+        )
     x = length_um / dl_um
+    # Mirrors resolve_cell_count's exclusive upper bound. Check before floor so
+    # an extremely fine but finite grid reports a validation error instead of
+    # leaking Python's OverflowError for floor(inf).
+    if (
+        not math.isfinite(x)
+        or x >= float(MAX_RESOLVED_AXIS_CELLS) + 0.5
+    ):
+        raise ValueError(
+            "resolved axis cell count exceeds the supported maximum of "
+            f"{MAX_RESOLVED_AXIS_CELLS}"
+        )
     n = math.floor(x)
     if x - n >= 0.5:
         n += 1
     return max(4, n)
+
+
+def enforce_resolved_grid_limits(
+    counts: Sequence[int],
+) -> Tuple[int, int, int]:
+    """Mirror the engine's cheap beta field-layout resource envelope.
+
+    The logical grid and the x-padded layout including both z halo planes must
+    each fit in ``INT_MAX`` cells. Division guards match the C++ implementation
+    and avoid constructing any large arrays or overflowing fixed-width math.
+    """
+    if len(counts) != 3:
+        raise ValueError("resolved grid must contain exactly three dimensions")
+    nx, ny, nz = (int(value) for value in counts)
+    if nx < 1 or ny < 1 or nz < 1:
+        raise ValueError("resolved grid dimensions must all be positive")
+
+    limit = MAX_RESOLVED_LAYOUT_CELLS
+
+    def exceeds(a: int, b: int, c: int) -> bool:
+        return (
+            a > limit
+            or b > limit
+            or c > limit
+            or a > limit // b
+            or a * b > limit // c
+        )
+
+    if exceeds(nx, ny, nz):
+        raise ValueError(
+            "resolved grid exceeds the beta maximum of "
+            f"{limit} logical cells"
+        )
+
+    pitch_x = ((nx + _FIELD_PITCH - 1) // _FIELD_PITCH) * _FIELD_PITCH
+    if exceeds(pitch_x, ny, nz + 2):
+        raise ValueError(
+            "resolved x-padded grid including z halos exceeds the beta "
+            f"maximum of {limit} layout cells"
+        )
+    return nx, ny, nz
+
+
+def resolved_cell_counts(size_um, grid) -> Tuple[int, int, int]:
+    """Resolve per-axis counts and enforce the engine's beta layout limits."""
+    coords = getattr(grid, "coords", None)
+    counts = []
+    for axis, length_um in zip("xyz", size_um):
+        q = getattr(coords, axis) if coords is not None else None
+        counts.append(
+            len(q) if q is not None else realized_cells(length_um, grid.dl_um)
+        )
+    return enforce_resolved_grid_limits(counts)
 
 
 def snapped_plane_index(position_um: float, dl_um: float) -> int:

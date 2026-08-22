@@ -26,6 +26,7 @@ into one device S-matrix. Built on ``VectorModeSolver``; CPU only. See
 """
 
 from .cvcs import cvcs_sections, interpolate_mode, interpolate_plane
+from .diffraction import DiffractionOrders, diffraction_orders
 from .eme import (
     EMEResult,
     Section,
@@ -68,6 +69,7 @@ from .mode_overlap import (
 )
 from .eq_current_source import equivalence_current_source
 from .gaussian_beam import gaussian_beam, gaussian_beam_source
+from .import_source import import_field, import_source
 from .kfj_smoothing import (
     mode_bank_on_cross_section,
     sample_cross_section_kfj,
@@ -95,9 +97,19 @@ from .smatrix import (
     reciprocity_error,
     smatrix,
 )
+from .smatrix_driver import (
+    SMatrixPlan,
+    SMatrixPort,
+    SMatrixResult,
+    plan_smatrix,
+    run_smatrix,
+    write_touchstone,
+)
 from .vector_modes import VectorMode, VectorModeSolver
+from .waveguide import WaveguideModes, rectangular_waveguide
 
 __all__ = [
+    "DiffractionOrders",
     "EMEResult",
     "FarField",
     "Mode",
@@ -106,22 +118,29 @@ __all__ = [
     "ModeOverlap",
     "ModeSolver",
     "ResonanceFinder",
+    "SMatrixPlan",
+    "SMatrixPort",
+    "SMatrixResult",
     "SPort",
     "Section",
     "TrackingResult",
     "VectorMode",
     "VectorModeSolver",
+    "WaveguideModes",
     "assemble_smatrix",
     "assert_passive",
     "assert_reciprocal",
     "cascade",
     "cvcs_sections",
+    "diffraction_orders",
     "equivalence_current_source",
     "equivalent_currents",
     "far_field",
     "gaussian_beam",
     "gaussian_beam_source",
     "gaussian_mode",
+    "import_field",
+    "import_source",
     "interface_smatrix",
     "interpolate_mode",
     "interpolate_plane",
@@ -139,12 +158,15 @@ __all__ = [
     "mode_source_vector",
     "mode_transmission",
     "passivity_violation",
+    "plan_smatrix",
     "propagation_smatrix",
     "reciprocity_error",
     "rectangular_base_section",
+    "rectangular_waveguide",
     "reorder_to_tracks",
     "run_eme",
     "run_eme_band",
+    "run_smatrix",
     "sample_cross_section_kfj",
     "sample_staggered_eps",
     "select_resonances",
@@ -163,4 +185,5 @@ __all__ = [
     "transverse_overlap",
     "vector_modal_fields",
     "waveguide_section",
+    "write_touchstone",
 ]

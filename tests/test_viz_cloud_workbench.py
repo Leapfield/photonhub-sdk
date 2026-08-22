@@ -691,6 +691,139 @@ def test_opened_cloud_result_restores_idle_after_restart(monkeypatch, tmp_path):
             completed["ledger_run_id"]]
 
 
+def _real_solver():
+    import photonhub as ph
+    try:
+        return ph.find_solver()
+    except ph.SolverRunError:
+        return None
+
+
+@pytest.mark.skipif(_real_solver() is None,
+                    reason="no phsolver binary found (build the engine first)")
+def test_completed_cloud_run_reopens_from_history_in_fresh_offline_session(
+        monkeypatch, tmp_path):
+    """The whole beta journey: run on the cloud, quit the Workbench, reopen it
+    with the service unreachable — the paid result must come back from the
+    durable archive with its monitor DATA intact. Uses a real solver output
+    shaped like the deployed coordinator's bundle (no sim.json member, so the
+    archive step must reconstruct and digest-verify the executed spec)."""
+    import subprocess
+
+    import photonhub as ph
+
+    run_root = tmp_path / "runs"
+    freqs = [1.8e14, 1.934e14]
+    cloud_sim = ph.Simulation(
+        size_um=(1.2, 0.8, 0.8),
+        grid=ph.UniformGridSpec(dl_um=0.05),
+        run=ph.RunSpec(n_steps=20, shutoff=0.0),
+        boundaries=ph.Boundaries(x="pml", y="periodic", z="pml"),
+        pml_num_layers=6,
+        sources=[ph.PointDipole(
+            center_um=(0.5, 0.4, 0.4), polarization="Ez",
+            source_time=ph.GaussianPulse(freq0_hz=1.934e14,
+                                         fwidth_hz=4.0e13))],
+        monitors=[
+            ph.FieldTimeMonitor(name="probe", center_um=(0.6, 0.4, 0.4),
+                                fields=["Ez"]),
+            ph.FluxMonitor(name="flux", axis="x", position_um=0.75,
+                           freqs_hz=freqs)],
+    )
+    cloud_spec = cloud_sim.to_wire_dict()
+
+    # The coordinator stores and executes exactly these no-newline bytes;
+    # phsolver hashes the file it reads, so provenance.input_sha256 matches
+    # the workbench's deterministic reconstruction — as on the live service.
+    cache_dir = tmp_path / "cloud-cache" / "job-fresh-open"
+    cache_dir.mkdir(parents=True)
+    spec_path = tmp_path / "coordinator-spec.json"
+    spec_path.write_bytes(cloud_sim.to_wire_json(indent=0).encode("utf-8"))
+    solver_proc = subprocess.run(
+        [str(_real_solver()), "run", str(spec_path), "--output",
+         str(cache_dir), "--progress", "none"],
+        capture_output=True, text=True, timeout=300)
+    assert solver_proc.returncode == 0, solver_proc.stderr
+    assert not (cache_dir / "sim.json").exists()  # deployed-worker shape
+    fake_data = service.load_result(cache_dir)
+
+    class DownloadedJob:
+        job_id = "job-fresh-open"
+
+        def result(self):
+            return fake_data
+
+    monkeypatch.setattr(
+        web, "preflight", lambda *_args, **_kwargs: _accepted(quote_usd=1))
+    monkeypatch.setattr(
+        web, "run_async", lambda *_args, **_kwargs: DownloadedJob())
+    monkeypatch.setattr(web, "job_status", lambda job_id: {
+        "job_id": job_id, "state": "succeeded", "actual_micros": 1_000_000,
+    })
+
+    with _app_client(run_root) as first:
+        quote = first.post("/api/cloud/preflight", json={
+            "spec": cloud_spec, "device": "gpu:mi300x", "max_usd": 5,
+        }).json()
+        assert first.post("/api/cloud/run", json={
+            "spec": cloud_spec, "preflight_token": quote["token"],
+        }).status_code == 200
+        deadline = time.monotonic() + 10
+        completed = None
+        while time.monotonic() < deadline:
+            completed = first.get("/api/cloud/run/status").json()
+            if completed.get("session"):
+                break
+            time.sleep(0.02)
+        assert completed and completed["download_status"] == "completed"
+        run_id = completed["ledger_run_id"]
+        first_probe = first.get("/api/monitor/probe/timeseries").json()
+        first_flux = first.get("/api/monitor/flux/spectrum").json()
+
+    # Fresh session, dead service, and the download cache is GONE (the user
+    # cleared ~/.cache): the reload must live entirely on the durable archive.
+    import shutil
+
+    shutil.rmtree(cache_dir)
+
+    def _no_cloud(*_args, **_kwargs):
+        raise AssertionError("fresh-session reload must not touch the service")
+
+    for entry in ("preflight", "run_async", "job_status", "resume", "cancel"):
+        monkeypatch.setattr(web, entry, _no_cloud)
+
+    with _app_client(run_root) as fresh:
+        assert fresh.get("/api/cloud/run/status").json() == {
+            "status": "idle", "download_status": "idle",
+        }
+        history = fresh.get("/api/runs").json()["runs"]
+        sealed = next(item for item in history if item["run_id"] == run_id)
+        assert sealed["recorded_status"] == "completed"
+        assert sealed["device"] == "cloud:gpu:mi300x"
+
+        reopened = fresh.post(f"/api/runs/{run_id}/open")
+        assert reopened.status_code == 200
+        session_payload = reopened.json()
+        assert session_payload["run_id"] == run_id
+        names = {m["name"] for m in session_payload["monitors"]}
+        assert {"probe", "flux"} <= names
+
+        assert fresh.get("/api/monitor/probe/timeseries").json() == first_probe
+        assert fresh.get("/api/monitor/flux/spectrum").json() == first_flux
+        # The archived spec is loadable as a model and equals the submission.
+        spec_response = fresh.get("/api/result/spec")
+        assert spec_response.status_code == 200
+
+        # And the run is a usable starting point for further design work: the
+        # durable request spec recovers an editable workspace equal to the
+        # submitted simulation.
+        recovered = fresh.post(f"/api/runs/{run_id}/workspace")
+        assert recovered.status_code == 200
+        recovered_sim, _ = service.parse_sim_spec(
+            recovered.json()["spec"])
+        assert recovered_sim.to_wire_dict() == cloud_spec
+
+
 def test_ledger_open_resolves_restored_cloud_recovery(monkeypatch, tmp_path):
     run_root = tmp_path / "runs"
     cloud_spec = _spec()

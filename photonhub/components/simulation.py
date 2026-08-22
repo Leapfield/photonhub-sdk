@@ -11,11 +11,18 @@ from typing import Optional, Tuple, Union
 from pydantic import Field, field_validator, model_validator
 
 from ..cost import CostEstimate, estimate_cost
-from .base import MAX_INT32, FrozenModel, PositiveUm, SubpixelMethodName
+from .base import (
+    MAX_INT32,
+    FrozenModel,
+    PositiveUm,
+    SubpixelMethodName,
+    _monitor_name_key,
+)
 from .grid import (
     GridSpecType,
     graded_primary_spacings,
     realized_cells,
+    resolved_cell_counts,
     snap_mixed_plane,
     snapped_plane_index,
 )
@@ -30,7 +37,7 @@ from .run import RunSpec
 from .sources import ModeSource, PlaneWave, SourceType
 from .structures import Structure
 
-SCHEMA_VERSION = "1.16.0-alpha.1"
+SCHEMA_VERSION = "1.17.0-alpha.1"
 SUPPORTED_SCHEMA_MAJOR = 1
 
 _AXES = "xyz"
@@ -215,10 +222,19 @@ class Simulation(FrozenModel):
     @field_validator("monitors")
     @classmethod
     def _unique_monitor_names(cls, v):
-        names = [m.name for m in v]
-        dupes = sorted({n for n in names if names.count(n) > 1})
+        by_key: dict[str, list[str]] = {}
+        for monitor in v:
+            by_key.setdefault(_monitor_name_key(monitor.name), []).append(
+                monitor.name
+            )
+        dupes = sorted(
+            {name for names in by_key.values() if len(names) > 1 for name in names}
+        )
         if dupes:
-            raise ValueError(f"monitor names must be unique; duplicates: {dupes}")
+            raise ValueError(
+                "monitor names must be unique ignoring ASCII case; "
+                f"duplicates: {dupes}"
+            )
         return v
 
     @field_validator("symmetry")
@@ -233,6 +249,15 @@ class Simulation(FrozenModel):
                     f"0 (none), or +1 (magnetic/PMC), got {s}"
                 )
         return v
+
+    @model_validator(mode="after")
+    def _resolved_grid_resource_limits(self) -> "Simulation":
+        # Cheap mirror of engine/include/phcore/grid.h: reject a typo-sized
+        # grid before cost estimation or solver launch. This computes only
+        # three integers (or tuple lengths); phsolver validate remains the
+        # authoritative resolver for the complete device/grid contract.
+        resolved_cell_counts(self.size_um, self.grid)
+        return self
 
     @model_validator(mode="after")
     def _modal_port_rules(self) -> "Simulation":
@@ -551,7 +576,7 @@ class Simulation(FrozenModel):
         band = self.pml_num_layers * self.grid.dl_um
         out = [False, False, False]
         for s in self.structures:
-            if getattr(s.medium, "lorentz", None) is None:
+            if not s.medium.is_dispersive:
                 continue
             bb = geometry_bounds_um(s.geometry)
             for a in range(3):
@@ -913,7 +938,7 @@ class Simulation(FrozenModel):
         if (info.context or {}).get("wire_ingest"):
             return self
         dispersive = any(
-            getattr(s.medium, "lorentz", None) is not None
+            s.medium.is_dispersive
             for s in self.structures
         )
         if "subpixel" not in self.model_fields_set:
@@ -1024,7 +1049,7 @@ class Simulation(FrozenModel):
         # a PML.
         if (info.context or {}).get("wire_ingest") or not self.structures:
             return self
-        if not any(getattr(s.medium, "lorentz", None) is not None
+        if not any(s.medium.is_dispersive
                    for s in self.structures):
             return self
         if "pml" not in (self.boundaries.x, self.boundaries.y, self.boundaries.z):
@@ -1096,6 +1121,13 @@ class Simulation(FrozenModel):
         nlohmann typing exactly: JSON int -> float fields is accepted,
         string -> number and float -> int are rejected. Use this (not lax
         ``model_validate_json``) when consuming sim.json files."""
+        # Engine parity: nlohmann skips a UTF-8 BOM, so a hand-edited
+        # (Windows-authored) sim.json the engine runs must load here too.
+        if isinstance(text, bytes):
+            if text.startswith(b"\xef\xbb\xbf"):
+                text = text[3:]
+        elif text.startswith("\ufeff"):
+            text = text[1:]
         # context wire_ingest: do NOT apply the D2 construction-time subpixel
         # default to a parsed document — absent means the engine default (off),
         # so older docs round-trip byte-identically (see _resolve_subpixel_default).

@@ -294,17 +294,29 @@ class FieldDftMonitor(FrozenModel):
 
 
 class FluxMonitor(FrozenModel):
-    """Poynting-flux monitor over the full plane perpendicular to ``axis`` at
-    ``position_um``, snapped to a plane index ``1 <= kp <= n_axis - 1``
-    (NUMERICS.md section 12). Positive values mean power toward +axis; the
-    reported power carries the ``1/|A0*S(f)|^2`` normalization of the shared
-    phasors, so it is not absolute watts."""
+    """Poynting-flux monitor perpendicular to ``axis`` at ``position_um``,
+    snapped to a plane index ``1 <= kp <= n_axis - 1`` (NUMERICS.md
+    section 12). Positive values mean power toward +axis; the reported power
+    carries the ``1/|A0*S(f)|^2`` normalization of the shared phasors, so it
+    is not absolute watts.
+
+    By default the monitor integrates the FULL transverse plane. Schema 1.17
+    adds an optional sub-region WINDOW: pass BOTH ``center_um`` and
+    ``size_um`` as ``(u, v)`` pairs in the plane's CYCLIC transverse order
+    ``u = (axis+1) % 3, v = (axis+2) % 3`` (z-normal -> (x, y); x-normal ->
+    (y, z); y-normal -> (z, x)). The realized window snaps to whole cells by
+    cell-centre membership and must cover at least one cell (the engine
+    validates). None/None (default) keeps the legacy full plane and is
+    omitted from the wire. Not yet supported by the multi-GPU decomposition
+    (single GPU / CPU only)."""
 
     type: Literal["flux"] = "flux"
     name: MonitorName
     axis: AxisName
     position_um: float
     freqs_hz: Tuple[FreqHz, ...] = Field(min_length=1)
+    center_um: Optional[Tuple[float, float]] = None
+    size_um: Optional[Tuple[PositiveUm, PositiveUm]] = None
 
     @field_validator("freqs_hz")
     @classmethod
@@ -312,6 +324,14 @@ class FluxMonitor(FrozenModel):
         if len(set(value)) != len(value):
             raise ValueError("monitor freqs_hz must be unique")
         return value
+
+    @model_validator(mode="after")
+    def _window_both_or_neither(self) -> "FluxMonitor":
+        if (self.center_um is None) != (self.size_um is None):
+            raise ValueError(
+                "flux window needs BOTH center_um and size_um (or neither "
+                "for the full plane)")
+        return self
 
 
 MonitorType = Annotated[

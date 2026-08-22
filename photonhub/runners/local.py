@@ -79,9 +79,13 @@ def run_local(
     solver = find_solver(solver_path)
     if solver is None:
         raise SolverRunError(
-            "phsolver binary not found: pass solver_path=, set $PHOTONHUB_SOLVER, "
-            "put phsolver on PATH, or build the engine "
-            "(cmake -S engine -B build && cmake --build build)"
+            "phsolver engine binary not found. Local runs need the engine; "
+            "pip installs the Python client only. Either run on the cloud "
+            "instead (ph.web.run(sim) — no engine needed), or point this "
+            "client at an engine: pass solver_path=, set $PHOTONHUB_SOLVER, "
+            "or put phsolver on PATH (the desktop Workbench install bundles "
+            "one). Developers with the source tree: "
+            "cmake -S engine -B build && cmake --build build"
         )
 
     out_dir = Path(output_dir) if output_dir is not None else Path(
