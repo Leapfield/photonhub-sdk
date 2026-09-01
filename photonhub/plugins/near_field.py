@@ -6,8 +6,8 @@ frequency-domain tangential ``E`` and ``H`` recorded by a ``FieldDftMonitor``
 on a plane (or the six faces of a box), it computes the far field
 ``E_theta(theta, phi, f)``, ``E_phi(theta, phi, f)``, the radiation intensity
 ``U = r^2 |E|^2 / (2 eta0)`` and the (optionally) normalized directivity, in
-arbitrary directions ``(theta, phi)``. Tidy3D's analogue is
-``FieldProjectionMonitor``; Lumerical's is the far-field projection.
+arbitrary directions ``(theta, phi)``. This is the near-to-far-field (NTFF)
+transformation.
 
 Physics / method
 ================
@@ -83,9 +83,12 @@ error). ``colocate=True`` (the default, mirroring the mode-overlap readout)
 fixes the TRANSVERSE part by averaging each component to the in-plane cell node
 (:func:`~photonhub.plugins.mode_overlap._colocate_to_node`); pass
 ``colocate=False`` for synthetic, already-co-located fields. The NORMAL-axis
-half-cell E/H stagger is NOT corrected — the recorded plane carries a single
-normal coordinate and no grid spacing, so the required ``e^{i k cos(theta)
-dl/2}``-type phase is not formable here; a remaining O(k dl/2) phase error on
+half-cell E/H stagger is NOT corrected: the recorded plane carries a single
+normal coordinate and no grid spacing, and the SIGN of the offset depends on
+how the monitor plane was snapped (the quarter-cell placement idiom), so the
+referral is not inferrable from the DataArray alone — a trial correction made
+a real dipole box's pattern asymmetry WORSE monotonically in the assumed
+direction (benchmarks/meep FINDINGS.md F12). A remaining O(k dl/2) phase on
 the ``N`` vs ``L`` balance persists (cf. the longitudinal de-stagger
 ``mode_overlap.mode_transmission(destagger_dl=...)`` applies for modal
 readouts).
@@ -267,8 +270,18 @@ def _plane_component_3d(
         nc = np.asarray(da.coords[normal].values, dtype=np.float64).ravel()
         if nc.size >= 1:
             normal_um = float(nc[0])
-    da = da.squeeze(drop=True)
-    if set(da.dims) != {t1, t2}:
+    # Keep a length-1 TRANSVERSE axis: on a quasi-2-D run (a 1-cell
+    # plain-periodic axis) the recorded plane is genuinely one cell deep, and
+    # squeezing that axis away left dims like ('y',) and rejected the plane --
+    # locking near-to-far out of 2-D scenes. Third site of this pattern after
+    # diffraction_orders and the modal readout.
+    keep = {t1, t2}
+    drop = [d for d in da.dims if d not in keep and da.sizes[d] == 1]
+    da = da.squeeze(drop, drop=True) if drop else da
+    for ax in (t1, t2):
+        if ax not in da.dims:
+            da = da.expand_dims(ax)
+    if set(da.dims) != keep:
         raise ValueError(
             f"component {name!r}: after reduction dims are {tuple(da.dims)}, "
             f"expected the two transverse axes {{{t1!r}, {t2!r}}}")
@@ -345,6 +358,33 @@ def equivalent_currents(
     return out
 
 
+def _cell_widths_clipped(coords: np.ndarray,
+                         clip: Optional[Tuple[float, float]]) -> np.ndarray:
+    """Per-sample quadrature widths, optionally CLIPPED to a span.
+
+    The plain :func:`_cell_widths` midpoint rule extends a half-cell past each
+    end sample — right for an open aperture, wrong for one face of a CLOSED
+    box: each face then over-covers its span by a full cell per axis and
+    double-counts the edge strips its neighbouring faces already integrate
+    (measured +5-17% radiated power on the analytic-dipole box, F11). Clamping
+    the cell edges to the box extent tiles the surface exactly once
+    (trapezoid-consistent: edge samples carry half-cells, outside samples 0).
+    """
+    c = np.asarray(coords, dtype=np.float64)
+    if clip is None or c.size == 1:
+        return _cell_widths(c)
+    n = c.size
+    edges = np.empty(n + 1)
+    edges[1:-1] = 0.5 * (c[:-1] + c[1:])
+    edges[0] = c[0] - 0.5 * (c[1] - c[0])
+    edges[-1] = c[-1] + 0.5 * (c[-1] - c[-2])
+    lo, hi = (float(clip[0]), float(clip[1]))
+    if hi < lo:
+        lo, hi = hi, lo
+    np.clip(edges, lo, hi, out=edges)
+    return np.abs(np.diff(edges))
+
+
 def _project_one_face(
     currents: Mapping[str, np.ndarray],
     *,
@@ -352,6 +392,8 @@ def _project_one_face(
     rx: np.ndarray,
     ry: np.ndarray,
     rz: np.ndarray,
+    clip1: Optional[Tuple[float, float]] = None,
+    clip2: Optional[Tuple[float, float]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Radiation-vector contributions ``(N_x,N_y,N_z, L_x,L_y,L_z)`` of one face
     for a set of direction cosines ``(rx,ry,rz)`` (each a flat ``(n_dir,)``
@@ -369,7 +411,16 @@ def _project_one_face(
     c2 = np.asarray(currents["c2"], dtype=np.float64) * 1e-6
     n_m = float(currents["normal_um"]) * 1e-6
 
-    dA = np.outer(_cell_widths(c2), _cell_widths(c1))  # [i_t2, i_t1] m^2
+    # A length-1 transverse axis is one cell deep, not a line monitor: give it
+    # the grid spacing (taken from the sampled axis -- these monitors ride
+    # uniform grids) instead of _cell_widths' single-sample width of 1.0.
+    def _w(coords, clip, other):
+        w = _cell_widths_clipped(coords, clip)
+        if coords.size == 1 and other.size >= 2:
+            return np.array([abs(float(other[1] - other[0]))])
+        return w
+
+    dA = np.outer(_w(c2, clip2, c1), _w(c1, clip1, c2))  # [i_t2, i_t1] m^2
 
     # Cartesian position of every surface point: t1, t2 in-plane, normal fixed.
     pos = {t1: c1[None, :] * np.ones((c2.size, 1)),       # [i_t2, i_t1]
@@ -511,6 +562,49 @@ def far_field(
     cos_t, sin_t = np.cos(th), np.sin(th)
     cos_p, sin_p = np.cos(ph), np.sin(ph)
 
+    # Closed-box tiling (F11): when both faces of an axis are present, their
+    # normal planes bound the box on that axis; each face's in-plane quadrature
+    # is CLIPPED to those bounds (in meters) so the six faces tile the surface
+    # exactly once — no per-face half-cell overhang, no edge double-count. An
+    # axis with fewer than two faces (an open surface) stays unclipped.
+    # A closed-surface projection needs a surface that is actually CLOSED in
+    # 3-D. On a quasi-2-D scene (a 1-cell plain-periodic axis) the invariant
+    # axis is periodic, not terminated, so a "box" of four lateral faces is an
+    # open tube: the 3-D radiation integral below is then the wrong transform
+    # and returns a silently wrong pattern -- measured 13.4% anisotropy and a
+    # 0.134 front/back asymmetry for an ISOTROPIC 2-D point dipole, where the
+    # 2-D Green's-function transform gives 2.1% and exactly 0
+    # (benchmarks/meep n04, FINDINGS.md F20). Refuse it rather than answer
+    # wrongly; a genuine 2-D near-to-far needs the 2-D kernel, which this
+    # plugin does not implement.
+    if len(face_specs) > 1:
+        axes_present = {ax for _, ax, _ in face_specs}
+        for da, ax, _ in face_specs:
+            t1, t2 = _TRANSVERSE[ax]
+            for letter in (t1, t2):
+                if (letter in getattr(da, "sizes", {})
+                        and da.sizes[letter] == 1
+                        and letter not in axes_present):
+                    raise ValueError(
+                        "closed-surface far_field needs a surface closed in "
+                        f"3-D, but axis {letter!r} is one cell deep and no "
+                        "face is normal to it (a quasi-2-D scene). The 3-D "
+                        "radiation integral is the wrong transform there — a "
+                        "2-D near-to-far needs the 2-D Green's function, "
+                        "which this plugin does not implement. Use a full 3-D "
+                        "scene, or project a single plane instead of a box.")
+
+    bounds_m: Dict[str, Tuple[float, float]] = {}
+    if len(face_specs) > 1:
+        by_axis: Dict[str, list] = {}
+        for da, ax, sg in face_specs:
+            nc = np.asarray(da.coords[ax].values, dtype=np.float64).ravel()
+            if nc.size >= 1:
+                by_axis.setdefault(ax, []).append(float(nc[0]) * 1e-6)
+        for ax, positions in by_axis.items():
+            if len(positions) >= 2:
+                bounds_m[ax] = (min(positions), max(positions))
+
     for fi, f in enumerate(freqs):
         k = 2.0 * np.pi * f / C0  # free-space wavenumber (1/m)
         Ntot = [np.zeros(n_dir, dtype=np.complex128) for _ in range(6)]
@@ -518,7 +612,10 @@ def far_field(
             currents = equivalent_currents(
                 _as_component_mapping(da, ax), axis=ax, freq_hz=f, sign=sg,
                 colocate=colocate)
-            contribs = _project_one_face(currents, k=k, rx=rx, ry=ry, rz=rz)
+            t1, t2 = _TRANSVERSE[ax]
+            contribs = _project_one_face(
+                currents, k=k, rx=rx, ry=ry, rz=rz,
+                clip1=bounds_m.get(t1), clip2=bounds_m.get(t2))
             for i in range(6):
                 Ntot[i] = Ntot[i] + contribs[i]
         Nx, Ny, Nz, Lx, Ly, Lz = Ntot

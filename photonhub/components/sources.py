@@ -73,6 +73,14 @@ class PlaneWave(FrozenModel):
     )
     amplitude: float = 1.0
     source_time: SourceTimeType
+    # Schema 1.18 — oblique injection (constant-k Bloch method): angle_theta
+    # tilts off the propagation direction; angle_phi is the tilt azimuth in
+    # the transverse plane from the first CYCLIC transverse axis (axis+1)%3.
+    # None (default) = normal incidence, omitted from the wire. Nonzero
+    # angles need the transverse axes set to "bloch" with the matching
+    # Simulation.bloch_k_per_um — use Simulation.with_oblique_plane_wave.
+    angle_theta: Optional[float] = None
+    angle_phi: Optional[float] = None
 
     @field_validator("polarization")
     @classmethod
@@ -198,7 +206,7 @@ class ModeSource(FrozenModel):
     # scalar-limit (byte-identical wire).
     profile_h: Optional[Tuple[float, ...]] = Field(default=None, min_length=1)
     profile_h_minor: Optional[Tuple[float, ...]] = Field(default=None, min_length=1)
-    # Broadband injection (schema 1.11.0, additive/optional — the Tidy3D
+    # Broadband injection (schema 1.11.0, additive/optional — the broadband
     # `num_freqs` analogue, NUMERICS.md §18.3). When `freqs_hz` is set the engine
     # injects the mode with a FREQUENCY-DEPENDENT transverse profile and phase
     # index, partition-of-unity-windowed across the band from these N >= 2
@@ -420,6 +428,64 @@ class ModeSource(FrozenModel):
             )
 
 
+class TfsfBox(FrozenModel):
+    """Closed total-field/scattered-field box (NUMERICS.md section 13.5,
+    schema 1.18): a normal-incidence plane wave injected on all SIX faces of
+    an axis-aligned box, so the incident field exists ONLY inside — everything
+    outside is pure scattered field. Single-run scattering cross-sections with
+    PML on every side (no periodic transverse boundaries needed). CPU solver
+    only in this release. ``phsolver validate`` enforces: uniform grid, every
+    face in the uniform background (structures strictly inside — the
+    scatterer — or strictly outside), faces clear of the PML/absorber layers,
+    and no Bloch boundaries or symmetry planes."""
+
+    type: Literal["tfsf_box"] = "tfsf_box"
+    axis: AxisName
+    direction: DirectionName
+    polarization: FieldComponentName = Field(
+        json_schema_extra={"enum": ["Ex", "Ey", "Ez"]}
+    )
+    amplitude: float = 1.0
+    center_um: Tuple[float, float, float]
+    size_um: Tuple[float, float, float]
+    source_time: SourceTimeType
+
+    @field_validator("polarization")
+    @classmethod
+    def _electric_only(cls, v: str) -> str:
+        if not v.startswith("E"):
+            raise ValueError(
+                f"TFSF-box polarization '{v}' must be an E component "
+                "(the tangential E axis); use one of Ex, Ey, Ez"
+            )
+        return v
+
+    @field_validator("size_um")
+    @classmethod
+    def _positive_size(cls, v):
+        if any(not (s > 0) for s in v):
+            raise ValueError(
+                f"TFSF-box size_um must be positive on every axis, got {v}"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _polarization_tangential(self) -> "TfsfBox":
+        if self.polarization[1] == self.axis:
+            raise ValueError(
+                f"TFSF-box polarization '{self.polarization}' must be "
+                f"tangential to the propagation axis '{self.axis}'"
+            )
+        if self.source_time.band_freqs_hz is not None:
+            raise ValueError(
+                "GaussianPulse band_freqs_hz/carrier_index are reserved for "
+                "PointDipole equivalence-current sheets; a TFSF box uses "
+                "its ordinary Gaussian carrier"
+            )
+        return self
+
+
 SourceType = Annotated[
-    Union[PointDipole, PlaneWave, ModeSource], Field(discriminator="type")
+    Union[PointDipole, PlaneWave, ModeSource, TfsfBox],
+    Field(discriminator="type"),
 ]

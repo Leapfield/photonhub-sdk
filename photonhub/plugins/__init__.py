@@ -7,30 +7,55 @@ pure. Import what you need explicitly::
 
     from photonhub.plugins import ModeSolver
 
-Phase-1 plugins
----------------
+Mode and propagation plugins
+----------------------------
 ``ModeSolver`` — a finite-difference eigenmode (FDE) solver for the guided
 modes of a *straight* dielectric waveguide cross-section (semi-vectorial,
 quasi-TE/quasi-TM). CPU/numpy only; see :mod:`photonhub.plugins.modes`.
 
 ``VectorModeSolver`` — a *full-vectorial* FDE solver using the
 Fallahkhair–Li–Murphy transverse-H operator: all six field components, group
-index, and bent/leaky modes with complex ``n_eff``. Host-side; requires scipy.
-See :mod:`photonhub.plugins.vector_modes`.
+index, bent/leaky modes with real ``n_eff`` plus ``k_eff`` attenuation metadata,
+and experimental EME bases containing guided, radiation, and evanescent modes.
+The continuum/PML path is not yet validated for quantitative device radiation
+loss. Host-side; requires scipy. See
+:mod:`photonhub.plugins.vector_modes`.
 
-``run_eme`` — a minimal eigenmode-expansion (EME) propagator: staircase a
-z-varying device into z-invariant sections, mode-match at the interfaces and
-cascade the per-section/-interface scattering matrices (Redheffer star product)
-into one device S-matrix. Built on ``VectorModeSolver``; CPU only. See
+``run_eme`` — a full-vector, bidirectional eigenmode-expansion propagator:
+staircase a z-varying device into z-invariant sections, match independent
+tangential-E/H equations across unequal modal bases, and cascade the rectangular
+scattering matrices with the Redheffer star product. Interface residual,
+passivity, reciprocity, and fixed-port stability diagnostics expose truncation
+instead of forcing unitarity. Built on ``VectorModeSolver``; CPU only. See
 :mod:`photonhub.plugins.eme`.
+
+``solve_yee_eme_basis`` — an experimental, engine-native Yee hard-wall basis
+for EME. It returns reaction-validated propagating guided and box-radiation
+modes only; evanescent roots/PML and quantitative radiation accuracy remain
+unvalidated. Use a spectral ``neff_cutoff`` (not a fixed count) for window
+convergence controls. CPU only. See :mod:`photonhub.plugins.yee_mode`.
+
+``cvcs_sections`` — interpolate a few tracked, ordinary guided non-PML key
+planes into a dense smooth-section EME model, including each mode's full complex
+propagation constant. See :mod:`photonhub.plugins.cvcs`.
+
+``SpectrumCompleter`` — analytic completion of a truncated resonator spectrum:
+fit the ringdown's poles (via ``ResonanceFinder``), validate the model on a
+held-out window, and add the closed-form remainder of the DFT sum, so a high-Q
+run can stop after a few resolved ringdown periods instead of stepping the
+spectrum to convergence. Point-probe spectra only in v1; CPU only. See
+:mod:`photonhub.plugins.spectral_completion`.
 """
 
 from .cvcs import cvcs_sections, interpolate_mode, interpolate_plane
 from .diffraction import DiffractionOrders, diffraction_orders
 from .eme import (
+    EMEConvergenceReport,
     EMEResult,
+    InterfaceDiagnostics,
     Section,
     cascade,
+    eme_convergence_report,
     interface_smatrix,
     propagation_smatrix,
     rectangular_base_section,
@@ -77,14 +102,18 @@ from .kfj_smoothing import (
 )
 from .modes import Mode, ModeSolver
 from .near_field import FarField, equivalent_currents, far_field
+from .propagate import FocalScan, focal_scan, propagate_plane
+from .thin_lens import thin_lens_beam, thin_lens_source
 from .resonance import ResonanceFinder, select_resonances
+from .spectral_completion import CompletionRejected, SpectrumCompleter
 from .yee_mode import (
     sample_staggered_eps,
+    solve_yee_eme_basis,
     solve_yee_mode,
     solve_yee_mode_bank,
+    solve_yee_multimode_bank,
     solve_yee_port_mode_bank,
     window_min_face_bcs,
-    solve_yee_multimode_bank,
 )
 from .smatrix import (
     SPort,
@@ -110,8 +139,11 @@ from .waveguide import WaveguideModes, rectangular_waveguide
 
 __all__ = [
     "DiffractionOrders",
+    "EMEConvergenceReport",
     "EMEResult",
     "FarField",
+    "FocalScan",
+    "InterfaceDiagnostics",
     "Mode",
     "ModeBank",
     "ModeMonitor",
@@ -122,6 +154,7 @@ __all__ = [
     "SMatrixPort",
     "SMatrixResult",
     "SPort",
+    "SpectrumCompleter",
     "Section",
     "TrackingResult",
     "VectorMode",
@@ -130,12 +163,15 @@ __all__ = [
     "assemble_smatrix",
     "assert_passive",
     "assert_reciprocal",
+    "CompletionRejected",
     "cascade",
     "cvcs_sections",
     "diffraction_orders",
+    "eme_convergence_report",
     "equivalence_current_source",
     "equivalent_currents",
     "far_field",
+    "focal_scan",
     "gaussian_beam",
     "gaussian_beam_source",
     "gaussian_mode",
@@ -159,6 +195,7 @@ __all__ = [
     "mode_transmission",
     "passivity_violation",
     "plan_smatrix",
+    "propagate_plane",
     "propagation_smatrix",
     "reciprocity_error",
     "rectangular_base_section",
@@ -174,16 +211,19 @@ __all__ = [
     "solve_mode_bank",
     "solve_mode_on_cross_section",
     "solve_modes_by_freq",
+    "solve_yee_eme_basis",
     "solve_yee_mode",
     "solve_yee_mode_bank",
-    "solve_yee_port_mode_bank",
-    "window_min_face_bcs",
     "solve_yee_multimode_bank",
+    "solve_yee_port_mode_bank",
     "star_product",
+    "thin_lens_beam",
+    "thin_lens_source",
     "track_modes",
     "transmission",
     "transverse_overlap",
     "vector_modal_fields",
     "waveguide_section",
+    "window_min_face_bcs",
     "write_touchstone",
 ]

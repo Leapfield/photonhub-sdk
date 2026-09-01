@@ -1,4 +1,4 @@
-"""PhotonHub Workbench desktop release-manifest contract.
+"""PhotonHub desktop release-manifest contract.
 
 The desktop installer is a composition of independently built native artifacts:
 Electron, a frozen Python sidecar, and ``phsolver``.  This module gives that
@@ -25,8 +25,8 @@ from urllib.parse import urlsplit
 
 
 MANIFEST_VERSION = "1"
-PRODUCT_NAME = "PhotonHub Workbench"
-APP_ID = "com.photonhub.workbench"
+PRODUCT_NAME = "PhotonHub"
+APP_ID = "app.leapfield.photonhub"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _FULL_GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -397,7 +397,7 @@ def validate_release_manifest(manifest: Any, *, require_promoted: bool = False) 
     product = _object(root["product"], "product")
     _exact_keys(product, {"name", "version", "app_id"}, "product")
     if product["name"] != PRODUCT_NAME or product["app_id"] != APP_ID:
-        raise ReleaseManifestError("product name/app_id do not match PhotonHub Workbench")
+        raise ReleaseManifestError("product name/app_id do not match PhotonHub")
     _text(product["version"], "product.version")
 
     source = _object(root["source"], "source")
@@ -737,7 +737,7 @@ def desktop_release_schema() -> dict[str, Any]:
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": "https://photonhub.dev/schemas/desktop_release_v1.json",
-        "title": "PhotonHub Workbench desktop release manifest v1",
+        "title": "PhotonHub desktop release manifest v1",
         "type": "object",
         "additionalProperties": False,
         "allOf": [{

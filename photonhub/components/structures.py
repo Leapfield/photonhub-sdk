@@ -59,6 +59,42 @@ class DrudePole(FrozenModel):
     linewidth_hz: float = Field(default=0.0, ge=0.0)  # gamma / 2pi
 
 
+class PermittivityData(FrozenModel):
+    """Node-based permittivity data grid for a custom medium (NUMERICS.md
+    §10.3, schema 1.18). ``shape`` = (nx, ny, nz), each >= 2; ``values`` is
+    the flat C-order (x-major) array of nx*ny*nz node values, each >= 1.
+    Node [0, 0, 0] sits ON the structure box's low corner and
+    [nx-1, ny-1, nz-1] on the high corner; the engine trilinear-interpolates
+    at its §9 Yee sample points. Prefer :meth:`Medium.from_eps_array`."""
+
+    shape: Tuple[int, int, int]
+    values: Tuple[float, ...] = Field(min_length=8, repr=False)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "PermittivityData":
+        if any(n < 2 for n in self.shape):
+            raise ValueError(
+                f"permittivity_data shape must be >= 2 per axis (node-based "
+                f"trilinear grid), got {self.shape}")
+        want = self.shape[0] * self.shape[1] * self.shape[2]
+        if want > (1 << 24):
+            raise ValueError(
+                f"permittivity_data carries {want} nodes — exceeds the "
+                "16.7M inline-wire cap")
+        if len(self.values) != want:
+            raise ValueError(
+                f"permittivity_data values length {len(self.values)} != "
+                f"shape product {want} (C order, x-major)")
+        bad = next((v for v in self.values
+                    if not (v >= 1.0) or v != v or v in (float("inf"),)),
+                   None)
+        if bad is not None:
+            raise ValueError(
+                f"permittivity_data values must be finite and >= 1, "
+                f"found {bad}")
+        return self
+
+
 class Medium(FrozenModel):
     """Isotropic nonmagnetic medium: scalar relative permittivity plus an
     electric conductivity entering the lossy Ca/Cb update (NUMERICS.md
@@ -83,6 +119,15 @@ class Medium(FrozenModel):
     # document round-trips byte-identically).
     poles: Optional[Tuple[LorentzPole, ...]] = None
     drude: Optional[Tuple[DrudePole, ...]] = None
+    # Schema 1.18 — optional DIAGONAL permittivity tensor (eps_xx, eps_yy,
+    # eps_zz), each >= 1: uniaxial/biaxial crystals on the axis-aligned
+    # principal frame (LiNbO3: ordinary on two axes, extraordinary on the
+    # optic axis). When set, ``permittivity`` is required by the wire but
+    # IGNORED (write e.g. the mean). v1 exclusions: no dispersion poles, no
+    # pec, and the engine requires subpixel=False (the Simulation default
+    # flips off automatically for anisotropic scenes). None omitted from the
+    # wire (byte-back-compat).
+    permittivity_xyz: Optional[Tuple[float, float, float]] = None
     # Schema 1.17 — perfect electric conductor STRUCTURE material (NUMERICS.md
     # §10.1): every E component whose Yee point falls inside is pinned to 0
     # (staircased hard mirror — the structure analogue of the 'pec' outer
@@ -90,6 +135,77 @@ class Medium(FrozenModel):
     # conductivity and dispersion poles are contradictions and rejected.
     # None/False are equivalent and omitted from the wire (byte-back-compat).
     pec: Optional[bool] = None
+    # Schema 1.18 — optional spatially-varying ISOTROPIC permittivity
+    # (NUMERICS.md §10.3): a node-based data grid spanning the structure's
+    # Box extent, trilinear-interpolated at the engine's §9 sample points.
+    # When set, ``permittivity`` is required by the wire but IGNORED (write
+    # e.g. the mean). Build with :meth:`Medium.from_eps_array`. v1
+    # exclusions: Box geometry only, no dispersion poles, no pec, no
+    # permittivity_xyz, subpixel off (Simulation auto-flips), CPU solver
+    # only. None omitted from the wire (byte-back-compat).
+    permittivity_data: Optional["PermittivityData"] = None
+
+    @model_validator(mode="after")
+    def _aniso_rules(self) -> "Medium":
+        if self.permittivity_xyz is not None:
+            if any(not (e >= 1.0) for e in self.permittivity_xyz):
+                raise ValueError(
+                    "permittivity_xyz components must each be >= 1, got "
+                    f"{self.permittivity_xyz}")
+            if self.is_dispersive:
+                raise ValueError(
+                    "anisotropic media cannot carry dispersion poles "
+                    "(anisotropic dispersion is deferred)")
+            if self.pec:
+                raise ValueError("permittivity_xyz contradicts pec")
+        return self
+
+    @model_validator(mode="after")
+    def _custom_data_rules(self) -> "Medium":
+        if self.permittivity_data is not None:
+            if self.is_dispersive:
+                raise ValueError(
+                    "custom media cannot carry dispersion poles (deferred; "
+                    "NUMERICS.md §10.3)")
+            if self.pec:
+                raise ValueError("permittivity_data contradicts pec")
+            if self.permittivity_xyz is not None:
+                raise ValueError(
+                    "permittivity_data contradicts permittivity_xyz "
+                    "(anisotropic custom media are deferred)")
+        return self
+
+    @property
+    def is_anisotropic(self) -> bool:
+        return self.permittivity_xyz is not None
+
+    @property
+    def is_custom(self) -> bool:
+        return self.permittivity_data is not None
+
+    @classmethod
+    def from_eps_array(cls, values, *, conductivity_s_per_m: float = 0.0
+                       ) -> "Medium":
+        """A custom medium from a 3-D array of permittivity node values
+        (NUMERICS.md §10.3). ``values`` is any (nx, ny, nz) nested sequence /
+        numpy array with nx, ny, nz >= 2 and every value >= 1; node [0,0,0]
+        sits on the structure box's low corner, node [-1,-1,-1] on the high
+        corner, C order on the wire. ``permittivity`` is set to the mean
+        (the wire requires it; the engine ignores it)."""
+        import numpy as _np
+
+        arr = _np.asarray(values, dtype=float)
+        if arr.ndim != 3:
+            raise ValueError(
+                f"from_eps_array needs a 3-D (nx, ny, nz) array, got shape "
+                f"{arr.shape}")
+        return cls(
+            permittivity=max(1.0, float(arr.mean())),
+            conductivity_s_per_m=conductivity_s_per_m,
+            permittivity_data=PermittivityData(
+                shape=tuple(int(n) for n in arr.shape),
+                values=tuple(float(v) for v in arr.reshape(-1))),
+        )
 
     @model_validator(mode="after")
     def _pec_excludes_other_response(self) -> "Medium":
@@ -255,3 +371,13 @@ class Structure(FrozenModel):
     geometry: GeometryType
     medium: Medium
     name: Optional[StructureName] = None
+
+    @model_validator(mode="after")
+    def _custom_medium_needs_box(self) -> "Structure":
+        # NUMERICS.md §10.3: the data grid spans the structure's Box extent.
+        if getattr(self.medium, "is_custom", False) and (
+                self.geometry.type != "box"):
+            raise ValueError(
+                "permittivity_data (custom media) requires a Box geometry — "
+                f"got '{self.geometry.type}' (NUMERICS.md §10.3)")
+        return self

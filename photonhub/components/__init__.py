@@ -27,11 +27,12 @@ from .monitors import (
 )
 from .run import RunSpec
 from .simulation import SCHEMA_VERSION, Simulation
-from .source_time import GaussianPulse, SourceTimeType
+from .source_time import CW, GaussianPulse, SourceTimeType
 from .sources import (
     ModeSolveProvenance,
     ModeSource,
     PlaneWave,
+    TfsfBox,
     PointDipole,
     SourceType,
 )
@@ -42,6 +43,7 @@ from .structures import (
     DrudePole,
     LorentzPole,
     Medium,
+    PermittivityData,
     PolySlab,
     Sphere,
     Structure,
@@ -60,6 +62,7 @@ __all__ = [
     "FieldTimeMonitor",
     "FluxMonitor",
     "FrozenModel",
+    "CW",
     "GaussianPulse",
     "GeometryType",
     "GradedAxisCoords",
@@ -69,11 +72,13 @@ __all__ = [
     "DrudePole",
     "LorentzPole",
     "Medium",
+    "PermittivityData",
     "ModeSolveProvenance",
     "ModePort",
     "ModeSource",
     "MonitorType",
     "PlaneWave",
+    "TfsfBox",
     "PointDipole",
     "PortMode",
     "PolySlab",

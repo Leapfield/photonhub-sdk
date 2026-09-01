@@ -29,6 +29,17 @@ _STDERR_TAIL_CHARS = 4000
 EventCb = Optional[Callable[[dict], None]]
 
 
+# The Workbench/packaging issuer hands a release solver its one-launch
+# capability through these two variables (docs/desktop-solver-authorization.md).
+# They are the solver's OWN credential — the gated binary refuses to start
+# without them — so the generic scrub below must not eat them, even though
+# the secret's name ends in a credential suffix.
+_SOLVER_AUTHORIZATION_ENV = (
+    "PHOTONHUB_SOLVER_AUTHORIZATION_FILE",
+    "PHOTONHUB_SOLVER_LAUNCH_SECRET",
+)
+
+
 def _solver_subprocess_env() -> dict:
     """Copy the process environment without cloud credentials.
 
@@ -36,8 +47,17 @@ def _solver_subprocess_env() -> dict:
     ``phsolver`` children never do. Keeping this at the shared process seam
     prevents API keys from spreading to local CPU/GPU solver processes or
     appearing in their crash diagnostics.
+
+    The solver's launch authorization is the one deliberate exception: without
+    it, every SDK-spawned invocation of an installed (auth-required) solver is
+    denied — which surfaced in the candidate gate as ``--capabilities``
+    denials, four ``run_local`` failures, and preflight 422s, all one bug.
     """
-    return without_credentials(os.environ)
+    scrubbed = without_credentials(os.environ)
+    for name in _SOLVER_AUTHORIZATION_ENV:
+        if name in os.environ:
+            scrubbed[name] = os.environ[name]
+    return scrubbed
 
 
 class _WindowsJob:

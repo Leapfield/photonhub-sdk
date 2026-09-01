@@ -119,9 +119,12 @@ def _cells_and_min_spacing_um(sim: "Simulation"):
     """Per-axis (cell count, minimum primary spacing in microns), matching the
     engine: a graded axis has ``len(coords)`` cells (the §15.1 replicate-last
     closing node derives the final cell), a uniform axis has the round-half-away
-    cell count and constant spacing ``dl``."""
+    cell count and constant spacing ``dl`` (with the boundary-aware §1 floor —
+    a plain periodic axis may be a single cell)."""
     dl = sim.grid.dl_um
-    counts = list(resolved_cell_counts(sim.size_um, sim.grid))
+    counts = list(
+        resolved_cell_counts(sim.size_um, sim.grid, sim._axis_min_cells())
+    )
     min_spacing = []
     for i, length_um in enumerate(sim.size_um):
         q = _axis_coords_um(sim.grid, i)
@@ -132,17 +135,26 @@ def _cells_and_min_spacing_um(sim: "Simulation"):
     return counts, min_spacing
 
 
-def _dt_seconds(sim: "Simulation", min_spacing_um) -> float:
+def _dt_seconds(sim: "Simulation", counts, min_spacing_um) -> float:
     """dt exactly as resolve.cpp computes it: the §2 uniform limit
-    ``C*dl/(c0*sqrt(3))`` for a UniformGridSpec, else the §15.5 graded limit
-    over per-axis minimum spacings (a graded grid whose axes happen to be
-    uniform reduces to the §2 form, as the engine's graded_courant_dt does)."""
+    ``C*dl/(c0*sqrt(D))`` over the D ACTIVE axes (n > 1; a 1-cell plain
+    periodic axis carries no curl term and leaves the Courant sum) for a
+    UniformGridSpec, else the §15.5 graded limit over the active axes' minimum
+    spacings (a graded grid whose axes happen to be uniform reduces to the §2
+    form, as the engine's graded_courant_dt does)."""
     courant = sim.run.courant
     is_graded = getattr(sim.grid, "coords", None) is not None
     if not is_graded:
         dl_m = sim.grid.dl_um * 1e-6
-        return courant * dl_m / (_C0 * sqrt(3.0))
-    inv_sq = sum(1.0 / (d * 1e-6) ** 2 for d in min_spacing_um)
+        active = sum(1 for n in counts if n > 1) or 1
+        return courant * dl_m / (_C0 * sqrt(float(active)))
+    inv_sq = sum(
+        1.0 / (d * 1e-6) ** 2
+        for n, d in zip(counts, min_spacing_um)
+        if n > 1
+    )
+    if inv_sq == 0.0:
+        inv_sq = 1.0 / (sim.grid.dl_um * 1e-6) ** 2
     return courant / (_C0 * sqrt(inv_sq))
 
 
@@ -179,22 +191,34 @@ def _monitor_bytes(sim: "Simulation", num_steps: int, cells_per_axis):
     resident = 0
     output = 0
     for m in sim.monitors:
+        kind = getattr(m, "type", None)
+        if kind is None:
+            # A plugin WRAPPER (ModeMonitor and friends) carries the real
+            # monitor on .field_monitor; Simulation.model_copy(update=...)
+            # does not re-validate, so a wrapper passed by mistake reaches
+            # here and used to die on a bare AttributeError far from the
+            # cause. Say what actually happened.
+            hint = (" — add its .field_monitor to the simulation"
+                    if hasattr(m, "field_monitor") else "")
+            raise TypeError(
+                f"monitor {getattr(m, 'name', m)!r} is a "
+                f"{type(m).__name__}, not a wire monitor{hint}")
         ncomp = len(getattr(m, "fields", ()) or ())
-        if m.type == "field_time":
+        if kind == "field_time":
             n_samp = max(1, num_steps // m.interval_steps)
             output += n_samp * ncomp * 4
-        elif m.type == "field_snapshot":
+        elif kind == "field_snapshot":
             n_samp = 1 if m.interval_steps == 0 else max(1, num_steps // m.interval_steps)
             frame = ncomp * domain_cells * 4
             output += n_samp * frame
             resident += frame  # one staging frame on the device
-        elif m.type == "field_dft":
+        elif kind == "field_dft":
             nfreq = len(m.freqs_hz)
             region = _region_cells(m.size_um, dl, cells_per_axis,
                                    getattr(m, "interval_space", None))
             output += nfreq * ncomp * region * 2 * 4   # [re, im] float32
             resident += nfreq * ncomp * region * 2 * 8  # fp64 accumulators
-        elif m.type == "flux":
+        elif kind == "flux":
             output += len(m.freqs_hz) * 4
     return resident, output
 
@@ -217,7 +241,7 @@ def estimate_cost(
 
     counts, min_spacing = _cells_and_min_spacing_um(sim)
     num_cells = counts[0] * counts[1] * counts[2]
-    dt_s = _dt_seconds(sim, min_spacing)
+    dt_s = _dt_seconds(sim, counts, min_spacing)
     num_steps = _num_steps(sim, dt_s)
 
     cell_steps = num_cells * num_steps

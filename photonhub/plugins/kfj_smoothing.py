@@ -2,7 +2,7 @@
 
 The benchmark (and any readout that wants a faithful reference mode) used to solve
 its launch/readout modes on an *idealized* rectangular core (``_asym_strip_eps``,
-8x8 volume average). Tidy3D instead solves its modes on the **real** grid
+8x8 volume average). An alternative is to solve the modes on the **real** grid
 cross-section with a subpixel tensor. This module closes that gap: it samples the
 actual ``Simulation`` geometry on a transverse plane, builds the **diagonal
 Kottke-Farjadpour-Johnson** effective-permittivity tensor (the same
@@ -214,7 +214,7 @@ def cross_section_kfj_sampler(
     # (k+1/2)*dl from the domain origin 0), so the sampled cross-section's cells
     # COINCIDE with the sim's — the readout/launch mode then sees the dielectric
     # walls at the same sub-cell positions the FDTD field did (grid-consistent,
-    # like Tidy3D solving its mode on its own grid). Without this the window has an
+    # like solving the mode on its own grid). Without this the window has an
     # arbitrary sub-cell offset and the wall placement (hence n_eff) drifts.
     h_lo_um, v_lo_um, nh, nv = _snap_window(
         h_lo_um, h_hi_um, v_lo_um, v_hi_um, dl_um)
@@ -292,7 +292,7 @@ def solve_mode_on_cross_section(
     ``use_yee`` (default **True**) solves the **engine-consistent discrete-Yee**
     eigenmode (:func:`~photonhub.plugins.yee_mode.solve_yee_mode`): the mode on the FDTD's
     own Yee-staggered grid, so source and readout match the propagated field's
-    discretization exactly (the discrete analogue of what Tidy3D does).
+    discretization exactly (the discrete form of that projection).
     ``use_yee=False`` falls back to the node-collocated Fallahkhair–Li–Murphy
     ``VectorModeSolver`` (the prior default; kept for A/B and backward comparison).
     Both read the real geometry + diagonal KFJ subpixel and return the ``mode_index``-th

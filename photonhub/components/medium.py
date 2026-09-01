@@ -20,7 +20,9 @@ class Boundaries(FrozenModel):
     Bloch problem (and for the transverse axes of a plane-wave source), ``pec``
     for a hard mirror, or ``absorber`` for the adiabatic-absorber fallback when
     a structure crosses the boundary and the PML would diverge (NUMERICS.md
-    §11/§21).
+    §11/§21). ``bloch`` (schema 1.18) is the phase-shifted periodic wrap for
+    oblique plane waves / band structure — pair it with
+    ``Simulation.bloch_k_per_um`` (CPU solver only in this release).
     """
 
     x: BoundaryKind = "pml"

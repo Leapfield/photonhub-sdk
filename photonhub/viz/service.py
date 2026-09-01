@@ -1694,8 +1694,7 @@ def solve_mode_source(sim, source_index: int, settings: dict):
     """Re-solve one canonical ``ModeSource`` from practical port settings.
 
     The Workbench must never ask a user to edit the coupled profile arrays by
-    hand.  This operation takes the same compact controls exposed by commercial
-    port/mode-source editors, solves an engine-consistent full-vector Yee mode,
+    hand.  This operation takes the usual compact port controls, solves an engine-consistent full-vector Yee mode,
     and replaces exactly one source with the canonical, power-normalized
     profile arrays the native solver consumes.
 
@@ -1703,7 +1702,7 @@ def solve_mode_source(sim, source_index: int, settings: dict):
     cross-section (``viz._geometry.in_plane_axes(axis)``).  The solve wavelength
     is authoritative for both the eigenmode and the returned Gaussian carrier;
     bandwidth, offset, phase, and the existing top-level source amplitude are
-    preserved.  ``num_freqs > 1`` is the Tidy3D-style broadband option: modes
+    preserved.  ``num_freqs > 1`` is the broadband option: modes
     are sampled over the carrier's +/-2-sigma frequency band.
 
     Returns ``(updated_simulation, summary)``.  The helper is presentation-free
@@ -1711,7 +1710,8 @@ def solve_mode_source(sim, source_index: int, settings: dict):
     """
     from ..components.sources import ModeSolveProvenance, ModeSource
     from ..components.source_time import GaussianPulse
-    from ..components.grid import graded_primary_spacings, realized_cells
+    from ..components.grid import (graded_primary_spacings,
+                                   realized_cells, sim_axis_min_cells)
     from ..plugins.mode_devices import mode_launch
     from ..plugins.yee_mode import (
         solve_yee_mode,
@@ -1864,7 +1864,8 @@ def solve_mode_source(sim, source_index: int, settings: dict):
     # the position control rather than much later in phsolver preflight.
     q_axis = sim._axis_coords_um(axis_i)
     if q_axis is None:
-        n_axis = realized_cells(sim.size_um[axis_i], sim.grid.dl_um)
+        n_axis = realized_cells(sim.size_um[axis_i], sim.grid.dl_um,
+                                sim_axis_min_cells(sim, axis_i))
         plane_index = int(math.floor(position_um / sim.grid.dl_um + 0.5))
         plane_coord = lambda k: k * sim.grid.dl_um
     else:
@@ -2222,8 +2223,8 @@ _MODE_CONVERTER_STARTER = {
         "Design and Results; o3 resolves both TE0 and TE1 from one raw DFT plane."
     ),
     "reference": (
-        "Matched res25 headline at 1550 nm: PhotonHub 45.74% vs Tidy3D 45.69% "
-        "TE0→TE1 conversion (+0.05 percentage points)."
+        "Matched res25 headline at 1550 nm: 45.74% TE0→TE1 conversion, within "
+        "0.05 percentage points of an independent FDTD reference."
     ),
 }
 

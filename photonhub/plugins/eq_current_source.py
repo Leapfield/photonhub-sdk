@@ -24,7 +24,7 @@ backward 0.20→0.003 %, near-source p_in placement wobble 0.24→0.11 %.
 
 The trade: a cloud of ~10–40 k point dipoles instead of one ModeSource (linear
 per-step cost, negligible next to the curl updates) and a frozen single-frequency
-profile (like Tidy3D's num_freqs=1 source; the §18 broadband carriers remain the
+profile (like a single-frequency mode source; the §18 broadband carriers remain the
 tool for wide-band launches).
 """
 from __future__ import annotations
@@ -89,6 +89,104 @@ def _launched_power(mode, dl_um: float, wh_um=None, wv_um=None,
     return float(0.5 * (np.sum(s1 * dA_1) - np.sum(s2 * dA_2)))
 
 
+# Largest fraction of a sheet's peak amplitude allowed to sit inside a
+# PML/absorber band on a TRANSVERSE axis. Every practical window truncates some
+# exponential tail against the domain wall — a 3-sigma Gaussian window edge is
+# ~1e-4 of peak, and the committed benchmark frames (edge-coupler uniform,
+# practical case 1) reach ~2e-2 where the window is clipped to the domain —
+# all physically negligible. The failure this rejects is a WINDOW SIZED INTO
+# the absorber (the 08-14 edge-coupler auto15 frame put 30 % of the beam's
+# peak amplitude inside the transverse PML, sized for 20*dl instead of 20
+# LOCAL cells): the run completes and reports silently wrong power/profile.
+_ABSORBER_AMPLITUDE_TOL = 0.05
+
+
+def _absorbing_interval(sim, axis_index: int):
+    """``(lo_um, hi_um, boundary)`` of the axis' nonabsorbing interior, or
+    ``None`` when the axis has no absorbing boundary — or when ``sim`` is a
+    duck-typed shell without the resolver (unit-test rigs; a real
+    :class:`Simulation` always has it)."""
+    if not hasattr(sim, "_nonabsorbing_bounds_um"):
+        return None
+    lo, hi, boundary = sim._nonabsorbing_bounds_um(axis_index)
+    if boundary not in ("pml", "absorber"):
+        return None
+    return float(lo), float(hi), boundary
+
+
+def _reject_absorber_overlap(sim, dips, *, a: int, ih_ax: int, iv_ax: int,
+                             aJ: float, aM: float) -> None:
+    """Refuse a Huygens sheet that meaningfully overlaps PML/absorber cells.
+
+    Dipoles inside an absorbing band drive a damped, coordinate-stretched
+    medium: the run completes and the launch is silently wrong (power AND
+    profile) instead of failing. Boundary layers are counted in realized LOCAL
+    cells (graded axes carve physically thick bands from coarse face cells),
+    which is exactly how such a sheet ends up there by accident.
+
+    Two rules:
+
+    - the J/M sheet PLANES inside the propagation axis' band is always an
+      error — the entire launch is inside the absorber;
+    - on a transverse in-plane axis, in-band dipoles are an error only when
+      one carries more than ``_ABSORBER_AMPLITUDE_TOL`` of its own sheet's
+      (J or M) peak amplitude — window tails against the wall are expected
+      and harmless.
+    """
+    span = _absorbing_interval(sim, a)
+    if span is not None:
+        lo, hi, boundary = span
+        for name, pos in (("J (electric)", aJ), ("M (magnetic)", aM)):
+            if not (lo + 1e-12 < pos < hi - 1e-12):
+                raise ValueError(
+                    f"the {name} sheet plane at {pos:.6g} um on axis "
+                    f"'{_AXES[a]}' lies inside the {boundary} band: the "
+                    f"nonabsorbing interior is ({lo:.6g}, {hi:.6g}) um "
+                    f"(boundary layers are counted in realized LOCAL cells, "
+                    f"so a graded axis' band is thicker than layers*dl). A "
+                    f"sheet inside the absorber launches silently wrong "
+                    f"fields — move position_um into the interior.")
+    if not dips:
+        return
+    peaks = {}
+    for d in dips:
+        kind = d.polarization[0]                        # 'E' (J) / 'H' (M)
+        peaks[kind] = max(peaks.get(kind, 0.0), d.amplitude)
+    problems = []
+    for axis_index in (ih_ax, iv_ax):
+        span = _absorbing_interval(sim, axis_index)
+        if span is None:
+            continue
+        lo, hi, boundary = span
+        worst, count = 0.0, 0
+        for d in dips:
+            # In-band means STRICTLY beyond an interval edge: a §20-folded
+            # axis has lo = 0.0 with no lower band at all, and its on-plane
+            # dipole row sits exactly AT 0.0 (it can carry the beam's peak);
+            # a window edge exactly ON the first absorber node is likewise
+            # not yet inside the band's cells.
+            c = d.center_um[axis_index]
+            if not (c < lo - 1e-9 or c > hi + 1e-9):
+                continue
+            count += 1
+            worst = max(worst, d.amplitude / peaks[d.polarization[0]])
+        if worst > _ABSORBER_AMPLITUDE_TOL:
+            problems.append(
+                f"axis '{_AXES[axis_index]}': {count} dipoles beyond the "
+                f"nonabsorbing interval ({lo:.6g}, {hi:.6g}) um carry up to "
+                f"{worst:.1%} of the sheet's peak amplitude inside the "
+                f"{boundary} band")
+    if problems:
+        raise ValueError(
+            "the Huygens sheet window reaches into absorbing boundary cells "
+            "with significant amplitude — the launch would be silently wrong "
+            "(the band is carved from realized LOCAL cells, so on a graded "
+            "axis it is thicker than layers*dl): " + "; ".join(problems) +
+            f". Tails at or below {_ABSORBER_AMPLITUDE_TOL:.0%} of peak are "
+            "accepted, so shrink the window (half_w_um / half_v_um / "
+            "window_sigmas), enlarge the domain, or re-center the beam.")
+
+
 def equivalence_current_source(
     sim,
     mode,
@@ -120,7 +218,7 @@ def equivalence_current_source(
 
     Returns the list of :class:`PointDipole` (electric + magnetic) to put in
     ``Simulation.sources``. Single-frequency profile (band-centre), like a
-    Tidy3D ``num_freqs=1`` mode source.
+    single-frequency (``num_freqs=1``) mode source.
 
     **Broadband (``num_freqs`` analogue, NUMERICS.md §5/§18.3).** Pass
     ``modes_by_freq`` (``{freq_hz: Yee mode}``, N >= 2, each solved AT that
@@ -397,4 +495,6 @@ def _build_sheet(
             #   J_v (E_v dipole at (h, v+1/2)) carries  +H_h = hx        (+ph_j)
             add(h_letter, "E", hm, vv, aJ, hy[iv, ih], math.pi + ph_j, wJ)
             add(v_letter, "E", hh, vm, aJ, hx[iv, ih], ph_j, wJ)
+    _reject_absorber_overlap(sim, dips, a=a, ih_ax=ih_ax, iv_ax=iv_ax,
+                             aJ=aJ, aM=aM)
     return dips

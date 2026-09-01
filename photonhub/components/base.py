@@ -11,10 +11,20 @@ from typing import Annotated, Literal, Tuple
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
 FieldComponentName = Literal["Ex", "Ey", "Ez", "Hx", "Hy", "Hz"]
-BoundaryKind = Literal["periodic", "pec", "pml", "absorber"]
+BoundaryKind = Literal["periodic", "pec", "pml", "absorber", "bloch", "pmc"]
 SubpixelMethodName = Literal[
     "volume", "tensor", "tensor_full", "contour", "contour_diag", "contour_full"
 ]
+# NUMERICS.md §23 — field STORAGE precision. "fp16" narrows only the six
+# field arrays (behind exact power-of-two per-run scales); every arithmetic
+# operation and all stiff state stay fp32/fp64. Opt-in bandwidth fast lane.
+FieldPrecisionName = Literal["fp32", "fp16"]
+# NUMERICS.md §12.6 — storage precision of the field_dft running-DFT
+# accumulators. "fp64" (default) is byte-identical to prior releases;
+# "fp32c" is a compensated fp32 pair (same bytes, fp64-class accuracy);
+# "fp32" is a plain fp32 pair (half the accumulator bytes and traffic, at a
+# signal-dependent accuracy cost).
+DftPrecisionName = Literal["fp64", "fp32c", "fp32"]
 AxisName = Literal["x", "y", "z"]
 DirectionName = Literal["+", "-"]
 

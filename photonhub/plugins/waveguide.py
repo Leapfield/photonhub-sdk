@@ -1,6 +1,6 @@
 """One-call strip / rib waveguide mode analysis.
 
-The PhotonHub analogue of Tidy3D's ``waveguide.RectangularDielectric`` and the
+A rectangular-dielectric waveguide builder and the
 "draw the cross-section, press solve" FDE workflow: declare the geometry (and
 optionally the materials), get the solved mode set with the numbers designers
 actually quote — ``n_eff``, TE fraction, group index, bend loss — without

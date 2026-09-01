@@ -10,7 +10,7 @@ JSON wire format; the published simulation schema is generated from them via
 Python 3.11+:
 
 ```sh
-python -m pip install "photonhub @ git+https://github.com/Leapfield/photonhub-sdk"
+python -m pip install photonhub
 ```
 
 (From a monorepo checkout: `python -m pip install ./photonhub`.)
@@ -78,10 +78,10 @@ sim.plot_3d()                     # interactive 3D  (pip install photonhub[viz])
 
 ## What you can do today
 
-Shipped surface as of schema **v1.17.0-alpha.1** (validated dispersive solver
+Shipped surface as of schema **v1.20.0-alpha.1** (validated dispersive solver
 core — multi-pole Lorentz + Drude ADE with a fitted metals library (Au/Ag/Cu/Al)
-and PEC structures, with recorded MI300X CPU↔GPU equivalence under
-the numerical contract's tolerances — plus full-vector mode
+and PEC structures, with recorded MI300X CPU↔GPU equivalence for the pre-1.18
+surface under the numerical contract's tolerances — plus full-vector mode
 injection, GDS import (`ph.import_gds`), adjoint gradients, and the silicon-PIC
 MVP):
 
@@ -95,10 +95,13 @@ MVP):
 - **Geometry:** `Box`, `Sphere`, `Cylinder` (full, or an annular sector / ring
   via `inner_radius_um` + `angle_start` / `angle_stop`), and `PolySlab` (an
   extruded polygon — e.g. a taper).
-- **Sources:** `PointDipole`, `PlaneWave` (normal-incidence TF/SF), and the
-  recommended `mode_launch` waveguide-mode builder, all driven by a
-  `GaussianPulse`. The `ModeSource` wire type remains for legacy scalar and
-  continuous-adjoint compatibility.
+- **Sources:** `PointDipole`, `PlaneWave` (normal-incidence TF/SF; oblique
+  via `Simulation.with_oblique_plane_wave` + Bloch boundaries, schema 1.18),
+  the closed `TfsfBox` scattering box (single-run cross-sections with PML on
+  all sides), and the recommended `mode_launch` waveguide-mode builder — all
+  driven by a `GaussianPulse` or a steady-state `CW` carrier. The
+  `ModeSource` wire type remains for legacy scalar and continuous-adjoint
+  compatibility.
 - **Monitors:** `FieldTimeMonitor`, `FieldSnapshotMonitor`, `FieldDftMonitor`,
   and `FluxMonitor` — fp64 DFT field and flux power. A DFT plane may carry the
   optional `ModePort` authoring recipe; the engine strictly validates and then
@@ -124,9 +127,9 @@ MVP):
   the legacy `ModeSolver` / `mode_source` path remains for scalar and adjoint
   compatibility. Full complex multiport S-matrices:
   `plugins.smatrix` (`SPort` + `assemble_smatrix`, one run per driven port —
-  the analogue of Tidy3D's ComponentModeler).
+  a multi-port S-parameter driver).
 - **Meshing:** `UniformGridSpec`, or `GradedGridSpec` + `auto_grid` for a
-  cells-per-λ graded mesh; `MeshOverride` (Tidy3D `MeshOverrideStructure`) forces
+  cells-per-λ graded mesh; `MeshOverride` (a per-structure mesh override) forces
   a target spacing inside a geometry regardless of material —
   `sim.with_mesh_overrides(MeshOverride(geometry=Box(...), dl_um=(0.02,0.02,None)))`.
   Graded meshes run on CPU, single GPU, and multi-GPU with PML/absorber,
@@ -169,8 +172,10 @@ eigenmode, inject it with `mode_launch`, ratio two `mode_monitor` planes, and pl
 
 ## Learn more
 
+- **[API documentation and guides](https://leapfield.app/docs/)** — the full reference for
+  every public symbol in this package, plus install and quickstart guides.
 - [PhotonHub product overview](https://leapfield.app/#product)
 - [Request beta access or support](https://leapfield.app/#request)
 
 The project source tree also includes an end-to-end quickstart, examples index,
-and **fifteen-notebook** gallery.
+and **twenty-six-notebook** gallery.

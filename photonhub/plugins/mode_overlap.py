@@ -59,7 +59,7 @@ handled correctly — no uniform-spacing assumption.
 **Scope.** Fundamental mode, looped over the monitor's frequencies. By default
 one scalar mode profile (+ its ``n_eff``) is used for every frequency (the frozen
 mode); pass ``modes_by_freq`` to project each frequency onto its OWN solved mode
-(profile + ``n_eff``), matching Tidy3D's per-frequency ``ModeMonitor`` and
+(profile + ``n_eff``), matching the standard per-frequency mode-monitor convention and
 recovering the waveguide dispersion the frozen mode drops. A scalar per-frequency
 ``n_eff`` override is also accepted.
 
@@ -118,6 +118,20 @@ ModeBank = Union[Mapping[float, Mapping[int, Any]], Mapping[int, Any]]
 
 _QUANTITIES = ("transmission", "power", "amplitude")
 
+# One µm² in m². The overlap quadrature integrates over the plane's µm
+# coordinates (dA in µm²), while the engine's FluxMonitor forms its §12
+# Poynting sum with the SI grid spacing (dA in m²; NUMERICS.md — internal
+# units are SI). The "power" readout multiplies by this ONCE, as the last
+# operation, so the returned modal power is FLUX-COMMENSURATE: mode_power /
+# FluxMonitor on the same plane is the modal power fraction (O(1), ~the modal
+# confinement), not ~1e12 (the historical µm²-Poynting convention). Applied to
+# the power quantity only — amplitudes (a/P) and transmissions (|a|²/P²) are
+# dimensionless in the area element and keep their exact historical bit
+# patterns; power RATIOS (same-kind divisions, e.g. T = P_out/P_in) cancel the
+# factor analytically and move by at most ~3e-16 relative (one last-place
+# rounding of each operand).
+_UM2_TO_M2 = 1.0e-12
+
 # ETA0 (vacuum wave impedance, ohms) and C0 (free-space speed of light, m/s —
 # maps a monitor frequency to a wavelength for the longitudinal Yee de-stagger
 # phase beta = 2*pi*n_eff/lambda) come from the shared plugins._constants
@@ -164,9 +178,8 @@ def _colocate_to_node(a: np.ndarray, axis: int) -> np.ndarray:
     components are physically staggered by half a cell. Combining them in the
     overlap cross-products without first interpolating each to a COMMON point is a
     FIRST-ORDER error; co-locating restores SECOND-ORDER accuracy (Oskooi &
-    Johnson, *Comp. Phys. Comm.* 181, 687 (2010); MEEP issues #1470/#1773). This
-    is what Lumerical (monitor spatial-interpolation, default "nearest mesh cell")
-    and Tidy3D (``ModeMonitor(colocate=True)``, the default) do before the
+    Johnson, *Comp. Phys. Comm.* 181, 687 (2010); MEEP issues #1470/#1773). Interpolating the tangential
+    components to a common point is therefore standard practice before the
     two-term mode overlap. The collocated FDE mode needs no shift."""
     prev = np.roll(a, 1, axis=axis)
     idx = [slice(None)] * a.ndim
@@ -361,14 +374,29 @@ def modal_fields(
     t1c = np.asarray(t1_um, dtype=np.float64)
     t2c = np.asarray(t2_um, dtype=np.float64)
 
+    # Degenerate (invariant) axis alignment. On a quasi-2-D scene one axis is a
+    # single plain-periodic cell, so BOTH the mode window and the recorded
+    # plane carry exactly one sample there — and the coordinate is arbitrary,
+    # because nothing varies along it. It is also inconsistent in practice: the
+    # engine reports the recorded plane at the cell NODE (z = 0) while the
+    # natural authoring value is the cell CENTRE (z = dl/2), so passing the
+    # centre put the plane sample on the window's edge and the resample
+    # zero-filled it -- the whole mode vanished and the caller saw only
+    # "P_mode is zero" (benchmarks/meep FINDINGS.md F21). When both sides are
+    # single-sampled, align them instead of interpolating by coordinate.
+    def _align_degenerate(mode_coords, plane_coords):
+        if mode_coords.size == 1 and plane_coords.size == 1:
+            return np.array([float(plane_coords[0])])
+        return mode_coords
+
     if width_axis == a1:  # width -> t1, height -> t2 (legacy orientation)
-        wc = w_coords + center_um[0]
-        hc = h_coords + center_um[1]
+        wc = _align_degenerate(w_coords + center_um[0], t1c)
+        hc = _align_degenerate(h_coords + center_um[1], t2c)
         profile = _resample_real(mode.field, wc, hc, t1c, t2c,
                                  order=interp_order)  # [i_t2, i_t1]
     else:  # width -> t2, height -> t1 (e.g. y-propagation, thickness on a1)
-        wc = w_coords + center_um[1]
-        hc = h_coords + center_um[0]
+        wc = _align_degenerate(w_coords + center_um[1], t2c)
+        hc = _align_degenerate(h_coords + center_um[0], t1c)
         # width(mode-x)->t2, height(mode-y)->t1; transpose to [i_t2, i_t1].
         profile = _resample_real(mode.field, wc, hc, t2c, t1c,
                                  order=interp_order).T
@@ -513,6 +541,34 @@ def vector_modal_fields(
     return {"e1": e1, "e2": e2, "h1": h1, "h2": h2}
 
 
+def _degenerate_width(coords: np.ndarray, mode, axis_letter: str,
+                      t1: str, t2: str) -> Optional[float]:
+    """Cell width to use for a length-1 transverse axis, from the mode's grid.
+
+    ``_cell_widths`` gives a single sample width 1.0 -- the line/point-monitor
+    convention, where the "integral" is just that sample's value. On a
+    quasi-2-D plane (a 1-cell plain-periodic axis) that is wrong: the plane is
+    a real plane, one cell deep, so its area element must use the GRID
+    spacing. Getting this wrong scales modal power by 1/dl against a
+    FluxMonitor over the same plane and breaks the documented
+    flux-commensurability of ``power=True`` (measured 30x at dl = 0.04 um).
+    The reference mode carries the spacing, so take it from there.
+    """
+    if coords.size != 1 or mode is None:
+        return None
+    dl = getattr(mode, "dl_y_um" if axis_letter == t2 else "dl_x_um", None)
+    if dl is None:
+        dl = getattr(mode, "dl_x_um", None) or getattr(mode, "dl_y_um", None)
+    return float(dl) if dl else None
+
+
+def _widths_with_grid(coords: np.ndarray, mode, axis_letter: str,
+                      t1: str, t2: str) -> np.ndarray:
+    w = _cell_widths(coords)
+    dl = _degenerate_width(coords, mode, axis_letter, t1, t2)
+    return np.array([dl]) if dl is not None else w
+
+
 def _plane_component(
     fields: Mapping[str, xr.DataArray],
     name: str,
@@ -530,9 +586,21 @@ def _plane_component(
     if "f" in da.dims:
         da = da.sel(f=freq_hz, method="nearest") if freq_hz is not None \
             else da.isel(f=0)
-    # Drop the (singleton) normal axis and any other length-1 dims, keeping t1/t2.
-    da = da.squeeze(drop=True)
-    if set(da.dims) != {t1, t2}:
+    # Drop the (singleton) normal axis and any other length-1 dims, keeping
+    # t1/t2 -- INCLUDING a transverse axis that is itself length 1. On a
+    # quasi-2-D run (a 1-cell plain-periodic axis, NUMERICS.md section 1) the
+    # recorded plane is genuinely 1-D: squeezing that axis away left dims like
+    # ('y',) and the readout refused the plane, which locked every modal
+    # workflow out of 2-D scenes -- the same degenerate-axis family as the
+    # diffraction-order fix. Keep the length-1 transverse axis and let the
+    # quadrature treat it as one cell.
+    keep = {t1, t2}
+    drop = [d for d in da.dims if d not in keep and da.sizes[d] == 1]
+    da = da.squeeze(drop, drop=True) if drop else da
+    for axis in (t1, t2):
+        if axis not in da.dims:
+            da = da.expand_dims(axis)
+    if set(da.dims) != keep:
         raise ValueError(
             f"component {name!r}: after reduction dims are {tuple(da.dims)}, "
             f"expected the two transverse axes {{{t1!r}, {t2!r}}}")
@@ -622,7 +690,7 @@ def _overlap_terms(
         use_mode, use_neff = mode, n_eff
         if modes_by_freq and f is not None:
             # per-λ: project this frequency onto its OWN solved mode (profile +
-            # n_eff), matching Tidy3D's per-frequency ModeMonitor decomposition.
+            # n_eff), matching the standard per-frequency mode decomposition.
             key = min(modes_by_freq, key=lambda k: abs(k - f))
             use_mode, use_neff = modes_by_freq[key], None
         yee_mode = getattr(use_mode, "yee_staggered", False)
@@ -637,9 +705,11 @@ def _overlap_terms(
             Hs1 = _colocate_to_node(Hs1, 0)
             Hs2 = _colocate_to_node(Hs2, -1)
 
-        # Area element from the plane's real (possibly graded) coord spacings.
-        w1 = _cell_widths(c1)            # along t1
-        w2 = _cell_widths(c2)            # along t2
+        # Area element from the plane's real (possibly graded) coord spacings;
+        # a length-1 transverse axis (quasi-2-D) takes the grid spacing from
+        # the mode rather than the line-monitor width of 1.0.
+        w1 = _widths_with_grid(c1, use_mode, t1, t1, t2)   # along t1
+        w2 = _widths_with_grid(c2, use_mode, t2, t1, t2)   # along t2
         # §20 folded-domain quadrature (see the docstring): halve the first
         # sample's weight on a folded in-plane axis whose ladder starts ON the
         # symmetry plane — for NODE-registered products only. Guard on the
@@ -681,7 +751,7 @@ def _overlap_terms(
         if hasattr(use_mode, "hx"):
             # Full-vector mode: project with the mode's TRUE transverse H, not the
             # scalar-limit (n_eff/eta0)·(z_hat x e). This is the grid-consistent
-            # "smooth readout" path — see benchmarks/tidy3d/SMOOTH_CONVERGENCE_PLAN.md
+            # "smooth readout" path.
             # (issue #34). n_eff is intrinsic to the vector mode, so use_neff is
             # not applicable here.
             m = vector_modal_fields(use_mode, c1, c2, axis=axis,
@@ -855,11 +925,17 @@ def mode_transmission(
     ``direction="+"`` returns forward T, ``direction="-"`` backward T.
 
     ``power=True`` instead returns the actual modal **power**
-    ``|a_pm|^2 / |P_mode|`` (= ``|c|^2 * |P_mode|``, always ``>= 0`` — the
-    magnitude of ``P_mode`` so a backward ``direction="-"`` reading, whose
-    signed flux through the +n_hat plane is negative, is still a power). Use
-    this when ratioing two planes whose modes may DIFFER (e.g. a w1→w2 taper):
-    ``P_out / P_in`` is then the true power transmission. The bare ``|c|^2`` (power=False) drops each port's ``P_mode``,
+    ``|a_pm|^2 / |P_mode| * 1e-12`` (= ``|c|^2 * |P_mode|`` in the engine's SI
+    flux units, always ``>= 0`` — the magnitude of ``P_mode`` so a backward
+    ``direction="-"`` reading, whose signed flux through the +n_hat plane is
+    negative, is still a power). The ``1e-12`` converts the µm² area element of
+    the overlap quadrature to m², making the value **flux-commensurate**: it
+    carries the same §12 source-spectrum normalization AND the same SI area
+    element as a ``FluxMonitor``, so ``mode_power / flux`` on one plane is the
+    modal power fraction (~1 for a clean guide). (Before 2026-08 the µm² element
+    was returned unconverted — a ~1e12 unit mismatch against flux.) Use
+    ``power=True`` when ratioing two planes whose modes may DIFFER (e.g. a
+    w1→w2 taper): ``P_out / P_in`` is then the true power transmission. The bare ``|c|^2`` (power=False) drops each port's ``P_mode``,
     so its ratio is only correct when both ports carry the SAME mode (it cancels);
     for unequal-width ports it is wrong (the historical taper-parity bug).
 
@@ -939,7 +1015,7 @@ def mode_transmission(
         # negative). The modal power carried in the mode's own propagation
         # sense is |a_pm|^2/|P_mode| >= 0 — the same |P| normalization
         # mode_overlap applies to its backward operand.
-        return {f: float(np.abs(a_pm) ** 2 / abs(p_mode))
+        return {f: float(np.abs(a_pm) ** 2 / abs(p_mode) * _UM2_TO_M2)
                 for f, (a_pm, p_mode) in terms.items()}
     return {f: float(np.abs(a_pm) ** 2 / p_mode ** 2)
             for f, (a_pm, p_mode) in terms.items()}
@@ -957,8 +1033,9 @@ def _term_to_quantity(a_pm: complex, p_mode: float, quantity: str):
         return complex(a_pm / p_mode)
     if quantity == "power":
         # |P_mode| so a backward (direction="-") reading is a non-negative
-        # power — see mode_transmission's power branch.
-        return float(np.abs(a_pm) ** 2 / abs(p_mode))
+        # power — see mode_transmission's power branch (incl. the µm²→m²
+        # flux-units factor).
+        return float(np.abs(a_pm) ** 2 / abs(p_mode) * _UM2_TO_M2)
     # "transmission": squared normalised amplitude |c|^2 (self-overlap == 1).
     return float(np.abs(a_pm) ** 2 / p_mode ** 2)
 
@@ -982,8 +1059,8 @@ def mode_decomposition(
 
     This is the multi-mode / multi-frequency generalization of
     :func:`mode_transmission` and :func:`mode_amplitude`, which project onto a
-    SINGLE mode at a time. It is the PhotonHub analogue of Tidy3D's
-    ``ModeMonitor(mode_spec=ModeSpec(num_modes=N), freqs=[...])``: the recorded
+    SINGLE mode at a time. It performs a multi-mode, multi-frequency
+    modal decomposition: the recorded
     field on a port plane is decomposed into the guided-mode basis ``[0..N-1]``,
     so you can read how much power leaves in each mode (and at each frequency),
     separate the fundamental from higher-order content, and check that the modal
@@ -1018,8 +1095,10 @@ def mode_decomposition(
         ``"+"`` forward (default) or ``"-"`` backward — applied to every index.
     quantity:
         ``"transmission"`` (default) → ``|c|² = |a_pm|²/P_mode²`` (real,
-        self-overlap 1); ``"power"`` → ``|a_pm|²/P_mode`` (real modal power, the
-        quantity to ratio across unequal-mode ports); ``"amplitude"`` → the
+        self-overlap 1); ``"power"`` → ``|a_pm|²/P_mode · 1e-12`` (real modal
+        power in the engine's SI flux units — flux-commensurate, see
+        :func:`mode_transmission` ``power=True`` — the quantity to ratio
+        across unequal-mode ports); ``"amplitude"`` → the
         complex normalised amplitude ``c = a_pm/P_mode`` (carries phase, for an
         S-matrix / multimode-port assembler).
     center_um, thickness_axis, colocate:
@@ -1121,7 +1200,7 @@ class ModeOverlap:
     """Result of a mode⇄mode overlap (:func:`mode_overlap`).
 
     Carries BOTH common definitions of "mode overlap" so the caller picks the one
-    their convention wants — Lumerical reports the same pair ("power coupling" and
+    their convention wants — both are in common use ("power coupling" and
     "overlap"):
 
     Attributes
@@ -1134,15 +1213,15 @@ class ModeOverlap:
         operands:
 
         * **both full-vector** (``method="snyder_love"``) — the rigorous Snyder &
-          Love / Tidy3D / Lumerical power coupling
+          Love power coupling
 
               A = ∫ (E₁ × H₂*) · n̂ dA ,   B = ∫ (E₂ × H₁*) · n̂ dA ,
               P_i = ½ Re ∫ (E_i × H_i*) · n̂ dA ,
               power = | ¼ (conj(A) + B) |² / (P₁ P₂)
                     = | ¼ ∫ (E₁* × H₂ + E₂ × H₁*) · n̂ dA |² / (P₁ P₂) .
 
-          This is the physically exact power transfer and reproduces Tidy3D's
-          ``ModeData.dot`` to the colocation floor (~1e-4), carrying the genuine
+          This is the physically exact power transfer and reproduces the standard
+          the analytic power-coupling overlap to the colocation floor (~1e-4), carrying the genuine
           ``n_eff`` (impedance) mismatch through each mode's true ``H``.
 
         * **either operand scalar / Gaussian** (``method="geomean"``) — the bounded,
@@ -1155,7 +1234,7 @@ class ModeOverlap:
         ``power`` is ``1`` for two identical co-propagating modes and ``0`` for
         power-orthogonal modes (e.g. TE0 vs TE1). It is bounded by 1 to within
         discretization error; two *dissimilar* full-vector modes can overshoot 1 by
-        a small margin (``≲ 1e-3`` on a shared grid — Tidy3D's ``dot`` does the same,
+        a small margin (``≲ 1e-3`` on a shared grid — the standard overlap does the same,
         since distinct modes of *different* guides are not a single orthonormal
         basis). Take ``min(power, 1)`` for a hard efficiency, or read :attr:`field`
         for the rigorously bounded overlap.
@@ -1406,8 +1485,9 @@ def mode_overlap(
     e1a, e2a, h1a, h2a = ma["e1"], ma["e2"], ma["h1"], ma["h2"]
     e1b, e2b, h1b, h2b = mb["e1"], mb["e2"], mb["h1"], mb["h2"]
 
-    w1 = _cell_widths(c1)                       # along t1
-    w2 = _cell_widths(c2)                       # along t2
+    _t1, _t2 = _TRANSVERSE[axis]
+    w1 = _widths_with_grid(c1, mode_a, _t1, _t1, _t2)   # along t1
+    w2 = _widths_with_grid(c2, mode_a, _t2, _t1, _t2)   # along t2
     dA = np.outer(w2, w1)                        # [i_t2, i_t1]
 
     # Power coupling — the two-term (E and H) Poynting overlap. n̂-component of a
@@ -1428,11 +1508,11 @@ def mode_overlap(
             f"(P_a={p_a:.3e}, P_b={p_b:.3e}); check that the grid covers each mode.")
 
     # Headline power coupling. When BOTH modes carry a true vector H (a VectorMode
-    # / FDTD-derived mode), use the rigorous Snyder & Love / Tidy3D / Lumerical form
+    # / FDTD-derived mode), use the rigorous Snyder & Love form
     #   power = |¼∫(E_a*×H_b + E_b×H_a*)|² / (P_a P_b) = |¼(conj(A)+B)|² / (P_a P_b),
-    # the physically exact butt-joint power transfer — it matches Tidy3D's
-    # ``ModeData.dot`` to the colocation floor (~1e-4; see
-    # benchmarks/tidy3d/mode_overlap_parity.py), versus the ~1e-3 the geometric-mean
+    # the physically exact butt-joint power transfer — it matches the reference
+    # the analytic overlap to the colocation floor (~1e-4; see
+    # the parity study), versus the ~1e-3 the geometric-mean
     # form costs for dissimilar modes. When EITHER operand is scalar / Gaussian, its
     # (n_eff/η₀)·(ẑ×E) reconstruction of H makes that two-term metric non-positive
     # across an index step (it over-counts by the inverse-Fresnel factor

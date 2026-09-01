@@ -222,10 +222,20 @@ class ModeSolver:
         if eps_arr.ndim != 2:
             raise ValueError(
                 f"eps must be a 2-D [iy, ix] array, got ndim={eps_arr.ndim}")
-        if eps_arr.shape[0] < 3 or eps_arr.shape[1] < 3:
+        # Each axis needs interior points for its second-order stencil (>= 3)
+        # — OR is size 1, the INVARIANT (slab) reduction: that axis carries no
+        # stencil at all and the solve is the 1-D slab eigenproblem along the
+        # other axis (the quasi-2-D cross-section, e.g. every Meep 2-D scene).
+        for axis_len in eps_arr.shape:
+            if axis_len != 1 and axis_len < 3:
+                raise ValueError(
+                    f"eps grid too small {eps_arr.shape}; each axis needs >= 3 "
+                    "points for a second-order stencil, or exactly 1 (an "
+                    "invariant slab axis)")
+        if eps_arr.shape[0] == 1 and eps_arr.shape[1] == 1:
             raise ValueError(
-                f"eps grid too small {eps_arr.shape}; need at least 3x3 so a "
-                "second-order stencil has interior points")
+                f"eps grid {eps_arr.shape} has no transverse extent at all — "
+                "at least one axis must resolve the cross-section")
         if not np.all(np.isfinite(eps_arr)):
             raise ValueError("eps contains non-finite values (NaN/Inf)")
         if np.any(eps_arr < 1.0):
@@ -351,13 +361,25 @@ class ModeSolver:
         flux_x = polarization == "TE"
         flux_y = polarization == "TM"
 
+        # A size-1 axis is INVARIANT (the slab reduction): its derivative term
+        # is identically zero — dropping the stencil, not Dirichlet walls (the
+        # historical unconditional -2/h^2 diagonal was a hard wall squeezing a
+        # nonexistent axis). For a slab varying along x, "TE" (flux-x) is then
+        # the slab TM polarization (E normal to the walls, eps*E continuous)
+        # and "scalar"/"TM" the slab TE (continuous E parallel to the walls —
+        # Meep's 2-D Ez convention).
+        y_invariant = ny == 1
+        x_invariant = nx == 1
+
         for j in range(ny):
             for i in range(nx):
                 p = j * nx + i
                 diag = 0.0
 
                 # --- y-derivative ---
-                if not flux_y:
+                if y_invariant:
+                    pass
+                elif not flux_y:
                     diag += -2.0 * ihy2
                     if j > 0:
                         a[p, p - nx] += ihy2
@@ -374,7 +396,9 @@ class ModeSolver:
                         diag += -ihy2 * g_lo * e[j, i]
 
                 # --- x-derivative ---
-                if not flux_x:
+                if x_invariant:
+                    pass
+                elif not flux_x:
                     diag += -2.0 * ihx2
                     if i > 0:
                         a[p, p - 1] += ihx2

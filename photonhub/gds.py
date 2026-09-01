@@ -13,8 +13,8 @@ requested layer, using that layer's z-extent and medium. Polygon winding is
 normalized to counter-clockwise (the orientation :class:`PolySlab` and the
 rasterizer expect).
 
-This is the client-side analogue of Tidy3D's ``Geometry.from_gds`` paired with a
-``LayerStack``. It is what the GDS benchmark suite (``benchmarks/gds/``) uses to
+It pairs a GDS layout with a layer stack: each layer becomes an extruded
+medium. It is what the GDS benchmark suite (``benchmarks/gds/``) uses to
 build devices from the JPPhotonics ``fdtd-pipeline`` layouts (arXiv:2506.16665).
 
 >>> import photonhub as ph
@@ -83,8 +83,8 @@ def _import_gdstk():
     except ImportError as exc:  # pragma: no cover - exercised only when missing
         raise ImportError(
             "import_gds needs the optional 'gdstk' dependency to read GDSII "
-            "files. Install it with `pip install gdstk` (the same reader Tidy3D "
-            "and gdsfactory use)."
+            "files. Install it with `pip install gdstk` (the same reader "
+            "gdsfactory uses)."
         ) from exc
     return gdstk
 

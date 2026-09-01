@@ -58,7 +58,7 @@ class FieldSnapshotMonitor(FrozenModel):
 
 
 class Apodization(FrozenModel):
-    """Time window applied to a monitor's running DFT (the Tidy3D
+    """Time window applied to a monitor's running DFT (the standard
     ``ApodizationSpec`` analogue, NUMERICS.md section 12). A Gaussian roll-ON of
     standard deviation ``width_s`` for t < ``start_s``, flat (== 1) on
     ``[start_s, end_s]``, and a Gaussian roll-OFF for t > ``end_s`` — used to
@@ -243,9 +243,27 @@ class FieldDftMonitor(FrozenModel):
     component to that component's Yee sublattice, and the engine validator
     REJECTS boxes whose per-component snaps disagree (the output carries one
     shape/origin per monitor). When ``fields`` mixes Yee offsets along an
-    axis, place that axis' box faces strictly between an integer cell
-    boundary and the next half-cell plane — canonically ``(k + 0.25) * dl``,
-    which every component snaps to cell ``k`` with quarter-cell fp margin."""
+    axis, a face belongs strictly between an integer cell boundary and the
+    next half-cell plane — canonically ``(k + 0.25) * dl``, which every
+    component snaps to cell ``k`` with quarter-cell fp margin.
+
+    You do not have to place faces there yourself: building a
+    :class:`~photonhub.Simulation` AUTO-SNAPS every box face that would fail
+    (or pass only on float rounding luck) that engine check to the nearest
+    quarter-cell plane of its local cell, clamped into the grid, and reports
+    each adjustment on the ``photonhub.components.simulation`` DEBUG log.
+    The policy is deterministic and minimal: faces already strictly inside a
+    first half-cell, axes whose listed components share one Yee offset, and
+    faces at/beyond the domain edges (where the engine's index clamp makes
+    every component agree — full-domain boxes stay full-domain) are left
+    byte-identical, and a face and its quarter point snap to the SAME cell,
+    so any scene the engine already accepted keeps its exact recorded
+    region. A sub-half-cell box straddling a cell boundary cannot be snapped
+    and is rejected with guidance at construction. Client-side only: the
+    wire schema is unchanged, documents ingested via ``from_wire_json`` /
+    ``from_file`` are never adjusted, and
+    ``with_auto_grid``/``with_mesh_overrides`` re-apply the snap against the
+    regenerated grid."""
 
     type: Literal["field_dft"] = "field_dft"
     name: MonitorName
@@ -254,14 +272,14 @@ class FieldDftMonitor(FrozenModel):
     fields: Tuple[FieldComponentName, ...] = Field(min_length=1)
     freqs_hz: Tuple[FreqHz, ...] = Field(min_length=1)
     # Per-axis spatial sampling stride (schema 1.11.0, additive/optional — the
-    # Tidy3D interval_space). None (default) records every cell; (sx, sy, sz)
+    # interval_space). None (default) records every cell; (sx, sy, sz)
     # decimates the recorded region along each axis (output cell i -> snapped
     # cell + i*stride), cutting field-monitor output for large planes/volumes.
     # Each stride >= 1. Omitted from the wire when unset (older engines/readers
     # round-trip unchanged); the data layer strides the coordinates to match.
     interval_space: Optional[Tuple[int, int, int]] = None
     # Optional time-apodization of the running DFT (schema 1.13.0, additive —
-    # the Tidy3D ApodizationSpec). None (default) => no window, omitted from the
+    # an apodization spec). None (default) => no window, omitted from the
     # wire so older engines/readers round-trip unchanged.
     apodization: Optional[Apodization] = None
     # Schema 1.16 authoring metadata. The resolved execution object remains this
@@ -299,6 +317,15 @@ class FluxMonitor(FrozenModel):
     section 12). Positive values mean power toward +axis; the reported power
     carries the ``1/|A0*S(f)|^2`` normalization of the shared phasors, so it
     is not absolute watts.
+
+    **Resolving a resonance peak** (Q from a spectrum): the FWHM of a
+    quality-factor-``Q`` peak at ``f0`` is ``f0/Q``, so ``freqs_hz`` must be
+    spaced much finer than that — ``df << f0/Q`` — or the fitted width (and
+    hence Q) is dominated by sampling. E.g. a Q ~ 400 cavity peak needs a
+    dedicated narrow band around ``f0``, not the source's full bandwidth
+    (measured: a full-band 300-point sweep under-read Q by ~13%; a
+    peak-centred band recovered it — the ring-down ``ResonanceFinder`` route
+    avoids the issue entirely).
 
     By default the monitor integrates the FULL transverse plane. Schema 1.17
     adds an optional sub-region WINDOW: pass BOTH ``center_um`` and

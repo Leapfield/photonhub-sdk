@@ -1,0 +1,7 @@
+# Package-local ignores. This file is also what the published sdist carries,
+# so it deliberately contains no repository-internal paths.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/

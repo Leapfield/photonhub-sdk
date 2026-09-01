@@ -34,11 +34,42 @@ MAX_RESOLVED_LAYOUT_CELLS = MAX_INT32
 _FIELD_PITCH = 32
 
 
-def realized_cells(length_um: float, dl_um: float) -> int:
+def axis_min_cells(boundary_kind: str, symmetry: int = 0) -> int:
+    """NUMERICS.md section 1 per-axis cell floor: 1 on a plain periodic axis
+    (no symmetry plane — the quasi-2D/1D reduction, where the ghost copies
+    make every difference across the axis identically zero), 4 on every other
+    boundary kind (PML/absorber need their layer slabs, PEC/PMC mirrors need
+    an interior, and Bloch keeps the historical floor)."""
+    return 1 if (boundary_kind == "periodic" and symmetry == 0) else 4
+
+
+def sim_axis_min_cells(sim, axis_index: int) -> int:
+    """Section 1 floor for one axis of a Simulation-like object. Defensive:
+    objects without a ``boundaries`` attribute (viz plot stubs) get the
+    historical 4 so the helper never widens behavior for them."""
+    bounds = getattr(sim, "boundaries", None)
+    kind = (
+        getattr(bounds, "xyz"[axis_index], None) if bounds is not None else None
+    )
+    if not isinstance(kind, str):
+        return 4
+    symmetry = 0
+    sym = getattr(sim, "symmetry", None)
+    if sym is not None:
+        try:
+            symmetry = int(sym[axis_index])
+        except (TypeError, ValueError, IndexError):
+            symmetry = 0
+    return axis_min_cells(kind, symmetry)
+
+
+def realized_cells(length_um: float, dl_um: float, min_cells: int = 4) -> int:
     """NUMERICS.md section 1 cell-count rule, shared by every client-side
-    consumer: ``n = max(4, round(L/dl))`` with round-half-AWAY-FROM-ZERO —
-    NOT Python's built-in banker's rounding, which would disagree with the
-    engine's ``std::llround`` at exact halves."""
+    consumer: ``n = max(min_cells, round(L/dl))`` with round-half-AWAY-FROM-
+    ZERO — NOT Python's built-in banker's rounding, which would disagree with
+    the engine's ``std::llround`` at exact halves. ``min_cells`` is the
+    boundary-aware section 1 floor (:func:`axis_min_cells`); the default 4 is
+    the non-periodic floor."""
     if (
         not math.isfinite(length_um)
         or not math.isfinite(dl_um)
@@ -63,7 +94,7 @@ def realized_cells(length_um: float, dl_um: float) -> int:
     n = math.floor(x)
     if x - n >= 0.5:
         n += 1
-    return max(4, n)
+    return max(min_cells, n)
 
 
 def enforce_resolved_grid_limits(
@@ -107,14 +138,22 @@ def enforce_resolved_grid_limits(
     return nx, ny, nz
 
 
-def resolved_cell_counts(size_um, grid) -> Tuple[int, int, int]:
-    """Resolve per-axis counts and enforce the engine's beta layout limits."""
+def resolved_cell_counts(
+    size_um, grid, min_cells: Tuple[int, int, int] = (4, 4, 4)
+) -> Tuple[int, int, int]:
+    """Resolve per-axis counts and enforce the engine's beta layout limits.
+
+    ``min_cells`` carries the boundary-aware section 1 floor per axis
+    (:func:`axis_min_cells`); the default keeps the historical non-periodic
+    floor of 4 for callers without boundary context."""
     coords = getattr(grid, "coords", None)
     counts = []
-    for axis, length_um in zip("xyz", size_um):
+    for axis_index, (axis, length_um) in enumerate(zip("xyz", size_um)):
         q = getattr(coords, axis) if coords is not None else None
         counts.append(
-            len(q) if q is not None else realized_cells(length_um, grid.dl_um)
+            len(q)
+            if q is not None
+            else realized_cells(length_um, grid.dl_um, min_cells[axis_index])
         )
     return enforce_resolved_grid_limits(counts)
 
@@ -176,9 +215,140 @@ def snap_mixed_plane(sim, axis_index: int, position_um: float):
     return float(quarters[best]), float(dq[best])
 
 
+# NUMERICS.md section 1.1 Yee sublattice offsets, mirroring the engine's
+# yee_offset() (engine/include/phcore/grid.h) exactly — units of the LOCAL
+# cell along each axis. Two components "mix offsets" along an axis when one
+# samples on the primary (integer) planes and the other half a cell in; only
+# then can the section-12 per-component region snap of a shared box face
+# disagree between them.
+_YEE_OFFSETS_BY_COMPONENT = {
+    "Ex": (0.5, 0.0, 0.0),
+    "Ey": (0.0, 0.5, 0.0),
+    "Ez": (0.0, 0.0, 0.5),
+    "Hx": (0.0, 0.5, 0.5),
+    "Hy": (0.5, 0.0, 0.5),
+    "Hz": (0.5, 0.5, 0.0),
+}
+
+
+def yee_axis_offsets(fields: Iterable[str], axis_index: int) -> set:
+    """Distinct section-1.1 Yee offsets (0.0/0.5) of ``fields`` along an axis."""
+    return {_YEE_OFFSETS_BY_COMPONENT[f][axis_index] for f in fields}
+
+
+def _llround(x: float) -> int:
+    """C++ ``std::llround``: nearest integer, ties half AWAY FROM ZERO.
+    (Python's built-in ``round`` banker's-rounds ties and disagrees at every
+    exact half; the engine snaps with llround, so parity requires this form.)"""
+    return math.floor(x + 0.5) if x >= 0.0 else math.ceil(x - 0.5)
+
+
+def _snap_axis_index(
+    pos_um: float,
+    offset: float,
+    n_cells: int,
+    dl_um: Optional[float],
+    coords_um: Optional[Sequence[float]],
+    spacings_um: Optional[Sequence[float]],
+) -> int:
+    """Engine ``detail::snap_axis`` / ``snap_axis_graded`` (phcore/grid.h),
+    replicated: the CLAMPED index of the nearest Yee node of sublattice
+    ``offset`` along one axis. Uniform: ``llround(pos/dl - offset)`` clamped
+    to [0, n-1]. Graded: the coordinate-nearest node ``q[i] + offset*dq[i]``,
+    ties to the HIGHER index (the engine's ``<=`` scan), search bisected to a
+    4-candidate window (the nodes are strictly increasing, so the nearest one
+    lives within two indices of the bisection point)."""
+    if coords_um is None:
+        i = _llround(pos_um / dl_um - offset)
+        return 0 if i < 0 else (n_cells - 1 if i >= n_cells else i)
+    import bisect
+
+    j = bisect.bisect_left(coords_um, pos_um)
+    best, best_d = 0, -1.0
+    for i in range(max(0, j - 2), min(n_cells, j + 2)):
+        node = coords_um[i] + offset * spacings_um[i]
+        d = abs(pos_um - node)
+        if best_d < 0.0 or d <= best_d:  # <= : ties resolve to the higher index
+            best, best_d = i, d
+    return best
+
+
+def quarter_snap_dft_face(
+    position_um: float,
+    axis_offsets: Iterable[float],
+    *,
+    n_cells: int,
+    dl_um: Optional[float],
+    coords_um: Optional[Sequence[float]] = None,
+    tol_frac: float = 1e-9,
+) -> Optional[float]:
+    """Section-12 auto-snap decision for ONE box face of a DFT field monitor.
+
+    The engine snaps each box corner per listed component to that component's
+    own Yee sublattice and REJECTS the monitor when the snapped indices
+    disagree (resolve.cpp, "the section-12 per-component region snap of ...").
+    With mixed offsets along an axis the agreement region of a face is the
+    OPEN first half-cell ``(k*dl, (k+1/2)*dl)``; exact integer boundaries
+    agree only via a round-half-away tie whose um->meters fp chain is
+    rounding-sensitive ("float luck"), exact half-cell planes and the second
+    half-cell disagree outright — except against the domain edges, where the
+    engine's [0, n-1] clamp restores agreement (which is why full-domain and
+    edge-shaved plugin faces are fine as authored).
+
+    Rather than re-deriving those bands (graded axes shift them by the
+    neighbor-cell spacings), this replicates the engine snap itself for every
+    distinct offset at ``position_um`` and at ``position_um +- tol_frac`` of
+    the local cell: a face whose indices all agree and hold under the probe is
+    left alone (``None``); anything else — a definite engine reject or a tie
+    within fp luck — returns the deterministic replacement, the nearest local
+    quarter point ``q_k + (1/4)*dq_k`` clamped into the grid, which every
+    sublattice snaps to cell ``k`` with quarter-cell margin. A face already
+    at a quarter point is stable, so the snap is idempotent. Single-offset
+    axes never disagree and are never touched.
+    """
+    offsets = sorted(set(axis_offsets))
+    if len(offsets) < 2:
+        return None
+    spacings = None
+    if coords_um is not None:
+        coords_um = tuple(coords_um)
+        spacings = graded_primary_spacings(coords_um)
+        import bisect
+
+        cell = min(max(bisect.bisect_right(coords_um, position_um) - 1, 0),
+                   n_cells - 1)
+        local_dl = spacings[cell]
+    else:
+        local_dl = dl_um
+    tol = tol_frac * local_dl
+    snapped = {
+        _snap_axis_index(pos, off, n_cells, dl_um, coords_um, spacings)
+        for pos in (position_um - tol, position_um, position_um + tol)
+        for off in offsets
+    }
+    if len(snapped) == 1:
+        return None
+    if coords_um is None:
+        k = _llround(position_um / dl_um - 0.25)
+        k = 0 if k < 0 else (n_cells - 1 if k >= n_cells else k)
+        return (k + 0.25) * dl_um
+    import bisect
+
+    j = bisect.bisect_left(coords_um, position_um)
+    best, best_d = 0, -1.0
+    for i in range(max(0, j - 2), min(n_cells, j + 2)):
+        quarter = coords_um[i] + 0.25 * spacings[i]
+        d = abs(position_um - quarter)
+        if best_d < 0.0 or d <= best_d:  # <= : ties resolve to the higher index
+            best, best_d = i, d
+    return coords_um[best] + 0.25 * spacings[best]
+
+
 class UniformGridSpec(FrozenModel):
     """Uniform Cartesian grid, single spacing for all axes.
-    n_axis = max(4, round(L_axis / dl)), round half away from zero."""
+    n_axis = max(n_min, round(L_axis / dl)), round half away from zero, with
+    n_min = 1 on a plain periodic axis (quasi-2D reduction) and 4 otherwise
+    (NUMERICS.md section 1)."""
 
     type: Literal["uniform"] = "uniform"
     dl_um: float = Field(gt=0)
@@ -258,7 +428,7 @@ GridSpecType = Annotated[
 # a product decision, not a numerics one.
 #
 # FOLLOW-UP DECISION (not done in this pass): flipping the default GridSpec to an
-# auto-meshed one (Tidy3D ships AutoGrid as the default). If/when taken, it must
+# auto-meshed one (automatic meshing is the usual default). If/when taken, it must
 # (1) regenerate every golden/example wire file in the same commit (the
 # coordinate arrays move), (2) bump the schema minor and gate it behind a
 # capability/version so older parsers are not silently handed graded specs, and
@@ -287,7 +457,7 @@ _C0_M_PER_S = 2.99792458e8
 def _wavelength_from_source(source) -> float:
     """Free-space wavelength (microns) implied by a source's time profile —
     ``c / freq0_hz`` of its :class:`GaussianPulse`. Used by ``auto_grid`` when
-    no explicit ``wavelength_um`` is given (Tidy3D AutoGrid infers its target
+    no explicit ``wavelength_um`` is given (automatic meshers infer their target
     frequency from the source the same way). Raises if the source has no
     readable ``source_time.freq0_hz``."""
     st = getattr(source, "source_time", None)
@@ -440,7 +610,7 @@ def _axis_target_field(
     ``feature_ceil`` (default True) quantizes each structure interval's target so
     an INTEGER number of cells spans the feature at a size <= the raw target:
     ``eff = width / ceil(width / dl_target)`` where ``width`` is the structure's
-    own extent on this axis. This is Tidy3D's GradedMesher convention
+    own extent on this axis. This is the standard graded-mesher convention
     (``num = ceil(len/dl)``) and guarantees the realized in-material resolution
     is AT LEAST the requested steps-per-wavelength (never coarser) — where the
     bare marcher could land a finite feature just under the target (a partial
@@ -452,11 +622,11 @@ def _axis_target_field(
 
     ``enforced`` carries explicit ``(lo, hi, dl)`` override regions (an
     enforced-refinement box the caller wants meshed at a fixed ``dl`` regardless
-    of the local material — Tidy3D's MeshOverrideStructure); these are NOT padded
+    of the local material — a per-structure mesh override); these are NOT padded
     (the caller sized them) and compete with the material targets, finest wins.
     ``dl_min_um`` is an absolute lower bound: no segment's target may fall below
     it, so a high-index structure or an over-fine override cannot blow up the
-    cell count past the requested floor (Tidy3D AutoGrid ``dl_min``)."""
+    cell count past the requested floor (an absolute ``dl_min`` floor)."""
 
     def dl_of_index(n: float) -> float:
         return wavelength_um / (n * steps_per_wvl)
@@ -467,7 +637,7 @@ def _axis_target_field(
         return max(dl, floor)
 
     def ceil_fit(width: float, dl: float) -> float:
-        """dl shrunk so an INTEGER number of cells spans `width` (Tidy3D's
+        """dl shrunk so an INTEGER number of cells spans `width` (the standard
         num = ceil(width/dl); eff = width/num <= dl). No-op when off, or for a
         degenerate span. The 1e-6 relative tolerance keeps a width that already
         holds a whole number of cells EXACTLY at dl (no 1-ULP perturbation of
@@ -734,7 +904,7 @@ def _snap_axis_coords(
     preserve_first_spacing: bool = False,
 ) -> Tuple[float, ...]:
     """Nudge the marched primary nodes so a node coincides with each structure
-    interface in ``targets`` (Tidy3D AutoGrid grid-line snapping), WITHOUT
+    interface in ``targets`` (grid-line snapping), WITHOUT
     breaking the graded mesh's invariants.
 
     Method — a monotone PIECEWISE-LINEAR remap. For each target we pick the
@@ -920,8 +1090,7 @@ def _snap_axis_coords(
 
 
 class MeshOverride(FrozenModel):
-    """A geometry-based mesh-refinement override — Tidy3D's
-    ``MeshOverrideStructure``. Inside ``geometry`` the auto-mesh is forced to the
+    """A geometry-based mesh-refinement override. Inside ``geometry`` the auto-mesh is forced to the
     target spacing ``dl_um`` REGARDLESS of the local material: a coarse
     background region can be meshed fine, or a structure meshed finer than its
     refractive index alone would call for (a feature edge, a resonant gap, a
@@ -938,7 +1107,7 @@ class MeshOverride(FrozenModel):
 
     ``dl_um`` is either a single spacing applied on every axis, or a per-axis
     ``(dx, dy, dz)`` tuple in which a ``None`` entry leaves that axis ungoverned
-    by this override (Tidy3D's per-component ``dl``). For example
+    by this override (a per-component ``dl``). For example
     ``dl_um=(0.02, 0.02, None)`` refines x and y tightly around a waveguide while
     leaving the propagation axis at the background spacing."""
 
@@ -1034,7 +1203,7 @@ def auto_grid(
     wavelength_um : free-space wavelength of interest (use the SHORTEST in a
         band so every frequency is resolved). Pass ``c / freq`` to drive from a
         frequency. If omitted, it is INFERRED from ``source`` (``c /
-        source.source_time.freq0_hz``) — Tidy3D AutoGrid drives its target
+        source.source_time.freq0_hz``) — automatic meshers drive their target
         frequency from the source the same way. Exactly one of ``wavelength_um``
         / ``source`` must be supplied.
     structures : the simulation's structures. Each is sampled per axis; its
@@ -1066,7 +1235,7 @@ def auto_grid(
     source : optional source object to infer ``wavelength_um`` from when it is
         not given (reads ``source.source_time.freq0_hz``).
     dl_min_um : absolute LOWER bound (microns) on the minimum cell spacing —
-        Tidy3D AutoGrid's ``dl_min``. No medium target or override may push a
+        an absolute ``dl_min`` floor. No medium target or override may push a
         cell below this, so a very high-index inclusion (or an over-fine
         override) cannot explode the cell count. Must be > 0 if given.
     refine_regions : explicit enforced-refinement boxes, each
@@ -1075,15 +1244,15 @@ def auto_grid(
         axis-interval form of a mesh override). The finest of {material target,
         override} wins at every point. ``dl_um`` is still clamped to
         ``dl_min_um``.
-    mesh_overrides : geometry-based :class:`MeshOverride` objects (Tidy3D's
-        ``MeshOverrideStructure``). Each is projected onto every axis it governs
+    mesh_overrides : geometry-based :class:`MeshOverride` objects (a per-structure
+        override). Each is projected onto every axis it governs
         (its per-axis bounding span at the override's ``dl_um``) and merged with
         ``refine_regions`` — the convenient front-end when the refinement region
         is a real scene geometry rather than hand-written axis intervals.
     snap_interfaces : when True (default), nudge the generated nodes so a primary
         grid line lands EXACTLY on each structure interface coordinate (every
         in-domain box face / curved-shape bbox edge / polyslab boundary) and each
-        refine-region edge — Tidy3D AutoGrid grid-line snapping, so a material
+        refine-region edge — grid-line snapping, so a material
         boundary never falls mid-cell. Snapping is a monotone piecewise-linear
         remap that PRESERVES the grading-ratio and ``dl_min`` invariants (a target
         that cannot be reconciled with ``max_grading`` / the floor is abandoned
@@ -1103,10 +1272,10 @@ def auto_grid(
         automatically; only direct ``auto_grid`` callers pass it by hand.
     feature_ceil : when True (default), quantize each structure's target cell so
         an INTEGER number of cells spans the feature at a size <= the requested
-        ``lambda/(n*steps_per_wvl)`` — ``eff = width / ceil(width/dl)``, Tidy3D
-        AutoGrid's convention. This guarantees the realized in-material
+        ``lambda/(n*steps_per_wvl)`` — ``eff = width / ceil(width/dl)``, as standard meshers do.
+        This guarantees the realized in-material
         resolution is AT LEAST ``steps_per_wvl`` (never coarser), matching
-        Tidy3D and removing the run-to-run variance of where the plain marcher
+        and removing the run-to-run variance of where the plain marcher
         lands a partial last cell. A feature that already holds a whole number
         of target cells (or a full-domain medium) is unchanged. False recovers
         the exact-target marcher (realized steps ~= requested, occasionally a

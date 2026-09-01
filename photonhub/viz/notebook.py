@@ -23,6 +23,8 @@ import ctypes
 import io
 import json
 import os
+import re
+import sys
 import tempfile
 import threading
 import time
@@ -38,7 +40,7 @@ _STREAM_LIMIT = 200_000       # chars kept per stream output
 _REPR_LIMIT = 20_000          # chars kept for a result repr
 
 _WELCOME_CODE = """\
-# PhotonHub Workbench notebook — the live workspace is available as `wb`.
+# PhotonHub notebook — the live workspace is available as `wb`.
 #   wb.spec              current Simulation spec (dict, same as the Export tab)
 #   wb.apply(spec)       validate + push a spec to the workbench (3D view updates)
 #   res = wb.run()       run the current setup locally; blocks, returns the result
@@ -191,6 +193,7 @@ class Workbench:
                 "wb.show expects a plotly {'data': [...], 'layout': {...}} dict, "
                 "an object with to_plotly_json(), or a matplotlib figure")
         self._kernel.emit_output(output)
+        _release_pyplot_figure(figure)
 
     def _print_progress(self, progress: Optional[dict], status: str) -> None:
         self._kernel.print_progress_line(_progress_text(progress, status))
@@ -253,6 +256,28 @@ def _figure_output(value: Any) -> Optional[dict]:
     return None
 
 
+def _release_pyplot_figure(value: Any) -> None:
+    """Drop an already-displayed matplotlib figure from pyplot's registry.
+
+    ``_capture_pyplot_figures`` sweeps every figure still open at the end of a
+    cell, so a figure that was displayed explicitly — ``wb.show(fig)``, or a
+    trailing bare ``fig`` — would otherwise be rendered a second time.  The
+    Figure object itself stays usable (``fig.savefig(...)`` still works); only
+    pyplot's book-keeping entry goes, and the end-of-cell sweep closes every
+    figure anyway.
+    """
+    if not callable(getattr(value, "savefig", None)):
+        return                      # plotly dicts and friends: nothing to do
+    plt = sys.modules.get("matplotlib.pyplot")
+    if plt is None:
+        return
+    try:
+        if getattr(value, "number", None) in plt.get_fignums():
+            plt.close(value)
+    except Exception:  # noqa: BLE001 — displaying must never fail on cleanup
+        pass
+
+
 def _json_fallback(value: Any):
     tolist = getattr(value, "tolist", None)
     if callable(tolist):
@@ -263,9 +288,66 @@ def _json_fallback(value: Any):
     return str(value)
 
 
+_LINE_MAGIC_RE = re.compile(r"^\s*%[A-Za-z][A-Za-z0-9_]*(?:\s.*)?$")
+_CELL_MAGIC_RE = re.compile(r"^\s*%%[A-Za-z][A-Za-z0-9_]*(?:\s.*)?$")
+_SHELL_ESCAPE_RE = re.compile(r"^\s*!\s*\S.*$")
+
+
+def _rewrite_magics(code: str) -> tuple[str, list[tuple[int, str]],
+                                        list[tuple[int, str]]]:
+    """Blank out IPython line magics so a pasted gallery cell parses.
+
+    Every notebook under ``examples/notebooks`` opens with ``%matplotlib
+    inline`` — a line this kernel has no reason to honour (the backend is
+    already Agg and figures are captured automatically) and no reason to choke
+    on.  Magic lines are blanked rather than deleted so traceback line numbers
+    keep pointing at the line the user actually wrote.  Cell magics and shell
+    escapes change what the whole cell means, so they are reported rather than
+    quietly dropped.  Returns ``(rewritten source, ignored, unsupported)``,
+    each entry a ``(1-based line number, text)`` pair.
+    """
+    lines = code.splitlines(keepends=True)
+    ignored: list[tuple[int, str]] = []
+    unsupported: list[tuple[int, str]] = []
+    for index, line in enumerate(lines):
+        if _CELL_MAGIC_RE.match(line) or _SHELL_ESCAPE_RE.match(line):
+            unsupported.append((index + 1, line.strip()))
+        elif _LINE_MAGIC_RE.match(line):
+            ignored.append((index + 1, line.strip()))
+            lines[index] = "\n" if line.endswith("\n") else ""
+    return "".join(lines), ignored, unsupported
+
+
+def _parse_cell(code: str, filename: str) -> tuple[ast.Module, list[str]]:
+    """Parse a cell, tolerating the IPython line magics notebooks open with.
+
+    Valid Python parses untouched, so a ``%`` inside a string literal is never
+    even considered.  Beyond that, a magic is only ever blamed when the
+    interpreter's own first complaint lands on the magic line itself — any
+    other syntax error is reported exactly as Python reported it, rather than
+    being rewritten into a guess.
+    """
+    try:
+        return ast.parse(code, filename=filename), []
+    except SyntaxError as original:
+        rewritten, ignored, unsupported = _rewrite_magics(code)
+        flagged = {line for line, _ in ignored} | {line for line, _ in unsupported}
+        if original.lineno not in flagged:
+            raise                     # a real syntax error somewhere else
+        if unsupported:
+            _, text = unsupported[0]
+            raise SyntaxError(
+                "the Workbench notebook runs plain Python, and "
+                f"{text!r} is an IPython cell magic or shell escape. Use the "
+                "Python equivalent (subprocess.run for a shell command), or "
+                "run that cell in Jupyter.") from None
+        # Line numbers survive blanking, so anything still broken reports
+        # against the line the user wrote.
+        return ast.parse(rewritten, filename=filename), [t for _, t in ignored]
+
+
 def _capture_pyplot_figures() -> list[dict]:
     """Collect and close any figures pyplot accumulated during the cell."""
-    import sys
     plt = sys.modules.get("matplotlib.pyplot")
     if plt is None:
         return []
@@ -580,7 +662,11 @@ class NotebookKernel:
         try:
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 try:
-                    tree = ast.parse(code, filename=f"<cell {count}>")
+                    tree, ignored_magics = _parse_cell(
+                        code, filename=f"<cell {count}>")
+                    for magic in ignored_magics:
+                        print(f"ignored IPython magic: {magic}",
+                              file=sys.stderr)
                     trailing = None
                     if tree.body and isinstance(tree.body[-1], ast.Expr):
                         trailing = ast.Expression(tree.body[-1].value)
@@ -596,6 +682,7 @@ class NotebookKernel:
                         figure = _figure_output(value)
                         if figure is not None:
                             live["outputs"].append(figure)
+                            _release_pyplot_figure(value)
                         else:
                             live["outputs"].append({
                                 "type": "result",

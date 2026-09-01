@@ -215,4 +215,31 @@ class GaussianPulse(FrozenModel):
 
 
 # Single member today; new time dependences slot into the union.
-SourceTimeType = Annotated[Union[GaussianPulse], Field(discriminator="type")]
+class CW(FrozenModel):
+    """Continuous wave (NUMERICS.md §5-CW, schema 1.18):
+    ``J(t) = amplitude * ramp(t) * cos(2 pi freq0 t + phase)`` with a C¹
+    smooth sin² turn-on over ``ramp_cycles`` carrier periods, then constant
+    forever. For steady-state analysis: the source never ends, so §7
+    auto-shutoff never fires — set ``run_time_s`` long enough to ring up.
+
+    §12 normalization is defined AT THE CARRIER only: when a CW is the
+    normalization source (first in wire order), every DFT/flux monitor
+    frequency must equal ``freq0_hz`` (``phsolver validate`` enforces);
+    the normalized phasors then converge to the steady-state response per
+    unit drive as the run lengthens. CPU reference solver only in this
+    release."""
+
+    type: Literal["cw"] = "cw"
+    freq0_hz: float = Field(gt=0)
+    ramp_cycles: float = Field(default=10.0, ge=1.0)
+    phase: float = 0.0
+
+    @property
+    def band_freqs_hz(self):
+        # Broadband windowed carriers are a Gaussian-pulse feature; sources
+        # probe this attribute generically.
+        return None
+
+
+SourceTimeType = Annotated[Union[GaussianPulse, CW],
+                           Field(discriminator="type")]

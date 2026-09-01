@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "photonhub"
-version = "0.0.1"
+version = "0.1.1"
 description = "Python client for the PhotonHub GPU FDTD photonics solver"
 readme = "README.md"
 # 3.11 floor: the floor CI exercises is 3.12, and on 3.10 the resolver falls
@@ -50,13 +50,13 @@ test = [
     "pyyaml",
     "gdstk",
     "h5py",
-    "mcp",
+    "mcp>=1,<2",
     "nbformat",
 ]  # complete offline package suite used by CI
 viz = ["plotly", "ipywidgets"]              # plotly = 3D; ipywidgets = interactive_preview
-mcp = ["mcp"]                                # photonhub-mcp agent-tool server
+mcp = ["mcp>=1,<2"]                                # photonhub-mcp agent-tool server
 server = ["fastapi", "uvicorn"]              # photonhub-serve-viz HTTP facade
-app = ["plotly", "fastapi", "uvicorn", "mcp", "h5py", "gdstk"]  # desktop opens bundles + HDF5 results and imports GDSII layouts
+app = ["plotly", "fastapi", "uvicorn", "mcp>=1,<2", "h5py", "gdstk"]  # desktop opens bundles + HDF5 results and imports GDSII layouts
 replicate = ["pyyaml"]                       # PaperSpec.from_yaml parses the YAML paper specs
 gds = ["gdstk"]                              # import/export GDSII
 hdf5 = ["h5py"]                              # SimulationData HDF5 export
@@ -68,6 +68,17 @@ photonhub-mcp = "photonhub._mcp_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["photonhub"]
+
+# The published sdist is the installable client, not the development tree.
+# Tests are deliberately excluded: they carry no value for someone installing
+# from PyPI (several import a competitor's package to assert convention parity
+# and skip without it), and that comparison material is development context we
+# keep in the repository and the public SDK mirror rather than on a public index.
+[tool.hatch.build.targets.sdist]
+include = ["photonhub", "LICENSE", "README.md", "pyproject.toml"]
+# Hatchling adds VCS metadata by default; the repo-root .gitignore names
+# private benchmark paths that do not belong in a published artifact.
+exclude = ["/.gitignore"]  # superseded by photonhub/.gitignore; kept as intent
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

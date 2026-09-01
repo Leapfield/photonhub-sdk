@@ -1204,7 +1204,7 @@ def create_app(result_dir: Optional[str | Path] = None,
 
         Solved field arrays remain part of the execution IR returned in
         ``spec`` but are intentionally absent from the request controls.  This
-        is the Workbench equivalent of a Tidy3D/Lumerical port-mode solve, not
+        is the Workbench's port-mode solve, not
         an invitation to hand-edit tens of thousands of coupled samples.
         """
         request_seq = _begin_workspace_update()
@@ -3610,7 +3610,7 @@ def _main(argv=None) -> int:
     except (OSError, ValueError) as exc:
         if a.release_manifest:
             print(
-                "PhotonHub Workbench installation verification failed; "
+                "PhotonHub installation verification failed; "
                 f"repair or reinstall the application: {exc}",
                 file=__import__("sys").stderr,
             )

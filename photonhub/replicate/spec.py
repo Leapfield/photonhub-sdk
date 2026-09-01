@@ -75,8 +75,8 @@ class Source:
     citation: str
     doi: str = ""
     arxiv: str = ""
-    #: A runnable matched-simulator reference, e.g. ``"tidy3d:WaveguideCrossing"``
-    #: (the Tidy3D example that reproduces this paper). Free text; consumed by the
+    #: A runnable matched-simulator reference, e.g. ``"solver:WaveguideCrossing"``
+    #: (the example that reproduces this paper). Free text; consumed by the
     #: report layer to run a head-to-head comparison when available.
     matched_sim: str = ""
 
@@ -286,7 +286,7 @@ class Convergence:
     medium) until the band-centre metric stops moving within ``tol_pp``."""
 
     ladder_cpw: Tuple[int, ...] = (15, 20, 25, 30)
-    subpixel_method: str = "contour"  # repo default (Tidy3D exact-fill); best for curved walls
+    subpixel_method: str = "contour"  # repo default (exact-fill); best for curved walls
     tol_pp: float = 0.3
 
     @classmethod

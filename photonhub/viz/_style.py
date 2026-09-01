@@ -8,7 +8,8 @@ builder map the same permittivity to the same color and draw the same glyphs.
 
 from typing import Dict, Iterable, Optional, Tuple
 
-from ..components.grid import graded_primary_spacings, realized_cells
+from ..components.grid import (graded_primary_spacings, realized_cells,
+                               sim_axis_min_cells)
 from . import _geometry as geom
 
 _AXES = "xyz"
@@ -182,7 +183,8 @@ def _axis_spacings_um(sim, axis_index: int):
     dl = sim.grid.dl_um
     q = sim._axis_coords_um(axis_index)
     if q is None:
-        n = realized_cells(sim.size_um[axis_index], dl)
+        n = realized_cells(sim.size_um[axis_index], dl,
+                           sim_axis_min_cells(sim, axis_index))
         return dl, dl, n * dl
     dq = graded_primary_spacings(q)
     realized = q[-1] + dq[-1]

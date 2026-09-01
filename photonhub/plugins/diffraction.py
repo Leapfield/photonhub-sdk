@@ -1,7 +1,6 @@
 """Grating diffraction-order decomposition of a periodic DFT plane.
 
-The PhotonHub analogue of Tidy3D's ``DiffractionMonitor`` and Lumerical's
-grating projections, as pure post-processing: a full-plane
+Pure post-processing, no engine support required: a full-plane
 ``FieldDftMonitor`` recording the four tangential components over a
 transverse-PERIODIC unit cell is decomposed into its discrete plane-wave
 (grating) orders — complex s/p amplitudes per order and direction, per-order
@@ -11,12 +10,14 @@ Physics
 =======
 On a plane normal to ``axis`` with both in-plane axes periodic (periods
 ``L1, L2``), the transverse field is exactly a sum of Floquet orders
-``(m1, m2)`` with in-plane wavevectors ``k1 = 2 pi m1 / L1``,
-``k2 = 2 pi m2 / L2`` (normal incidence / zero-phase periodic boundaries —
-the only kind the engine has; the oblique generalization adds the Bloch
-k-offset here when Bloch boundaries land). Each order with
-``|k_t|^2 < (n w / c)^2`` is a propagating plane wave with
-``k_n = sqrt(k^2 - |k_t|^2)``; the rest are evanescent.
+``(m1, m2)`` with in-plane wavevectors ``k1 = k_B1 + 2 pi m1 / L1``,
+``k2 = k_B2 + 2 pi m2 / L2``, where ``k_B`` is the Bloch wavevector of the
+boundaries (0 on plain periodic axes; ``Simulation.bloch_k_per_um`` on
+``"bloch"`` axes — the oblique-incidence order ladder, NUMERICS.md §22).
+The recorded field is only QUASI-periodic under a nonzero ``k_B``, so each
+component is demodulated by ``e^{-i k_B x}`` at its own sample coordinates
+before the FFT. Each order with ``|k_t|^2 < (n w / c)^2`` is a propagating
+plane wave with ``k_n = sqrt(k^2 - |k_t|^2)``; the rest are evanescent.
 
 Per order the four recorded tangential components over-determine the four
 physical unknowns — the complex s- and p-polarized amplitudes travelling
@@ -50,8 +51,6 @@ bookkeeping cross-check, not a physics reference.
 
 What's not handled
 ==================
-* **Oblique incidence** — zero-phase periodic boundaries only (the engine has
-  no Bloch phase yet); the order ladder is un-shifted.
 * **Symmetry-folded planes** — a §20 symmetry plane on an in-plane axis
   folds the recorded half-domain; rebuild is not implemented (raises).
 * **Decimated planes** — ``interval_space`` strides > 1 on an in-plane axis
@@ -67,7 +66,11 @@ from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 import numpy as np
 
-from ..components.grid import snap_mixed_plane
+from ..components.grid import (
+    realized_cells,
+    sim_axis_min_cells,
+    snap_mixed_plane,
+)
 from ._constants import _TANGENTIAL, C0
 from .mode_overlap import ETA0
 
@@ -195,8 +198,38 @@ def _resolve_monitor(simulation, monitor):
     raise ValueError(f"monitor {name!r} not found on the simulation")
 
 
-def _uniform_spacing(coords: np.ndarray, letter: str) -> float:
+def _degenerate_spacing(simulation, letter: str) -> Optional[float]:
+    """Cell size of a 1-cell plain-periodic in-plane axis, else ``None``.
+
+    A quasi-2-D (or quasi-1-D) run reduces one axis to a single plain-periodic
+    cell (NUMERICS.md section 1), so the recorded plane carries ONE sample
+    there and ``np.diff`` cannot supply the spacing.  The physics is exact and
+    trivial: the axis is invariant, its order ladder is the single ``m = 0``
+    term, and the sampled period is one cell.  Only a uniform-at-dl axis can be
+    1-cell, so the parent ``dl_um`` is the spacing.
+    """
+    idx = _AXIS_IDX[letter]
+    grid = getattr(simulation, "grid", None)
+    dl = getattr(grid, "dl_um", None)
+    if dl is None:
+        return None
+    coords = getattr(grid, "coords_um", None)
+    if coords is not None and getattr(coords, letter, None) is not None:
+        return None                     # graded ladder: not a 1-cell axis
+    size = getattr(simulation, "size_um", None)
+    if size is None:
+        return None
+    if realized_cells(float(size[idx]), float(dl),
+                      sim_axis_min_cells(simulation, idx)) != 1:
+        return None
+    return float(dl)
+
+
+def _uniform_spacing(coords: np.ndarray, letter: str,
+                     degenerate_dl: Optional[float] = None) -> float:
     if coords.size < 2:
+        if degenerate_dl is not None:
+            return float(degenerate_dl)   # quasi-2-D invariant axis, m = 0 only
         raise ValueError(
             f"in-plane axis {letter!r} carries {coords.size} sample(s) — a "
             "periodic order decomposition needs the full sampled period "
@@ -264,12 +297,18 @@ def diffraction_orders(
     u1, u2 = _CYCLIC[axis]
 
     # --- physics preconditions ---------------------------------------------
+    # In-plane Bloch offsets (0 on plain periodic axes): the Floquet order
+    # ladder is k_B + 2 pi m / L (NUMERICS.md §22).
+    bk = getattr(simulation, "bloch_k_per_um", None) or (0.0, 0.0, 0.0)
+    kb1 = float(bk[_AXIS_IDX[u1]])
+    kb2 = float(bk[_AXIS_IDX[u2]])
     for letter in (u1, u2):
         kind = getattr(simulation.boundaries, letter, None)
-        if kind != "periodic":
+        if kind not in ("periodic", "bloch"):
             raise ValueError(
                 f"in-plane axis {letter!r} has boundary {kind!r} — grating "
-                "orders need periodic boundaries on both in-plane axes")
+                "orders need periodic (or bloch) boundaries on both in-plane "
+                "axes")
         sym = simulation.symmetry["xyz".index(letter)] if getattr(
             simulation, "symmetry", None) else 0
         if sym:
@@ -297,8 +336,8 @@ def diffraction_orders(
     freqs = np.asarray(da.coords["f"].values, dtype=np.float64)
     p1 = np.asarray(da.coords[u1].values, dtype=np.float64)
     p2 = np.asarray(da.coords[u2].values, dtype=np.float64)
-    d1 = _uniform_spacing(p1, u1)
-    d2 = _uniform_spacing(p2, u2)
+    d1 = _uniform_spacing(p1, u1, _degenerate_spacing(simulation, u1))
+    d2 = _uniform_spacing(p2, u2, _degenerate_spacing(simulation, u2))
     n1, n2 = p1.size, p2.size
     L1, L2 = n1 * d1, n2 * d2
     area = L1 * L2
@@ -336,10 +375,23 @@ def diffraction_orders(
     # e^{-i k_m (p0 + delta d)}.
     m1 = np.fft.fftfreq(n1, d=1.0 / n1)  # integers 0,1,...,-1
     m2 = np.fft.fftfreq(n2, d=1.0 / n2)
-    k1 = 2.0 * math.pi * m1 / L1
-    k2 = 2.0 * math.pi * m2 / L2
+    # Full physical order wavevectors, including the Bloch offset. The FFT
+    # diagonalizes only the PERIODIC factor, so under a nonzero k_B each
+    # component is first demodulated by e^{-i k_B x} at its own sample
+    # coordinates (index part here, p0/stagger part in the referral phase,
+    # which already uses the full k below).
+    k1 = kb1 + 2.0 * math.pi * m1 / L1
+    k2 = kb2 + 2.0 * math.pi * m2 / L2
+    dem1 = (np.exp(-1j * kb1 * d1 * np.arange(n1))[None, :, None]
+            if kb1 != 0.0 else None)
+    dem2 = (np.exp(-1j * kb2 * d2 * np.arange(n2))[None, None, :]
+            if kb2 != 0.0 else None)
 
     def orders_of(arr: np.ndarray, delta1: float, delta2: float) -> np.ndarray:
+        if dem1 is not None:
+            arr = arr * dem1
+        if dem2 is not None:
+            arr = arr * dem2
         c = np.fft.fft2(arr, axes=(1, 2)) / (n1 * n2)
         ph1 = np.exp(-1j * k1 * (p1[0] + delta1 * d1))[None, :, None]
         ph2 = np.exp(-1j * k2 * (p2[0] + delta2 * d2))[None, None, :]

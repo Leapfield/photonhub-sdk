@@ -26,6 +26,7 @@ import numpy as np
 
 from ..viz import _geometry as _geom
 from ..components.grid import (graded_primary_spacings, realized_cells,
+                               sim_axis_min_cells,
                                snap_mixed_plane)
 from ..components.monitors import FieldDftMonitor
 from ..components.sources import ModeSource
@@ -65,7 +66,7 @@ def _axis_cell_centers(simulation, axis_name: str) -> np.ndarray:
     if q is None:  # uniform axis (UniformGridSpec, or a non-graded graded axis)
         dl = simulation.grid.dl_um
         size = simulation.size_um[idx]
-        n = realized_cells(size, dl)
+        n = realized_cells(size, dl, sim_axis_min_cells(simulation, idx))
         return (np.arange(n) + 0.5) * dl
     # Graded axis: cell i spans [q[i], q[i+1]] (q[n] = §15.1 replicate-last
     # closing node), so its center is q[i] + dq[i]/2 with dq the primary
@@ -195,7 +196,7 @@ def mode_source(
     discrete paired-H (``profile_h``). That makes the launch the discrete
     full-vector equivalent-current source (J=n×H_true, M=−n×E_true) instead of the
     scalar-impedance-H limit, which cuts the near-source radiation several-fold (a
-    controlled study is in ``benchmarks/launch_fidelity/``; Tidy3D/Meep use this
+    controlled study is in ``benchmarks/launch_fidelity/``; this is the standard construction and uses
     construction). The launch is then power-normalized (``power_watts = amplitude²``
     so a non-unit ``amplitude`` still scales power as a peak-field would). Pass
     ``paired_h=False`` to force the legacy scalar-limit launch, or pass a scalar
@@ -337,6 +338,36 @@ def _eq_current_ineligible(simulation, mode, modes_by_freq):
     return None
 
 
+def _solved_center_um(mode) -> Optional[Tuple[float, float]]:
+    """The transverse ``(h, v)`` centre the mode was actually SOLVED at, from
+    its ``solve_params`` provenance, or ``None`` when it carries none.
+
+    Defaulting a launch or a readout to the domain centre silently mis-places
+    every off-centre device: the sheet is stamped, and the overlap projected,
+    on a cut the mode was never solved on. It does not raise — the run
+    completes and the numbers look plausible. A measured coupler read
+    through 1.0065 + cross 0.9538 (energy sum 1.96, physically impossible)
+    and passed for a working 3 dB splitter; supplying the solve centre gave
+    0.4922 / 0.5097, sum 1.0020. Every shipped example is centred, so the
+    default was never exercised by the docs.
+
+    ``solve_params`` is recorded by ``solve_mode_on_cross_section`` for every
+    mode except an ``eps_of_medium`` override (which cannot be replayed), so
+    this resolves for the ordinary path.
+    """
+    params = getattr(mode, "solve_params", None)
+    if not params:
+        return None
+    try:
+        h = params["h_center_um"]
+        v = params["v_center_um"]
+    except (KeyError, TypeError):
+        return None
+    if h is None or v is None:
+        return None
+    return float(h), float(v)
+
+
 def mode_launch(
     simulation,
     mode,
@@ -362,7 +393,7 @@ def mode_launch(
     scalar/FLM modes and other ineligible inputs. The eq-current launch's
     near-source radiation falls
     with resolution where §18 floors (0.44→0.09% at 20 nm on a straight strip;
-    see ``benchmarks/launch_fidelity``), and it is what Tidy3D/Meep do; it also
+    see ``benchmarks/launch_fidelity``), and it is the standard construction; it also
     honors §20 symmetry planes automatically. Returns a list because the sheet
     is many dipoles while §18 is one component — a single call, either way.
 
@@ -392,8 +423,16 @@ def mode_launch(
     # center in the (h, v) = in_plane_axes frame (what the Yee/eq stack uses).
     h_letter, v_letter = _geom.in_plane_axes(axis)
     if center_um is None:
-        h_center = simulation.size_um[_AXIS_IDX[h_letter]] / 2.0
-        v_center = simulation.size_um[_AXIS_IDX[v_letter]] / 2.0
+        # Default to where the mode was SOLVED, not the domain centre: an
+        # off-centre waveguide launched at the domain centre is silently
+        # wrong physics (see _solved_center_um). The domain centre remains
+        # the fallback only when the mode carries no provenance to use.
+        solved = _solved_center_um(mode)
+        if solved is not None:
+            h_center, v_center = solved
+        else:
+            h_center = simulation.size_um[_AXIS_IDX[h_letter]] / 2.0
+            v_center = simulation.size_um[_AXIS_IDX[v_letter]] / 2.0
     else:
         h_center, v_center = float(center_um[0]), float(center_um[1])
 
@@ -659,7 +698,7 @@ class ModeMonitor:
     #: re-solves ``mode`` at EVERY monitor frequency through its solve
     #: provenance (``mode.solve_params``, attached by
     #: ``solve_mode_on_cross_section``) and projects each frequency onto its
-    #: own-frequency mode — Tidy3D's ``ModeMonitor`` convention. Silently keeps
+    #: own-frequency mode — the standard mode-monitor convention. Silently keeps
     #: the frozen band-centre mode when the provenance or ``simulation`` is
     #: missing. Set False for the legacy frozen-mode readout.
     per_freq_modes: bool = True
@@ -759,10 +798,17 @@ class ModeMonitor:
         colocate: bool = True,
         destagger_dl=_DESTAGGER_AUTO,
     ) -> Dict[float, float]:
-        """The forward (or backward) modal **power** ``{freq_hz: |a_pm|²/P_mode}``
-        on this plane — the actual power carried by ``mode`` through it, in the
-        run's (source-spectrum-normalized) units. This is NOT a 0–1 transmission
-        on its own; ratio two planes for that (see :func:`transmission`).
+        """The forward (or backward) modal **power** ``{freq_hz:
+        |a_pm|²/P_mode · 1e-12}`` on this plane — the actual power carried by
+        ``mode`` through it, in the run's (source-spectrum-normalized) SI flux
+        units. The value is **flux-commensurate**: it shares both the §12
+        normalization and the SI (m²) area element with a ``FluxMonitor``, so
+        ``mode_power / flux`` on one plane is the modal power fraction (~the
+        modal confinement, O(1)) — see
+        :func:`~photonhub.plugins.mode_overlap.mode_transmission`
+        ``power=True`` for the µm²→m² conversion note. This is still NOT a 0–1
+        transmission on its own; ratio two planes for that (see
+        :func:`transmission`).
 
         Returns true *power* (``|c|²·P_mode``), not the bare squared amplitude
         ``|c|²``, so that ``P_out / P_in`` is the correct power transmission even
@@ -785,7 +831,7 @@ class ModeMonitor:
         **De-stagger is ON by default** (the longitudinal Yee de-stagger; see
         :func:`~photonhub.plugins.mode_overlap.mode_transmission`): when ``colocate``
         is True it uses the monitor's grid ``dl_um`` automatically, matching what
-        Tidy3D's ``ModeMonitor(colocate=True)`` does when it interpolates the
+        a colocating mode monitor does when it interpolates the
         staggered Yee components to common coordinates. Pass ``destagger_dl=None``
         to force it off (e.g. for already-co-located synthetic fields), or a float
         to override the spacing."""
@@ -822,7 +868,7 @@ class ModeMonitor:
         destagger_dl=_DESTAGGER_AUTO,
     ) -> Dict[int, Dict[float, Any]]:
         """Decompose the recorded plane onto MULTIPLE modes → ``{mode_index:
-        {freq_hz: value}}`` (Tidy3D ``ModeMonitor`` with ``num_modes``).
+        {freq_hz: value}}`` (a mode monitor with ``num_modes``).
 
         Projects the plane onto every mode in the bank (each index, each
         frequency) instead of the single ``self.mode`` that :meth:`mode_power`
@@ -830,7 +876,8 @@ class ModeMonitor:
         ``self.mode_bank``; it is ``{freq_hz: {mode_index: Mode}}`` (per-frequency,
         dispersive — see :func:`solve_mode_bank`) or ``{mode_index: Mode}``
         (frozen). ``quantity`` selects ``"transmission"`` (``|c|²``, default),
-        ``"power"`` (``|a_pm|²/P_mode``, the per-mode power to ratio across ports),
+        ``"power"`` (``|a_pm|²/P_mode · 1e-12``, the flux-commensurate per-mode
+        power to ratio across ports),
         or ``"amplitude"`` (complex ``c``, for a multimode S-matrix). See
         :func:`~photonhub.plugins.mode_overlap.mode_decomposition`."""
         bank = mode_bank if mode_bank is not None else self.mode_bank
@@ -882,7 +929,7 @@ def transmission(
 
     The longitudinal Yee de-stagger is applied by default (each monitor uses
     its own grid ``dl_um`` when ``colocate=True``) — it removes the input-plane
-    standing-wave ripple and matches Tidy3D's ``colocate=True`` convention;
+    standing-wave ripple and matches the colocating-readout convention;
     pass ``destagger_dl=None`` to force it off. See
     :meth:`ModeMonitor.mode_power`."""
     p_in = in_monitor.mode_power(data, direction=direction, n_eff=n_eff,
@@ -922,7 +969,7 @@ def mode_monitor(
     ``mode`` came from ``solve_mode_on_cross_section`` (it carries its solve
     provenance), the monitor re-solves the mode at EVERY ``freqs_hz`` on first
     use and projects each recorded frequency onto its own-frequency mode —
-    the per-λ readout Tidy3D's ``ModeMonitor`` performs, now the default here
+    the per-λ readout a standard mode monitor performs, now the default here
     too. False keeps the frozen band-centre ``mode`` for all frequencies (the
     legacy readout)."""
     if axis not in _TRANSVERSE:
@@ -963,7 +1010,12 @@ def mode_monitor(
         field_monitor=fm,
         mode=mode,
         axis=axis,
-        center_um=center_um,
+        # Same default as mode_launch: project the readout where the mode was
+        # SOLVED. A launch and a readout that disagree on the transverse
+        # centre produce a plausible-looking but wrong transmission, which is
+        # exactly how the 1.96 energy sum arose.
+        center_um=center_um if center_um is not None
+        else _solved_center_um(mode),
         direction=direction,
         thickness_axis=thickness_axis,
         modes_by_freq=modes_by_freq,
@@ -985,7 +1037,7 @@ def solve_modes_by_freq(
 ) -> Dict[float, Mode]:
     """Solve the FDE eigenmode at each frequency and return ``{freq_hz: Mode}``,
     ready to hand to :func:`mode_monitor` (or :class:`ModeMonitor`) as
-    ``modes_by_freq`` — the readout-side analogue of Tidy3D's ``num_freqs``.
+    ``modes_by_freq`` — the readout-side per-frequency mode basis.
 
     A single frozen mode is overlapped per frequency by default; with
     ``modes_by_freq`` each recorded DFT frequency is instead projected onto a
@@ -1058,8 +1110,7 @@ def solve_mode_bank(
 
     This is the multi-mode generalization of :func:`solve_modes_by_freq` (which
     keeps only a single ``mode_index`` per frequency) and the readout-side
-    analogue of Tidy3D's ``ModeMonitor(mode_spec=ModeSpec(num_modes=N),
-    num_freqs=M)``: it gives the full guided-mode basis ``mode_indices`` at every
+    multi-mode, multi-frequency basis: it gives the full guided-mode basis ``mode_indices`` at every
     monitor frequency, so a recorded plane can be decomposed into per-mode powers
     (the fundamental vs higher-order content) with the correct per-(mode, λ)
     profile and ``n_eff``.

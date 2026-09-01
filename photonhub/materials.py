@@ -73,6 +73,7 @@ from .components.structures import (MAX_ADE_POLES, DrudePole,
 
 __all__ = [
     "Material",
+    "uniaxial_medium",
     "LorentzFit",
     "Sellmeier",
     "Polynomial",
@@ -281,7 +282,9 @@ class LorentzFit:
         (µm) with the engine's 3-D Courant timestep
         ``dt = courant * dl / (c0 * sqrt(3))``. The engine's ``validate()``
         rejects a pole with ``omega0 * dt >= 2`` (NUMERICS.md §19.4); keep a
-        healthy margin below that."""
+        healthy margin below that. NB: a quasi-2D run (one 1-cell plain
+        periodic axis, NUMERICS §1/§2) steps sqrt(3/2) LARGER than this 3-D
+        estimate — ``validate()`` remains authoritative there."""
         if self.resonance_frequency_hz is None:
             return 0.0
         # lazy import: plugins.__init__ is heavy and materials must stay
@@ -343,7 +346,8 @@ class PoleFit:
     def omega0_dt(self, dl_um: float, courant: float = 0.99) -> float:
         """The largest ``omega0 * dt`` over the fitted Lorentz poles at grid
         spacing ``dl_um`` — must stay < 2 for ADE stability (§19.4; Drude
-        poles impose no resonance bound)."""
+        poles impose no resonance bound). Uses the 3-D Courant dt; a quasi-2D
+        run steps sqrt(3/2) larger (``validate()`` is authoritative)."""
         if not self.lorentz:
             return 0.0
         dt = courant * (dl_um * 1e-6) / (_C0_M_PER_S * math.sqrt(3.0))
@@ -1109,6 +1113,35 @@ PMMA = Material(
     ),
     comments="poly(methyl methacrylate)",
 )
+
+
+def uniaxial_medium(
+    ordinary: "Material",
+    extraordinary: "Material",
+    wavelength_um: float,
+    *,
+    optic_axis: str = "z",
+) -> Medium:
+    """A DIAGONAL anisotropic :class:`Medium` (schema 1.18
+    ``permittivity_xyz``) for a uniaxial crystal frozen at one wavelength:
+    the ordinary index on the two transverse axes, the extraordinary index on
+    ``optic_axis``. This is what the split ``_o`` / ``_e`` library entries
+    exist for:
+
+    >>> lno = uniaxial_medium(LiNbO3_o, LiNbO3_e, 1.55, optic_axis="z")
+
+    Absorption is ignored (the anisotropic engine path is lossless-dielectric
+    v1); the scalar ``permittivity`` carries the ordinary value (required by
+    the wire, ignored by the engine when ``permittivity_xyz`` is set).
+    """
+    if optic_axis not in ("x", "y", "z"):
+        raise ValueError(f"optic_axis must be x/y/z, got {optic_axis!r}")
+    n_o = float(ordinary.n(wavelength_um))
+    n_e = float(extraordinary.n(wavelength_um))
+    eps = {"x": n_o * n_o, "y": n_o * n_o, "z": n_o * n_o}
+    eps[optic_axis] = n_e * n_e
+    return Medium(permittivity=n_o * n_o,
+                  permittivity_xyz=(eps["x"], eps["y"], eps["z"]))
 
 
 # ---------------------------------------------------------------------------

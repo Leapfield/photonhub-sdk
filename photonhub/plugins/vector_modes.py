@@ -9,19 +9,23 @@ it returns *real* hybrid/TM effective indices and **all six** field components.
 It models a straight (z-invariant) waveguide cross-section like the semi-vec, and
 additionally — via an opt-in curvature term + tangential PML (see *Bent
 waveguides* below) — **bent** waveguides with radiation (bend) loss, returning a
-**complex** ``n_eff``. Anisotropy (diagonal ε) is supported; dispersion and a
-fully anisotropic (off-diagonal) ε are out of scope.
+real ``n_eff`` plus positive attenuation index ``k_eff`` (the derived
+``n_eff_complex = n_eff + i*k_eff`` is positive-loss metadata). Anisotropy
+(diagonal ε) is supported; dispersion and a fully anisotropic (off-diagonal) ε
+are out of scope.
 
 Physics / method
 ================
 For a z-invariant cross-section with a **diagonal permittivity tensor**
-``ε(x, y) = diag(εxx, εyy, εzz)``, guided modes have the separable form
-``H(x, y, z, t) = h(x, y) * exp(-i (omega t - beta z))`` — the engine's
-``e^{-i omega t}`` time convention, forward phasor ``e^{+i beta z}`` (see
-``mode_overlap.py``; a note on the longitudinal components' phase under this
-convention lives in the field-reconstruction docstring) — with propagation
-constant ``beta`` and modal index ``n_eff = beta / k0`` (``k0 = 2*pi/lambda``). The
-transverse magnetic field ``[Hx; Hy]`` satisfies the **Fallahkhair–Li–Murphy**
+``ε(x, y) = diag(εxx, εyy, εzz)``, the eigensolver uses the engine convention
+``exp(-i*omega*t + i*beta_store*z)``.  Its positive-loss metadata is
+``beta_store = k0*(n_eff + i*k_eff)``; ``k_eff > 0`` therefore decays along +z.
+Returned :class:`VectorMode` arrays instead use EME's conjugate convention
+``exp(+i*omega*t - i*beta_eme*z)``, with
+``beta_eme = beta_store.conjugate()``.  Lossless transverse fields coincide
+between the two conventions; complex PML/bend fields, their beta, and their
+contour are conjugated together before return.  The transverse magnetic field
+``[Hx; Hy]`` satisfies the **Fallahkhair–Li–Murphy**
 full-vector finite-difference eigenproblem (A.B. Fallahkhair, K.S. Li, T.E.
 Murphy, *"Vector Finite Difference Modesolver for Anisotropic Dielectric
 Waveguides"*, J. Lightwave Technol. **26**(11), 1423–1431, 2008), implemented
@@ -49,20 +53,26 @@ per row → ``O(N)`` nonzeros) and the eigenpairs nearest a target index come fr
 :func:`scipy.sparse.linalg.eigs` in **shift-invert** mode
 (``sigma = (n_guess*k0)^2``, ``which='LM'``) — far cheaper than the semi-vec's
 dense ``O(N^3)`` path, so the ``2N`` problem stays tractable on a generous
-window. Returned eigenpairs are filtered to genuinely guided
-(``n_clad < n_eff < n_core``, near-real positive ``b^2``) and sorted by
-descending ``n_eff``.
+window. :meth:`solve` filters the returned eigenpairs to genuinely guided modes
+(``n_clad < n_eff < n_core``, near-real positive ``b^2``) and sorts them by
+descending ``n_eff``. :meth:`solve_eme_basis` instead targets guided, box/PML
+radiation, and negative-``beta^2`` evanescent parts of one common operator.
+The continuum path is experimental: its analytic operator regressions pass, but
+device-level radiation/PML shell convergence has not yet been demonstrated.
 
 Field reconstruction (all six components)
 =========================================
-From the transverse magnetic field ``(Hx, Hy)`` and ``beta``:
+From the returned transverse magnetic field ``(Hx, Hy)`` and ``beta_eme``:
 
-    Hz = (i / beta) (dHx/dx + dHy/dy)          (from div H = 0),
+    Hz = (-i / beta_eme) (dHx/dx + dHy/dy)     (from div H = 0),
     E  = (1 / (i omega eps)) (curl H)          (Ampere, source-free),
 
 with ``omega = k0 c0``. All six components are returned as complex ``(ny, nx)``
 arrays indexed ``[iy, ix]`` (row = y, col = x). The modal power is the real
-z-Poynting flux ``(1/2) integral Re(E x H*) . z_hat dA``.
+z-Poynting flux ``(1/2) integral Re(E x H*) . z_hat dA``.  The public same-shape
+arrays use a documented component-aware co-location approximation; native FLM
+places H on vertices and E/ε at cell centres, so field-level tensor accuracy is
+not claimed to be identical to a fully staggered FLM reconstruction.
 
 Boundary conditions
 ====================
@@ -74,12 +84,14 @@ and a homogeneous-Dirichlet ghost on the normal-H component.
 x-wall, which makes the lowest mode exactly x-uniform (``kx = 0``) — the 1-D slab
 limit a 2-D solver must reproduce for the analytic-slab validation.
 
-Bent waveguides (complex n_eff = bend loss)
-===========================================
+Bent waveguides (real phase index + loss metadata)
+==================================================
 ``solve(bend_radius_um=R)`` solves the **bent**-waveguide mode of radius ``R``
-(microns) by the **physical cylindrical** treatment. An azimuthal mode evolves as
-``exp(-i ν φ)`` with ``ν = n_eff·k0·R`` (Tidy3D's convention, ``n_eff`` referenced
-at ``R``, so ``R → ∞`` recovers the straight ``n_eff``); substituting into the
+(microns) by the **physical cylindrical** treatment. In the engine/eigensolver
+convention an azimuthal mode evolves as ``exp(+i ν_store φ)``; returned EME
+arrays use ``exp(-i ν_eme φ)`` with ``ν_eme = ν_store.conjugate()``. Here
+``Re(ν_store) = n_eff·k0·R`` (``n_eff`` referenced at ``R``, so ``R → ∞``
+recovers the straight ``n_eff``). Substituting into the
 Helmholtz equation turns the constant longitudinal ``β²`` into the radius-dependent
 ``ν²/r²``, so with ``β₀ = n_eff·k0`` the transverse-H eigenproblem becomes the
 **generalized** problem ``A h = β₀² B h`` where ``A`` is the *ungraded* (physical-ε)
@@ -88,11 +100,11 @@ the radial offset ``x`` (+x outward from the bend center). This ``(R/r)²``
 "centrifugal" weight is the full non-perturbative curvature effect — it replaces the
 older scalar Heiblum–Harris conformal-index map ``ε → ε·exp(2x/R)``, which only
 reproduced the bend shift to first order in ``1/R`` and was ~12× too weak at tight
-radii vs Tidy3D's ``ModeSolver`` (which is mathematically equivalent: a
+radii vs an independent full-vector bend solve (which is mathematically equivalent: a
 transformation-optics radial Jacobian on ε *and* μ — see
 :meth:`_centrifugal_weight`). The reported ``Re(n_eff)`` is the **highest in-band**
 eigenvalue of a clean (PML-free) generalized solve — the physical, outer-shifted
-bend index, matching Tidy3D's "sort by descending neff". A bend radiates, so the
+bend index, sorting by descending neff. A bend radiates, so the
 **loss** ``mode.k_eff`` / ``mode.loss_db_per_cm`` comes from a second generalized
 solve **with** a tangential PML (complex coordinate stretch ``s(x) = 1 + iσ/k0`` on
 the in-plane edges, made by turning the FLM half-cell x-spacings complex): it takes
@@ -104,8 +116,8 @@ real — bit-for-bit the original lossless operator.
 .. note::
    The leaky bend ``n_eff(R)`` (real part) and loss are *window-dependent* for a
    tight, lossy bend (the outward-radiating mode samples the finite window/PML) —
-   the same caveat Tidy3D carries. The match to Tidy3D's ``ModeSolver`` is at the
-   *identical* cross-section + window (``benchmarks/tidy3d/bent_modes/spec.py``,
+   a caveat any bend solver carries. The match to an independent full-vector bend solve is at the
+   *identical* cross-section + window (a fixed bend-mode study,
    5×3 µm). Widen the window ~linearly with ``R`` for a converged result.
 
 Group index
@@ -127,14 +139,24 @@ Public API
   bend_radius_um=None, num_pml=0, pml_strength=30.0)`` — the best-confined guided
   modes, highest ``Re(n_eff)`` first. **No polarization argument**: the
   full-vector solve finds every mode; polarization is a property of the result.
-  ``bend_radius_um`` switches on the bent/leaky (complex-``n_eff``) solve.
-* ``VectorMode`` (frozen dataclass): ``.n_eff`` (real part), ``.k_eff`` (imaginary
-  modal index / loss, 0 for a straight mode), ``.bend_radius_um``, ``.n_group``,
+  ``bend_radius_um`` switches on the bent/leaky solve.
+* ``VectorModeSolver.solve_eme_basis(num_guided=1, num_radiation=0,
+  num_evanescent=0, ...)`` — a common-operator EME basis. Continuum requests
+  use closed-box spectral seeds followed by four-sided complex-coordinate PML
+  continuation; ``pml_cells_xy=(0, 0)`` selects an analytic hard-wall box.
+  Radiation/evanescent requests are experimental and are not yet validated for
+  quantitative device radiation loss.
+* ``VectorMode`` (frozen dataclass): ``.n_eff`` (real phase index), ``.k_eff``
+  (positive passive attenuation metadata, 0 for a straight lossless mode),
+  ``.bend_radius_um``, ``.n_group``,
   the six complex component arrays ``ex, ey, ez, hx, hy, hz``, ``.wavelength_um``,
   ``.dl_x_um``/``.dl_y_um``; derived ``.te_fraction`` / ``.polarization`` /
-  ``.n_eff_complex`` / ``.loss_db_per_cm`` and the helpers
+  ``.n_eff_complex`` (positive-loss engine/eigensolver metadata) /
+  ``.loss_db_per_cm`` and the helpers
   ``.field_dataarray(component=...)`` (xarray, real-space µm coords) and
-  ``.core_fraction(...)``.
+  ``.core_fraction(...)``. EME bases additionally set ``.mode_type``,
+  ``.overlap_weights``, ``.physical_mask``, ``.pml_cells_xy``, and
+  ``.eigen_residual``.
 
 CPU only. Requires :mod:`scipy` (sparse assembly + shift-invert eigensolve);
 :mod:`numpy` + :mod:`xarray` as for the rest of the plugins.
@@ -142,7 +164,7 @@ CPU only. Requires :mod:`scipy` (sparse assembly + shift-invert eigensolve);
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal, Mapping, Optional, Tuple
 
 import numpy as np
@@ -172,10 +194,16 @@ XSymmetry = Literal["none", "pmc"]
 #: Cross-section rasterization for :meth:`VectorModeSolver.from_rectangular_core`.
 #: ``"staircase"`` hard-samples ε (no smoothing); ``"volume"`` area-averages each
 #: boundary cell (arithmetic / second-order on the tangential field); ``"tensor"``
-#: applies the Kottke–Farjadpour–Johnson subpixel **tensor** (harmonic mean for
-#: the interface-normal component, arithmetic for the tangential) so the *normal*
-#: field also converges at second order — the default.
+#: applies a diagonalized Kottke–Farjadpour–Johnson subpixel tensor (harmonic
+#: interface-normal and arithmetic tangential means). It is exact on the
+#: axis-aligned face cells; the diagonal-only solver omits the off-diagonal
+#: xy term of partially filled corner cells — the default.
 SubpixelMethod = Literal["staircase", "volume", "tensor"]
+
+#: Physical role of a mode in an EME basis.  ``solve()`` continues to return
+#: only ``"guided"`` modes; :meth:`VectorModeSolver.solve_eme_basis` additionally
+#: returns PML-discretised radiation and below-cutoff evanescent modes.
+ModeType = Literal["guided", "radiation", "evanescent"]
 
 
 # ---------------------------------------------------------------------------
@@ -274,16 +302,45 @@ def _odd(n: int) -> int:
     return n if n % 2 == 1 else n + 1
 
 
+def _detuned_eigenvalue_shift(beta_squared: complex, k0: float) -> complex:
+    """Move an exact Ritz-value target off the singular shift-invert pole."""
+    return complex(beta_squared + 1e-8 * k0 * k0)
+
+
+def _deterministic_arpack_start(
+    size: int, stream: int = 0, *, complex_dtype: bool = False
+) -> np.ndarray:
+    """Return a reproducible, non-pathological ARPACK starting vector.
+
+    Recent SciPy releases seed ``eigs(rng=None)`` from operating-system entropy,
+    so setting NumPy's legacy global seed does not make a solve reproducible.
+    Supplying ``v0`` avoids that hidden entropy source while retaining distinct
+    starts for a multi-shift search.  The stream is local to one deterministic
+    solve sequence; it is deliberately independent of process-global RNG state.
+    """
+    seed = np.random.SeedSequence((0x50484F54, int(size), int(stream)))
+    rng = np.random.default_rng(seed)
+    values = rng.standard_normal(size)
+    if complex_dtype:
+        values = values + 1j * rng.standard_normal(size)
+    return values / np.linalg.norm(values)
+
+
 @dataclass(frozen=True)
 class VectorMode:
-    """One guided eigenmode of a straight waveguide, **full-vector** (all six
-    field components).
+    """One full-vector waveguide mode (guided, radiation, evanescent, or bent)
+    carrying all six field components.
 
     Attributes
     ----------
     n_eff:
-        Modal effective index ``beta / k0`` (dimensionless, real). For a properly
-        confined guided mode this lies between the cladding and core indices.
+        Real phase index (dimensionless). For a properly confined guided mode
+        this lies between the cladding and core indices.
+    k_eff:
+        Nonnegative passive attenuation metadata.  The engine/eigensolver beta is
+        ``beta_store = k0*(n_eff + i*k_eff)``; ``k_eff > 0`` decays under its
+        ``exp(-i*omega*t + i*beta_store*z)`` convention.  Returned field arrays
+        use the conjugate EME beta ``beta_store.conjugate()``.
     n_group:
         Group index ``n_g = n_eff - lambda dn_eff/dlambda`` (waveguide
         dispersion), or ``None`` if not requested (``solve(group_index=False)``).
@@ -292,8 +349,10 @@ class VectorMode:
         indexed ``[iy, ix]`` (row = y, column = x). The transverse pair
         ``(ex, ey)`` is jointly L2-normalized (``sum |ex|^2 + |ey|^2 == 1``) and
         phase-fixed so the dominant transverse-E component is real-positive at its
-        peak; the other components are scaled consistently with the same
-        eigenvector and ``beta``.
+        peak; the other components share that scale.  All returned arrays use
+        ``exp(+i*omega*t - i*beta_eme*z)`` with
+        ``beta_eme = k0*n_eff_complex.conjugate()``.  For complex PML/bend modes
+        this is intentionally the conjugate of the positive-loss metadata.
     wavelength_um:
         Free-space wavelength the mode was solved at (microns).
     dl_x_um, dl_y_um:
@@ -355,6 +414,36 @@ class VectorMode:
     #: modes (no auto-bank) and for dispatcher solves given an ``eps_of_medium``
     #: override (id-keyed, not replayable).
     solve_params: Optional[Mapping[str, Any]] = None
+    #: Role in an EME expansion.  Kept as a trailing default so existing
+    #: hand-built ``VectorMode`` objects remain source compatible.
+    mode_type: ModeType = "guided"
+    #: Complex-coordinate Jacobian ``s_x(x) s_y(y)`` used by Lorentz/reaction
+    #: overlaps for a PML-discretised modal basis. ``None`` means ordinary real
+    #: quadrature.  This is deliberately separate from physical power
+    #: integration, which never uses a complex contour weight.
+    overlap_weights: Optional[np.ndarray] = None
+    #: Boolean mask selecting the non-PML physical part of the cross-section.
+    #: Hermitian Poynting-flux observables use this mask; reaction overlaps use
+    #: :attr:`overlap_weights`.
+    physical_mask: Optional[np.ndarray] = None
+    #: ``(x, y)`` PML cell counts used for this modal solve.
+    pml_cells_xy: Tuple[int, int] = (0, 0)
+    #: Relative eigenpair residual ``||A h - beta^2 h||`` for spectrum/PML
+    #: solves. ``None`` for legacy and hand-built modes.
+    eigen_residual: Optional[float] = None
+    #: Explicit provenance gate for native-staggered EME matching.  Generic
+    #: ``yee_staggered`` modes include symmetry-reduced and graded solves whose
+    #: reaction mass is not the full uniform box EME assumes.  This flag stays
+    #: False by default and is set True only after
+    #: :func:`solve_yee_eme_basis` validates the complete basis reaction Gram.
+    yee_eme_compatible: bool = False
+    #: Propagation axis and absolute transverse node origin for a validated
+    #: Yee EME basis.  ``center_offset_um`` records only the sub-cell snap
+    #: relative to a requested centre, so it cannot distinguish two otherwise
+    #: identical windows translated in the simulation.  These fields are set
+    #: together with ``yee_eme_compatible`` and checked at every interface.
+    yee_eme_axis: Optional[str] = None
+    yee_eme_origin_um: Optional[Tuple[float, float]] = None
 
     @property
     def shape(self) -> Tuple[int, int]:
@@ -363,14 +452,14 @@ class VectorMode:
 
     @property
     def n_eff_complex(self) -> complex:
-        """Complex modal index ``Re(n_eff) + i Im(n_eff)``. The imaginary part
-        :attr:`k_eff` is the modal attenuation: ``k_eff > 0`` is LOSS — under
-        the engine's ``e^{-i(omega t - beta z)}`` convention a forward mode
-        goes as ``e^{+i beta z}`` with ``beta = k0*(n_eff + i*k_eff)``, so
-        ``k_eff > 0`` gives ``|field| ~ e^{-k0*k_eff*z}``, decay along +z
-        (this is exactly how :attr:`loss_db_per_cm` and the EME propagation
-        factor consume it). Zero for a straight, lossless mode
-        (``bend_radius_um is None``)."""
+        """Positive-loss complex-index metadata for the engine/eigensolver.
+
+        ``beta_store = k0*(n_eff + i*k_eff)`` decays in
+        ``exp(-i*omega*t + i*beta_store*z)`` when ``k_eff > 0``.  The returned
+        field arrays use the conjugate EME phasor, so their curl/propagation
+        constant is ``beta_eme = beta_store.conjugate()`` and EME propagates by
+        ``exp(-i*beta_eme*L)``.  Do not insert this property directly into
+        ``exp(-i*k0*n*L)``; that would turn passive loss into growth."""
         return complex(self.n_eff, self.k_eff)
 
     @property
@@ -380,10 +469,9 @@ class VectorMode:
         ``alpha [1/m] = 2 k0 k_eff`` (field ~ ``exp(-alpha/2 z)`` ⇒ power ~
         ``exp(-alpha z)``), and ``loss[dB/m] = 10 alpha / ln 10``; converted to
         dB/cm. For a bent mode this is the **radiation (bend) loss**; ``0`` for a
-        straight lossless mode. A small *negative* value can appear for a
-        nominally lossless mode from finite-PML residue — the bend solve filters
-        spurious-gain (strongly negative) eigenpairs (see
-        :meth:`VectorModeSolver.solve`)."""
+        straight lossless mode. Solver-produced passive modes have
+        ``k_eff >= 0``. A negative user-supplied value denotes gain metadata; it
+        is not the negative imaginary part of a passive EME field beta."""
         k0 = 2.0 * np.pi / (self.wavelength_um * 1e-6)
         alpha = 2.0 * k0 * self.k_eff           # power attenuation [1/m]
         loss_db_per_m = 10.0 * alpha / np.log(10.0)
@@ -502,10 +590,13 @@ class VectorMode:
               = (1/2) integral Re( Ex Hy* - Ey Hx* ) dA ,
 
         evaluated on the mode's own transverse grid (``dA = dl_x * dl_y`` in m²,
-        midpoint quadrature). The six components are in SI units (E in V/m, H in
-        A/m), so the integral is in watts. Used by the §18 mode-source builder to
-        scale the injected profiles to **1 W** (``profile /= sqrt(P)``), and by
-        any consumer that wants the absolute (not just relative) modal power.
+        midpoint quadrature). For a PML-discretized EME mode,
+        :attr:`physical_mask` excludes the artificial complex-contour cells from
+        this physical observable. The six components are in SI units (E in V/m,
+        H in A/m), so the integral is in watts. Used by the §18 mode-source
+        builder to scale the injected profiles to **1 W**
+        (``profile /= sqrt(P)``), and by any consumer that wants the absolute
+        (not just relative) modal power.
 
         For the dominant-forward (``+z``) guided mode this is positive; a sign
         flip indicates a predominantly backward eigenpair.
@@ -513,6 +604,13 @@ class VectorMode:
         dx = self.dl_x_um * 1e-6
         dy = self.dl_y_um * 1e-6
         sz = np.real(self.ex * np.conj(self.hy) - self.ey * np.conj(self.hx))
+        if self.physical_mask is not None:
+            mask = np.asarray(self.physical_mask, dtype=bool)
+            if mask.shape != sz.shape:
+                raise ValueError(
+                    "physical_mask shape must match the modal field grid"
+                )
+            sz = sz[mask]
         return 0.5 * float(np.sum(sz)) * dx * dy
 
 
@@ -699,14 +797,13 @@ class VectorModeSolver:
             ``False`` hard-samples ε (staircase). ``True`` (default) smooths the
             high-contrast walls; the kind is set by ``subpixel_method``.
         subpixel_method:
-            ``"tensor"`` (default) applies the **Kottke–Farjadpour–Johnson**
-            subpixel tensor — the interface-normal ε-component gets the harmonic
-            mean and the tangential ones the arithmetic mean — so both the normal
-            and tangential fields converge second-order (the FDTD engine's §16
-            smoothing, here in the diagonal-tensor FDE operator). ``"volume"`` uses
-            the scalar area-average (second-order on the tangential field only;
-            the normal-field error stays first-order at high contrast). Ignored
-            when ``subpixel=False``.
+            ``"tensor"`` (default) applies a diagonalized
+            **Kottke–Farjadpour–Johnson** subpixel tensor — the interface-normal
+            ε-component gets the harmonic mean and tangential components the
+            arithmetic mean. This is exact on the rectangle's axis-aligned face
+            cells; at a partially filled corner the diagonal-only FLM solver
+            omits KFJ's off-diagonal xy term. ``"volume"`` uses the scalar
+            area-average. Ignored when ``subpixel=False``.
         """
         if window_w_um is None:
             window_w_um = core_w_um + 2.0 * clad_pad_um
@@ -802,9 +899,9 @@ class VectorModeSolver:
         core_w_um: float, core_h_um: float,
         eps_core: float, eps_clad: float,
     ) -> Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """Centered rectangular core with the **Kottke–Farjadpour–Johnson**
-        subpixel tensor. Returns ``(eps_scalar, (εxx, εyy, εzz))`` indexed
-        ``[iy, ix]``.
+        """Centered rectangular core with a diagonalized
+        **Kottke–Farjadpour–Johnson** subpixel tensor. Returns
+        ``(eps_scalar, (εxx, εyy, εzz))`` indexed ``[iy, ix]``.
 
         Each cell's fill fraction ``f`` (the exact separable axis-aligned overlap)
         and the interface normal ``n̂ = ∇f/|∇f|`` give a diagonal effective tensor:
@@ -814,8 +911,12 @@ class VectorModeSolver:
         combined as ``ε_aa = ε∥ + (ε⊥-ε∥)·n̂_a²`` (KFJ; the FDTD engine's §16.x
         smoothing). ``z`` is always tangential to a z-invariant cross-section, so
         ``εzz = ε∥``. Interior/exterior cells have ``f ∈ {0,1}`` (``ε⊥ = ε∥``), so
-        the tensor is isotropic there. ``eps_scalar`` is the volume average ``ε∥``
-        (the representative scalar for ``self.eps`` / ``n_guess``)."""
+        the tensor is isotropic there. On face cells the interface normal is
+        axis-aligned and this diagonal form is exact. At partially filled corner
+        cells the full KFJ transform also has
+        ``εxy=(ε⊥-ε∥) n_x n_y``; the diagonal-only FLM surface omits that
+        small-measure term. ``eps_scalar`` is the volume average ``ε∥`` (the
+        representative scalar for ``self.eps`` / ``n_guess``)."""
         xs = (np.arange(nx) - (nx - 1) / 2.0) * dl_x_um
         ys = (np.arange(ny) - (ny - 1) / 2.0) * dl_y_um
 
@@ -861,12 +962,14 @@ class VectorModeSolver:
         This is the *physical cylindrical* bend treatment (it replaces the older
         scalar Heiblum–Harris conformal-index map ``ε → ε·exp(2x/R)``, which only
         reproduced the bend shift to first order in ``1/R`` and was ~12× too weak
-        at tight radii vs Tidy3D's ``ModeSolver``). An azimuthal mode of a bend
-        evolves as ``exp(-i ν φ)``; Tidy3D's reported index is ``ν = n_eff·k0·R``
-        (referenced at ``R``, so ``R→∞`` recovers the straight ``n_eff``).
-        Substituting ``exp(-iνφ)`` into the Helmholtz equation, the **longitudinal**
-        term is ``ν²/r²`` instead of a constant ``β²``: with ``β₀ = n_eff·k0 = ν/R``
-        the transverse wave equation reads
+        at tight radii vs an independent bend solve). In the engine convention an
+        azimuthal mode evolves as ``exp(+i ν_store φ)``; returned arrays use the
+        conjugate EME phasor. A reported phase index gives
+        ``Re(ν_store) = n_eff·k0·R`` (referenced at ``R``, so ``R→∞`` recovers the
+        straight ``n_eff``). The squared generalized eigenproblem is insensitive
+        to that phasor sign: its **longitudinal** term is ``ν²/r²`` instead of a
+        constant ``β²``. With ``β₀ = n_eff·k0 = Re(ν_store)/R`` the transverse
+        wave equation reads
 
             ∇ₜ² h + k0² ε(x,y) h = β₀² (R/r)² h ,
 
@@ -874,7 +977,7 @@ class VectorModeSolver:
         mass matrix ``B = diag((R/r)²)`` and ``A`` the *ungraded* (physical-ε)
         straight transverse-H operator. The ``(R/r)²`` "centrifugal" weight is the
         full non-perturbative curvature effect — the dominant term at tight bends,
-        where Tidy3D's ``n_eff(R)`` rises far faster than ``1/R``.
+        where the reported ``n_eff(R)`` rises far faster than ``1/R``.
 
         Returns the per-column ``(R/r)²`` (length ``nx``); all-ones for the
         straight path (``bend_radius_um is None``), so ``B`` is the identity and
@@ -907,17 +1010,17 @@ class VectorModeSolver:
     def _pml_stretch(
         self, nx: int, pml_cells: int, strength: float, k0: float,
     ) -> np.ndarray:
-        """Complex coordinate-stretch factor ``s(x) = 1 + i σ(x)/k0`` per x-column
-        for a tangential PML of ``pml_cells`` layers on **both** x-edges.
+        """Complex coordinate-stretch factor ``s = 1 + i σ/k0`` along one axis
+        for a PML of ``pml_cells`` layers on both ends.
 
         Standard polynomial UPML conductivity profile ``σ(ξ) = σ_max ξ^m`` over the
         normalized PML depth ``ξ∈[0,1]`` (``m=3``); the complex stretch
         ``1 + iσ/k0`` enters the FLM half-cell spacings (so ``∂x → ∂x/s``),
         attenuating outgoing radiation and turning the eigenvalue complex. The
-        ``+i`` sign is set so that a radiating (lossy) mode gets
-        ``Im(n_eff) > 0`` — positive ``k_eff`` = loss, the sign
-        :attr:`VectorMode.loss_db_per_cm` and the EME attenuation consume;
-        the opposite sign would label loss as gain. The PML sits
+        ``+i`` sign belongs to the engine/operator convention and gives a
+        radiating mode positive ``k_eff`` metadata. EME return paths conjugate
+        the stretch, eigenfield, and beta together, while retaining that
+        positive-loss metadata for propagation. The PML sits
         *outside* the guided core (the window is cladding-padded), so it does not
         perturb the bound mode while absorbing the leaky/radiated tail. Returns
         all-ones (real, no stretch) when ``pml_cells == 0`` — the straight,
@@ -932,6 +1035,22 @@ class VectorModeSolver:
         s[nx - pml_cells:] = 1.0 + 1j * sigma               # +x (outer) wall
         s[:pml_cells] = 1.0 + 1j * sigma[::-1]              # -x (inner) wall
         return s
+
+    @staticmethod
+    def _pml_strength_for_imaginary_thickness(
+        pml_cells: int, dl_um: float, imaginary_thickness_um: float,
+    ) -> float:
+        """Convert an integrated imaginary contour thickness to peak strength.
+
+        The stretch is ``s = 1 + i strength * depth**3``.  Describing a PML by
+        ``sum(Im(s) * dl)`` makes grid and PML-cell convergence meaningful,
+        unlike holding the peak profile value fixed while changing the mesh.
+        """
+        if pml_cells <= 0:
+            return 0.0
+        depth = (np.arange(pml_cells, dtype=float) + 1.0) / pml_cells
+        denom = float(dl_um * np.sum(depth ** 3))
+        return float(imaginary_thickness_um / denom) if denom > 0.0 else 0.0
 
     def _core_confinement(
         self, vecs: np.ndarray, nx: int, ny: int,
@@ -967,6 +1086,8 @@ class VectorModeSolver:
         bend_radius_um: Optional[float] = None,
         pml_cells: int = 0,
         pml_strength: float = 5.0,
+        pml_cells_y: int = 0,
+        pml_strength_y: Optional[float] = None,
     ) -> "_sp.csr_matrix":
         """Assemble the sparse ``(2N, 2N)`` full-vector transverse-H operator
         ``[[Pxx, Pxy], [Pyx, Pyy]]`` for a **diagonal permittivity tensor**
@@ -978,19 +1099,19 @@ class VectorModeSolver:
         treatment, :meth:`_centrifugal_weight`), so ``A`` is the *ungraded*
         physical-ε operator. A tangential PML (``pml_cells > 0``) is layered on
         **without touching the FLM stencil derivation** as complex-stretched
-        half-cell x-spacings — they flow through the algebraic coefficient
-        expressions, so the eigenvalue ``β²`` becomes complex (its imaginary part
-        is the radiation/bend loss). With ``pml_cells == 0`` every quantity is real
-        and the operator is **bit-for-bit** the straight, lossless operator.
+        half-cell x-spacings. ``pml_cells_y`` adds the y contour used by an EME
+        radiation basis; the legacy bend path remains x-only. The stretches flow
+        through the algebraic coefficient expressions, so ``β²`` becomes complex.
+        With both PML counts zero every quantity is real and the operator is
+        **bit-for-bit** the straight, lossless operator.
 
         Direct implementation of the Fallahkhair–Li–Murphy anisotropic stencil
         (A.B. Fallahkhair, K.S. Li, T.E. Murphy, JLT 26(11):1423, 2008), Appendix
         eqs (21)–(37): ``Pxx``/``Pxy`` from :func:`_axx_coeffs`/:func:`_axy_coeffs`,
         ``Pyy``/``Pyx`` from the paper's x↔y transformation (36) via
         :func:`_yblock`. Scalar ε (``εxx=εyy=εzz``) recovers the isotropic
-        full-vector operator (the paper's refs [16],[17]); a KFJ subpixel tensor
-        feeds the interface-normal harmonic mean through εyy/εzz so the *normal*
-        field also converges second-order.
+        full-vector operator (the paper's refs [16],[17]); the diagonalized KFJ
+        tensor feeds the interface-normal harmonic mean through εyy/εzz.
 
         Index convention: built in **(ix, iy)** order, ``p = ix*ny + iy`` (x outer,
         y inner), on each ε component transposed to ``[ix, iy]``. The four ε
@@ -1021,20 +1142,28 @@ class VectorModeSolver:
         # ``A`` is the *ungraded* (physical-ε) straight operator, optionally with a
         # complex tangential PML stretch (``pml_cells > 0``) that absorbs the bend
         # radiation and makes the eigenvalue complex (the loss).
-        leaky = pml_cells > 0
+        leaky = pml_cells > 0 or pml_cells_y > 0
         # Uniform half-cell spacings (meters) as length-N arrays, so the published
         # coefficient expressions evaluate verbatim per node.
         dx = self.dl_x_um * 1e-6
         dy = self.dl_y_um * 1e-6
         if leaky:
             sx = self._pml_stretch(nx, pml_cells, pml_strength, k0)  # (nx,) cplx
+            sy = self._pml_stretch(
+                ny,
+                pml_cells_y,
+                pml_strength if pml_strength_y is None else pml_strength_y,
+                k0,
+            )
             # Half-cell distance to the EAST/WEST face carries the average stretch
-            # of the two cells the face separates (e at ix uses
-            # (sx[ix]+sx[ix+1])/2). The tangential PML stretches only x.
+            # of the two cells the face separates. North/south use the analogous
+            # y-contour distance.
             sx_e = 0.5 * (sx + np.r_[sx[1:], sx[-1]])               # face to x+
             sx_w = 0.5 * (sx + np.r_[sx[0], sx[:-1]])               # face to x-
-            n = np.full(N, dy, dtype=complex)            # north  (y+)
-            s = np.full(N, dy, dtype=complex)            # south  (y-)
+            sy_n = 0.5 * (sy + np.r_[sy[1:], sy[-1]])               # face to y+
+            sy_s = 0.5 * (sy + np.r_[sy[0], sy[:-1]])               # face to y-
+            n = (dy * np.tile(sy_n, nx)).astype(complex)    # north (y+)
+            s = (dy * np.tile(sy_s, nx)).astype(complex)    # south (y-)
             e = (dx * np.repeat(sx_e, ny)).astype(complex)   # east  (x+)
             w = (dx * np.repeat(sx_w, ny)).astype(complex)   # west  (x-)
         else:
@@ -1162,14 +1291,15 @@ class VectorModeSolver:
             If set (nonzero), solve the **bent**-waveguide mode of this radius
             (microns) via the physical cylindrical/centrifugal generalized
             eigenproblem ``A h = β₀² B h``, ``B = diag((R/r)²)`` (see
-            :meth:`_centrifugal_weight`); the reported ``n_eff`` follows Tidy3D's
-            convention (field ~ ``exp(i n k0 R φ)``, so ``R→∞`` recovers the
-            straight ``n_eff``). The bend radiates, so a second PML solve makes the
-            eigenvalue **complex** — ``mode.k_eff`` (imaginary index) and
-            ``mode.loss_db_per_cm`` carry the bend loss. The loss solve needs a
-            tangential PML to absorb the radiation; if ``num_pml`` is left at 0 a
-            default PML is used. ``None`` (default) is the straight, lossless solve
-            (``k_eff == 0``).
+            :meth:`_centrifugal_weight`); the reported ``n_eff`` follows the
+            engine convention (field ~ ``exp(+i n k0 R φ)``, so ``R→∞`` recovers
+            the straight ``n_eff``). The real phase index/field branch comes from
+            the clean PML-free solve; a second PML solve supplies positive
+            ``mode.k_eff`` and ``mode.loss_db_per_cm`` bend-loss metadata. The
+            returned arrays are conjugated into the EME phasor. The loss solve
+            needs a tangential PML to absorb the radiation; if ``num_pml`` is
+            left at 0 a default PML is used. ``None`` (default) is the straight,
+            lossless solve (``k_eff == 0``).
         num_pml:
             Number of complex-coordinate-stretched **PML** cells on each in-plane
             (x) window edge (:meth:`_pml_stretch`) so leaky/radiated fields are
@@ -1186,13 +1316,17 @@ class VectorModeSolver:
         tuple[VectorMode, ...]
             Up to ``num_modes`` :class:`VectorMode` objects, highest ``Re(n_eff)``
             first. Fewer are returned if the window supports fewer guided modes.
+            Any complex mode follows the split convention documented on
+            :attr:`VectorMode.n_eff_complex`: positive-loss metadata remains in
+            ``n_eff + i*k_eff``, while the field arrays use its EME conjugate.
 
         Notes
         -----
         **Large-radius spurious-gain trap.** For a wide bend the field is nearly
         bound and its evanescent tail barely reaches the PML; finite PML absorption
-        of that tail can flip the loss sign (nonphysical *gain*, ``Im(n_eff) < 0``)
-        or spawn PML-localized spurious modes — the documented Tidy3D caveat
+        of that tail can flip the engine-metadata loss sign (nonphysical *gain*,
+        ``k_eff < 0``) or spawn PML-localized spurious modes — the documented
+        radiation caveat
         (window/PML size must grow ~linearly with R). The bend solve guards this in
         two layers: (i) the physical mode is selected by **core confinement**
         (:meth:`_core_confinement`), not by ``n_eff`` proximity, so the
@@ -1264,8 +1398,493 @@ class VectorModeSolver:
                 wavelength_um=m.wavelength_um,
                 dl_x_um=m.dl_x_um, dl_y_um=m.dl_y_um,
                 k_eff=m.k_eff, bend_radius_um=m.bend_radius_um,
+                mode_type=m.mode_type,
+                overlap_weights=m.overlap_weights,
+                physical_mask=m.physical_mask,
+                pml_cells_xy=m.pml_cells_xy,
+                eigen_residual=m.eigen_residual,
             ))
         return tuple(out)
+
+    def solve_eme_basis(
+        self,
+        *,
+        num_guided: int = 1,
+        num_radiation: int = 0,
+        num_evanescent: int = 0,
+        n_guess: Optional[float] = None,
+        pml_cells_xy: Optional[Tuple[int, int]] = None,
+        pml_imaginary_thickness_um: Tuple[float, float] = (0.10, 0.10),
+        residual_tolerance: float = 1e-7,
+    ) -> Tuple[VectorMode, ...]:
+        """Return a common-operator EME basis containing guided, radiation and
+        evanescent modes.
+
+        .. warning::
+           Radiation/evanescent and PML requests are experimental. Analytic
+           spectrum/Maxwell checks pass, but the current high-contrast device
+           basis does not stabilize under nested continuum-shell refinement.
+           Require independent mesh, window, PML, basis, and FDTD convergence
+           before interpreting a result as quantitative radiation loss.
+
+        Unlike :meth:`solve`, which deliberately filters to bound guided modes,
+        this method samples the complex spectrum at guided, radiation and
+        negative-``beta^2`` shifts.  When continuum modes are requested it uses
+        a four-sided complex-coordinate PML, so the open radiation continuum is
+        represented by a finite set of passive box/PML modes.  All returned modes
+        come from that *same* operator and therefore retain diagonal propagation.
+        Before return, each PML eigenfield, beta, and complex contour is conjugated
+        together into the EME convention. ``mode.n_eff_complex`` deliberately
+        retains the positive-loss engine eigenvalue as metadata. Thus an
+        evanescent channel has approximately ``n_eff=0, k_eff>0``,
+        ``beta_eme=-i*k0*k_eff``, and the EME propagation factor
+        ``exp(-i*beta_eme*L)=exp(-k0*k_eff*L)`` decays.
+
+        ``pml_cells_xy=(0, 0)`` is an explicit hard-wall box-spectrum mode useful
+        for analytic verification.  Otherwise the default PML occupies roughly
+        one eighth of each transverse window.  Its strength is parameterised by
+        integrated imaginary contour thickness, not a grid-dependent peak. The
+        current classifier requires one homogeneous scalar cladding surrounding
+        all four PML strips; asymmetric air/substrate exteriors need a
+        multi-exterior light-line treatment and are rejected.
+        """
+        counts = (int(num_guided), int(num_radiation), int(num_evanescent))
+        if any(n < 0 for n in counts) or sum(counts) < 1:
+            raise ValueError(
+                "num_guided/num_radiation/num_evanescent must be >= 0 and "
+                "at least one mode must be requested"
+            )
+        if residual_tolerance <= 0.0:
+            raise ValueError("residual_tolerance must be > 0")
+        if len(pml_imaginary_thickness_um) != 2 or any(
+            x < 0.0 or not np.isfinite(x) for x in pml_imaginary_thickness_um
+        ):
+            raise ValueError(
+                "pml_imaginary_thickness_um must be two finite values >= 0"
+            )
+        if num_radiation == 0 and num_evanescent == 0:
+            return self.solve(num_modes=max(1, num_guided), n_guess=n_guess)[
+                :num_guided
+            ]
+
+        ny, nx = self.eps.shape
+        N = nx * ny
+        if N > self.MAX_UNKNOWNS:
+            raise ValueError(
+                f"cross-section has {N} cells, exceeding MAX_UNKNOWNS="
+                f"{self.MAX_UNKNOWNS}"
+            )
+        if pml_cells_xy is None:
+            pml_x = max(3, nx // 8)
+            pml_y = max(3, ny // 8)
+        else:
+            if len(pml_cells_xy) != 2:
+                raise ValueError("pml_cells_xy must be an (x, y) pair")
+            pml_x, pml_y = (int(pml_cells_xy[0]), int(pml_cells_xy[1]))
+        if pml_x < 0 or pml_y < 0:
+            raise ValueError("PML cell counts must be >= 0")
+        if 2 * pml_x >= nx - 2 or 2 * pml_y >= ny - 2:
+            raise ValueError(
+                f"PML ({pml_x}, {pml_y}) leaves too little physical window "
+                f"inside the {nx}x{ny} grid"
+            )
+        if (pml_x == 0) != (pml_y == 0):
+            raise ValueError(
+                "an EME radiation basis needs either four-sided PML or the "
+                "explicit hard-wall box pml_cells_xy=(0, 0)"
+            )
+        if (pml_x > 0 or pml_y > 0) and any(
+            value <= 0.0 for value in pml_imaginary_thickness_um
+        ):
+            raise ValueError(
+                "a nonzero PML requires positive imaginary thickness on both "
+                "axes; use pml_cells_xy=(0, 0) for a hard-wall box"
+            )
+
+        # A PML must lie entirely in homogeneous cladding.  Letting a core or a
+        # material interface enter the complex contour invalidates both the
+        # coordinate transform and its overlap quadrature.
+        if pml_x > 0 or pml_y > 0:
+            mask = np.zeros((ny, nx), dtype=bool)
+            if pml_x > 0:
+                mask[:, :pml_x] = True
+                mask[:, -pml_x:] = True
+            if pml_y > 0:
+                mask[:pml_y, :] = True
+                mask[-pml_y:, :] = True
+            edge = self.eps[mask]
+            clad = float(self.eps.min())
+            if edge.size == 0 or not np.allclose(edge, clad, rtol=1e-8, atol=1e-10):
+                raise ValueError(
+                    "PML overlaps non-cladding material; enlarge the transverse "
+                    "window or reduce pml_cells_xy"
+                )
+
+        wavelength_um = self.wavelength_um
+        k0 = 2.0 * np.pi / (wavelength_um * 1e-6)
+        n_max = float(np.sqrt(self.eps.max()))
+        n_min = float(np.sqrt(self.eps.min()))
+        if n_guess is None:
+            n_guess = n_max
+        strength_x = self._pml_strength_for_imaginary_thickness(
+            pml_x, self.dl_x_um, float(pml_imaginary_thickness_um[0])
+        )
+        strength_y = self._pml_strength_for_imaginary_thickness(
+            pml_y, self.dl_y_um, float(pml_imaginary_thickness_um[1])
+        )
+        closed_seeds: Optional[Tuple[VectorMode, ...]] = None
+        if pml_x > 0 or pml_y > 0:
+            # A blind search of a PML spectrum is dominated by contour-localised
+            # branches.  First solve the corresponding closed box, then target
+            # the open/PML operator at those physical eigenvalues and match on
+            # the non-PML interior.
+            closed_seeds = self.solve_eme_basis(
+                num_guided=num_guided,
+                num_radiation=num_radiation,
+                num_evanescent=num_evanescent,
+                n_guess=n_guess,
+                pml_cells_xy=(0, 0),
+                pml_imaginary_thickness_um=(0.0, 0.0),
+                residual_tolerance=residual_tolerance,
+            )
+        A = self._build_operator(
+            k0,
+            None,
+            pml_x,
+            strength_x,
+            pml_y,
+            strength_y,
+        )
+
+        # Multiple shifts are essential: one high-index solve cannot see enough
+        # of the radiation continuum, while a negative beta^2 shift is required
+        # to retrieve below-cutoff evanescent channels.
+        anchors: list[complex] = []
+        if closed_seeds is not None:
+            anchors.extend(
+                complex((k0 * m.n_eff_complex) ** 2) for m in closed_seeds
+            )
+        else:
+            if num_guided:
+                guided_seeds = self.solve(
+                    num_modes=num_guided, n_guess=n_guess
+                )
+                # ``guided_seeds`` came from this exact hard-wall operator.  Using
+                # one of its eigenvalues verbatim as a shift makes ``A-sigma*I``
+                # singular; depending on the SuperLU pivot path, ARPACK then emits
+                # an exact-shift warning or fails before returning any vectors.
+                # Move only the *search target* by a deterministic, mesh-scale-
+                # negligible amount.  The returned Ritz values/eigenvectors remain
+                # those of ``A``; this is not an eigenvalue perturbation.
+                anchors.extend(
+                    _detuned_eigenvalue_shift((m.n_eff * k0) ** 2, k0)
+                    for m in guided_seeds
+                )
+            if num_radiation:
+                for frac in np.linspace(
+                    0.18, 0.94, min(5, max(2, num_radiation))
+                ):
+                    anchors.append(complex((float(frac) * n_min * k0) ** 2))
+            if num_evanescent:
+                for alpha in np.geomspace(
+                    0.15 * n_min,
+                    1.5 * max(n_min, n_max),
+                    min(5, max(2, num_evanescent)),
+                ):
+                    anchors.append(complex(-(float(alpha) * k0) ** 2))
+
+        per_shift = max(8, 2 * max(counts) + 4)
+        k_req = max(1, min(2 * N - 2, per_shift))
+        candidates: list[tuple[complex, np.ndarray, float]] = []
+        for shift_index, sigma in enumerate(anchors):
+            try:
+                vals, vecs = _spla.eigs(
+                    A,
+                    k=k_req,
+                    sigma=sigma,
+                    which="LM",
+                    v0=_deterministic_arpack_start(
+                        A.shape[0],
+                        shift_index,
+                        complex_dtype=np.issubdtype(A.dtype, np.complexfloating),
+                    ),
+                )
+            except _spla.ArpackNoConvergence as exc:
+                vals, vecs = exc.eigenvalues, exc.eigenvectors
+                if vals.size == 0:
+                    continue
+            for col, val in enumerate(vals):
+                vec = np.asarray(vecs[:, col], dtype=complex)
+                av = A @ vec
+                denom = np.linalg.norm(av) + abs(val) * np.linalg.norm(vec)
+                residual = float(np.linalg.norm(av - val * vec) / max(denom, 1e-300))
+                if not np.isfinite(residual) or residual > residual_tolerance:
+                    continue
+                # Repeated shift-invert searches return arbitrary rotations of a
+                # degenerate eigenspace.  Pairwise collinearity is insufficient:
+                # three different rotations of a two-dimensional eigenspace are
+                # pairwise distinct but collectively rank deficient.  Within
+                # each eigenvalue cluster, retain a vector only when it adds a
+                # numerically independent subspace direction.
+                same_eigenspace: list[np.ndarray] = []
+                for old_val, old_vec, _ in candidates:
+                    close = abs(val - old_val) <= 1e-7 * max(
+                        abs(val), abs(old_val), k0 * k0
+                    )
+                    if close:
+                        same_eigenspace.append(old_vec)
+                independent = True
+                vec_norm = float(np.linalg.norm(vec))
+                if same_eigenspace and vec_norm > 0.0:
+                    cluster = np.column_stack(same_eigenspace)
+                    q, _ = np.linalg.qr(cluster, mode="reduced")
+                    remainder = vec - q @ (q.conj().T @ vec)
+                    independent = (
+                        float(np.linalg.norm(remainder)) / vec_norm > 1e-6
+                    )
+                if independent:
+                    candidates.append((complex(val), vec, residual))
+
+        guided: list[tuple[float, float, VectorMode]] = []
+        radiation: list[tuple[float, float, VectorMode]] = []
+        evanescent: list[tuple[float, float, VectorMode]] = []
+        physical = np.ones((ny, nx), dtype=bool)
+        if pml_x > 0:
+            physical[:, :pml_x] = False
+            physical[:, -pml_x:] = False
+        if pml_y > 0:
+            physical[:pml_y, :] = False
+            physical[-pml_y:, :] = False
+
+        for val, vec, residual in candidates:
+            beta = complex(np.sqrt(val))
+            # Causal forward branch: positive phase for propagating modes and
+            # positive decay for evanescent/complex modes.  Never convert a gain
+            # branch into a loss branch by clamping Im(beta).
+            if val.real < 0.0:
+                if beta.imag < 0.0:
+                    beta = -beta
+            elif beta.real < 0.0:
+                beta = -beta
+            if beta.imag < 0.0:
+                # A well-bound guided seed can pick up a tiny negative PML
+                # residue from the finite contour/discretisation.  Project only
+                # that near-real branch back to the passive axis; a material
+                # negative-imaginary branch is rejected, never relabelled loss.
+                looks_bound = beta.real / k0 > n_min * (1.0 + 1e-6)
+                near_axis = abs(beta.imag) <= 1e-3 * max(abs(beta.real), k0)
+                if looks_bound and near_axis:
+                    beta = complex(beta.real, 0.0)
+                else:
+                    continue
+            if abs(beta) < 1e-12 * k0:
+                continue
+
+            hx = vec[:N].reshape(nx, ny).T.astype(np.complex128)
+            hy = vec[N:].reshape(nx, ny).T.astype(np.complex128)
+            h_energy = np.abs(hx) ** 2 + np.abs(hy) ** 2
+            physical_fraction = float(
+                h_energy[physical].sum() / max(float(h_energy.sum()), 1e-300)
+            )
+            if (pml_x > 0 or pml_y > 0) and physical_fraction < 0.03:
+                continue  # PML-localised numerical branch
+
+            neff_r = float(beta.real / k0)
+            if val.real < 0.0 or abs(neff_r) < 1e-7:
+                kind: ModeType = "evanescent"
+            elif neff_r <= n_min * (1.0 + 1e-6):
+                kind = "radiation"
+            else:
+                kind = "guided"
+            # The sparse operator/PML uses the engine convention
+            # exp(-i*omega*t + i*beta*z). EME uses its complex conjugate
+            # exp(+i*omega*t - i*beta* z). Convert the eigenfield, propagation
+            # constant, and complex contour together before applying the EME
+            # curl reconstruction; retain positive k_eff as storage metadata.
+            mode = self._reconstruct(
+                hx.conj(),
+                hy.conj(),
+                beta.conjugate(),
+                k0,
+                wavelength_um,
+                None,
+                mode_type=kind,
+                pml_cells_xy=(pml_x, pml_y),
+                pml_strength_xy=(-strength_x, -strength_y),
+                eigen_residual=residual,
+            )
+            mode = replace(
+                mode,
+                n_eff=float(beta.real / k0),
+                k_eff=float(beta.imag / k0),
+            )
+            key = (neff_r, float(beta.imag / k0), mode)
+            if kind == "guided":
+                guided.append(key)
+            elif kind == "radiation":
+                radiation.append(key)
+            else:
+                evanescent.append(key)
+
+        guided.sort(key=lambda x: (-x[0], x[1]))
+        radiation.sort(key=lambda x: (-x[0], x[1]))
+        evanescent.sort(key=lambda x: (x[1], -x[0]))
+
+        if closed_seeds is None:
+            selected_guided = [m for _, _, m in guided[:num_guided]]
+            selected_radiation = [m for _, _, m in radiation[:num_radiation]]
+            selected_evanescent = [
+                m for _, _, m in evanescent[:num_evanescent]
+            ]
+        else:
+            # PML beta is complex and can cross the closed-box light-line
+            # classifier.  Classification therefore belongs to the real
+            # closed-box seed, not to the PML eigenvalue.  Match each degenerate
+            # seed *subspace* against one global candidate pool and inherit its
+            # role.  A vector-by-vector greedy match is not rotation invariant:
+            # ARPACK may return arbitrary bases for the same degenerate
+            # eigenspace, allowing the first match to strand its rotated partner
+            # and substitute an unrelated branch for the second.
+            available = [
+                m for _, _, m in (*guided, *radiation, *evanescent)
+            ]
+            selected_by_type: dict[ModeType, list[VectorMode]] = {
+                "guided": [],
+                "radiation": [],
+                "evanescent": [],
+            }
+            interior = physical
+
+            seed_clusters: list[list[VectorMode]] = []
+            for seed in closed_seeds:
+                for cluster in seed_clusters:
+                    reference = cluster[0]
+                    same_type = seed.mode_type == reference.mode_type
+                    beta_close = abs(
+                        seed.n_eff_complex - reference.n_eff_complex
+                    ) <= 1e-6 * max(
+                        abs(seed.n_eff_complex),
+                        abs(reference.n_eff_complex),
+                        1.0,
+                    )
+                    if same_type and beta_close:
+                        cluster.append(seed)
+                        break
+                else:
+                    seed_clusters.append([seed])
+
+            def interior_e(mode: VectorMode) -> np.ndarray:
+                return np.concatenate(
+                    [mode.ex[interior], mode.ey[interior]]
+                )
+
+            for seed_cluster in seed_clusters:
+                kind = seed_cluster[0].mode_type
+                multiplicity = len(seed_cluster)
+                seed_matrix = np.column_stack(
+                    [interior_e(seed) for seed in seed_cluster]
+                )
+                u_seed, singular_values, _ = np.linalg.svd(
+                    seed_matrix, full_matrices=False
+                )
+                if (
+                    singular_values.size < multiplicity
+                    or singular_values[0] <= 0.0
+                    or np.count_nonzero(
+                        singular_values > 1e-8 * singular_values[0]
+                    ) < multiplicity
+                ):
+                    raise RuntimeError(
+                        "closed-box EME seed cluster is rank deficient; "
+                        "increase the window or change the spectral targets"
+                    )
+                seed_subspace = u_seed[:, :multiplicity]
+                beta_center = sum(
+                    seed.n_eff_complex for seed in seed_cluster
+                ) / multiplicity
+
+                scored: list[tuple[float, float, int]] = []
+                for i, candidate in enumerate(available):
+                    candidate_e = interior_e(candidate)
+                    candidate_norm = float(np.linalg.norm(candidate_e))
+                    if candidate_norm <= 0.0:
+                        continue
+                    # Squared projection onto the entire seed subspace is
+                    # invariant to rotations within a degenerate eigenbasis.
+                    projection = float(
+                        np.linalg.norm(
+                            seed_subspace.conj().T @ candidate_e
+                        ) ** 2
+                        / candidate_norm**2
+                    )
+                    beta_gap = abs(
+                        candidate.n_eff_complex - beta_center
+                    ) / max(abs(beta_center), 1.0)
+                    scored.append(
+                        (projection - 0.05 * beta_gap, projection, i)
+                    )
+                scored.sort(reverse=True)
+                chosen = scored[:multiplicity]
+                if (
+                    len(chosen) < multiplicity
+                    or min(item[1] for item in chosen) < 0.10
+                ):
+                    raise RuntimeError(
+                        "PML/closed-box modal-subspace correspondence is "
+                        "ambiguous; enlarge the physical window or weaken the "
+                        "complex contour"
+                    )
+
+                # Selection happened for the cluster as a whole.  Reorder only
+                # within that fixed set for deterministic seed association; this
+                # cannot eject a correct rotated partner.
+                chosen_indices = [item[2] for item in chosen]
+                chosen_modes = [available[i] for i in chosen_indices]
+                ordered: list[VectorMode] = []
+                remaining = list(chosen_modes)
+                for seed in seed_cluster:
+                    seed_e = interior_e(seed)
+                    seed_norm = float(np.linalg.norm(seed_e))
+                    best_i = max(
+                        range(len(remaining)),
+                        key=lambda i: (
+                            abs(np.vdot(seed_e, interior_e(remaining[i])))
+                            / max(
+                                seed_norm
+                                * float(np.linalg.norm(interior_e(remaining[i]))),
+                                1e-300,
+                            )
+                            - 0.05
+                            * abs(
+                                remaining[i].n_eff_complex
+                                - seed.n_eff_complex
+                            )
+                            / max(abs(seed.n_eff_complex), 1.0)
+                        ),
+                    )
+                    ordered.append(remaining.pop(best_i))
+                for i in sorted(chosen_indices, reverse=True):
+                    available.pop(i)
+                selected_by_type[kind].extend(
+                    replace(candidate, mode_type=kind)
+                    for candidate in ordered
+                )
+            selected_guided = selected_by_type["guided"]
+            selected_radiation = selected_by_type["radiation"]
+            selected_evanescent = selected_by_type["evanescent"]
+        picked = selected_guided + selected_radiation + selected_evanescent
+        got = (
+            len(selected_guided),
+            len(selected_radiation),
+            len(selected_evanescent),
+        )
+        if got != counts:
+            raise RuntimeError(
+                "EME basis spectrum incomplete: requested "
+                f"guided/radiation/evanescent={counts}, found {got}. Increase "
+                "the window, relax residual_tolerance, or change the PML contour."
+            )
+        return tuple(picked)
 
     # -- internals ----------------------------------------------------------
 
@@ -1287,9 +1906,10 @@ class VectorModeSolver:
         the **generalized** eigenproblem ``A h = β₀² B h`` with the centrifugal
         mass matrix ``B = diag((R/r)²)`` (:meth:`_mass_matrix`) — the physical
         cylindrical treatment (see :meth:`_centrifugal_weight`). The reported
-        ``Re(n_eff)`` is the physical bend index (Tidy3D's ``exp(-iνφ)``,
-        ``ν = n_eff k0 R``); when a PML is present the **loss** (``k_eff``) comes
-        from the radiating confined mode (a second PML eigensolve)."""
+        real ``n_eff`` is the physical bend phase index; when a PML is present
+        the positive-loss metadata ``k_eff`` comes from the radiating confined
+        mode (a second PML eigensolve). Returned fields use the conjugate EME
+        phasor."""
         eps = self.eps
         ny, nx = eps.shape
         N = nx * ny
@@ -1301,7 +1921,7 @@ class VectorModeSolver:
             n_guess = n_max
 
         # Guided band on Re(β²). The bend pushes Re(n_eff) WELL above the straight
-        # n_max at tight radii (Tidy3D: n_eff(R=5) ~ 1.99 for an n_max=2 core), so a
+        # n_max at tight radii (reference: n_eff(R=5) ~ 1.99 for an n_max=2 core), so a
         # generous upper margin is needed; the straight path keeps the tight band.
         margin = 1.0 if not is_bend else 1.5
         upper = (k0 * n_max * margin) ** 2
@@ -1315,7 +1935,16 @@ class VectorModeSolver:
             extra = 16 if num_pml > 0 else 6
             k_req = max(1, min(2 * N - 2, max(num_modes + extra, 2 * num_modes)))
             try:
-                vals, vecs = _spla.eigs(A, k=k_req, sigma=sigma, which="LM")
+                vals, vecs = _spla.eigs(
+                    A,
+                    k=k_req,
+                    sigma=sigma,
+                    which="LM",
+                    v0=_deterministic_arpack_start(
+                        A.shape[0],
+                        complex_dtype=np.issubdtype(A.dtype, np.complexfloating),
+                    ),
+                )
             except _spla.ArpackNoConvergence as exc:
                 vals, vecs = exc.eigenvalues, exc.eigenvectors
                 if vals.size == 0:
@@ -1345,14 +1974,30 @@ class VectorModeSolver:
                 vec = vecs[:, col]
                 hx = vec[:N].reshape(nx, ny).T.astype(np.complex128)
                 hy = vec[N:].reshape(nx, ny).T.astype(np.complex128)
-                out.append(self._reconstruct(hx, hy, beta, k0, wavelength_um, None))
+                if num_pml > 0:
+                    mode = self._reconstruct(
+                        hx.conj(), hy.conj(), beta.conjugate(),
+                        k0, wavelength_um, None,
+                        pml_cells_xy=(num_pml, 0),
+                        pml_strength_xy=(-pml_strength, 0.0),
+                    )
+                    mode = replace(
+                        mode,
+                        n_eff=float(beta.real / k0),
+                        k_eff=float(beta.imag / k0),
+                    )
+                else:
+                    mode = self._reconstruct(
+                        hx, hy, beta, k0, wavelength_um, None
+                    )
+                out.append(mode)
             return tuple(out)
 
         # ---- bent path: generalized eigenproblem A h = β₀² B h ----------------
         # (1) n_eff (and the fields) come from a PML-FREE generalized solve, where
         #     the physical bend mode is the **highest in-band Re(n_eff)** — the
         #     centrifugal weight makes the outer-shifted mode the top guided one,
-        #     matching Tidy3D's "sort by descending neff". (No PML here keeps the
+        #     sorting by descending neff. (No PML here keeps the
         #     real-index spectrum clean: PML adds dense leaky/edge eigenpairs that
         #     muddy the highest-n selection.)
         # (2) the loss (k_eff) comes from a SEPARATE PML solve, taking the radiating
@@ -1368,10 +2013,16 @@ class VectorModeSolver:
         anchors = (n_guess, n_guess + 0.3 * (n_max - n_min),
                    min(n_max * (margin - 1e-3), n_guess + 0.6 * (n_max - n_min)))
         seen: set[int] = set()
-        for a in anchors:
+        for anchor_index, a in enumerate(anchors):
             try:
-                vals, vecs = _spla.eigs(A0, k=k_req, M=B,
-                                        sigma=float((a * k0) ** 2), which="LM")
+                vals, vecs = _spla.eigs(
+                    A0,
+                    k=k_req,
+                    M=B,
+                    sigma=float((a * k0) ** 2),
+                    which="LM",
+                    v0=_deterministic_arpack_start(A0.shape[0], anchor_index),
+                )
             except _spla.ArpackNoConvergence as exc:
                 vals, vecs = exc.eigenvalues, exc.eigenvectors
                 if vals.size == 0:
@@ -1404,8 +2055,21 @@ class VectorModeSolver:
             beta = complex(neff * k0, loss_keff * k0)
             hx = vec[:N].reshape(nx, ny).T.astype(np.complex128)
             hy = vec[N:].reshape(nx, ny).T.astype(np.complex128)
-            out.append(self._reconstruct(hx, hy, beta, k0, wavelength_um,
-                                         bend_radius_um))
+            # The generalized/PML eigensolve uses the engine phasor
+            # exp(-i*omega*t + i*beta*z), whereas _reconstruct and EME use its
+            # conjugate.  Convert the field and beta together, then retain the
+            # passive positive-loss value as public propagation metadata.
+            mode = self._reconstruct(
+                hx.conj(),
+                hy.conj(),
+                beta.conjugate(),
+                k0,
+                wavelength_um,
+                bend_radius_um,
+            )
+            out.append(
+                replace(mode, n_eff=neff, k_eff=loss_keff)
+            )
         return tuple(out)
 
     def _bend_loss_keff(
@@ -1428,8 +2092,16 @@ class VectorModeSolver:
         A = self._build_operator(k0, None, num_pml, pml_strength)   # complex (PML)
         k_req = max(1, min(2 * N - 2, 24))
         try:
-            vals, vecs = _spla.eigs(A, k=k_req, M=Bc,
-                                    sigma=complex((n_guess * k0) ** 2), which="LM")
+            vals, vecs = _spla.eigs(
+                A,
+                k=k_req,
+                M=Bc,
+                sigma=complex((n_guess * k0) ** 2),
+                which="LM",
+                v0=_deterministic_arpack_start(
+                    A.shape[0], complex_dtype=True
+                ),
+            )
         except _spla.ArpackNoConvergence as exc:
             vals, vecs = exc.eigenvalues, exc.eigenvectors
             if vals.size == 0:
@@ -1458,25 +2130,27 @@ class VectorModeSolver:
         k0: float,
         wavelength_um: float,
         bend_radius_um: Optional[float] = None,
+        *,
+        mode_type: ModeType = "guided",
+        pml_cells_xy: Tuple[int, int] = (0, 0),
+        pml_strength_xy: Tuple[float, float] = (0.0, 0.0),
+        eigen_residual: Optional[float] = None,
     ) -> VectorMode:
         """Reconstruct all six complex field components from ``(Hx, Hy, beta)``.
 
-        ``beta`` may be **complex** for a bent/leaky mode (its imaginary part is
-        the modal attenuation); the curl/divergence algebra below already uses
-        ``1j*beta`` so it carries through, and the returned :class:`VectorMode`
-        records ``k_eff = Im(beta)/k0`` and ``bend_radius_um``.
+        ``beta`` is always the returned-field/EME constant:
+        ``beta_eme = beta_store.conjugate()`` for a complex passive mode.
+        Consequently its imaginary part is negative for passive loss. Complex
+        callers conjugate the engine eigenfield, beta, and PML contour together,
+        then restore positive ``n_eff``/``k_eff`` engine metadata on the public
+        mode after reconstruction.
 
-        Ampère + ``div H = 0``. NOTE ON THE PHASOR SIGN: the algebra below is
-        written with ``d/dz -> -i beta`` — the ``exp(+i(omega t - beta z))``
-        phasor, the CONJUGATE of the engine's ``e^{-i omega t}`` convention the
-        rest of the stack (and this module's headline) uses. For the lossless
-        straight modes returned here the transverse fields are real, so both
-        conventions coincide there; the LONGITUDINAL components ``Ez``/``Hz``
-        (purely imaginary) come out as the complex conjugates of the
-        engine-convention fields (their imaginary parts carry the opposite
-        sign). Transverse-only consumers (mode overlap, EME, launch profiles)
-        are unaffected; anything consuming Ez/Hz phases against engine DFT
-        data must conjugate. With ``omega = k0 c0``:
+        Ampère + ``div H = 0`` use ``d/dz -> -i beta`` under
+        ``exp(+i*omega*t - i*beta*z)``. For lossless straight modes the transverse
+        fields coincide with the engine convention; the purely imaginary
+        longitudinal components carry the conjugate sign. Anything comparing
+        ``Ez/Hz`` phase directly against engine DFT data must conjugate. With
+        ``omega = k0 c0``:
 
             Hz = (-i / beta) (dHx/dx + dHy/dy),                 (div H = 0)
             (curl H)_x = dHz/dy + i beta Hy,
@@ -1484,18 +2158,18 @@ class VectorModeSolver:
             (curl H)_z = dHy/dx - dHx/dy,
             E = (1 / (i omega eps0 eps_eff)) curl H.
 
-        The permittivity used per E-component is **tangential-averaged**: ``Ex``
-        is continuous across the y/z interfaces (tangential there) and jumps only
-        across x, so it is divided by ``eps`` smoothed along y; ``Ey`` by ``eps``
-        smoothed along x; ``Ez`` (everywhere tangential to the cross-section
-        interfaces) by ``eps`` smoothed in both. This is the standard
-        tangential-field permittivity averaging — it honours the actual
-        field-continuity conditions so the dominant transverse E stays confined
-        in the core (a *pointwise* ``curl/eps`` instead spuriously amplifies the
-        tangential component on the low-index side of every interface). The sharp
-        normal-E discontinuity is preserved (no averaging across the normal
-        direction). The transverse-E pair is L2-normalized and phase-fixed on the
-        dominant component's magnitude peak."""
+        This legacy public surface collocates H and E onto one same-size node
+        array, whereas the native FLM lattice places H on cell vertices and
+        ``D/E/ε`` at cell centres.  Until that staggered registration is exposed
+        here, reconstruction uses a component-aware co-location bridge:
+        ``Ex`` smooths ``εxx`` along y, ``Ey`` smooths ``εyy`` along x, and
+        ``Ez`` smooths ``εzz`` along both.  This preserves the KFJ normal versus
+        tangential tensor distinction and is materially closer to the reference
+        cell-centred FLM fields than either scalar-ε division or direct tensor
+        division at the wrong lattice points.  It is an approximation, not a
+        replacement for native vertex-to-cell FLM reconstruction.  The
+        transverse-E pair is L2-normalized and phase-fixed on the dominant
+        component's magnitude peak."""
         ny, nx = hx.shape
         dx = self.dl_x_um * 1e-6
         dy = self.dl_y_um * 1e-6
@@ -1504,19 +2178,43 @@ class VectorModeSolver:
         # F/m = (mu0 c0^2)^-1, CODATA 2018 (matches engine kEps0 in types.h).
         eps0 = EPS0
 
-        def ddx(f: np.ndarray) -> np.ndarray:
-            g = np.zeros_like(f)
-            g[:, 1:-1] = (f[:, 2:] - f[:, :-2]) / (2.0 * dx)
-            g[:, 0] = (f[:, 1] - f[:, 0]) / dx
-            g[:, -1] = (f[:, -1] - f[:, -2]) / dx
+        pml_x, pml_y = (int(pml_cells_xy[0]), int(pml_cells_xy[1]))
+        strength_x, strength_y = (
+            float(pml_strength_xy[0]), float(pml_strength_xy[1])
+        )
+        sx = self._pml_stretch(nx, pml_x, strength_x, k0)
+        sy = self._pml_stretch(ny, pml_y, strength_y, k0)
+
+        def derivative(
+            f: np.ndarray, spacing: float, stretch: np.ndarray, axis: int,
+        ) -> np.ndarray:
+            """Differentiate on the same complex coordinate contour as the
+            eigen-operator.  Face distances are the arithmetic stretch average;
+            a centred denominator is the sum of its two adjacent face distances.
+            """
+            face = 0.5 * (stretch[:-1] + stretch[1:]) * spacing
+            g = np.zeros_like(f, dtype=complex)
+            if axis == 1:
+                g[:, 1:-1] = (
+                    (f[:, 2:] - f[:, :-2])
+                    / (face[:-1] + face[1:])[None, :]
+                )
+                g[:, 0] = (f[:, 1] - f[:, 0]) / face[0]
+                g[:, -1] = (f[:, -1] - f[:, -2]) / face[-1]
+            else:
+                g[1:-1, :] = (
+                    (f[2:, :] - f[:-2, :])
+                    / (face[:-1] + face[1:])[:, None]
+                )
+                g[0, :] = (f[1, :] - f[0, :]) / face[0]
+                g[-1, :] = (f[-1, :] - f[-2, :]) / face[-1]
             return g
 
+        def ddx(f: np.ndarray) -> np.ndarray:
+            return derivative(f, dx, sx, axis=1)
+
         def ddy(f: np.ndarray) -> np.ndarray:
-            g = np.zeros_like(f)
-            g[1:-1, :] = (f[2:, :] - f[:-2, :]) / (2.0 * dy)
-            g[0, :] = (f[1, :] - f[0, :]) / dy
-            g[-1, :] = (f[-1, :] - f[-2, :]) / dy
-            return g
+            return derivative(f, dy, sy, axis=0)
 
         # Hz from div(H)=0: dHx/dx + dHy/dy - i*beta*Hz = 0 -> Hz = (-i/beta)(...).
         hz = (-1j / beta) * (ddx(hx) + ddy(hy))
@@ -1525,10 +2223,10 @@ class VectorModeSolver:
         curl_y = -1j * beta * hx - ddx(hz)
         curl_z = ddx(hy) - ddy(hx)
 
-        # Tangential permittivity averaging (one 3-point pass per tangential axis):
-        # Ex tangential in y -> smooth eps in y; Ey tangential in x -> smooth in x;
-        # Ez tangential in x and y -> smooth in both. Keeps the normal-direction
-        # interface sharp so the physical normal-E jump survives.
+        # Same-grid compatibility bridge for the native FLM vertex/cell
+        # staggering (one 3-point pass per tangential axis).  Preserve each
+        # tensor component instead of collapsing the anisotropic KFJ boundary
+        # cell back to representative scalar epsilon.
         def smooth_y(e: np.ndarray) -> np.ndarray:
             g = e.astype(float).copy()
             g[1:-1, :] = (e[:-2, :] + e[1:-1, :] + e[2:, :]) / 3.0
@@ -1539,9 +2237,9 @@ class VectorModeSolver:
             g[:, 1:-1] = (e[:, :-2] + e[:, 1:-1] + e[:, 2:]) / 3.0
             return g
 
-        eps_x = smooth_y(eps)            # for Ex
-        eps_y = smooth_x(eps)            # for Ey
-        eps_z = smooth_x(smooth_y(eps))  # for Ez
+        eps_x = smooth_y(self._exx)            # for Ex
+        eps_y = smooth_x(self._eyy)            # for Ey
+        eps_z = smooth_x(smooth_y(self._ezz))  # for Ez
         pref = 1.0 / (1j * omega * eps0)
         ex = pref * curl_x / eps_x
         ey = pref * curl_y / eps_y
@@ -1568,6 +2266,24 @@ class VectorModeSolver:
         g = scale * phase_fix
 
         neff_c = complex(beta) / k0
+        overlap_weights: Optional[np.ndarray]
+        physical_mask: Optional[np.ndarray]
+        if pml_x > 0 or pml_y > 0:
+            # Analytic-coordinate representation: reaction integrals follow the
+            # same complex contour dxtilde*dytilde.  Physical Poynting observables
+            # instead exclude the artificial PML cells.
+            overlap_weights = sy[:, None] * sx[None, :]
+            physical_mask = np.ones((ny, nx), dtype=bool)
+            if pml_x > 0:
+                physical_mask[:, :pml_x] = False
+                physical_mask[:, -pml_x:] = False
+            if pml_y > 0:
+                physical_mask[:pml_y, :] = False
+                physical_mask[-pml_y:, :] = False
+        else:
+            overlap_weights = None
+            physical_mask = None
+
         return VectorMode(
             n_eff=float(neff_c.real),
             n_group=None,
@@ -1578,6 +2294,11 @@ class VectorModeSolver:
             k_eff=float(neff_c.imag),
             bend_radius_um=(None if bend_radius_um is None
                             else float(bend_radius_um)),
+            mode_type=mode_type,
+            overlap_weights=overlap_weights,
+            physical_mask=physical_mask,
+            pml_cells_xy=(pml_x, pml_y),
+            eigen_residual=eigen_residual,
         )
 
     @staticmethod

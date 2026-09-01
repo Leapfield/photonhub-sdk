@@ -1,8 +1,8 @@
 """One-call multiport S-matrix extraction — plan, run, assemble, export.
 
 This is the automation layer over :mod:`photonhub.plugins.smatrix` (the
-per-column assembler): the PhotonHub analogue of Tidy3D's
-``ModalComponentModeler`` and Lumerical's S-parameter matrix sweep. You declare
+per-column assembler): a modal multi-port
+S-parameter matrix sweep. You declare
 the device once (a :class:`~photonhub.components.simulation.Simulation` whose
 sources are placeholders) and the N ports once (plane + outgoing direction +
 mode channel); the driver then

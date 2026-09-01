@@ -17,16 +17,18 @@ The eigenproblem is the canonical transverse-E full-vector FDFD (diagonal eps,
 mu=1): ``mat @ [Ex;Ey] = -n_eff^2 [Ex;Ey]`` with the block operator built from the
 forward/backward derivative matrices (standard formulation; here wired to the
 engine's curls + staggered eps). The launched mode is then the FDTD discrete mode,
-so a TF/SF injection of it is clean (Tidy3D matches its FDTD the same way).
+so a TF/SF injection of it is clean (this is how a mode solve is matched to an FDTD grid).
 
-KNOWN COMPROMISE — consumers COLLOCATE the staggered components. The returned
-:class:`VectorMode` carries one field array per component on a single index
-grid; downstream (``vector_modal_fields`` and everything built on it) assigns
-ALL components the same node coordinates ``lo + i*dl`` (+ the carried
-``center_offset_um``), discarding the intra-cell Yee stagger this solver
-faithfully used (Ex at +1/2 in h, Ey at +1/2 in v, Ez at the node) — a
-per-component error of up to half a cell, recorded in the GDS-benchmark
-findings. Do not assume the arrays keep their Yee offsets downstream.
+KNOWN COMPROMISE — real-space field consumers still COLLOCATE the staggered
+components. The returned :class:`VectorMode` carries one field array per
+component on a single index grid; ``vector_modal_fields`` and its downstream
+real-space consumers assign ALL components the same node coordinates
+``lo + i*dl`` (+ the carried ``center_offset_um``), discarding the intra-cell
+Yee stagger this solver faithfully used (Ex at +1/2 in h, Ey at +1/2 in v,
+Ez at the node) — a per-component error of up to half a cell. EME reaction
+matching is the deliberate exception: ``Ex``/``Hy`` and ``Ey``/``Hx`` are
+multiplied directly at their shared native Yee locations. Do not assume other
+downstream array consumers preserve those offsets.
 """
 from __future__ import annotations
 
@@ -42,7 +44,7 @@ from ..components.monitors import (
 from ..viz import _geometry as _geom
 from ._constants import C0, MU0
 from .kfj_smoothing import _paint_hard
-from .vector_modes import VectorMode
+from .vector_modes import VectorMode, _deterministic_arpack_start
 
 
 # --------------------------------------------------------------------------- #
@@ -52,7 +54,7 @@ def dual_spacings(dq: np.ndarray) -> np.ndarray:
     """Dual-grid steps for the backward (H-curl) derivatives from the primal
     steps ``dq`` (§15.2): interior dual width = midpoint average of the two
     adjacent primal cells; the first entry keeps the first primal width (the
-    same convention Tidy3D's mode solver uses — ``dl_b[0] = dl_f[0]`` — so the
+    standard convention — ``dl_b[0] = dl_f[0]`` — so the
     §20 face rules read the face row over one whole cell). Uniform input
     reproduces the constant spacing exactly."""
     dq = np.asarray(dq, dtype=float)
@@ -74,7 +76,7 @@ def _dmats(nx: int, ny: int, dl: float, h_min_bc=None, v_min_bc=None,
     passes its PRIMAL spacing vector ``dq`` (length n, §15.1 replicate-last):
     forward rows divide by the primal widths (node i -> i+1 distance), backward
     rows by the DUAL widths (:func:`dual_spacings`) — the standard nonuniform
-    Yee FDFD (Zhu & Brown; the same construction Tidy3D's open mode solver
+    Yee FDFD (Zhu & Brown; the same construction an open mode solver
     uses, ``diags(1/dls) @ D``). The scalar path is kept verbatim rather than
     expressed as a constant vector so uniform grids stay bit-identical
     (reciprocal-multiply vs divide differ in ULPs).
@@ -221,10 +223,23 @@ def window_nodes(sim, axis, *, h_center, half_w, v_center, half_v, dl):
 def _fine_centers(h0, v0, nh, nv, dl, off_h, off_v, ss):
     """The supersampled fill-fraction grid centers for the nh*nv Yee-offset grid
     whose node (ih,iv) sits at (h0+(ih+off_h)*dl, v0+(iv+off_v)*dl)."""
-    hcen = h0 + (np.arange(nh) + off_h) * dl
-    vcen = v0 + (np.arange(nv) + off_v) * dl
-    fine_h = (hcen[:, None] + (np.arange(ss) - (ss - 1) / 2.0)[None, :] / ss * dl).ravel()
-    fine_v = (vcen[:, None] + (np.arange(ss) - (ss - 1) / 2.0)[None, :] / ss * dl).ravel()
+    # The engine evaluates a uniform-grid point from its GLOBAL integer index,
+    # ``(i + offset) * dl``.  Reassociating this as ``h0 + i * dl`` makes the
+    # last bit depend on the selected window origin and can flip exact closed-
+    # face Box membership when an otherwise identical window is padded.  The
+    # origins are grid-snapped, so recover their integer indices and retain the
+    # engine arithmetic for every sub-sample.
+    h_index0 = int(np.rint(h0 / dl))
+    v_index0 = int(np.rint(v0 / dl))
+    sub = (np.arange(ss) - (ss - 1) / 2.0) / ss
+    fine_h = (
+        h_index0 + np.arange(nh)[:, None] + off_h + sub[None, :]
+    ) * dl
+    fine_v = (
+        v_index0 + np.arange(nv)[:, None] + off_v + sub[None, :]
+    ) * dl
+    fine_h = fine_h.ravel()
+    fine_v = fine_v.ravel()
     return fine_h, fine_v
 
 
@@ -417,10 +432,15 @@ def sample_staggered_eps(sim, axis, plane_value_um, *, h_center, v_center,
 def _solve_yee_eig(exx, eyy, ezz, nh, nv, wavelength_um: float, dl_um: float,
                    nmodes: int, center_offset=None, h_min_bc=None,
                    v_min_bc=None, dq_h=None, dq_v=None,
-                   x_coords_um=None, y_coords_um=None):
+                   x_coords_um=None, y_coords_um=None, min_neff: float = 1.0):
     """Solve the discrete-Yee eigenproblem at ``wavelength_um`` for pre-sampled,
-    Yee-staggered diagonal permittivity arrays over a window, returning the guided
-    :class:`VectorMode`\\ s (n_eff-descending). Factored out of :func:`solve_yee_mode`
+    Yee-staggered diagonal permittivity arrays over a window, returning
+    :class:`VectorMode`\\ s above ``min_neff`` in descending real ``n_eff``.
+    The legacy default ``min_neff=1`` retains guided modes; the experimental
+    hard-wall EME caller lowers it to retain propagating box-radiation modes.
+    Pure-imaginary-beta roots remain excluded because reconstruction divides by
+    real beta. Each mode carries its ordinary right-eigenpair residual. Factored
+    out of :func:`solve_yee_mode`
     so a per-frequency bank (:func:`solve_yee_mode_bank`) can sample the ε ONCE and
     re-solve per λ (only ``k0`` changes) — the Yee analogue of
     :meth:`VectorModeSolver.at_wavelength`. ``center_offset`` is the window
@@ -480,16 +500,38 @@ def _solve_yee_eig(exx, eyy, ezz, nh, nv, wavelength_um: float, dl_um: float,
         P = sp.spdiags(mask, 0, 2 * N, 2 * N)
         mat = (P @ mat @ P).tocsc()
 
-    n_core = float(np.sqrt(np.max(exx.real)))
+    # KFJ samples epsilon independently at the three E-component locations.
+    # A sub-cell wall can therefore leave (say) exx harmonic-averaged while
+    # eyy/ezz retain the full core epsilon.  Shifting from max(exx) alone can
+    # target the radiation spectrum and omit every guided root.  The scalar-
+    # dielectric upper bound is the maximum over all component samples.
+    n_core = float(
+        np.sqrt(
+            max(
+                np.max(np.asarray(exx).real),
+                np.max(np.asarray(eyy).real),
+                np.max(np.asarray(ezz).real),
+            )
+        )
+    )
     if nmodes >= 2 * N - 1:
         raise ValueError(
             f"trial mode count {nmodes} is too large for a {nh} x {nv} "
             f"cross-section ({2 * N} transverse unknowns); reduce num_modes "
             "or enlarge the solve window")
-    vals, vecs = spl.eigs(mat, k=nmodes, sigma=-(n_core ** 2), which="LM")
+    vals, vecs = spl.eigs(
+        mat,
+        k=nmodes,
+        sigma=-(n_core ** 2),
+        which="LM",
+        v0=_deterministic_arpack_start(
+            mat.shape[0],
+            complex_dtype=np.issubdtype(mat.dtype, np.complexfloating),
+        ),
+    )
     neff = np.sqrt(-vals)                        # eigenvalue = -n_eff^2
     order = np.argsort(-neff.real)
-    neff, vecs = neff[order], vecs[:, order]
+    vals, neff, vecs = vals[order], neff[order], vecs[:, order]
 
     # raw (per-um) and per-meter derivative ops for field reconstruction
     Dxf_u, Dxb_u, Dyf_u, Dyb_u = _dmats(nh, nv, dl, **bcs)     # per um
@@ -504,8 +546,18 @@ def _solve_yee_eig(exx, eyy, ezz, nh, nv, wavelength_um: float, dl_um: float,
     modes = []
     for m in range(len(order)):
         ne = complex(neff[m])
-        if ne.real <= 1.0:
+        if ne.real <= min_neff:
             continue
+        eigvec = np.asarray(vecs[:, m], dtype=complex)
+        av = mat @ eigvec
+        residual_denominator = (
+            np.linalg.norm(av)
+            + abs(complex(vals[m])) * np.linalg.norm(eigvec)
+        )
+        eigen_residual = float(
+            np.linalg.norm(av - complex(vals[m]) * eigvec)
+            / max(float(residual_denominator), 1e-300)
+        )
         ex = vecs[:N, m]; ey = vecs[N:, m]
         beta = ne.real * k0                                  # per um
         beta_m = beta * 1e6                                  # per m
@@ -535,7 +587,8 @@ def _solve_yee_eig(exx, eyy, ezz, nh, nv, wavelength_um: float, dl_um: float,
                         wavelength_um=wavelength_um, dl_x_um=dl, dl_y_um=dl,
                         k_eff=ne.imag, center_offset_um=center_offset,
                         yee_staggered=True,   # solved on the engine's Yee grid
-                        x_coords_um=x_coords_um, y_coords_um=y_coords_um)
+                        x_coords_um=x_coords_um, y_coords_um=y_coords_um,
+                        eigen_residual=eigen_residual)
         modes.append(vm)
     return modes
 
@@ -578,6 +631,192 @@ def _pick_yee(modes, pol, mode_index, axis, plane_value_um):
     return cands[mode_index]
 
 
+def _homogeneous_yee_exterior(exx, eyy, ezz, geom: "_WindowGeom") -> float:
+    """Return the scalar relative permittivity on the hard-wall box exterior.
+
+    The classifier used by :func:`solve_yee_eme_basis` needs one unambiguous
+    exterior light line. Check every Yee E-component on all four outer faces.
+    Requiring all samples to agree catches a core, substrate, or material
+    junction that reaches the box wall. Symmetry-reduced boxes are rejected by
+    the public caller before this helper is reached.
+    """
+
+    def grid(values):
+        raw = np.asarray(values)
+        if np.iscomplexobj(raw) and np.any(np.abs(raw.imag) > 0.0):
+            raise ValueError(
+                "solve_yee_eme_basis requires real, lossless sampled "
+                "permittivity; complex epsilon is not supported"
+            )
+        return np.asarray(raw.real, dtype=float).reshape(geom.nh, geom.nv).T
+
+    edge_values = []
+    for component in (grid(exx), grid(eyy), grid(ezz)):
+        edge_values.append(component[0, :])
+        edge_values.append(component[-1, :])
+        edge_values.append(component[:, 0])
+        edge_values.append(component[:, -1])
+    edge = np.concatenate([np.ravel(values) for values in edge_values])
+    exterior_eps = float(edge[0])
+    if (
+        not np.isfinite(edge).all()
+        or exterior_eps <= 0.0
+        or not np.allclose(edge, exterior_eps, rtol=1e-8, atol=1e-10)
+    ):
+        edge_min = float(np.nanmin(edge)) if edge.size else float("nan")
+        edge_max = float(np.nanmax(edge)) if edge.size else float("nan")
+        raise ValueError(
+            "solve_yee_eme_basis requires one homogeneous scalar exterior "
+            "around the hard-wall window so the guided/radiation light line "
+            f"is defined; sampled exterior permittivity spans "
+            f"[{edge_min:.6g}, {edge_max:.6g}]. Enlarge the transverse "
+            "window beyond every material interface."
+        )
+    return exterior_eps
+
+
+def _stable_positive_yee_modes(modes, residual_tolerance: float):
+    """Near-real, finite, positive-beta hard-wall modes with good Ritz pairs."""
+    stable = []
+    for mode in modes:
+        scale = max(abs(float(mode.n_eff)), 1.0)
+        finite_fields = all(
+            np.isfinite(field).all()
+            for field in (mode.ex, mode.ey, mode.ez, mode.hx, mode.hy, mode.hz)
+        )
+        residual = mode.eigen_residual
+        if (
+            mode.n_eff > 1e-6
+            and np.isfinite(mode.n_eff)
+            and np.isfinite(mode.k_eff)
+            and abs(mode.k_eff) <= 1e-8 * scale
+            and residual is not None
+            and np.isfinite(residual)
+            and residual <= residual_tolerance
+            and finite_fields
+        ):
+            # A real hard-wall operator has real beta.  Remove only accepted
+            # roundoff-scale Im(n_eff); retaining it as signed gain/loss metadata
+            # would make otherwise lossless EME propagation non-passive.
+            stable.append(replace(mode, k_eff=0.0))
+    return stable
+
+
+def _yee_window_structure_indices(
+    sim, axis, plane_value_um, geom: "_WindowGeom", supersample: int
+):
+    """Structures sampled by this exact uniform Yee/KFJ window."""
+    from .kfj_smoothing import _paint_indices
+
+    active = set()
+    for off_h, off_v in ((0.5, 0.0), (0.0, 0.5), (0.0, 0.0)):
+        fine_h, fine_v = _fine_centers(
+            geom.h_lo,
+            geom.v_lo,
+            geom.nh,
+            geom.nv,
+            geom.dl,
+            off_h,
+            off_v,
+            supersample,
+        )
+        painted = _paint_indices(
+            sim, axis, plane_value_um, fine_h, fine_v
+        )
+        active.update(int(i) for i in np.unique(painted) if i >= 0)
+    return active
+
+
+def _reject_lossy_yee_eme_materials(
+    sim, eps_of_medium, active_indices
+) -> None:
+    """Reject unsupported media sampled by this real hard-wall window."""
+    active_media_ids = {
+        id(sim.structures[index].medium) for index in active_indices
+    }
+    if eps_of_medium is not None:
+        for medium_id, value in eps_of_medium.items():
+            if medium_id not in active_media_ids:
+                continue
+            anchored = complex(value)
+            if not np.isfinite(anchored.real) or not np.isfinite(anchored.imag):
+                raise ValueError("eps_of_medium values must be finite")
+            if anchored.imag != 0.0:
+                raise ValueError(
+                    "solve_yee_eme_basis requires real, lossless epsilon; "
+                    "complex eps_of_medium anchors are not supported"
+                )
+    for index in active_indices:
+        structure = sim.structures[index]
+        medium = structure.medium
+        if (
+            getattr(medium, "is_anisotropic", False)
+            or getattr(medium, "is_custom", False)
+            or bool(getattr(medium, "pec", False))
+        ):
+            raise ValueError(
+                "solve_yee_eme_basis supports only finite scalar dielectric "
+                "media; anisotropic, custom-data, and PEC media are not "
+                "supported"
+            )
+        lossy = float(getattr(medium, "conductivity_s_per_m", 0.0)) > 0.0
+        poles = tuple(getattr(medium, "all_lorentz_poles", lambda: ())())
+        poles += tuple(getattr(medium, "drude", None) or ())
+        lossy = lossy or any(float(p.linewidth_hz) > 0.0 for p in poles)
+        if lossy:
+            raise ValueError(
+                "solve_yee_eme_basis requires a real, lossless cross-section; "
+                "conductive or damped-dispersive media are not supported"
+            )
+
+
+def _validate_yee_reaction_basis(
+    modes, dl_um: float, reaction_tolerance: float
+) -> None:
+    """Reject a numerically valid right spectrum that is unsafe for EME.
+
+    A tiny-beta pair can have an excellent ordinary eigen residual while its
+    self reaction tends to zero and the reaction Gram becomes singular.  EME
+    matching uses that Gram, so validate the actual Yee reaction traces before
+    exposing the basis rather than allowing a later interface solve to amplify
+    the exceptional shell catastrophically.
+    """
+    from .eme import _basis_trace
+
+    if any(mode.overlap_weights is not None for mode in modes):
+        raise RuntimeError(
+            "solve_yee_eme_basis supports only a real hard-wall contour; "
+            "complex overlap_weights/PML modes are not accepted"
+        )
+    try:
+        trace = _basis_trace(modes, dl_um, dl_um, rcond=1e-10)
+    except ValueError as exc:
+        raise RuntimeError(
+            "Yee EME basis is reaction-unstable: "
+            f"{exc}. Request fewer modes or enlarge the transverse window."
+        ) from exc
+
+    condition_limit = 1.0 / reaction_tolerance
+    unstable = (
+        not np.isfinite(trace.gram_condition)
+        or trace.gram_condition > condition_limit
+        or not np.isfinite(trace.gram_asymmetry)
+        or trace.gram_asymmetry > reaction_tolerance
+        or not np.isfinite(trace.reaction_orthogonality_error)
+        or trace.reaction_orthogonality_error > reaction_tolerance
+    )
+    if unstable:
+        raise RuntimeError(
+            "Yee EME basis is reaction-unstable "
+            f"(Gram condition={trace.gram_condition:.3g}, "
+            f"asymmetry={trace.gram_asymmetry:.3g}, nondegenerate "
+            f"off-diagonal={trace.reaction_orthogonality_error:.3g}; "
+            f"limits={condition_limit:.3g}, {reaction_tolerance:.3g}, "
+            f"{reaction_tolerance:.3g}). Request fewer modes or enlarge the "
+            "transverse window."
+        )
+
+
 def solve_yee_mode(sim, axis: str, plane_value_um: float, wavelength_um: float,
                    pol: str, mode_index: int, *, h_center_um: float,
                    v_center_um: float, half_w_um: float, half_v_um: float,
@@ -608,6 +847,314 @@ def solve_yee_mode(sim, axis: str, plane_value_um: float, wavelength_um: float,
                            dq_h=geom.h_dq, dq_v=geom.v_dq,
                            x_coords_um=xc, y_coords_um=yc)
     return _pick_yee(modes, pol, mode_index, axis, plane_value_um)
+
+
+def solve_yee_eme_basis(
+    sim,
+    axis: str,
+    plane_value_um: float,
+    wavelength_um: float,
+    num_modes: Optional[int] = None,
+    *,
+    h_center_um: float,
+    v_center_um: float,
+    half_w_um: float,
+    half_v_um: float,
+    dl_um: float,
+    supersample: int = 8,
+    eps_of_medium: Optional[Mapping[int, float]] = None,
+    residual_tolerance: float = 1e-7,
+    reaction_tolerance: float = 1e-7,
+    neff_cutoff: Optional[float] = None,
+    max_modes: int = 64,
+) -> Tuple[VectorMode, ...]:
+    """Return an experimental propagating Yee hard-wall basis for EME.
+
+    The solve uses the same per-component KFJ permittivity and staggered curl
+    operator as :func:`solve_yee_mode`, but retains both bound modes and the
+    positive-beta hard-wall discretization of the radiation continuum.  Modes
+    are ordered by decreasing real ``n_eff`` and labelled ``"guided"`` above
+    the homogeneous exterior light line, otherwise ``"radiation"``.  Every
+    returned mode is lossless, ``yee_staggered=True``, and safe under the
+    unconjugated reaction product used by EME.
+
+    .. warning::
+       This is a propagating-only basis: it excludes ``beta≈0`` and
+       pure-imaginary-beta roots because the current Yee field reconstruction
+       divides by real beta.  It therefore contains guided and box-radiation
+       modes, not the evanescent channels required for a complete EME basis.
+       Passing the reaction guard is a numerical precondition, not evidence of
+       quantitative device-radiation accuracy.
+
+    This first public continuum path deliberately supports only a uniform
+    transverse lattice and a homogeneous scalar exterior.  It has no modal PML:
+    the requested window is the discretization box, so radiation modes are box
+    modes whose quantitative use requires independent window and complete-shell
+    convergence sweeps.  Holding ``num_modes`` fixed while changing the window
+    is not a valid continuum control because it changes the represented beta
+    band and modal density.  For a window sweep, omit ``num_modes`` and pass
+    ``neff_cutoff``: the solver returns every complete propagating shell above
+    that spectral cutoff, subject to the explicit ``max_modes`` safety cap.
+    """
+    count_request = num_modes is not None
+    cutoff_request = neff_cutoff is not None
+    if count_request == cutoff_request:
+        raise ValueError(
+            "provide exactly one of num_modes (fixed-count solve) or "
+            "neff_cutoff (complete-shell spectral solve)"
+        )
+    requested = None
+    if count_request:
+        try:
+            count_is_finite = bool(np.isfinite(num_modes))
+        except (TypeError, ValueError):
+            count_is_finite = False
+        if (
+            isinstance(num_modes, (bool, np.bool_))
+            or not count_is_finite
+            or int(num_modes) != num_modes
+        ):
+            raise ValueError(
+                f"num_modes must be an integer >= 1, got {num_modes!r}"
+            )
+        requested = int(num_modes)
+        if requested < 1:
+            raise ValueError(f"num_modes must be >= 1, got {requested}")
+    else:
+        if not np.isfinite(neff_cutoff) or float(neff_cutoff) <= 1e-6:
+            raise ValueError("neff_cutoff must be finite and > 1e-6")
+        neff_cutoff = float(neff_cutoff)
+        try:
+            cap_is_finite = bool(np.isfinite(max_modes))
+        except (TypeError, ValueError):
+            cap_is_finite = False
+        if (
+            isinstance(max_modes, (bool, np.bool_))
+            or not cap_is_finite
+            or int(max_modes) != max_modes
+            or int(max_modes) < 1
+        ):
+            raise ValueError("max_modes must be an integer >= 1")
+        max_modes = int(max_modes)
+    if not np.isfinite(wavelength_um) or wavelength_um <= 0.0:
+        raise ValueError(f"wavelength_um must be finite and > 0, got {wavelength_um}")
+    if not np.isfinite(dl_um) or dl_um <= 0.0:
+        raise ValueError(f"dl_um must be finite and > 0, got {dl_um}")
+    if not np.isfinite(plane_value_um):
+        raise ValueError(
+            f"plane_value_um must be finite, got {plane_value_um}"
+        )
+    for name, value in (
+        ("h_center_um", h_center_um),
+        ("v_center_um", v_center_um),
+    ):
+        if not np.isfinite(value):
+            raise ValueError(f"{name} must be finite, got {value}")
+    for name, value in (
+        ("half_w_um", half_w_um),
+        ("half_v_um", half_v_um),
+    ):
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{name} must be finite and > 0, got {value}")
+    if (
+        isinstance(supersample, (bool, np.bool_))
+        or int(supersample) != supersample
+        or int(supersample) < 1
+    ):
+        raise ValueError("supersample must be an integer >= 1")
+    supersample = int(supersample)
+    if not np.isfinite(residual_tolerance) or residual_tolerance <= 0.0:
+        raise ValueError("residual_tolerance must be finite and > 0")
+    if (
+        not np.isfinite(reaction_tolerance)
+        or reaction_tolerance <= 0.0
+        or reaction_tolerance >= 1.0
+    ):
+        raise ValueError("reaction_tolerance must be finite and between 0 and 1")
+
+    sample, geom = staggered_eps_sampler(
+        sim,
+        axis,
+        plane_value_um,
+        h_center=h_center_um,
+        v_center=v_center_um,
+        half_w=half_w_um,
+        half_v=half_v_um,
+        dl=dl_um,
+        supersample=supersample,
+        eps_of_medium=eps_of_medium,
+    )
+    if geom.graded:
+        raise ValueError(
+            "solve_yee_eme_basis requires a uniform transverse grid; graded "
+            "Yee coordinates are not supported by EME interface matching"
+        )
+    if geom.h_bc is not None or geom.v_bc is not None:
+        raise ValueError(
+            "solve_yee_eme_basis requires a full transverse hard-wall box; "
+            "symmetry-reduced Yee windows need reaction-mass multiplicity "
+            "weights that are not implemented"
+        )
+    sim_dl = float(getattr(sim.grid, "dl_um", dl_um))
+    if not np.isclose(dl_um, sim_dl, rtol=1e-12, atol=1e-15):
+        raise ValueError(
+            "solve_yee_eme_basis must use the Simulation's uniform Yee "
+            f"spacing ({sim_dl:.9g} um), got dl_um={dl_um:.9g}"
+        )
+    active_indices = _yee_window_structure_indices(
+        sim, axis, plane_value_um, geom, supersample
+    )
+    _reject_lossy_yee_eme_materials(
+        sim, eps_of_medium, active_indices
+    )
+
+    frequency_hz = C0 / (wavelength_um * 1e-6)
+    exx, eyy, ezz = sample(frequency_hz)
+    exterior_eps = _homogeneous_yee_exterior(exx, eyy, ezz, geom)
+    exterior_index = float(np.sqrt(exterior_eps))
+    off, xc, yc = _window_placement(geom, h_center_um, v_center_um)
+
+    unknowns = 2 * geom.nh * geom.nv
+    max_trial = unknowns - 2
+    if requested is not None and requested > max_trial:
+        raise ValueError(
+            f"num_modes={requested} is too large for the {geom.nh} x "
+            f"{geom.nv} Yee box ({unknowns} transverse unknowns); request "
+            "fewer modes or enlarge the transverse window"
+        )
+    common_solve_kwargs = {
+        "center_offset": off,
+        "h_min_bc": geom.h_bc,
+        "v_min_bc": geom.v_bc,
+        "x_coords_um": xc,
+        "y_coords_um": yc,
+        "min_neff": 1e-6,
+    }
+    stable = []
+    if requested is not None:
+        # Oversample the Ritz spectrum because positive-beta filtering can
+        # discard below-cutoff pairs.  A bounded retry prevents a large
+        # impossible request from silently returning a truncated basis.
+        trial = min(max_trial, max(6, requested + max(4, requested // 2)))
+        for _ in range(3):
+            modes = _solve_yee_eig(
+                exx, eyy, ezz, geom.nh, geom.nv, wavelength_um, dl_um,
+                trial, **common_solve_kwargs,
+            )
+            stable = _stable_positive_yee_modes(modes, residual_tolerance)
+            if len(stable) >= requested:
+                break
+            larger = min(max_trial, max(trial + 4, 2 * trial))
+            if larger == trial:
+                break
+            trial = larger
+        if len(stable) < requested:
+            raise RuntimeError(
+                "Yee EME basis spectrum incomplete: requested "
+                f"{requested} positive-beta stable modes but found "
+                f"{len(stable)} in the {geom.nh} x {geom.nv} hard-wall box. "
+                "Request fewer modes or enlarge the transverse window."
+            )
+
+        selected = stable[:requested]
+        # Do not expose an arbitrary truncation of an (approximately)
+        # degenerate polarization/spatial multiplet.  Such a basis changes
+        # under harmless ARPACK rotations.
+        if len(stable) > requested:
+            edge = selected[-1].n_eff
+            following = stable[requested].n_eff
+            if abs(edge - following) <= 1e-6 * max(
+                abs(edge), abs(following), 1.0
+            ):
+                raise RuntimeError(
+                    f"num_modes={requested} splits a degenerate Yee beta "
+                    f"shell near n_eff={edge:.9g}; include the complete "
+                    "multiplet or request fewer modes"
+                )
+    else:
+        # A spectral cutoff is a defensible window-sweep control only after the
+        # eigensolve has crossed it.  Continue through TWO distinct shells below
+        # the threshold: the first below-cutoff shell is then internal to the
+        # returned Ritz spectrum rather than a possibly truncated final shell.
+        assert neff_cutoff is not None
+        lookahead = max(8, max_modes // 4)
+        trial_limit = min(max_trial, max_modes + lookahead)
+        trial = min(trial_limit, max(8, min(16, max_modes + 2)))
+        selected = []
+        bracketed = False
+        while True:
+            modes = _solve_yee_eig(
+                exx, eyy, ezz, geom.nh, geom.nv, wavelength_um, dl_um,
+                trial, **common_solve_kwargs,
+            )
+            stable = _stable_positive_yee_modes(modes, residual_tolerance)
+            shell_tol = 1e-6 * max(abs(neff_cutoff), 1.0)
+            if any(abs(mode.n_eff - neff_cutoff) <= shell_tol for mode in stable):
+                raise RuntimeError(
+                    f"neff_cutoff={neff_cutoff:.9g} intersects a Yee beta "
+                    "shell; move the cutoff between adjacent shells"
+                )
+            raw_above = [mode for mode in modes if mode.n_eff > neff_cutoff]
+            selected = [mode for mode in stable if mode.n_eff > neff_cutoff]
+            if len(raw_above) != len(selected):
+                raise RuntimeError(
+                    "Yee EME spectrum contains a non-real, non-finite, or "
+                    "high-residual mode above neff_cutoff; move the cutoff up, "
+                    "request fewer modes, or enlarge the transverse window"
+                )
+            if len(selected) > max_modes:
+                raise RuntimeError(
+                    f"neff_cutoff={neff_cutoff:.9g} selects more than "
+                    f"max_modes={max_modes}; raise max_modes or move the "
+                    "cutoff up"
+                )
+            below = [
+                mode.n_eff for mode in stable
+                if mode.n_eff < neff_cutoff - shell_tol
+            ]
+            distinct_below = []
+            for beta in below:
+                if not distinct_below or abs(beta - distinct_below[-1]) > (
+                    1e-6 * max(abs(beta), abs(distinct_below[-1]), 1.0)
+                ):
+                    distinct_below.append(beta)
+            if len(distinct_below) >= 2:
+                bracketed = True
+                break
+            if trial == trial_limit:
+                break
+            trial = min(trial_limit, max(trial + 4, 2 * trial))
+        if not selected:
+            raise RuntimeError(
+                f"neff_cutoff={neff_cutoff:.9g} selects no stable "
+                "positive-beta modes in this hard-wall box"
+            )
+        if not bracketed:
+            raise RuntimeError(
+                f"could not resolve two complete Yee beta shells below "
+                f"neff_cutoff={neff_cutoff:.9g} within max_modes={max_modes}; "
+                "raise max_modes, move the cutoff up, or enlarge the "
+                "transverse window"
+            )
+
+    light_line = exterior_index * (1.0 + 1e-6)
+    selected = [
+        replace(
+            mode,
+            mode_type="guided" if mode.n_eff > light_line else "radiation",
+        )
+        for mode in selected
+    ]
+    _validate_yee_reaction_basis(selected, dl_um, reaction_tolerance)
+    return tuple(
+        replace(
+            mode,
+            yee_eme_compatible=True,
+            yee_eme_axis=axis,
+            yee_eme_origin_um=(geom.h_lo, geom.v_lo),
+        )
+        for mode in selected
+    )
 
 
 def solve_yee_mode_bank(sim, axis: str, plane_value_um: float, freqs_hz, pol: str,

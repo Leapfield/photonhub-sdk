@@ -33,7 +33,7 @@ problem :math:`U_1 B = u\\, U_0 B` in a small basis seeded on an even grid of
 ``init_num_freqs`` trial frequencies across ``freq_window`` -- so a *short*,
 not-yet-decayed signal still yields sharp resonances (the property a spectral
 FWHM fit lacks). This is an independent implementation; it is validated against
-Tidy3D's ``ResonanceFinder`` (same algorithm) and an independent matrix-pencil
+a harmonic-inversion resonance finder (same algorithm) and an independent matrix-pencil
 oracle in the test suite.
 
 Example
@@ -191,7 +191,7 @@ class ResonanceFinder:
         ``dt`` is derived from the ``t`` coordinate (which must be uniformly
         spaced). If the array has a ``component`` dimension, the electric
         components are summed, falling back to the magnetic ones if no E field
-        is present (the Tidy3D convention -- never E and H mixed); pass a
+        is present (the standard convention -- never E and H mixed); pass a
         single-component array to control this exactly.
         """
         signal, dt = _signal_from_dataarray(dataarray, fields=None)
@@ -214,7 +214,7 @@ class ResonanceFinder:
             signal (more independent probes improve conditioning).
         fields : sequence of str, optional
             Field components to use (e.g. ``["Ez"]``). Default: sum the electric
-            components present, falling back to the magnetic ones -- the Tidy3D
+            components present, falling back to the magnetic ones -- the standard
             convention.
 
         Returns
@@ -238,6 +238,7 @@ def select_resonances(
     *,
     freq_window: Optional[Tuple[float, float]] = None,
     min_amplitude: Optional[float] = None,
+    min_amplitude_rel: Optional[float] = None,
     min_q: Optional[float] = None,
     max_error: Optional[float] = None,
     require_decay: bool = True,
@@ -257,6 +258,16 @@ def select_resonances(
         Keep only resonances with ``f_min <= freq <= f_max``.
     min_amplitude, min_q, max_error : float, optional
         Lower bound on amplitude / Q, upper bound on ``error``.
+        **``min_amplitude`` is in RAW FIELD UNITS** — a unit ``PointDipole``
+        ring-down probes at ~1e-6 V/m scale, so an absolute threshold that
+        looks small (1e-3) can silently reject every physical mode. Unless the
+        signal was pre-normalized, prefer ``min_amplitude_rel``.
+    min_amplitude_rel : float, optional
+        Lower amplitude bound as a FRACTION of the strongest mode in the
+        (freq_window-restricted) set — scale-free, so it works on raw probe
+        signals without knowing the field magnitude. E.g. ``1e-3`` keeps modes
+        within 60 dB of the dominant one. Combines with ``min_amplitude``
+        (both must pass).
     require_decay : bool, default True
         Drop non-physical modes with ``decay <= 0`` (growing in time).
     sort_by : str or None, default "Q"
@@ -281,6 +292,17 @@ def select_resonances(
         mask &= resonances["decay"].values > 0
     if min_amplitude is not None:
         mask &= resonances["amplitude"].values >= min_amplitude
+    if min_amplitude_rel is not None:
+        if not 0.0 <= float(min_amplitude_rel) <= 1.0:
+            raise ValueError(
+                f"min_amplitude_rel is a fraction of the strongest mode; got "
+                f"{min_amplitude_rel}")
+        amps = np.abs(resonances["amplitude"].values)
+        # reference = strongest mode already inside the window/decay mask, so
+        # an out-of-band or growing artifact cannot set the scale
+        ref = float(np.max(amps[mask])) if np.any(mask) else 0.0
+        if ref > 0.0:
+            mask &= amps >= float(min_amplitude_rel) * ref
     if min_q is not None:
         mask &= resonances["Q"].values >= min_q
     if max_error is not None:
@@ -477,7 +499,7 @@ def _components_of(da: xr.DataArray) -> list:
 
 def _select_components(present, fields: Optional[Sequence[str]]):
     """Field components to sum: explicit ``fields`` if given, else the electric
-    components present, falling back to the magnetic ones (the Tidy3D
+    components present, falling back to the magnetic ones (the standard
     convention) -- never E and H mixed, which is physically meaningless. Returns
     ``None`` when there are no recognized components (a component-less array)."""
     if fields is not None:

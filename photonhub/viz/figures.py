@@ -86,6 +86,11 @@ def field_figure(data, monitor: str, *, field: str = "Ex", val: str = "real",
         finite = np.abs(z[np.isfinite(z)])
         amax = float(finite.max()) if finite.size else 1.0
         trace["zmin"], trace["zmax"] = -(amax or 1.0), (amax or 1.0)
+    elif val == "phase":
+        # Cyclic twilight over a FIXED [-pi, pi]: auto-ranging a wrapped angle
+        # would rescale identical physics between planes (the CLI matplotlib
+        # path already pins this range).
+        trace["zmin"], trace["zmax"] = -float(np.pi), float(np.pi)
 
     traces = [trace]
     cut = resolved.get("cut")

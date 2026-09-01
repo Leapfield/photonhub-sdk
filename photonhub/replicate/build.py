@@ -397,8 +397,8 @@ def build_simulation(
         return _centre(port, _TRANSV)
 
     # Yee-native routing mode: solve_yee_mode reads the scene's OWN staggered eps
-    # -> a grid-consistent discrete eigenmode (the construction Tidy3D/Lumerical
-    # use). The window is centred on the PORT's transverse position, so a
+    # -> a grid-consistent discrete eigenmode (the standard
+    # construction). The window is centred on the PORT's transverse position, so a
     # transversely-offset arm (a Y-branch output) reads its own guide, not the
     # domain axis. Cached per (axis, transverse cell) since collinear same-offset
     # ports share a cross-section.
@@ -525,7 +525,7 @@ def build_simulation(
     # late-time divergence (the cpw=30 case). PR #158 auto-applies the aligned
     # profile at construction — but ONLY when no PML knob is user-set, and we DO
     # pass pml_num_layers (to size the domain around the mode planes), which
-    # suppresses it. So apply the same Tidy3D-StablePML-aligned alpha+kappa here,
+    # suppresses it. So apply the same stabilized-CPML alpha+kappa here,
     # keeping our layer count (with_stabilized_pml's default 40-layer slab would
     # collide with the monitor planes).
     if dispersive:

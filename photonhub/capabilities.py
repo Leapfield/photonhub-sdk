@@ -45,6 +45,15 @@ ENGINE_ADVERTISED_FEATURES = frozenset({
     "apodization",      # §12 DFT time window
     "interval_space",   # §12 DFT spatial decimation
     "mode_port",        # §12 post-processing metadata (schema 1.16)
+    # Schema 1.18 (2026-08)
+    "anisotropic_media",   # §10.2 diagonal eps tensor
+    "bloch",               # §22 Bloch boundaries (CPU)
+    "oblique_plane_wave",  # §22 stage C constant-k tilt
+    "tfsf_box",            # §13.5 closed TF/SF box (CPU)
+    # Schema 1.19 (2026-08)
+    "field_precision_fp16",  # §23 fp16 field storage lane
+    # Schema 1.20 (2026-08)
+    "dft_precision_narrow",  # §12.6 narrowed field_dft accumulator lanes
 })
 
 _PROBE_TIMEOUT_S = 30.0

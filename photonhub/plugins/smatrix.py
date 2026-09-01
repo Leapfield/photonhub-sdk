@@ -1,8 +1,7 @@
 """Multiport scattering-matrix (S-matrix) assembler — pure Python, no engine.
 
-This is the PhotonHub analogue of Tidy3D's ``ComponentModeler`` / Lumerical's
-S-parameter sweep, built entirely on top of the mode-resolved **complex** modal
-amplitude that :func:`photonhub.plugins.mode_overlap.mode_amplitude` extracts
+This assembles the multi-port scattering matrix, built entirely on top of the
+mode-resolved **complex** modal amplitude that :func:`photonhub.plugins.mode_overlap.mode_amplitude` extracts
 from a recorded DFT plane. Where :mod:`mode_devices` gives you single-mode power
 ``T(f) = |c|^2`` per monitor, this module keeps the *phase* of ``c`` and arranges
 the per-port amplitudes into a proper scattering matrix.
@@ -17,7 +16,8 @@ S-matrix relates the outgoing modal amplitudes ``b`` to the incoming ones ``a``:
 
 ``a_j`` is the amplitude **incident** on the device at the driven port; ``b_i``
 is the amplitude **scattered out** of the device at port i. Each is the
-**power-normalized wave amplitude** ``c * sqrt(|P_mode|)``, built from the
+**power-normalized wave amplitude** ``c * sqrt(|P_mode| * 1e-12)`` (µm²→m²,
+the engine's SI flux units), built from the
 normalized modal coefficient ``c = a_pm / P_mode`` of
 :func:`~photonhub.plugins.mode_overlap.mode_amplitude` and the port mode's own
 plane power ``P_mode`` — so
@@ -60,7 +60,9 @@ Normalization
 amplitudes already living in the run data: the recorded phasors are divided by
 ``A0*S(f)`` (NUMERICS.md section 12), so that normalization cancels in the ratio
 ``S_ij = b_i / a_j`` and leaves a dimensionless scattering parameter. Each port's
-amplitude is the power-normalized ``c * sqrt(|P_mode|)`` (see above), so
+amplitude is the power-normalized ``c * sqrt(|P_mode| * 1e-12)`` (see above —
+the µm²→m² factor keeps ``|b|^2`` equal to the flux-commensurate
+``ModeMonitor.mode_power``), so
 ``|S_ij|^2`` is a power ratio for same-mode AND unequal-mode port pairs alike
 (a clean straight through-guide reads ``|S21| ≈ 1``). No de-embedding of the
 source-to-monitor or monitor-to-port reference plane is applied — ``S`` is
@@ -102,7 +104,7 @@ import numpy as np
 
 from ._constants import _TANGENTIAL
 from .mode_devices import ModeMonitor
-from .mode_overlap import _overlap_terms
+from .mode_overlap import _UM2_TO_M2, _overlap_terms
 
 __all__ = [
     "SPort",
@@ -201,10 +203,13 @@ class SPort:
         )
         # c = a_pm/P_mode keeps the phase convention (a clean self-overlap reads
         # c == 1 in either direction, the SIGNED P_mode handling the backward
-        # flip); the sqrt(|P_mode|) factor converts it to a wave amplitude whose
-        # |.|^2 is the modal power, so per-port P_mode no longer biases S.
+        # flip); the sqrt(|P_mode| * um2->m2) factor converts it to a wave
+        # amplitude whose |.|^2 is the modal power in the engine's SI flux
+        # units — the same flux-commensurate value ModeMonitor.mode_power
+        # reports — so per-port P_mode no longer biases S. The unit factor is
+        # shared by every port, so S ratios are unchanged by it.
         return {
-            f: complex(a_pm / p_mode) * float(np.sqrt(abs(p_mode)))
+            f: complex(a_pm / p_mode) * float(np.sqrt(abs(p_mode) * _UM2_TO_M2))
             for f, (a_pm, p_mode) in terms.items()
         }
 

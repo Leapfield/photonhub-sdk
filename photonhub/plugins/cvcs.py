@@ -19,12 +19,13 @@ Method
 Between two key planes A, B (tracked so index ``m`` is the same physical mode),
 the mode at fractional position ``s in [0, 1]`` is the renormalized linear blend
 
-    e_m(s) = normalize[ (1-s) e_m^A + s * align * e_m^B ] ,   n_eff_m(s) = (1-s) n_eff_m^A + s n_eff_m^B
+    e_m(s) = normalize[ (1-s) e_m^A + s * align * e_m^B ]
+    n_complex,m(s) = (1-s) n_complex,m^A + s n_complex,m^B
 
 (and likewise for ``h``), where ``align`` is the unit phase that makes A and B
-co-phased (from their transverse-E overlap). The interpolated planes feed
-:func:`photonhub.plugins.eme.run_eme` exactly like solved ones — the EME interface
-re-orthonormalizes each basis, so the blend only needs to be *approximately* right.
+co-phased (from their transverse-E overlap) and
+``n_complex = n_eff + i*k_eff``. The interpolated planes feed
+:func:`photonhub.plugins.eme.run_eme` exactly like solved ones.
 
 Conversion (the fixed multimode basis)
 ======================================
@@ -49,6 +50,12 @@ variation there, so it needs near-staircase key-plane density — at which point
 plain :mod:`~photonhub.plugins.eme` staircase is the simpler tool. CVCS's ``N/K``
 eigensolve saving is realized wherever the modes are smooth (the common case);
 see ``benchmarks/eme/cvcs_taper.py``.
+
+CVCS currently interpolates only ordinary ``"guided"`` modes on a real,
+non-PML transverse contour. Radiation, evanescent, PML, and complex-contour
+bases need contour-aware mode tracking and interpolation of their reaction and
+physical-flux metrics; they are rejected explicitly instead of silently
+producing inconsistent basis metadata.
 """
 
 from __future__ import annotations
@@ -67,6 +74,40 @@ __all__ = ["interpolate_mode", "interpolate_plane", "cvcs_sections"]
 _COMPONENTS = ("ex", "ey", "ez", "hx", "hy", "hz")
 
 
+def _validate_interpolable_mode(mode: VectorMode, *, where: str) -> None:
+    """Reject modal bases whose CVCS interpolation is not yet well-defined."""
+    if mode.mode_type != "guided":
+        raise ValueError(
+            f"CVCS supports only ordinary guided modes; {where} has "
+            f"mode_type={mode.mode_type!r}. Radiation and evanescent basis "
+            "interpolation is not implemented."
+        )
+    if mode.bend_radius_um is not None:
+        raise ValueError(
+            f"CVCS does not yet support bend/curvature interpolation; {where} "
+            f"has bend_radius_um={mode.bend_radius_um!r}."
+        )
+    has_pml_cells = tuple(mode.pml_cells_xy) != (0, 0)
+    has_complex_contour = mode.overlap_weights is not None
+    has_physical_mask = mode.physical_mask is not None
+    if has_pml_cells or has_complex_contour or has_physical_mask:
+        raise ValueError(
+            f"CVCS supports only guided modes on a real, non-PML transverse "
+            f"contour; {where} carries PML/complex-contour metadata. "
+            "Contour-aware mode and metric interpolation is not implemented."
+        )
+    if mode.yee_staggered:
+        raise ValueError(
+            f"CVCS requires node-collocated modal fields; {where} is "
+            "Yee-staggered."
+        )
+    if mode.x_coords_um is not None or mode.y_coords_um is not None:
+        raise ValueError(
+            f"CVCS currently requires a uniform transverse grid; {where} "
+            "carries explicit coordinate arrays."
+        )
+
+
 def interpolate_mode(mode_a: VectorMode, mode_b: VectorMode, s: float) -> VectorMode:
     """Linear blend of two corresponding modes at fraction ``s`` in ``[0, 1]``
     (``s = 0`` -> ``mode_a``, ``s = 1`` -> ``mode_b``).
@@ -74,11 +115,17 @@ def interpolate_mode(mode_a: VectorMode, mode_b: VectorMode, s: float) -> Vector
     ``mode_b`` is sign/phase aligned to ``mode_a`` (via their transverse-E
     overlap) before blending, so the two add constructively. All six field
     components are interpolated and the result is renormalized to the
-    :class:`VectorMode` convention (transverse-E L2 = 1); ``n_eff`` is linearly
-    interpolated. Intended for *adjacent* tracked modes (see module docstring).
+    :class:`VectorMode` convention (transverse-E L2 = 1). The full complex modal
+    index ``n_eff + i*k_eff`` is linearly interpolated, preserving both phase
+    propagation and attenuation. Intended for *adjacent* tracked ordinary guided
+    modes (see module docstring). Endpoint ``solve_params`` provenance is cleared
+    because an interpolated field cannot be reproduced by replaying either
+    endpoint eigensolve.
     """
     if not 0.0 <= s <= 1.0:
         raise ValueError(f"s must be in [0, 1], got {s}")
+    _validate_interpolable_mode(mode_a, where="mode_a")
+    _validate_interpolable_mode(mode_b, where="mode_b")
     if mode_a.shape != mode_b.shape:
         raise ValueError(
             f"modes are on different grids ({mode_a.shape} vs {mode_b.shape})"
@@ -92,6 +139,32 @@ def interpolate_mode(mode_a: VectorMode, mode_b: VectorMode, s: float) -> Vector
             f"(({mode_a.dl_x_um}, {mode_a.dl_y_um}) vs "
             f"({mode_b.dl_x_um}, {mode_b.dl_y_um}) um); interpolation needs "
             "one common transverse grid")
+    if not np.isclose(
+        mode_a.wavelength_um,
+        mode_b.wavelength_um,
+        rtol=1e-12,
+        atol=1e-15,
+    ):
+        raise ValueError(
+            f"modes have different wavelengths ({mode_a.wavelength_um} vs "
+            f"{mode_b.wavelength_um} um); CVCS interpolates beta at one common "
+            "frequency"
+        )
+    offset_a = (
+        (0.0, 0.0)
+        if mode_a.center_offset_um is None
+        else tuple(mode_a.center_offset_um)
+    )
+    offset_b = (
+        (0.0, 0.0)
+        if mode_b.center_offset_um is None
+        else tuple(mode_b.center_offset_um)
+    )
+    if not np.allclose(offset_a, offset_b, rtol=0.0, atol=1e-12):
+        raise ValueError(
+            f"modes have different center offsets ({offset_a} vs {offset_b}); "
+            "CVCS does not translate or resample modal grids"
+        )
     if s == 0.0:
         return mode_a
     if s == 1.0:
@@ -106,10 +179,16 @@ def interpolate_mode(mode_a: VectorMode, mode_b: VectorMode, s: float) -> Vector
     if norm == 0.0:
         raise ValueError("interpolated mode has zero transverse-E norm")
     blended = {c: v / norm for c, v in blended.items()}
+    n_complex = (
+        (1.0 - s) * mode_a.n_eff_complex + s * mode_b.n_eff_complex
+    )
     return replace(
         mode_a,
-        n_eff=(1.0 - s) * mode_a.n_eff + s * mode_b.n_eff,
+        n_eff=float(n_complex.real),
+        k_eff=float(n_complex.imag),
         n_group=None,
+        eigen_residual=None,
+        solve_params=None,
         **blended,
     )
 
@@ -181,6 +260,11 @@ def cvcs_sections(
         raise ValueError("key_z_um must be strictly increasing")
     if n_subslices < 1:
         raise ValueError("n_subslices must be >= 1")
+    for plane_index, plane in enumerate(key_planes):
+        for mode_index, mode in enumerate(plane):
+            _validate_interpolable_mode(
+                mode, where=f"key plane {plane_index}, mode {mode_index}"
+            )
     counts = [len(p) for p in key_planes]
     if len(set(counts)) != 1:
         raise ValueError(

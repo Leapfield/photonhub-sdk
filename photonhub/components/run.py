@@ -46,7 +46,7 @@ class RunSpec(FrozenModel):
     # NUMERICS.md section 7 auto-shutoff (run-until-field-decay): the run may
     # finish before run_time_s/n_steps once the field energy decays below this
     # fraction of its peak (after the sources stop). 0 disables; default 1e-5
-    # (Tidy3D parity). The engine's resolve.cpp validate() is authoritative.
+    # (standard behavior). The engine's resolve.cpp validate() is authoritative.
     shutoff: float = Field(default=1.0e-5, ge=0, lt=1)
 
     @model_validator(mode="after")

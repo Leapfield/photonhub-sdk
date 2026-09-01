@@ -17,14 +17,17 @@ from .components import (
     FieldSnapshotMonitor,
     FieldTimeMonitor,
     FluxMonitor,
+    CW,
     GaussianPulse,
     DrudePole,
     LorentzPole,
     Medium,
+    PermittivityData,
     ModePort,
     ModeSolveProvenance,
     ModeSource,
     PlaneWave,
+    TfsfBox,
     PointDipole,
     PortMode,
     PolySlab,
@@ -69,7 +72,7 @@ from .inverse_design import (
     value_and_gradient,
 )
 
-__version__ = "0.0.1"
+__version__ = "0.1.1"
 
 __all__ = [
     "Apodization",
@@ -84,6 +87,7 @@ __all__ = [
     "FieldSnapshotMonitor",
     "FieldTimeMonitor",
     "FluxMonitor",
+    "CW",
     "GaussianPulse",
     "GdsLayer",
     "import_gds",
@@ -92,12 +96,14 @@ __all__ = [
     "DrudePole",
     "LorentzPole",
     "Medium",
+    "PermittivityData",
     "ModePort",
     "ModeSolveProvenance",
     "ModeSource",
     "library",
     "materials",
     "PlaneWave",
+    "TfsfBox",
     "PointDipole",
     "PortMode",
     "PolySlab",

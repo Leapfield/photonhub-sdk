@@ -85,6 +85,17 @@ from .plugins.modes import Mode
 # arg = -1.440 rad, the e^{-iwt} §12-phasor + Gaussian-pulse-delay phase. The
 # source/probe propagation phases cancel, so arg is ~geometry-independent (the
 # benchmark's two problems agree to ~0.2 rad -> cos > 0.98 frozen).
+# NOTE THE MAGNITUDE: |BETA| == 1 by construction. This constant is a fitted
+# PHASE, pinned by aligning the adjoint direction with finite differences
+# (gradient_check.py) — it carries no magnitude normalization, so the returned
+# gradient is meaningful in DIRECTION but NOT in scale. Measured against
+# central finite differences the norm is low by 2.2e4-3.2e4x, and the factor is
+# NOT a constant: it moves ~45% across pixel counts and region thicknesses, so
+# it cannot be absorbed into this constant (benchmarks/meep FINDINGS.md F22).
+# Consequence for callers: use it with a line-searching optimizer (L-BFGS, as
+# `optimize` does, which is insensitive to a scale), never with a fixed step
+# size, a gradient-norm stopping rule, or a cross-problem sensitivity
+# comparison.
 BETA: complex = 0.1304 - 0.9915j    # exp(-1.440j); see gradient_check.py
 
 # Same role as BETA but for a MODE-SOURCE adjoint (ModePower): the adjoint
@@ -429,6 +440,12 @@ def assemble_gradient(
     ``coeff`` is the objective's adjoint coefficient (``conj(u)`` for
     :class:`PointIntensity`). Returns a flat array of length
     ``region.n_params`` in row-major ``[ix, iy, iz]`` order.
+
+    **Direction, not magnitude.** ``BETA`` is a unit-magnitude fitted phase, so
+    the result is proportional to dJ/drho with an uncalibrated (and
+    configuration-dependent) constant — see the note on ``BETA``. Fine for a
+    line-searching optimizer; wrong for anything that reads the gradient's
+    size.
     """
     da = forward[monitor_name].sel(f=freq_hz)
     pix = region._pixel_index(da).ravel()                 # (Ncells,)
@@ -474,6 +491,14 @@ def value_and_gradient(
     monitor_name: str = "design_region",
 ) -> GradientResult:
     """One adjoint gradient: a forward solve + an adjoint solve (2 total).
+
+    **The returned gradient is calibrated in DIRECTION only.** Its magnitude is
+    uncalibrated and configuration-dependent (measured 2.2e4-3.2e4x below
+    central finite differences, varying ~45% with pixel count and region
+    thickness — benchmarks/meep FINDINGS.md F22). Pass it to a line-searching
+    optimizer such as :func:`optimize`; do NOT use it for a fixed step size, a
+    gradient-norm convergence test, or comparing sensitivities between two
+    problems.
 
     ``build_forward(rho)`` returns the forward :class:`~photonhub.Simulation`.
     The adjoint simulation is derived from it by swapping in the objective's

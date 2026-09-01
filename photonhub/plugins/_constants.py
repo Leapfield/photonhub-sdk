@@ -18,14 +18,21 @@ from typing import Dict, Tuple
 C0: float = 2.99792458e8
 
 
-def engine_dt_s(dl_um: float, courant: float = 0.99) -> float:
-    """The engine's timestep (seconds): ``dt = courant * dl / (C0 * sqrt(3))``
-    — the 3-D Courant formula of ``engine/src/core/resolve.cpp`` (NUMERICS §2).
-    ``courant`` is ``RunSpec.courant`` (user-settable, default 0.99); client
-    code that phases anything against the engine clock must call THIS with the
-    simulation's actual courant rather than re-deriving the formula, or a
-    non-default courant silently de-tunes it."""
-    return float(courant) * (float(dl_um) * 1e-6) / (C0 * math.sqrt(3.0))
+def engine_dt_s(dl_um: float, courant: float = 0.99,
+                active_axes: int = 3) -> float:
+    """The engine's timestep (seconds): ``dt = courant * dl /
+    (C0 * sqrt(active_axes))`` — the Courant formula of
+    ``engine/src/core/resolve.cpp`` (NUMERICS §2). ``courant`` is
+    ``RunSpec.courant`` (user-settable, default 0.99); client code that phases
+    anything against the engine clock must call THIS with the simulation's
+    actual courant rather than re-deriving the formula, or a non-default
+    courant silently de-tunes it. ``active_axes`` is the number of axes with
+    more than one cell (NUMERICS §2): a quasi-2D run — one 1-cell plain
+    periodic axis — steps at ``sqrt(2)``, so shape-aware callers must pass 2
+    there or the phase (and any ``omega*dt`` stability estimate) is off by
+    ``sqrt(3/2)``."""
+    return (float(courant) * (float(dl_um) * 1e-6)
+            / (C0 * math.sqrt(float(active_axes))))
 
 #: Vacuum permeability (H/m) — CODATA 2018 (engine ``kMu0``). NOT the pre-2019
 #: exact ``4e-7*pi`` (which differs by ~5e-10 relative).

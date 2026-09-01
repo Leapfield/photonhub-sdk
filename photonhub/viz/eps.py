@@ -30,7 +30,8 @@ from typing import List, Tuple
 
 import numpy as np
 
-from ..components.grid import graded_primary_spacings, realized_cells
+from ..components.grid import (graded_primary_spacings, realized_cells,
+                               sim_axis_min_cells)
 from . import _geometry as geom
 from . import _style
 
@@ -44,7 +45,8 @@ def axis_nodes_um(sim, axis_index: int) -> np.ndarray:
     dl = sim.grid.dl_um
     q = sim._axis_coords_um(axis_index)
     if q is None:
-        n = realized_cells(sim.size_um[axis_index], dl)
+        n = realized_cells(sim.size_um[axis_index], dl,
+                           sim_axis_min_cells(sim, axis_index))
         return np.arange(n + 1, dtype=np.float64) * dl
     # Graded: n cells from len(coords) nodes; the closing node is q[-1] + the
     # replicated final spacing (cost.py / Simulation._realized_um use this).
@@ -64,7 +66,8 @@ def realized_shape(sim) -> Tuple[int, int, int]:
     for i in range(3):
         q = sim._axis_coords_um(i)
         if q is None:
-            out.append(realized_cells(sim.size_um[i], sim.grid.dl_um))
+            out.append(realized_cells(sim.size_um[i], sim.grid.dl_um,
+                                      sim_axis_min_cells(sim, i)))
         else:
             out.append(len(q))
     return tuple(out)
@@ -106,7 +109,43 @@ def sample_eps_plane(sim, axis: str, value: float):
                 (np.abs(HH - c[h_idx]) <= s[h_idx] / 2.0)
                 & (np.abs(VV - c[v_idx]) <= s[v_idx] / 2.0)
             )
-            eps[inside] = eps_val
+            pd = getattr(structure.medium, "permittivity_data", None)
+            if pd is not None:
+                # §10.3 custom medium: trilinear node grid over the box
+                # extent (mirrors the engine's eps_data_at) — previews show
+                # the real profile, and downstream homogeneity checks (e.g.
+                # diffraction_orders' n inference) correctly see a
+                # non-uniform plane instead of the scalar mean.
+                shape = pd.shape
+                vals = np.asarray(pd.values, dtype=np.float64).reshape(shape)
+
+                def _frac(coord, cd, sd, n):
+                    f = ((np.asarray(coord, dtype=np.float64)
+                          - (cd - sd / 2.0)) / sd) if sd > 0 else 0.0
+                    return np.clip(f, 0.0, 1.0) * (n - 1)
+
+                q = [None, None, None]
+                q[h_idx] = _frac(HH, c[h_idx], s[h_idx], shape[h_idx])
+                q[v_idx] = _frac(VV, c[v_idx], s[v_idx], shape[v_idx])
+                q[a] = _frac(value, c[a], s[a], shape[a])
+                i0, w = [], []
+                for d in range(3):
+                    qq = np.asarray(q[d], dtype=np.float64)
+                    lo = np.minimum(qq.astype(np.int64), shape[d] - 2)
+                    i0.append(lo)
+                    w.append(qq - lo)
+                acc = np.zeros_like(HH, dtype=np.float64)
+                for bx in (0, 1):
+                    for by in (0, 1):
+                        for bz in (0, 1):
+                            wt = ((w[0] if bx else 1.0 - w[0])
+                                  * (w[1] if by else 1.0 - w[1])
+                                  * (w[2] if bz else 1.0 - w[2]))
+                            acc = acc + wt * vals[i0[0] + bx, i0[1] + by,
+                                                  i0[2] + bz]
+                eps[inside] = np.broadcast_to(acc, eps.shape)[inside]
+            else:
+                eps[inside] = eps_val
         elif gtype == "sphere":
             c, r = g.center_um, g.radius_um
             d_axis = value - c[a]

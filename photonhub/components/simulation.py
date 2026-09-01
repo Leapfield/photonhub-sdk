@@ -1,5 +1,6 @@
 """Top-level simulation model — the root of the wire format."""
 
+import logging
 import math
 import os
 import stat
@@ -13,6 +14,8 @@ from pydantic import Field, field_validator, model_validator
 from ..cost import CostEstimate, estimate_cost
 from .base import (
     MAX_INT32,
+    DftPrecisionName,
+    FieldPrecisionName,
     FrozenModel,
     PositiveUm,
     SubpixelMethodName,
@@ -20,11 +23,14 @@ from .base import (
 )
 from .grid import (
     GridSpecType,
+    axis_min_cells,
     graded_primary_spacings,
+    quarter_snap_dft_face,
     realized_cells,
     resolved_cell_counts,
     snap_mixed_plane,
     snapped_plane_index,
+    yee_axis_offsets,
 )
 from .medium import Background, Boundaries
 from .monitors import (
@@ -37,21 +43,67 @@ from .run import RunSpec
 from .sources import ModeSource, PlaneWave, SourceType
 from .structures import Structure
 
-SCHEMA_VERSION = "1.17.0-alpha.1"
+
+def _medium_poles(medium):
+    """Every Lorentz pole on a medium, across both wire spellings.
+
+    ``lorentz`` is the legacy OPTIONAL SINGLE pole (NUMERICS.md section 19.5)
+    and ``poles`` is the list form. Wrapping the single one in ``list(...)``
+    iterates a pydantic model into (name, value) tuples instead — which is how
+    two validators here quietly grew an AttributeError on any scene that used
+    the legacy spelling.
+    """
+    single = getattr(medium, "lorentz", None)
+    out = [single] if single is not None else []
+    out.extend(getattr(medium, "poles", None) or [])
+    return out
+
+
+def _structure_axis_span(geometry, axis_index: int):
+    """(lo, hi) extent of one geometry along an axis, or None if not derivable.
+
+    Used only by the quasi-2-D subpixel warning: a conservative None means "do
+    not warn about this shape".
+    """
+    kind = getattr(geometry, "type", None)
+    center = getattr(geometry, "center_um", None)
+    if kind == "box":
+        c = center[axis_index]
+        h = 0.5 * geometry.size_um[axis_index]
+        return c - h, c + h
+    if kind == "sphere":
+        c = center[axis_index]
+        return c - geometry.radius_um, c + geometry.radius_um
+    if kind == "cylinder":
+        c = center[axis_index]
+        along = _AXES[axis_index] == geometry.axis
+        h = 0.5 * geometry.length_um if along else geometry.radius_um
+        return c - h, c + h
+    if kind == "polyslab" and _AXES[axis_index] == geometry.axis:
+        lo, hi = geometry.slab_bounds_um
+        return float(lo), float(hi)
+    return None
+
+SCHEMA_VERSION = "1.20.0-alpha.1"
 SUPPORTED_SCHEMA_MAJOR = 1
 
 _AXES = "xyz"
 
+_LOG = logging.getLogger(__name__)
+
 # eta0 = mu0 * c0 — the vacuum wave impedance. Bridges the CPML sigma/alpha peak
-# between Tidy3D's dimensionless "units of 2*eps0/dt" convention and the engine's
+# between the dimensionless "units of 2*eps0/dt" convention and the engine's
 # S/m: since eps0*c0 = 1/eta0, the peak-conductivity unit 2*eps0/dt reduces to a
 # form needing only eta0, the cell spacing, and the Courant number (see
 # Simulation._two_eps0_over_dt).
 _ETA0 = 1.25663706212e-6 * 2.99792458e8
+_EPS0 = 8.8541878128e-12
+# Conservative ADE-resonance margin: below the measured stable point (0.75) and
+# well below NUMERICS.md section 19's non-tight bound of 2 (FINDINGS.md F18).
+_ADE_MARGIN = 0.8
 
-# Tidy3D StablePML-aligned CPML stabilization (its DefaultStablePMLParameters,
-# tidy3d/components/boundary.py): kappa_max = 5.0 and a CFS alpha_max = 0.9, both
-# quoted in Tidy3D's 2*eps0/dt units (StablePML also uses 40 layers and
+# Stabilized-CPML profile: kappa_max = 5.0 and a CFS alpha_max = 0.9, both
+# quoted in 2*eps0/dt units (that profile also uses 40 layers and
 # sigma_max = 1.0). The engine already reads sigma in that convention
 # (pml_sigma_max, default 1.5) but alpha in absolute S/m (pml_alpha_max) — which
 # is precisely WHY the default alpha (0.24 S/m) is inert — so we convert
@@ -62,7 +114,7 @@ _STABLE_PML_LAYERS = 40
 _STABLE_PML_KAPPA_MAX = 5.0
 _STABLE_PML_ALPHA_SCALE = 0.9
 # The AUTO-stabilizer dose (_auto_stabilize_dispersive_pml) is 9x GENTLER than
-# with_stabilized_pml's Tidy3D-parity 0.9. Tidy3D treats StablePML as an OPT-IN
+# with_stabilized_pml's 0.9. The stabilized profile is an OPT-IN
 # profile paired with 40 layers; auto-applying its alpha to the default 12-layer
 # slab de-tunes the PML for PROPAGATING waves: at optical grids omega*eps0 is
 # only ~0.02*(2*eps0/dt), so alpha = 0.9*(2*eps0/dt) throttles the CFS
@@ -72,7 +124,7 @@ _STABLE_PML_ALPHA_SCALE = 0.9
 # 5.5x the ring-down; 1-D normal incidence R 0.49). Curing the trapped-resonance
 # divergence only needs the CFS crossover alpha/(2*pi*eps0) up at the mode's
 # optical frequency — the 2026-07-03 cure measured ~2% of sigma_max, ~30x below
-# the Tidy3D value — so 0.1 keeps ~3x that margin (rod probe: stable through
+# that reference value — so 0.1 keeps ~3x that margin (rod probe: stable through
 # 294k steps at alpha 3e4-1e5 S/m; CFS-inert diverges @197k) while restoring
 # low reflection (crossing R: 3e4 -> 1e-4, 1e5 -> 0.024, vs 0.35 at the 0.9
 # dose). Measured 2026-07-17 on MI300X gfx942:
@@ -83,14 +135,149 @@ _AUTO_PML_ALPHA_SCALE = 0.1
 _CFS_INERT_FRAC = 0.005
 
 
+def _quarter_snapped_dft_monitors(monitors, *, size_um, grid):
+    """NUMERICS.md §12 quarter-cell auto-snap over a monitor list.
+
+    Pure function of ``(monitors, size_um, grid)``: returns ``(new_monitors,
+    notes)`` where ``notes`` carries one line per ADJUSTED monitor (empty =
+    nothing moved and ``new_monitors`` is the input, element-identical). For
+    each :class:`FieldDftMonitor` and each axis whose listed components mix
+    Yee offsets, both box faces are put through
+    :func:`~photonhub.components.grid.quarter_snap_dft_face`: a face whose
+    per-component engine snap already agrees — including domain-edge faces
+    rescued by the engine's index clamp — is left byte-identical, anything
+    else moves to the nearest local ``(k + 1/4)`` quarter-cell plane. A box
+    face and its quarter point snap to the SAME cell, so a scene the engine
+    already accepted keeps its exact recorded region; only rejected or
+    rounding-sensitive placements change at all.
+
+    Raises ``ValueError`` for a sub-half-cell box straddling a cell boundary
+    (its two faces would collapse onto one quarter point or invert), and when
+    a ``mode_port`` window can no longer fit on its snapped plane.
+    """
+    coords = getattr(grid, "coords", None)
+    dl = grid.dl_um
+    axis_q = []
+    for a, axis in enumerate(_AXES):
+        q = getattr(coords, axis) if coords is not None else None
+        n = len(q) if q is not None else realized_cells(size_um[a], dl)
+        axis_q.append((q, n))
+
+    out, notes = [], []
+    for m in monitors:
+        if not isinstance(m, FieldDftMonitor):
+            out.append(m)
+            continue
+        lo = [m.center_um[a] - m.size_um[a] / 2.0 for a in range(3)]
+        hi = [m.center_um[a] + m.size_um[a] / 2.0 for a in range(3)]
+        moved = []  # (axis_index, "lo"/"hi", old_um, new_um)
+        for a in range(3):
+            offsets = yee_axis_offsets(m.fields, a)
+            q, n = axis_q[a]
+            for which, faces in (("lo", lo), ("hi", hi)):
+                snapped = quarter_snap_dft_face(
+                    faces[a], offsets, n_cells=n, dl_um=dl, coords_um=q)
+                if snapped is not None and snapped != faces[a]:
+                    moved.append((a, which, faces[a], snapped))
+                    faces[a] = snapped
+            if m.size_um[a] > 0.0 and hi[a] <= lo[a]:
+                raise ValueError(
+                    f"monitor '{m.name}': the §12 quarter-snap of its "
+                    f"{_AXES[a]}-axis faces "
+                    f"[{m.center_um[a] - m.size_um[a] / 2.0:.9g}, "
+                    f"{m.center_um[a] + m.size_um[a] / 2.0:.9g}] um would "
+                    f"collapse or invert the box (snapped [{lo[a]:.9g}, "
+                    f"{hi[a]:.9g}] um): a box thinner than half a cell "
+                    "straddling a cell boundary cannot satisfy the engine's "
+                    "per-component region snap (NUMERICS.md §12). Place both "
+                    "faces strictly inside ONE first half-cell (e.g. center "
+                    "the box on a (k + 1/4)*dl_um plane), give the axis "
+                    "size 0 (a plane — snapped automatically), or widen it "
+                    "past a full cell."
+                )
+        if not moved:
+            out.append(m)
+            continue
+
+        update = {
+            "center_um": tuple(
+                0.5 * (lo[a] + hi[a])
+                if any(mv[0] == a for mv in moved) else m.center_um[a]
+                for a in range(3)),
+            "size_um": tuple(
+                hi[a] - lo[a]
+                if any(mv[0] == a for mv in moved) else m.size_um[a]
+                for a in range(3)),
+        }
+
+        # A snapped face can shrink the recorded plane from under a mode_port
+        # solve window authored flush against the old extents; clamp the
+        # window into the new plane (post-processing metadata only — the
+        # engine validates and discards it) instead of letting
+        # _modal_port_rules reject the auto-snapped scene. Only a window that
+        # FIT THE PLANE AS AUTHORED is followed: one that already stuck out is
+        # the author's error and stays for _modal_port_rules to reject.
+        port = m.mode_port
+        zero_axes = [a for a in range(3) if update["size_um"][a] == 0.0]
+        if port is not None and len(zero_axes) == 1:
+            normal = zero_axes[0]
+            transverse = tuple(a for a in range(3) if a != normal)
+            w_center, w_size, port_moved = list(port.center_um), list(
+                port.size_um), False
+            for local, a in enumerate(transverse):
+                w_lo = port.center_um[local] - port.size_um[local] / 2.0
+                w_hi = port.center_um[local] + port.size_um[local] / 2.0
+                orig_lo = m.center_um[a] - m.size_um[a] / 2.0
+                orig_hi = m.center_um[a] + m.size_um[a] / 2.0
+                if w_lo < orig_lo - 1e-12 or w_hi > orig_hi + 1e-12:
+                    continue  # never fit the authored plane — not ours to fix
+                new_lo, new_hi = max(w_lo, lo[a]), min(w_hi, hi[a])
+                if new_lo > w_lo + 1e-12 or new_hi < w_hi - 1e-12:
+                    if not (new_hi - new_lo > 0.0):
+                        raise ValueError(
+                            f"monitor '{m.name}': the §12 quarter-snap moved "
+                            f"its DFT plane off the mode_port window on "
+                            f"'{_AXES[a]}' ([{w_lo:.9g}, {w_hi:.9g}] um vs "
+                            f"snapped plane [{lo[a]:.9g}, {hi[a]:.9g}] um); "
+                            "re-center the window inside the plane."
+                        )
+                    w_center[local] = 0.5 * (new_lo + new_hi)
+                    w_size[local] = new_hi - new_lo
+                    port_moved = True
+                    moved.append((a, f"mode_port window {'lo' if new_lo != w_lo else 'hi'}",
+                                  w_lo if new_lo != w_lo else w_hi,
+                                  new_lo if new_lo != w_lo else new_hi))
+            if port_moved:
+                update["mode_port"] = port.model_copy(update={
+                    "center_um": tuple(w_center), "size_um": tuple(w_size)})
+
+        out.append(m.model_copy(update=update))
+        details = ", ".join(
+            f"{_AXES[a]} {which} {old:.9g} -> {new:.9g} um"
+            for a, which, old, new in moved)
+        notes.append(
+            f"monitor '{m.name}': §12 quarter-snap adjusted {details} "
+            "(box faces on/beyond a cell's half-cell plane, or on an interior "
+            "cell boundary, make the per-component region snap of mixed-Yee-"
+            "offset components disagree or depend on float rounding; each "
+            "face was nudged to the nearest (k + 1/4) quarter-cell plane of "
+            "its local cell — NUMERICS.md §12)")
+    return (tuple(out) if notes else monitors), notes
+
+
 class Simulation(FrozenModel):
     """Complete simulation description. Serializes 1:1 to the JSON wire
     format consumed by ``phsolver`` (schemas/GOVERNANCE.md).
 
     The cross-field validators here are best-effort early feedback mirroring
     the engine's checks where they are cheap and unambiguous; ``phsolver
-    validate`` remains authoritative (notably for Yee snapping at exact
-    boundaries and for the plane-wave/PML intersection rule)."""
+    validate`` remains authoritative (notably for the plane-wave/PML
+    intersection rule). One check is resolved rather than mirrored: DFT
+    field-monitor box faces are AUTO-SNAPPED at construction to §12
+    quarter-cell planes wherever the engine's per-component region snap would
+    reject them or pass on float rounding luck (see
+    :class:`~photonhub.components.monitors.FieldDftMonitor`); ingestion via
+    ``from_wire_json``/``from_file`` never adjusts a document."""
 
     schema_version: str = SCHEMA_VERSION
     size_um: Tuple[PositiveUm, PositiveUm, PositiveUm]
@@ -101,6 +288,13 @@ class Simulation(FrozenModel):
     # engine default is 12; an UNSET value is omitted from the wire format
     # (see to_wire_dict) so Phase-0 documents round-trip byte-identically and
     # remain consumable by schema-1.0 parsers that reject unknown keys.
+    #
+    # 4 is a hard FLOOR, not a recommendation. Measured spurious reflection of
+    # a normally incident pulse (benchmarks/meep n07, vs a reflection-free
+    # reference domain): 1.9e-05 at 4 layers, 5.5e-09 at 8, 2.2e-10 at 12,
+    # 4.0e-11 at 16. The default of 12 is quiet; 8 is the practical minimum for
+    # a clean boundary; 4 reflects ~250x more than the equivalent Meep PML and
+    # should be treated as "cheap and lossy" (FINDINGS.md F17).
     pml_num_layers: int = Field(default=12, ge=4, le=MAX_INT32)
     # NUMERICS.md §11 CPML profile (Roden–Gedney) tuning knobs. The defaults
     # reproduce the historically-hardcoded profile BIT-FOR-BIT, so an UNSET
@@ -113,16 +307,16 @@ class Simulation(FrozenModel):
     # The default alpha_max (0.24 S/m) is CFS-INERT: at optical frequencies it is
     # ~1e-5 of the sigma peak, so it costs no in-band reflectionlessness but does
     # NOT damp the DC/late-time pole. The alpha the CFS actually needs is quoted
-    # in Tidy3D's dimensionless 2*eps0/dt convention (like pml_sigma_max) — its
-    # StablePML uses alpha_max = 0.9 — and this asymmetry (sigma dt-relative,
+    # in the dimensionless 2*eps0/dt convention (like pml_sigma_max) — its
+    # the stabilized profile uses alpha_max = 0.9 — and this asymmetry (sigma dt-relative,
     # alpha absolute S/m) is why the default alpha reads as inert. Raising kappa_max
     # + alpha_max is the "stabilized" recipe for a grazing/long-run/dispersive
     # scene that diverges: a DISPERSIVE (Lorentz) scene gets kappa 5.0 +
     # alpha 0.9*(2*eps0/dt) applied AUTOMATICALLY at construction
     # (_auto_stabilize_dispersive_pml), and ``with_stabilized_pml`` builds the
-    # full Tidy3D-StablePML-aligned copy (also adding the layer bump).
-    #   pml_sigma_max peak conductivity in Tidy3D units (2*eps0/dt). The DEFAULT
-    #     1.5 matches Tidy3D's default PML sigma_max exactly — a resolution-
+    # full stabilized-CPML copy (also adding the layer bump).
+    #   pml_sigma_max peak conductivity in 2*eps0/dt units. The DEFAULT
+    #     1.5 matches the standard stabilized-profile PML sigma_max exactly — a resolution-
     #     consistent, dt-based peak that drains grazing/trapped modes cleanly.
     #     0 = the LEGACY Roden-Gedney dl-heuristic (0.8*(m+1)/(eta0*dl)), which is
     #     ~1.6-2.2x WEAKER (worst on a graded mesh) and reproduces the pre-1.5
@@ -167,9 +361,9 @@ class Simulation(FrozenModel):
     # is on. Six operators: "volume" (isotropic volume average, bit-identical to
     # schema < 1.7.0); "tensor" (diagonal anisotropic KFJ); "tensor_full" (full
     # off-diagonal KFJ); "contour" (diagonal KFJ fed the exact §16.10 PolySlab
-    # fill == Tidy3D's default PolarizedAveraging plus the exact vertical-wall
+    # fill == standard polarized averaging plus the exact vertical-wall
     # fill — the DEFAULT); and the rigorous contour-path EPs (Mohammadi-Nadgaran-
-    # Agio 2005 = Tidy3D's ContourPathAveraging): "contour_diag" (the paper's
+    # Agio 2005, contour-path averaging): "contour_diag" (the paper's
     # per-component scalar CP-EP) and "contour_full" (its full off-diagonal Kottke
     # tensor for tilted/curved walls). The FIELD default is "contour" to MATCH
     # the effective construction default: _resolve_subpixel_default auto-enables
@@ -177,12 +371,37 @@ class Simulation(FrozenModel):
     # "contour" on any explicit subpixel-on, so the declared default and the
     # auto/explicit-on paths agree. contour == tensor == contour_diag on axis-
     # aligned interfaces (they reduce to arithmetic/harmonic) and differ only on
-    # tilted/curved cells; contour is the Tidy3D-default match, contour_diag the
+    # tilted/curved cells; contour is the standard match, contour_diag the
     # rigorous CP-EP alternative.
     # Omitted from the wire when unset (see _wire_exclude), so an ingested pre-1.7.0
     # subpixel-on document (no method key) is still run by the engine as ITS default
     # (volume) — the field default is cosmetic on that ingest path.
     subpixel_method: SubpixelMethodName = "contour"
+    # Schema 1.19 — NUMERICS.md §23 field STORAGE precision. "fp16" stores the
+    # six field arrays as binary16 behind exact power-of-two per-run scales
+    # (lambda for E, lambda*2^9 for H); all arithmetic, coefficients, CPML psi,
+    # ADE state, and DFT accumulators stay fp32/fp64. Opt-in fast lane for
+    # bandwidth-bound GPU runs, validated by the §23 two-tier regime (not the
+    # §8 bit-equality gate); fp32 (default) is byte-identical to prior
+    # releases. Single-GPU + real-field core only in this release (the engine
+    # rejects fp16 with bloch boundaries or multi-GPU). Omitted from the wire
+    # when unset (see _wire_exclude) for earlier-minor parser back-compat.
+    field_precision: FieldPrecisionName = "fp32"
+    # Schema 1.20 — NUMERICS.md §12.6 field_dft ACCUMULATOR storage precision.
+    # The running DFT read-modify-writes one accumulator element per (monitored
+    # cell, frequency, component) per accumulation step, which is the dominant
+    # cost of a volume monitor and the only monitor term that scales with the
+    # frequency count. "fp64" (default) is byte-identical to prior releases.
+    # "fp32c" keeps a compensated (Kahan-Babuska-Neumaier) fp32 pair: the same
+    # 16 B per complex element, so it moves no fewer bytes, but its error stays
+    # ~1e-7 relative regardless of step count. "fp32" is a plain fp32 pair —
+    # 8 B per element, halving both accumulator traffic and footprint, at a
+    # signal-dependent accuracy cost that is worst on a ringdown (~1e-4 over
+    # 200k steps; see NUMERICS.md §12.6 for the measured table).
+    # Flux monitors always accumulate in fp64, in every mode.
+    # Omitted from the wire when unset (see _wire_exclude) for earlier-minor
+    # parser back-compat.
+    dft_precision: DftPrecisionName = "fp64"
     structures: Tuple[Structure, ...] = ()
     boundaries: Boundaries = Boundaries()
     # NUMERICS.md §20: optional symmetry plane on each axis' MINIMUM face.
@@ -198,8 +417,37 @@ class Simulation(FrozenModel):
     # an all-zero symmetry is omitted from the wire (see _wire_exclude), so
     # earlier-minor parsers and golden specs round-trip byte-identically.
     symmetry: Tuple[int, int, int] = (0, 0, 0)
+    # Schema 1.18 — per-axis Bloch wavevector (rad/um), used only on axes whose
+    # boundary kind is "bloch": F(x+L) = F(x) e^{i k L}. None (default) is
+    # omitted from the wire (byte-back-compat). Pair with
+    # boundaries.<axis> = "bloch"; the engine rejects a nonzero component on a
+    # non-bloch axis (silent-ignore trap). CPU solver only in this release.
+    bloch_k_per_um: Optional[Tuple[float, float, float]] = None
     sources: Tuple[SourceType, ...] = Field(min_length=1)
     monitors: Tuple[MonitorType, ...] = ()
+
+    @model_validator(mode="after")
+    def _bloch_pairing(self) -> "Simulation":
+        kinds = (self.boundaries.x, self.boundaries.y, self.boundaries.z)
+        k = self.bloch_k_per_um or (0.0, 0.0, 0.0)
+        for a, name in enumerate("xyz"):
+            if k[a] != 0.0 and kinds[a] != "bloch":
+                raise ValueError(
+                    f"bloch_k_per_um[{name}] is nonzero but boundaries.{name} "
+                    f"is {kinds[a]!r} — set it to 'bloch' (the value would be "
+                    "silently ignored otherwise)")
+        for s in self.sources:
+            theta = getattr(s, "angle_theta", None)
+            if theta:
+                ax = "xyz".index(s.axis)
+                for a, name in enumerate("xyz"):
+                    if a != ax and kinds[a] != "bloch":
+                        raise ValueError(
+                            f"plane wave with angle_theta != 0 requires "
+                            f"transverse boundaries.{name} = 'bloch' with the "
+                            "matching bloch_k_per_um — use "
+                            "Simulation.with_oblique_plane_wave(...)")
+        return self
 
     @field_validator("schema_version")
     @classmethod
@@ -256,7 +504,120 @@ class Simulation(FrozenModel):
         # grid before cost estimation or solver launch. This computes only
         # three integers (or tuple lengths); phsolver validate remains the
         # authoritative resolver for the complete device/grid contract.
-        resolved_cell_counts(self.size_um, self.grid)
+        counts = resolved_cell_counts(
+            self.size_um, self.grid, self._axis_min_cells()
+        )
+        # NUMERICS.md section 1 floor warning: an axis whose requested span
+        # rounds to fewer cells than the engine will realize gets silently
+        # widened server-side (4-cell floor on every non-plain-periodic
+        # axis). Surface that here, at authoring time — the classic trap is a
+        # quasi-2D request (size = 1*dl) on a non-periodic axis, which
+        # quadruples the cell count. A plain periodic axis realizes n = 1
+        # exactly, so it never warns.
+        dl = self.grid.dl_um
+        for axis_index, name in enumerate(_AXES):
+            if self._axis_coords_um(axis_index) is not None:
+                continue  # graded ladders carry their own >= 4-node contract
+            requested = realized_cells(
+                self.size_um[axis_index], dl, min_cells=1
+            )
+            if requested < counts[axis_index]:
+                warnings.warn(
+                    f"size_um[{axis_index}] ('{name}') = "
+                    f"{self.size_um[axis_index]:g} um spans "
+                    f"{requested} cell(s) at dl_um = {dl:g}, but the engine "
+                    f"realizes {counts[axis_index]} cells: NUMERICS.md "
+                    "section 1 floors a "
+                    f"'{getattr(self.boundaries, name)}' axis at "
+                    f"{counts[axis_index]} cells. Only a plain periodic axis "
+                    "(no symmetry plane) may run 1 cell deep (quasi-2D); "
+                    "widen the axis or set boundaries."
+                    f"{name} = 'periodic' if a quasi-2D reduction was "
+                    "intended.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+        return self
+
+    def _warn_degenerate_axis_subpixel(self) -> "Simulation":
+        """Warn when subpixel smoothing will dilute a quasi-2-D structure.
+
+        On a 1-cell plain-periodic axis (the quasi-2-D reduction) the physics
+        is invariant along that axis, but the subpixel sampler still smooths
+        ALONG it: the Yee voxel of a field component staggered on that axis is
+        centred half a cell off the primary node, so a structure sized to the
+        single cell fills only HALF of it and its in-plane eps is averaged with
+        the background. TM/Ez physics is unaffected (that voxel is aligned);
+        in-plane-E (TE) physics is corrupted — a photonic-crystal cavity mode
+        can vanish entirely. Until the engine treats a degenerate axis as
+        invariant, structures must extend PAST the domain along it.
+        """
+        if not self.subpixel or not self.structures:
+            return self
+        counts = resolved_cell_counts(
+            self.size_um, self.grid, self._axis_min_cells()
+        )
+        dl = self.grid.dl_um
+        for axis_index, name in enumerate(_AXES):
+            if counts[axis_index] != 1:
+                continue
+            if self._axis_coords_um(axis_index) is not None:
+                continue                      # graded axis: not the 1-cell case
+            extent = counts[axis_index] * dl
+            thin = []
+            for structure in self.structures:
+                span = _structure_axis_span(structure.geometry, axis_index)
+                if span is None:
+                    continue
+                lo, hi = span
+                # NUMERICS.md section 16.13: the engine wraps the smoothing
+                # voxel on a degenerate axis, so a structure covering the WHOLE
+                # single cell (lo <= 0, hi >= extent) is exact. Only a PARTIAL
+                # cover still warns — almost surely an authoring slip in a
+                # scene meant to be 2-D (it becomes a uniform in-plane average
+                # with the background at the covered fraction).
+                if lo > 1e-12 * dl or hi < extent * (1 - 1e-12):
+                    thin.append(structure.name or type(structure.geometry).__name__)
+            if thin:
+                warnings.warn(
+                    f"axis '{name}' realizes a single plain-periodic cell "
+                    f"(quasi-2D) and {len(thin)} structure(s) cover only part "
+                    f"of it ({', '.join(thin[:4])}"
+                    f"{', ...' if len(thin) > 4 else ''}): the axis is "
+                    "invariant, so a partial cover becomes a uniform average "
+                    "with the background at the covered fraction "
+                    "(NUMERICS.md section 16.13) — rarely what a 2-D scene "
+                    f"intends. Span the full 0..{extent:g} um (or beyond) on "
+                    f"'{name}' for solid 2-D geometry.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                return self
+        return self
+
+    @model_validator(mode="after")
+    def _dft_regions_quarter_snap(self, info) -> "Simulation":
+        # NUMERICS.md §12 ergonomics: auto-snap DFT field-monitor box faces
+        # to quarter-cell planes wherever the engine's per-component region
+        # snap would reject them or pass on float luck (see
+        # _quarter_snapped_dft_monitors / grid.quarter_snap_dft_face). This
+        # is a CONSTRUCTION-time convenience, client-side only — the wire
+        # schema is untouched and an INGESTED document (from_wire_json /
+        # from_file passes context ``wire_ingest``) is NEVER adjusted, so
+        # existing sim.json files round-trip byte-identically and phsolver
+        # remains authoritative for them. Runs BEFORE _modal_port_rules so
+        # the port checks see the final geometry. Adjustments are reported
+        # per monitor on this module's DEBUG log.
+        if (info.context or {}).get("wire_ingest"):
+            return self
+        if not any(isinstance(m, FieldDftMonitor) for m in self.monitors):
+            return self
+        snapped, notes = _quarter_snapped_dft_monitors(
+            self.monitors, size_um=self.size_um, grid=self.grid)
+        if notes:
+            object.__setattr__(self, "monitors", snapped)
+            for note in notes:
+                _LOG.debug("%s", note)
         return self
 
     @model_validator(mode="after")
@@ -460,13 +821,22 @@ class Simulation(FrozenModel):
             return None
         return getattr(coords, "xyz"[axis_index])
 
+    def _axis_min_cells(self) -> Tuple[int, int, int]:
+        """NUMERICS.md section 1 per-axis cell floor for THIS simulation:
+        1 on plain periodic axes (no symmetry plane), 4 elsewhere."""
+        return tuple(
+            axis_min_cells(getattr(self.boundaries, name), self.symmetry[a])
+            for a, name in enumerate(_AXES)
+        )
+
     def _realized_um(self) -> Tuple[float, float, float]:
         dl = self.grid.dl_um
+        mins = self._axis_min_cells()
         out = []
         for i, L in enumerate(self.size_um):
             q = self._axis_coords_um(i)
             if q is None:
-                out.append(realized_cells(L, dl) * dl)
+                out.append(realized_cells(L, dl, mins[i]) * dl)
             else:
                 # NUMERICS.md section 15.1: realized length = closing node
                 # q[n-1] + (replicate-last spacing).
@@ -513,8 +883,8 @@ class Simulation(FrozenModel):
 
         if lower_index > cells or upper_index < 0 or lower_index >= upper_index:
             raise ValueError(
-                f"modal ports require a nonabsorbing interior on axis "
-                f"'{axis}', but {layers} {boundary} layers leave none"
+                f"no nonabsorbing interior on axis '{axis}': "
+                f"{layers} {boundary} layers cover the whole axis"
             )
         return (
             float(coordinate(lower_index)),
@@ -524,29 +894,40 @@ class Simulation(FrozenModel):
 
     def _two_eps0_over_dt(self) -> float:
         """The CPML peak-conductivity unit ``2*eps0/dt`` [S/m] at this scene's
-        timestep — the scale Tidy3D quotes ``sigma_max`` / ``alpha_max`` in, and
+        timestep — the scale ``sigma_max`` / ``alpha_max`` are quoted in, and
         the bridge between its dimensionless convention and the engine's S/m
         ``pml_alpha_max``.
 
         Built from the engine's CFL timestep (NUMERICS.md §2; resolve.cpp and
         grid.h ``graded_courant_dt``): ``dt = courant / (c0*sqrt(sum_a 1/dl_a^2))``
-        over the per-axis MINIMUM primary spacing, which on a uniform grid is
+        over the per-axis MINIMUM primary spacing of the ACTIVE axes (a 1-cell
+        plain-periodic axis contributes no curl term and leaves the sum — the
+        section 2 quasi-2D reduction), which on a uniform 3-D grid is
         ``courant*dl / (c0*sqrt(3))``. Since ``eps0*c0 = 1/eta0`` this reduces to
         ``(2/eta0)*sqrt(sum_a 1/dl_a^2)/courant`` — needing only ``eta0``, the
         cell spacings, and the Courant number, and matching the engine's dt so a
-        converted alpha lands exactly on Tidy3D's scale."""
+        converted alpha lands exactly on that scale."""
+        mins = self._axis_min_cells()
         inv_sq = 0.0
         for a in range(3):
             q = self._axis_coords_um(a)
-            dl_um = self.grid.dl_um if q is None \
-                else min(graded_primary_spacings(q))
+            if q is None:
+                if realized_cells(self.size_um[a], self.grid.dl_um,
+                                  mins[a]) <= 1:
+                    continue  # degenerate quasi-2D axis: no curl term
+                dl_um = self.grid.dl_um
+            else:
+                dl_um = min(graded_primary_spacings(q))
             dl_m = dl_um * 1e-6
             inv_sq += 1.0 / (dl_m * dl_m)
+        if inv_sq == 0.0:
+            dl_m = self.grid.dl_um * 1e-6
+            inv_sq = 1.0 / (dl_m * dl_m)
         return (2.0 / _ETA0) * math.sqrt(inv_sq) / self.run.courant
 
     def _pml_sigma_peak_Sm(self) -> float:
         """The peak CPML conductivity [S/m] the engine will actually use:
-        ``pml_sigma_max`` interpreted in Tidy3D's ``2*eps0/dt`` convention when
+        ``pml_sigma_max`` interpreted in the ``2*eps0/dt`` convention when
         it is > 0 (the default 1.5), else the legacy dl-heuristic
         ``0.8*(m+1)/(eta0*dl)`` (see spec.pml_sigma_max, reference_solver.cpp
         ``cpml_coef``). The reference for the CFS-inert test — an alpha far below
@@ -632,7 +1013,7 @@ class Simulation(FrozenModel):
         ``refine_regions``, ...) pass straight through.
 
         Opt-in only: the default :class:`UniformGridSpec` is unchanged, so no
-        existing scene's wire output moves. Use this when you want Tidy3D-style
+        existing scene's wire output moves. Use this when you want per-medium
         per-medium refinement without hand-building coordinate arrays::
 
             sim = sim.with_auto_grid(steps_per_wvl=20)
@@ -660,7 +1041,20 @@ class Simulation(FrozenModel):
             steps_per_wvl=steps_per_wvl,
             **auto_grid_kwargs,
         )
-        return self._validated_copy({"grid": spec})
+        update: dict = {"grid": spec}
+        # Re-run the §12 quarter-snap against the NEW cell ladder: the
+        # construction-time snap used the grid being replaced, and
+        # _validated_copy validates under ``wire_ingest`` (which skips the
+        # convenience), so without this a monitor face quarter-snapped for
+        # the old uniform grid could land on a graded cell boundary and be
+        # rejected by the engine.
+        snapped, notes = _quarter_snapped_dft_monitors(
+            self.monitors, size_um=self.size_um, grid=spec)
+        if notes:
+            update["monitors"] = snapped
+            for note in notes:
+                _LOG.debug("%s", note)
+        return self._validated_copy(update)
 
     def with_mesh_overrides(
         self,
@@ -670,8 +1064,8 @@ class Simulation(FrozenModel):
         **auto_grid_kwargs,
     ) -> "Simulation":
         """Return a COPY whose ``grid`` is auto-meshed with one or more
-        geometry-based :class:`photonhub.MeshOverride` regions applied (Tidy3D's
-        ``MeshOverrideStructure``) — the mesh is forced fine inside each
+        geometry-based :class:`photonhub.MeshOverride` regions applied — the mesh
+        is forced fine inside each
         override's geometry regardless of the local material, on top of the
         ordinary per-medium refinement.
 
@@ -701,7 +1095,7 @@ class Simulation(FrozenModel):
         kappa_max: float = _STABLE_PML_KAPPA_MAX,
         alpha_scale: float = _STABLE_PML_ALPHA_SCALE,
     ) -> "Simulation":
-        """Return a COPY with the Tidy3D ``StablePML``-aligned CPML profile: more
+        """Return a COPY with the stabilized CPML profile: more
         layers, a higher real-stretch peak ``kappa_max``, and — the lever the
         default profile keeps inert — a RAISED CFS ``alpha_max`` (NUMERICS.md
         §11). The complex frequency shift is what moves the PML pole off DC and
@@ -709,14 +1103,14 @@ class Simulation(FrozenModel):
         that more layers alone do not fix; it costs a few percent of in-band
         absorption, paid back by the extra layers.
 
-        ``alpha_scale`` is quoted in Tidy3D's dimensionless ``2*eps0/dt`` units —
+        ``alpha_scale`` is quoted in dimensionless ``2*eps0/dt`` units —
         the SAME convention as ``pml_sigma_max`` — and converted to the engine's
         S/m ``pml_alpha_max`` at this scene's timestep, so the per-step CFS
-        damping is mesh-independent and lands on Tidy3D's value (a fixed absolute
-        alpha would weaken on finer grids). The defaults reproduce Tidy3D's
-        ``StablePML`` (40 layers, ``kappa_max`` 5, ``alpha_max`` 0.9);
-        ``pml_sigma_max`` is left at its default (1.5, already in Tidy3D units —
-        a slightly stronger peak than StablePML's 1.0, for a lower floor).
+        damping is mesh-independent and lands on the intended value (a fixed absolute
+        alpha would weaken on finer grids). The defaults reproduce the stabilized profile's
+        the stabilized profile (40 layers, ``kappa_max`` 5, ``alpha_max`` 0.9);
+        ``pml_sigma_max`` is left at its default (1.5, already in 2*eps0/dt units —
+        a slightly stronger peak than the 1.0 reference, for a lower floor).
 
         A dispersive (Lorentz) scene gets the alpha+kappa half of this
         AUTOMATICALLY at construction (see ``_auto_stabilize_dispersive_pml``);
@@ -724,7 +1118,7 @@ class Simulation(FrozenModel):
         that leaks/drifts. Opt-in — no non-dispersive scene's wire output moves
         unless you call it::
 
-            sim = sim.with_stabilized_pml()                 # StablePML-aligned
+            sim = sim.with_stabilized_pml()                 # stabilized profile
             sim = sim.with_stabilized_pml(num_layers=60, alpha_scale=1.2)
 
         (Renamed from the earlier ``with_stable_pml``, which raised only layers
@@ -733,9 +1127,89 @@ class Simulation(FrozenModel):
         return self._validated_copy({
             "pml_num_layers": num_layers,
             "pml_kappa_max": kappa_max,
-            # alpha_scale is a fraction of 2*eps0/dt (Tidy3D's alpha_max unit),
+            # alpha_scale is a fraction of 2*eps0/dt (the alpha_max unit),
             # converted to the engine's S/m field at this scene's dt.
             "pml_alpha_max": alpha_scale * self._two_eps0_over_dt(),
+        })
+
+    def with_oblique_plane_wave(
+        self,
+        *,
+        axis: str,
+        direction: str,
+        position_um: float,
+        polarization: str,
+        source_time,
+        angle_theta: float,
+        angle_phi: float = 0.0,
+        n: Optional[float] = None,
+        amplitude: float = 1.0,
+    ) -> "Simulation":
+        """A copy with an OBLIQUE plane wave as the (only) source and the
+        transverse axes configured as matching Bloch boundaries (schema 1.18,
+        constant-k method; CPU solver only in this release).
+
+        The in-plane Bloch wavevector is derived at the PULSE CENTRE:
+        ``k_t = 2 pi n f0 / c * sin(theta)``, split onto the two cyclic
+        transverse axes by ``angle_phi`` (measured from the first cyclic
+        transverse axis ``(axis+1) % 3``). ``n`` defaults to
+        ``sqrt(background.permittivity)`` — the index of the medium the wave
+        is launched in. NOTE (constant-k): across a broadband pulse the
+        physical angle varies with frequency; keep the band narrow when the
+        angle matters (``sin theta(f) = f0 sin(theta) / f``).
+        """
+        import math as _math
+
+        if not -0.5 * _math.pi < float(angle_theta) < 0.5 * _math.pi:
+            raise ValueError("angle_theta must be within (-pi/2, pi/2)")
+        c_phi = _math.cos(float(angle_phi))
+        s_phi = _math.sin(float(angle_phi))
+        # Engine v1 contract (NUMERICS.md §22): the tilt must lie along ONE
+        # transverse axis — the single-aux-line s/p decomposition. Mirror the
+        # engine's rejection here so it fails at authoring time.
+        if min(abs(c_phi), abs(s_phi)) > 1e-9:
+            raise ValueError(
+                "angle_phi must be a multiple of 90 degrees (pi/2) in this "
+                "release: the oblique tilt must lie along a single "
+                "transverse axis (NUMERICS.md §22)")
+        n_bg = float(n) if n is not None else _math.sqrt(
+            float(self.background.permittivity))
+        # Engine §22 CFL contract: the incident aux line runs at
+        # eps_eff = (n cos theta)^2, phase velocity c/(n cos theta) — FASTER
+        # than the 3-D wave — so courant <= sqrt(3) * n * cos(theta).
+        s_max = _math.sqrt(3.0) * n_bg * _math.cos(float(angle_theta))
+        if float(self.run.courant) > s_max * (1.0 + 1e-9):
+            raise ValueError(
+                f"run.courant = {self.run.courant} exceeds the oblique "
+                f"incident-line stability bound sqrt(3)*n*cos(theta) = "
+                f"{s_max:.4f} (NUMERICS.md §22); set run.courant to at most "
+                f"{0.95 * s_max:.4f}, e.g. "
+                f"sim.model_copy(update={{'run': sim.run.model_copy("
+                f"update={{'courant': {0.95 * s_max:.3f}}})}})")
+        f0 = float(source_time.freq0_hz)
+        c0 = 299792458.0
+        k_t = 2.0 * _math.pi * n_bg * f0 / c0 * _math.sin(
+            float(angle_theta)) * 1e-6  # rad/um
+        ax = "xyz".index(axis)
+        t1, t2 = (ax + 1) % 3, (ax + 2) % 3
+        k = [0.0, 0.0, 0.0]
+        # Snap the numerically-zero component of the axis-aligned azimuth
+        # exactly to 0 (cos(pi/2) ~ 6e-17), matching the engine's snap.
+        k[t1] = k_t * c_phi if abs(c_phi) > 0.5 else 0.0
+        k[t2] = k_t * s_phi if abs(s_phi) > 0.5 else 0.0
+        kinds = {"x": self.boundaries.x, "y": self.boundaries.y,
+                 "z": self.boundaries.z}
+        for a in (t1, t2):
+            kinds["xyz"[a]] = "bloch"
+        pw = PlaneWave(
+            axis=axis, direction=direction, position_um=position_um,
+            polarization=polarization, amplitude=amplitude,
+            source_time=source_time, angle_theta=float(angle_theta),
+            angle_phi=float(angle_phi))
+        return self.model_copy(update={
+            "sources": (pw,),
+            "boundaries": Boundaries(**kinds),
+            "bloch_k_per_um": tuple(k),
         })
 
     def with_absorber(self, *, num_layers: int = 40) -> "Simulation":
@@ -756,7 +1230,7 @@ class Simulation(FrozenModel):
 
     def with_auto_boundaries(self) -> "Simulation":
         """Return a COPY whose OPEN (radiating) boundaries are chosen PER AXIS
-        from the materials that reach the domain edge — mirroring Tidy3D's
+        from the materials that reach the domain edge — following standard
         material-aware guidance that a stretched-coordinate PML wants a
         non-dispersive medium in its absorbing region:
 
@@ -913,7 +1387,7 @@ class Simulation(FrozenModel):
     def _resolve_subpixel_default(self, info) -> "Simulation":
         # D2 (NUMERICS.md §16): default-ON subpixel smoothing for the common
         # case. When ``subpixel`` is NOT set explicitly, enable the diagonal-KFJ
-        # ``tensor`` average (matching Tidy3D's subpixel-on posture, the more
+        # ``tensor`` average (matching the common subpixel-on posture, the more
         # accurate out-of-box choice) for a NON-dispersive scene, and fall back
         # to OFF for a dispersive one. (Historical note: the dispersive
         # fallback was added for the "subpixel × Lorentz-ADE" divergence, since
@@ -941,6 +1415,15 @@ class Simulation(FrozenModel):
             s.medium.is_dispersive
             for s in self.structures
         )
+        # §10.2 / §10.3: anisotropic and custom (data-grid) media follow the
+        # dispersive policy — subpixel smoothing of either constituent is
+        # deferred, and the engine REJECTS subpixel != off with them.
+        anisotropic = any(
+            getattr(s.medium, "is_anisotropic", False)
+            or getattr(s.medium, "is_custom", False)
+            for s in self.structures
+        )
+        dispersive = dispersive or anisotropic
         if "subpixel" not in self.model_fields_set:
             if not dispersive:
                 # Enable + mark set so it serialises (engine field default = off).
@@ -983,18 +1466,108 @@ class Simulation(FrozenModel):
                 "sim.with_stabilized_pml() with subpixel+dispersive runs.",
                 stacklevel=2,
             )
+        # the resolved value of ``subpixel`` is only known here, so the
+        # quasi-2-D dilution warning runs at the end of this validator
+        self._warn_degenerate_axis_subpixel()
+        return self
+
+    @model_validator(mode="after")
+    def _warn_ade_resonance_margin(self, info) -> "Simulation":
+        """Warn when a Lorentz pole sits close to the ADE stability edge.
+
+        NUMERICS.md section 19 states the bound ``omega0*dt < 2`` and the
+        engine's ``validate()`` enforces it -- but that bound is not tight.
+        Measured (benchmarks/meep n03, Meep's own SiO2 fit carried across
+        pole-for-pole): ``omega0*dt = 1.064`` PASSES validation and then
+        diverges with ``non_finite_energy``; the same scene is stable at 0.75
+        and below. Lowering the Courant is what fixes it --
+        ``with_stabilized_pml()`` does not, so the dispersive-PML warning
+        alongside this one points at a different mechanism.
+
+        The trap is that nothing about such a scene looks aggressive: a
+        faithful fit of a transparent glass puts its resonance in the UV, which
+        is exactly what pushes ``omega0*dt`` up. Warn on the margin rather than
+        wait for the abort.
+        """
+        if (info.context or {}).get("wire_ingest"):
+            return self
+        poles = []
+        for structure in self.structures:
+            m = structure.medium
+            for pole in _medium_poles(m):
+                poles.append((structure.name or "structure",
+                              pole.resonance_frequency_hz))
+        if not poles:
+            return self
+        dt = 2.0 * _EPS0 / self._two_eps0_over_dt()
+        worst = max(poles, key=lambda p: p[1])
+        w0_dt = 2.0 * math.pi * worst[1] * dt
+        if w0_dt > _ADE_MARGIN:
+            warnings.warn(
+                f"Lorentz pole in {worst[0]!r} gives omega0*dt = {w0_dt:.2f}. "
+                f"NUMERICS.md section 19's bound is 2 and the engine accepts "
+                "anything below it, but that bound is NOT tight: a measured "
+                "case at 1.06 passes validation and then aborts with "
+                "non_finite_energy (stable at 0.75). Lower run.courant "
+                f"(to about {self.run.courant * _ADE_MARGIN / w0_dt:.2f} here) "
+                "if the run diverges. Note with_stabilized_pml() does NOT help "
+                "this failure — it is the ADE recursion, not the PML.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _warn_bloch_with_undamped_poles(self, info) -> "Simulation":
+        """Bloch wrap x low-loss resonance: warn that stability is Courant-
+        NON-monotone (benchmarks/meep FINDINGS.md F6).
+
+        Measured on the Meep material-dispersion scene (two Lorentz poles, a
+        4-cell Bloch axis): k = 1.8 (2 pi/a) is stable at courant 0.99 but
+        DIVERGES at 0.7, while k = 2.1 diverges at 0.99 and is stable at 0.7 —
+        a resonance between dt, the undamped pole, and the Bloch phase, not a
+        CFL margin. Until the NUMERICS 19/22 preflight covers the joint
+        (pole, k, dt) spectrum, surface the failure mode and the remedy (a
+        Courant RETRY LADDER, not a single lower value) at authoring time.
+        Skipped on wire ingest (a parsed document is a deliberate choice).
+        """
+        if (info.context or {}).get("wire_ingest"):
+            return self
+        if not self.bloch_k_per_um or not any(self.bloch_k_per_um):
+            return self
+        low_loss = []
+        for structure in self.structures:
+            m = structure.medium
+            for pole in _medium_poles(m):
+                if pole.linewidth_hz < 1e-3 * pole.resonance_frequency_hz:
+                    low_loss.append(structure.name or "structure")
+                    break
+        if low_loss:
+            warnings.warn(
+                "Bloch boundaries with low-loss Lorentz pole(s) "
+                f"({', '.join(low_loss[:3])}"
+                f"{', ...' if len(low_loss) > 3 else ''}): stability is "
+                "NON-monotone in the Courant number — a (k, dt) combination "
+                "can diverge at courant 0.7 yet run at 0.99, and vice versa "
+                "(a dt x pole x Bloch-phase resonance, not a CFL margin). If "
+                "the run aborts with 'divergence', retry over a Courant "
+                "LADDER (e.g. 0.99, 0.7, 0.5, 0.35) instead of assuming "
+                "lower is safer.",
+                UserWarning,
+                stacklevel=2,
+            )
         return self
 
     @model_validator(mode="after")
     def _warn_dispersive_media_in_pml(self, info) -> "Simulation":
-        # Material-aware boundary guidance, mirroring Tidy3D: a stretched-
+        # Material-aware boundary guidance: a stretched-
         # coordinate PML derives its absorbing profile assuming a NON-dispersive
         # medium, so a dispersive (Lorentz) structure extending into the PML can
         # drive a late-time divergence (Oskooi & Johnson, "Distinguishing
         # correct from incorrect PML proposals...", J. Comput. Phys. 2011). The
         # adiabatic absorber (graded electric conductivity, NUMERICS.md §21) is
         # the robust fallback for exactly that regime. WARN — never override —
-        # matching Tidy3D's posture, so the wire output is unchanged and the user
+        # matching the conservative posture, so the wire output is unchanged and the user
         # decides. ``with_auto_boundaries()`` acts on the advice automatically.
         #
         # Skipped on wire ingest (a parsed document is the user's deliberate
@@ -1034,7 +1607,7 @@ class Simulation(FrozenModel):
         #
         # Mirroring _resolve_subpixel_default: when the user has NOT tuned any
         # PML knob, AUTO-APPLY the CFS stabilization — kappa_max 5.0 and the
-        # GENTLE alpha_max 0.1*(2*eps0/dt) (_AUTO_PML_ALPHA_SCALE; the Tidy3D-
+        # GENTLE alpha_max 0.1*(2*eps0/dt) (_AUTO_PML_ALPHA_SCALE; the reference-
         # parity 0.9 dose reflects ~35% of a propagating guided mode at the
         # default 12 layers), the two levers that never change the slab
         # thickness (so they can never over-thicken a small domain, unlike the
@@ -1058,10 +1631,10 @@ class Simulation(FrozenModel):
                      "pml_sigma_max")
         if not any(k in self.model_fields_set for k in pml_knobs):
             # Auto-stabilize: raise kappa + the CFS alpha (fit-safe), mark set so
-            # they ride the wire. sigma_max (default 1.5, already in Tidy3D's
+            # they ride the wire. sigma_max (default 1.5, already in the stabilized profile's
             # 2*eps0/dt convention) and the 12-layer count are left untouched.
             # The alpha DOSE is _AUTO_PML_ALPHA_SCALE (0.1*2*eps0/dt), NOT
-            # with_stabilized_pml's Tidy3D-parity 0.9: at the default 12 layers
+            # with_stabilized_pml's 0.9: at the default 12 layers
             # the 0.9 dose de-tunes the slab for PROPAGATING waves and reflects
             # ~35% of a guided mode crossing the boundary (measured 2026-07-17;
             # see _AUTO_PML_ALPHA_SCALE above), while 0.1 keeps ~3x the measured
@@ -1084,7 +1657,7 @@ class Simulation(FrozenModel):
                 "structure far from the wall, and independent of subpixel "
                 "smoothing (engine/docs/subpixel-dispersion-instability.md). "
                 "Raise pml_alpha_max, or use sim.with_stabilized_pml() for the "
-                "Tidy3D-StablePML-aligned profile.",
+                "Stabilized-CPML profile.",
                 stacklevel=2,
             )
         return self
@@ -1104,7 +1677,9 @@ class Simulation(FrozenModel):
             # check here (phsolver validate remains authoritative).
             if self._axis_coords_um(axis) is not None:
                 continue
-            n = realized_cells(self.size_um[axis], dl)
+            n = realized_cells(
+                self.size_um[axis], dl, self._axis_min_cells()[axis]
+            )
             kp = snapped_plane_index(m.position_um, dl)
             if not (1 <= kp <= n - 1):
                 raise ValueError(
@@ -1184,6 +1759,16 @@ class Simulation(FrozenModel):
         # document and golden specs round-trip byte-identically.
         if "subpixel" not in self.model_fields_set:
             exclude["subpixel"] = True
+        # field_precision entered the wire in schema 1.19.0 (default "fp32",
+        # NUMERICS.md §23); omit it when unset so earlier-minor parsers accept
+        # the document and golden specs round-trip byte-identically.
+        if "field_precision" not in self.model_fields_set:
+            exclude["field_precision"] = True
+        # dft_precision entered the wire in schema 1.20.0 (default "fp64",
+        # NUMERICS.md §12.6); omit it when unset so earlier-minor parsers accept
+        # the document and golden specs round-trip byte-identically.
+        if "dft_precision" not in self.model_fields_set:
+            exclude["dft_precision"] = True
         # subpixel_method entered the wire in schema 1.7.0 (default "volume",
         # NUMERICS.md §16.5); omit when unset so earlier-minor parsers accept the
         # document and golden specs round-trip byte-identically.

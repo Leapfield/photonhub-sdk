@@ -9,7 +9,8 @@ Two pure entry points, both returning ``{"findings": [...], "counts": ...}``:
   setups that would RUN fine and record silent garbage (a flux plane inside
   the PML band, DFT frequencies the normalizing source barely drives, an
   aliased time probe, an apodization gate that excludes the whole run, a
-  multi-GB output budget).
+  frequency list longer than the run length can resolve, a multi-GB
+  output budget).
 - :func:`result_checks` — post-run data health over an open result bundle
   (non-finite values, all-zero recordings, a source-normalized flux far
   above unity).
@@ -39,6 +40,13 @@ _FLUX_UNITY_TOLERANCE = 1.5
 # Per-monitor on-disk output warning threshold, and the whole-run info line.
 _MONITOR_OUTPUT_WARN_BYTES = 1 << 30      # 1 GiB
 _TOTAL_OUTPUT_INFO_BYTES = 2 << 30        # 2 GiB
+# Spectral-redundancy margin. A run of duration T can only produce ~B*T + 1
+# INDEPENDENT values across a band B (see the redundant-frequencies check);
+# asking for a few more than that is harmless rounding, so only flag a monitor
+# whose frequency count exceeds the bound by this factor, and only once the
+# list is long enough for the saving to matter.
+_REDUNDANT_FREQ_FACTOR = 1.5
+_REDUNDANT_FREQ_MIN_COUNT = 8
 # Aliasing margin: a Gaussian pulse's energy above freq0 + 3*fwidth is
 # negligible (99.7 %), so that is the highest frequency a probe must resolve.
 _BAND_SIGMAS = 3.0
@@ -97,7 +105,7 @@ def monitor_checks(sim) -> dict:
     """Setup-time advisory findings for every monitor of a ``Simulation``."""
     findings: list[dict] = []
     cells_per_axis, min_spacing_um = _cells_and_min_spacing_um(sim)
-    dt_s = _dt_seconds(sim, min_spacing_um)
+    dt_s = _dt_seconds(sim, cells_per_axis, min_spacing_um)
     num_steps = _num_steps(sim, dt_s)
     reference = sim.sources[0].source_time  # the recorded normalization
 
@@ -180,6 +188,35 @@ def monitor_checks(sim) -> dict:
                     monitor=name, offending=len(offenders),
                     total=len(freqs), worst_wavelength_nm=_C / worst_f * 1e9,
                     worst_envelope=worst_env))
+
+            # --- redundant-frequencies (info): a running DFT costs time and
+            # memory bandwidth LINEARLY in the number of frequencies, but a
+            # run of duration T cannot produce more than about B*T + 1
+            # independent values across a band B.  The recorded signal is
+            # supported on [0, T], so its transform is an entire function of
+            # frequency and is fully determined by samples spaced 1/T apart
+            # (the sampling theorem with time and frequency swapped) — every
+            # extra frequency is an interpolation of its neighbours, computed
+            # at full price.  Advisory only: the extra values are CORRECT,
+            # just not independent, so this never blocks a run.
+            span_hz = max(freqs) - min(freqs)
+            duration_s = num_steps * dt_s
+            if span_hz > 0.0 and len(freqs) >= _REDUNDANT_FREQ_MIN_COUNT:
+                independent = span_hz * duration_s + 1.0
+                if len(freqs) > _REDUNDANT_FREQ_FACTOR * independent:
+                    findings.append(_finding(
+                        "redundant-frequencies", "info",
+                        f"{len(freqs)} recorded frequencies span "
+                        f"{span_hz:.3e} Hz, but a {duration_s:.3e} s run "
+                        f"resolves only ~{independent:.0f} independent "
+                        "values across that span — the rest are "
+                        "interpolations of their neighbours. DFT cost scales "
+                        f"linearly with the count, so ~{independent:.0f} "
+                        "frequencies (or a longer run) would record the same "
+                        "spectrum for less.",
+                        monitor=name, requested=len(freqs),
+                        independent=independent, span_hz=span_hz,
+                        duration_s=duration_s))
 
         # --- aliasing (warning): a decimated time probe must still resolve
         # the fastest driven oscillation.

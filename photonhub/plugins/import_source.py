@@ -1,8 +1,7 @@
 """Import source — launch a user-supplied field profile as a Huygens sheet.
 
-The PhotonHub analogue of Lumerical's *Import source* and Tidy3D's
-``CustomFieldSource``: any transverse field map — from another solver, an
-analytic model, a measurement, or a previous run — becomes an excitation by
+Any transverse field map — from another solver, an analytic model, a
+measurement, or a previous run — becomes an excitation by
 resampling it onto the simulation's Yee injection plane and stamping the
 per-cell equivalence-current sheet
 (:func:`~photonhub.plugins.eq_current_source.equivalence_current_source`,
