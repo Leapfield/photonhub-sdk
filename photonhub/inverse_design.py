@@ -63,13 +63,13 @@ import numpy as np
 
 from .components import (
     Box,
-    FieldDftMonitor,
+    ProfileMonitor,
     Medium,
     PointDipole,
     Simulation,
     Structure,
 )
-from .data import SimulationData
+from .data import RunResult
 from .runners import run_local
 from .plugins.mode_devices import _TANGENTIAL, mode_monitor, mode_source
 from .plugins.mode_overlap import mode_amplitude
@@ -89,11 +89,13 @@ from .plugins.modes import Mode
 # PHASE, pinned by aligning the adjoint direction with finite differences
 # (gradient_check.py) — it carries no magnitude normalization, so the returned
 # gradient is meaningful in DIRECTION but NOT in scale. Measured against
-# central finite differences the norm is low by 2.2e4-3.2e4x, and the factor is
-# NOT a constant: it moves ~45% across pixel counts and region thicknesses, so
-# it cannot be absorbed into this constant (benchmarks/meep FINDINGS.md F22).
-# Consequence for callers: use it with a line-searching optimizer (L-BFGS, as
-# `optimize` does, which is insensitive to a scale), never with a fixed step
+# central finite differences the norm is off by a scene-, grid- and
+# objective-dependent factor (from ~1e2 on the SOI mode-power scenes to ~1e4
+# on the earlier point-intensity records), and the factor is NOT a constant:
+# it moves ~45% across pixel counts and region thicknesses, so it cannot be
+# absorbed into this constant. Consequence for callers: use it with a
+# scale-adaptive optimizer (Adam, the `optimize` default) or a line-searching
+# one (L-BFGS-B, the `optimize_parametric` default), never with a fixed step
 # size, a gradient-norm stopping rule, or a cross-problem sensitivity
 # comparison.
 BETA: complex = 0.1304 - 0.9915j    # exp(-1.440j); see gradient_check.py
@@ -237,14 +239,14 @@ class DesignRegion:
         return tuple(out)
 
     def monitor(self, freq_hz: float, name: str = "design_region"
-                ) -> FieldDftMonitor:
+                ) -> ProfileMonitor:
         """The DFT monitor recording all three E-components over the region
         (quarter-cell faces so the components co-snap, §12)."""
         (i0, i1), (j0, j1), (k0, k1) = self.cells
         cx, sx = _axis_box(i0, i1, self.dl_um, quarter=True)
         cy, sy = _axis_box(j0, j1, self.dl_um, quarter=True)
         cz, sz = _axis_box(k0, k1, self.dl_um, quarter=True)
-        return FieldDftMonitor(
+        return ProfileMonitor(
             name=name, center_um=(cx, cy, cz), size_um=(sx, sy, sz),
             fields=("Ex", "Ey", "Ez"), freqs_hz=(freq_hz,))
 
@@ -301,17 +303,17 @@ class PointIntensity:
     #: Normalization constant for this objective's adjoint (unit point dipole).
     beta: complex = BETA
 
-    def monitor(self) -> FieldDftMonitor:
-        return FieldDftMonitor(
+    def monitor(self) -> ProfileMonitor:
+        return ProfileMonitor(
             name=self.name, center_um=self.probe_um, size_um=(0.0, 0.0, 0.0),
             fields=(self.component,), freqs_hz=(self.freq_hz,))
 
-    def amplitude(self, data: SimulationData) -> complex:
+    def amplitude(self, data: RunResult) -> complex:
         """The complex forward objective phasor ``u = E_comp(probe)``."""
         da = data[self.name].sel(component=self.component, f=self.freq_hz)
         return complex(np.asarray(da.values).reshape(()).item())
 
-    def value(self, data: SimulationData) -> float:
+    def value(self, data: RunResult) -> float:
         """Figure of merit ``|u|^2``."""
         return float(abs(self.amplitude(data)) ** 2)
 
@@ -323,7 +325,7 @@ class PointIntensity:
         return PointDipole(center_um=self.probe_um, polarization=self.component,
                            amplitude=1.0, source_time=pulse)
 
-    def adjoint_coeff(self, data: SimulationData) -> complex:
+    def adjoint_coeff(self, data: RunResult) -> complex:
         """The complex excitation coefficient ``conj(u)`` applied to the
         forward·adjoint field product when assembling the gradient."""
         return complex(np.conjugate(self.amplitude(data)))
@@ -351,7 +353,7 @@ class ModePower:
     By reciprocity the adjoint excitation is the SAME mode launched BACKWARD from
     the output plane (a `ModeSource` with ``direction`` reversed), with the
     post-multiplied coefficient ``conj(c)``. Build the recording monitor with
-    :meth:`monitor` (a 4-tangential `FieldDftMonitor` on the output plane) — pass
+    :meth:`monitor` (a 4-tangential `ProfileMonitor` on the output plane) — pass
     a `Simulation` that carries the run's grid (any shell with the right
     ``size_um``/``grid`` works; the domain is fixed across the optimization).
     """
@@ -374,12 +376,12 @@ class ModePower:
             freqs_hz=[self.freq_hz], name=self.name, direction=self.direction,
             center_um=self.center_um, thickness_axis=self.thickness_axis)
 
-    def monitor(self, simulation: Simulation) -> FieldDftMonitor:
+    def monitor(self, simulation: Simulation) -> ProfileMonitor:
         """The 4-tangential DFT monitor on the output plane (add to the sim's
         monitors). ``simulation`` supplies the grid/size only."""
         return self._mm(simulation).field_monitor
 
-    def amplitude(self, data: SimulationData) -> complex:
+    def amplitude(self, data: RunResult) -> complex:
         """The complex normalized modal amplitude ``c`` on the output plane.
 
         NOTE: this reads WITHOUT the longitudinal Yee de-stagger that
@@ -395,8 +397,9 @@ class ModePower:
                            thickness_axis=self.thickness_axis)
         return complex(c[self.freq_hz])
 
-    def value(self, data: SimulationData) -> float:
-        """Figure of merit ``|c|^2`` — the modal power transmission."""
+    def value(self, data: RunResult) -> float:
+        """Figure of merit ``|c|^2`` — relative modal power (not a calibrated
+        transmission; see the class warning)."""
         return float(abs(self.amplitude(data)) ** 2)
 
     def adjoint_source(self, forward_sim: Simulation):
@@ -410,7 +413,7 @@ class ModePower:
             source_time=pulse, direction=back, amplitude=1.0,
             center_um=self.center_um, thickness_axis=self.thickness_axis)
 
-    def adjoint_coeff(self, data: SimulationData) -> complex:
+    def adjoint_coeff(self, data: RunResult) -> complex:
         """The complex excitation coefficient ``conj(c)``."""
         return complex(np.conjugate(self.amplitude(data)))
 
@@ -423,12 +426,12 @@ class ModePower:
 class GradientResult:
     value: float                 # figure of merit J
     grad: np.ndarray             # dJ/drho, shape DesignRegion.shape (flat order)
-    forward: SimulationData
-    adjoint: SimulationData
+    forward: RunResult
+    adjoint: RunResult
     amplitude: complex           # forward objective phasor u
 
 
-def _region_field(data: SimulationData, region: DesignRegion, freq_hz: float,
+def _region_field(data: RunResult, region: DesignRegion, freq_hz: float,
                   name: str) -> np.ndarray:
     """Complex (3, nz, ny, nx) array of (Ex,Ey,Ez) over the design monitor."""
     da = data[name].sel(f=freq_hz)
@@ -438,8 +441,8 @@ def _region_field(data: SimulationData, region: DesignRegion, freq_hz: float,
 
 def assemble_gradient(
     region: DesignRegion,
-    forward: SimulationData,
-    adjoint: SimulationData,
+    forward: RunResult,
+    adjoint: RunResult,
     coeff: complex,
     freq_hz: float,
     *,
@@ -513,12 +516,13 @@ def value_and_gradient(
        magnitude until the launch is c_in-calibrated.
 
     **The returned gradient is calibrated in DIRECTION only.** Its magnitude is
-    uncalibrated and configuration-dependent (measured 2.2e4-3.2e4x below
-    central finite differences, varying ~45% with pixel count and region
-    thickness — benchmarks/meep FINDINGS.md F22). Pass it to a line-searching
-    optimizer such as :func:`optimize`; do NOT use it for a fixed step size, a
-    gradient-norm convergence test, or comparing sensitivities between two
-    problems.
+    uncalibrated and configuration-dependent (the factor against central
+    finite differences ranges from ~1e2 to ~1e4 across the recorded scenes and
+    varies ~45% with pixel count and region thickness). Pass it to a
+    scale-adaptive optimizer such as :func:`optimize` (Adam) or a
+    line-searching one such as :func:`optimize_parametric` (L-BFGS-B); do NOT
+    use it for a fixed step size, a gradient-norm convergence test, or
+    comparing sensitivities between two problems.
 
     ``build_forward(rho)`` returns the forward :class:`~photonhub.Simulation`.
     The adjoint simulation is derived from it by swapping in the objective's

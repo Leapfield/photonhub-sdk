@@ -59,7 +59,7 @@ server = ["fastapi", "uvicorn"]              # photonhub-serve-viz HTTP facade
 app = ["plotly", "fastapi", "uvicorn", "mcp>=1,<2", "h5py", "gdstk"]  # desktop opens bundles + HDF5 results and imports GDSII layouts
 replicate = ["pyyaml"]                       # PaperSpec.from_yaml parses the YAML paper specs
 gds = ["gdstk"]                              # import/export GDSII
-hdf5 = ["h5py"]                              # SimulationData HDF5 export
+hdf5 = ["h5py"]                              # RunResult HDF5 export
 notebook = ["nbformat"]                       # paper-replication tutorials
 
 [project.scripts]

@@ -9,7 +9,7 @@ real µm node coordinates so graded meshes are correct (never assumed uniform).
 
 Every Phase-2 geometry is rasterized here so the preview equals what the solver
 samples: ``Box`` and ``Sphere`` are exact on any cut, and the extruded
-``Cylinder`` (annular sector) and ``PolySlab`` (point-in-polygon) reproduce the
+``Cylinder`` (annular sector) and ``Polygon`` (point-in-polygon) reproduce the
 engine's ``cylinder_contains`` / ``polyslab_contains`` predicates
 (``engine/src/cpu_ref/reference_solver.cpp``) per pixel — both on a cut
 PERPENDICULAR to the extrusion axis (the exact in-plane cross-section) and on a
@@ -17,7 +17,7 @@ cut ALONG it (the rectangular bands where the plane crosses the solid).
 
 Caveat: subpixel smoothing (``Simulation.subpixel``) is NOT reflected here —
 this is the §9 hard point sample. Engine-faithful ε (incl. subpixel) via a
-future ``phsolver --mesh`` subcommand is deferred (design §11). The PolySlab
+future ``phsolver --mesh`` subcommand is deferred (design §11). The Polygon
 ``sidewall_angle`` taper IS applied (§17.6), mirroring the engine: this module
 feeds the client mode solver's cross-section, so painting the un-tapered
 reference polygon would solve launch/readout modes on a different guide than the
@@ -228,7 +228,7 @@ def _cylinder_inside(g, cut_axis, value, HH, VV, h_idx, v_idx):
 
 
 def _polyslab_inside(g, cut_axis, value, HH, VV, h_idx, v_idx):
-    """Boolean mask of the §9 hard sample for a ``PolySlab`` on the cut plane,
+    """Boolean mask of the §9 hard sample for a ``Polygon`` on the cut plane,
     or ``None`` if the plane misses it. Mirrors the engine's
     ``polyslab_contains`` (closed axial extent + even-odd point-in-polygon,
     plus the §17.6 ``sidewall_angle`` taper).

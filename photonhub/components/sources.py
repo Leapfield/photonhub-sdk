@@ -22,7 +22,15 @@ class PointDipole(FrozenModel):
     onto E after the E-update; a MAGNETIC polarization (``Hx``/``Hy``/``Hz``)
     injects a magnetic current density onto H right after the H-update
     (NUMERICS.md sections 5 and 12). ``amplitude`` is the peak current density
-    J0 [A/m^2] (electric) or M0 [V/m^2] (magnetic).
+    J0 [A/m^2] (electric) or M0 [V/m^2] (magnetic); the injected current
+    MOMENT is ``J0 * dl^3`` on a uniform grid, so the Hertzian radiated power
+    of an electric dipole in vacuum is ``eta0 * k^2 * (J0*dl^3)^2 / (12*pi)``.
+    Because every DFT/flux output is normalized per unit source amplitude,
+    changing ``amplitude`` rescales only the raw time-domain fields, not the
+    reported spectra. A dipole placed inside the PML/absorber layers is NOT
+    rejected by the engine and radiates almost nothing: keep sources inside
+    the interior (``run_local`` warns before launching such a scene; see
+    ``Simulation.point_sources_in_boundary_layers``).
 
     Magnetic dipoles are supported on both the CPU reference solver and the
     GPU (NUMERICS.md sections 5 and 12)."""
@@ -437,7 +445,10 @@ class TfsfBox(FrozenModel):
     only in this release. ``phsolver validate`` enforces: uniform grid, every
     face in the uniform background (structures strictly inside — the
     scatterer — or strictly outside), faces clear of the PML/absorber layers,
-    and no Bloch boundaries or symmetry planes."""
+    and no Bloch boundaries or symmetry planes. Accuracy note: scattering
+    cross-sections of curved bodies at ~20 cells per wavelength carry a
+    ~3-5 % band-mean staircase/smoothing bias (NUMERICS.md section 14.4);
+    refine the grid or use a convergence ladder for absolute values."""
 
     type: Literal["tfsf_box"] = "tfsf_box"
     axis: AxisName

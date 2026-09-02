@@ -22,7 +22,7 @@ from .base import (
 )
 
 
-class FieldTimeMonitor(FrozenModel):
+class TimeMonitor(FrozenModel):
     """Scalar time-series probe at the Yee node nearest ``center_um``. Samples
     are raw, non-colocated Yee values; H lags E by dt/2."""
 
@@ -40,7 +40,7 @@ class FieldTimeMonitor(FrozenModel):
         return value
 
 
-class FieldSnapshotMonitor(FrozenModel):
+class SnapshotMonitor(FrozenModel):
     """Full-domain dump of selected components. ``interval_steps = 0`` (the
     default) records only the final step."""
 
@@ -235,7 +235,7 @@ class ModePort(FrozenModel):
         return self
 
 
-class FieldDftMonitor(FrozenModel):
+class ProfileMonitor(FrozenModel):
     """Running-DFT field monitor over a box region (NUMERICS.md section 12):
     fp64 accumulation every step over the full run, raw Yee-located phasors,
     normalized by the first wire-order source's ``A0 * S(f)``. ``size_um``
@@ -262,7 +262,7 @@ class FieldDftMonitor(FrozenModel):
     and is rejected with guidance at construction. Client-side only: the
     wire schema is unchanged, documents ingested via ``from_wire_json`` /
     ``from_file`` are never adjusted, and
-    ``with_auto_grid``/``with_mesh_overrides`` re-apply the snap against the
+    ``with_auto_mesh``/``with_mesh_overrides`` re-apply the snap against the
     regenerated grid."""
 
     type: Literal["field_dft"] = "field_dft"
@@ -311,12 +311,19 @@ class FieldDftMonitor(FrozenModel):
         return v
 
 
-class FluxMonitor(FrozenModel):
+class PowerMonitor(FrozenModel):
     """Poynting-flux monitor perpendicular to ``axis`` at ``position_um``,
     snapped to a plane index ``1 <= kp <= n_axis - 1`` (NUMERICS.md
-    section 12). Positive values mean power toward +axis; the reported power
-    carries the ``1/|A0*S(f)|^2`` normalization of the shared phasors, so it
-    is not absolute watts.
+    section 12). Positive values mean power toward +axis. The reported power
+    is the response to a UNIT-amplitude time-harmonic drive: the shared
+    phasors are normalized by ``1/|A0*S(f)|^2``, so for a plane wave of
+    amplitude ``E0`` the empty-domain value equals ``A/(2*eta0)`` (watts for
+    ``E0 = 1 V/m``) and the physical power is ``|A0|^2`` times the reported
+    value; ratios such as R and T (divide by an empty reference run) cancel
+    the factor. The plane average of the staggered H components biases the
+    absolute value by ``cos(k*dl/2)`` (about -1.2 % at 20 cells per
+    wavelength), which also cancels in ratios. Time convention is
+    ``e^{-i omega t}``.
 
     **Resolving a resonance peak** (Q from a spectrum): the FWHM of a
     quality-factor-``Q`` peak at ``f0`` is ``f0/Q``, so ``freqs_hz`` must be
@@ -324,7 +331,7 @@ class FluxMonitor(FrozenModel):
     hence Q) is dominated by sampling. E.g. a Q ~ 400 cavity peak needs a
     dedicated narrow band around ``f0``, not the source's full bandwidth
     (measured: a full-band 300-point sweep under-read Q by ~13%; a
-    peak-centred band recovered it — the ring-down ``ResonanceFinder`` route
+    peak-centred band recovered it — the ring-down ``ResonanceAnalysis`` route
     avoids the issue entirely).
 
     By default the monitor integrates the FULL transverse plane. Schema 1.17
@@ -353,7 +360,7 @@ class FluxMonitor(FrozenModel):
         return value
 
     @model_validator(mode="after")
-    def _window_both_or_neither(self) -> "FluxMonitor":
+    def _window_both_or_neither(self) -> "PowerMonitor":
         if (self.center_um is None) != (self.size_um is None):
             raise ValueError(
                 "flux window needs BOTH center_um and size_um (or neither "
@@ -362,6 +369,6 @@ class FluxMonitor(FrozenModel):
 
 
 MonitorType = Annotated[
-    Union[FieldTimeMonitor, FieldSnapshotMonitor, FieldDftMonitor, FluxMonitor],
+    Union[TimeMonitor, SnapshotMonitor, ProfileMonitor, PowerMonitor],
     Field(discriminator="type"),
 ]

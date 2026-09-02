@@ -119,11 +119,11 @@ ModeBank = Union[Mapping[float, Mapping[int, Any]], Mapping[int, Any]]
 _QUANTITIES = ("transmission", "power", "amplitude")
 
 # One µm² in m². The overlap quadrature integrates over the plane's µm
-# coordinates (dA in µm²), while the engine's FluxMonitor forms its §12
+# coordinates (dA in µm²), while the engine's PowerMonitor forms its §12
 # Poynting sum with the SI grid spacing (dA in m²; NUMERICS.md — internal
 # units are SI). The "power" readout multiplies by this ONCE, as the last
 # operation, so the returned modal power is FLUX-COMMENSURATE: mode_power /
-# FluxMonitor on the same plane is the modal power fraction (O(1), ~the modal
+# PowerMonitor on the same plane is the modal power fraction (O(1), ~the modal
 # confinement), not ~1e12 (the historical µm²-Poynting convention). Applied to
 # the power quantity only — amplitudes (a/P) and transmissions (|a|²/P²) are
 # dimensionless in the area element and keep their exact historical bit
@@ -382,7 +382,7 @@ def modal_fields(
     # natural authoring value is the cell CENTRE (z = dl/2), so passing the
     # centre put the plane sample on the window's edge and the resample
     # zero-filled it -- the whole mode vanished and the caller saw only
-    # "P_mode is zero" (benchmarks/meep FINDINGS.md F21). When both sides are
+    # "P_mode is zero". When both sides are
     # single-sampled, align them instead of interpolating by coordinate.
     def _align_degenerate(mode_coords, plane_coords):
         if mode_coords.size == 1 and plane_coords.size == 1:
@@ -550,7 +550,7 @@ def _degenerate_width(coords: np.ndarray, mode, axis_letter: str,
     quasi-2-D plane (a 1-cell plain-periodic axis) that is wrong: the plane is
     a real plane, one cell deep, so its area element must use the GRID
     spacing. Getting this wrong scales modal power by 1/dl against a
-    FluxMonitor over the same plane and breaks the documented
+    PowerMonitor over the same plane and breaks the documented
     flux-commensurability of ``power=True`` (measured 30x at dl = 0.04 um).
     The reference mode carries the spacing, so take it from there.
     """
@@ -931,7 +931,7 @@ def mode_transmission(
     negative, is still a power). The ``1e-12`` converts the µm² area element of
     the overlap quadrature to m², making the value **flux-commensurate**: it
     carries the same §12 source-spectrum normalization AND the same SI area
-    element as a ``FluxMonitor``, so ``mode_power / flux`` on one plane is the
+    element as a ``PowerMonitor``, so ``mode_power / flux`` on one plane is the
     modal power fraction (~1 for a clean guide). (Before 2026-08 the µm² element
     was returned unconverted — a ~1e12 unit mismatch against flux.) Use
     ``power=True`` when ratioing two planes whose modes may DIFFER (e.g. a

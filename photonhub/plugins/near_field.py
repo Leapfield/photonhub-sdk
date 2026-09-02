@@ -2,7 +2,7 @@
 far-zone radiation pattern, via the surface-equivalence theorem.
 
 This is a pure-host post-processor (no engine / C++ change). Given the
-frequency-domain tangential ``E`` and ``H`` recorded by a ``FieldDftMonitor``
+frequency-domain tangential ``E`` and ``H`` recorded by a ``ProfileMonitor``
 on a plane (or the six faces of a box), it computes the far field
 ``E_theta(theta, phi, f)``, ``E_phi(theta, phi, f)``, the radiation intensity
 ``U = r^2 |E|^2 / (2 eta0)`` and the (optionally) normalized directivity, in
@@ -88,7 +88,7 @@ normal coordinate and no grid spacing, and the SIGN of the offset depends on
 how the monitor plane was snapped (the quarter-cell placement idiom), so the
 referral is not inferrable from the DataArray alone — a trial correction made
 a real dipole box's pattern asymmetry WORSE monotonically in the assumed
-direction (benchmarks/meep FINDINGS.md F12). A remaining O(k dl/2) phase on
+direction. A remaining O(k dl/2) phase on
 the ``N`` vs ``L`` balance persists (cf. the longitudinal de-stagger
 ``mode_overlap.mode_transmission(destagger_dl=...)`` applies for modal
 readouts).
@@ -477,7 +477,7 @@ def far_field(
     """Project a recorded near-field surface onto the far field.
 
     Single-plane (default) or closed-box projection of the tangential ``E``/``H``
-    recorded by a ``FieldDftMonitor`` (``data[monitor_name]``), via the
+    recorded by a ``ProfileMonitor`` (``data[monitor_name]``), via the
     surface-equivalence currents ``J = n_hat x H``, ``M = -n_hat x E`` and the
     radiation integral (see the module docstring). Returns a :class:`FarField`
     with ``E_theta``/``E_phi`` (far-field amplitudes), from which intensity,
@@ -486,7 +486,7 @@ def far_field(
     Parameters
     ----------
     data:
-        A :class:`~photonhub.data.SimulationData` (or any mapping) such that
+        A :class:`~photonhub.data.RunResult` (or any mapping) such that
         ``data[monitor_name]`` is the recorded DFT field DataArray, dims
         ``('f','component','z','y','x')`` (a single-plane slice has a singleton
         normal axis). For a closed box pass per-face monitors via ``faces``.
@@ -573,8 +573,8 @@ def far_field(
     # open tube: the 3-D radiation integral below is then the wrong transform
     # and returns a silently wrong pattern -- measured 13.4% anisotropy and a
     # 0.134 front/back asymmetry for an ISOTROPIC 2-D point dipole, where the
-    # 2-D Green's-function transform gives 2.1% and exactly 0
-    # (benchmarks/meep n04, FINDINGS.md F20). Refuse it rather than answer
+    # 2-D Green's-function transform gives 2.1% and exactly 0. Refuse it
+    # rather than answer
     # wrongly; a genuine 2-D near-to-far needs the 2-D kernel, which this
     # plugin does not implement.
     if len(face_specs) > 1:

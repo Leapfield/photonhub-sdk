@@ -6,8 +6,8 @@ later, so designing it now is cheap and retrofitting after Phase 3 is not. The
 shape mirrors common cloud job handles / ``web.Batch`` so the local and cloud paths
 read identically::
 
-    job = ph.run_async(sim)                 # returns immediately
-    data = job.result()                     # blocks; SimulationData
+    job = ph.submit(sim)                 # returns immediately
+    data = job.result()                     # blocks; RunResult
 
     batch = ph.Batch({"w20": sim20, "w40": sim40})
     batch_data = batch.run(path_dir="sweep") # blocks until all finish
@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Mapping, Optional, Tuple, Union
 
 from ..components import Simulation
-from ..data import SimulationData
+from ..data import RunResult
 from .local import SolverRunError, run_local
 
 # A batch key becomes an output subdirectory name, so it must be filesystem
@@ -47,10 +47,10 @@ def _check_batch_name(name: str) -> str:
 
 class Job:
     """Handle to a single asynchronous local run (the forward-compatible shape
-    a cloud job handle will also satisfy). Created by :func:`run_async`; the
+    a cloud job handle will also satisfy). Created by :func:`submit`; the
     work runs on a daemon thread so the call returns immediately."""
 
-    def __init__(self, fn: Callable[[], SimulationData],
+    def __init__(self, fn: Callable[[], RunResult],
                  name: Optional[str] = None, job_id: Optional[str] = None,
                  cancel_event: Optional[threading.Event] = None):
         self.name = name
@@ -59,14 +59,14 @@ class Job:
         self.job_id = job_id
         self._cancel_event = cancel_event
         self._done = threading.Event()
-        self._data: Optional[SimulationData] = None
+        self._data: Optional[RunResult] = None
         self._exc: Optional[BaseException] = None
         self._thread = threading.Thread(
             target=self._run, args=(fn,), name=f"photonhub-job-{name or ''}",
             daemon=True)
         self._thread.start()
 
-    def _run(self, fn: Callable[[], SimulationData]) -> None:
+    def _run(self, fn: Callable[[], RunResult]) -> None:
         try:
             self._data = fn()
         except BaseException as exc:  # captured; re-raised in result()
@@ -86,8 +86,8 @@ class Job:
         if self._cancel_event is not None:
             self._cancel_event.set()
 
-    def result(self, timeout: Optional[float] = None) -> SimulationData:
-        """Block until the run finishes and return its :class:`SimulationData`,
+    def result(self, timeout: Optional[float] = None) -> RunResult:
+        """Block until the run finishes and return its :class:`RunResult`,
         re-raising any :class:`SolverRunError` in the caller's thread. Raises
         :class:`TimeoutError` if ``timeout`` elapses first (the run keeps
         going; call again)."""
@@ -100,7 +100,7 @@ class Job:
         return self._data
 
 
-def run_async(
+def submit(
     sim: Simulation,
     output_dir: Union[str, Path, None] = None,
     solver_path: Union[str, Path, None] = None,
@@ -128,7 +128,7 @@ def run_async(
         name=name, cancel_event=ev)
 
 
-class BatchData:
+class BatchResults:
     """Results of a :meth:`Batch.run`. Dict-like over the **successful** runs
     (``batch_data[name]`` / ``items()`` / iteration), with failures captured in
     :attr:`errors`. Local failures are :class:`SolverRunError`; a remote batch
@@ -136,7 +136,7 @@ class BatchData:
     failed name re-raises that exception; indexing an unknown name raises
     ``KeyError``."""
 
-    def __init__(self, results: Dict[str, SimulationData],
+    def __init__(self, results: Dict[str, RunResult],
                  errors: Dict[str, Exception], path: Path,
                  names: List[str]):
         self._results = results
@@ -144,7 +144,7 @@ class BatchData:
         self.path = path
         self._names = list(names)
 
-    def __getitem__(self, name: str) -> SimulationData:
+    def __getitem__(self, name: str) -> RunResult:
         if name in self._results:
             return self._results[name]
         if name in self._errors:
@@ -161,8 +161,8 @@ class BatchData:
     def __len__(self) -> int:
         return len(self._results)
 
-    def items(self) -> Iterator[Tuple[str, SimulationData]]:
-        """Iterate (name, SimulationData) over the successful runs only."""
+    def items(self) -> Iterator[Tuple[str, RunResult]]:
+        """Iterate (name, RunResult) over the successful runs only."""
         return iter(self._results.items())
 
     def keys(self) -> List[str]:
@@ -188,7 +188,7 @@ class BatchData:
         return list(self._errors)
 
     def __repr__(self) -> str:
-        return (f"BatchData({str(self.path)!r}, "
+        return (f"BatchResults({str(self.path)!r}, "
                 f"succeeded={self.succeeded}, failed={self.failed})")
 
 
@@ -210,7 +210,7 @@ class Batch:
             validated[name] = sim
         self.simulations = validated
 
-    def estimate_cost(self, **kwargs):
+    def quote(self, **kwargs):
         """Per-name :class:`~photonhub.cost.CostEstimate` plus the batch total
         (the plan's per-batch upfront estimate). Returns
         ``(per_sim: dict, total_usd: float)``."""
@@ -227,7 +227,7 @@ class Batch:
         progress: Optional[Callable[[str, dict], None]] = None,
         timeout: Optional[float] = None,
         device: Optional[str] = None,
-    ) -> BatchData:
+    ) -> BatchResults:
         """Run every simulation, writing ``<path_dir>/<name>/`` per entry, and
         block until all finish. ``max_workers`` runs that many concurrently
         (default 1 = serial). ``progress`` (if given) receives ``(name,
@@ -235,12 +235,12 @@ class Batch:
         always suppressed (concurrent entries would interleave).
         ``device`` selects the backend for every entry, as in
         :func:`run_local`. Per-simulation failures are captured in
-        the returned :attr:`BatchData.errors`, not raised."""
+        the returned :attr:`BatchResults.errors`, not raised."""
         base = (Path(path_dir) if path_dir is not None
                 else Path(tempfile.mkdtemp(prefix="photonhub-batch-")))
         base.mkdir(parents=True, exist_ok=True)
 
-        def _run_one(name: str, sim: Simulation) -> SimulationData:
+        def _run_one(name: str, sim: Simulation) -> RunResult:
             cb = ((lambda ev: progress(name, ev)) if progress is not None
                   else None)
             # quiet: concurrent entries would interleave their live status
@@ -249,7 +249,7 @@ class Batch:
                              solver_path=solver_path, progress=cb,
                              timeout=timeout, quiet=True, device=device)
 
-        results: Dict[str, SimulationData] = {}
+        results: Dict[str, RunResult] = {}
         errors: Dict[str, SolverRunError] = {}
         with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
             futs = {ex.submit(_run_one, n, s): n
@@ -263,4 +263,4 @@ class Batch:
                     # batch. Non-SolverRunError (programming bugs) still
                     # propagate and abort the run.
                     errors[name] = exc
-        return BatchData(results, errors, base, list(self.simulations))
+        return BatchResults(results, errors, base, list(self.simulations))

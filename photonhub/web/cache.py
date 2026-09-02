@@ -60,7 +60,7 @@ def _validate_payload(out: Path) -> None:
     """Validate the cheap, structural portion of the raw output contract.
 
     This deliberately uses file metadata rather than reading every monitor
-    array into memory. :class:`SimulationData` performs the monitor-type and
+    array into memory. :class:`RunResult` performs the monitor-type and
     coordinate-level checks lazily when callers access data.
     """
     if out.is_symlink() or not out.is_dir():

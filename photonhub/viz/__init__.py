@@ -1,7 +1,7 @@
 """PhotonHub visualization layer (design doc: docs/viz-layer-design.md).
 
 The rendering engine behind ``Simulation.plot``/``plot_eps``/``plot_3d`` and
-``SimulationData.plot_field``. All 2D methods return a matplotlib ``Axes``,
+``RunResult.plot_field``. All 2D methods return a matplotlib ``Axes``,
 accept ``ax=``, and never call ``plt.show()``; ``plot_3d`` returns a plotly
 ``Figure`` (the optional ``photonhub[viz]`` extra, lazy-imported).
 

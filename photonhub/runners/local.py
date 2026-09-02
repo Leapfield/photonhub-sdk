@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable, Optional, Union
 
 from ..components import Simulation
-from ..data import SimulationData
+from ..data import RunResult
 from .phsolver import (
     SolverRunError,
     find_solver,
@@ -104,7 +104,7 @@ def run_local(
     quiet: bool = False,
     log_file: Union[str, Path, None] = None,
     cancel_event: Optional[threading.Event] = None,
-) -> SimulationData:
+) -> RunResult:
     """Run ``phsolver run sim.json --output <dir>`` and load the results.
 
     ``progress`` (if given) receives every parsed JSON-lines event dict as it
@@ -144,11 +144,26 @@ def run_local(
         raise SolverRunError(
             "phsolver engine binary not found. Local runs need the engine; "
             "pip installs the Python client only. Either run on the cloud "
-            "instead (ph.web.run(sim) — no engine needed), or point this "
-            "client at an engine: pass solver_path=, set $PHOTONHUB_SOLVER, "
-            "or put phsolver on PATH (the desktop Workbench install bundles "
-            "one). Developers with the source tree: "
+            "instead (ph.web.run_quoted(sim, max_usd=...) — no engine "
+            "needed), or point this client at an engine: pass solver_path=, "
+            "set $PHOTONHUB_SOLVER, or put phsolver on PATH. Invited beta "
+            "participants receive a standalone headless solver archive "
+            "(https://leapfield.app/docs/get-started/headless-solver/); the "
+            "copy inside the desktop app is locked to that app. Developers "
+            "with the source tree: "
             "cmake -S engine -B build && cmake --build build"
+        )
+
+    for index, axis, band in sim.point_sources_in_boundary_layers():
+        center = tuple(sim.sources[index].center_um)
+        warnings.warn(
+            f"sources[{index}] (point_dipole at {center} um) lies inside the "
+            f"boundary layers on axis '{axis}' ({band:g} um thick on each "
+            "side): the engine will run it, but the boundary absorbs the "
+            "source in place and the recorded spectra are physically "
+            "meaningless. Move the source into the interior or thin the "
+            "boundary layers.",
+            stacklevel=2,
         )
 
     out_dir = Path(output_dir) if output_dir is not None else Path(
@@ -191,7 +206,7 @@ def run_local(
     # .bin is still a solver failure — surface it as SolverRunError so callers
     # have a single exception surface, not a raw FileNotFoundError/ValueError.
     try:
-        return SimulationData(out_dir)
+        return RunResult(out_dir)
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as e:
         raise SolverRunError(
             f"phsolver exited cleanly but its outputs are unreadable: {e}") from e

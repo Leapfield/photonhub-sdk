@@ -59,16 +59,42 @@ class _DesktopCapabilityMiddleware:
     never placed in a page, URL, response, command line, or child environment.
     """
 
-    def __init__(self, app, launch_capability: Optional[str] = None):
+    def __init__(self, app, launch_capability: Optional[str] = None,
+                 notebook_enabled: bool = True):
         self.app = app
         self.launch_capability = launch_capability
+        self.notebook_enabled = notebook_enabled
 
     async def __call__(self, scope, receive, send):
         scope_type = scope.get("type")
         path = scope.get("path", "")
         protected = path == "/api" or path.startswith("/api/")
-        if (self.launch_capability is None or not protected
-                or scope_type not in {"http", "websocket"}):
+        if self.launch_capability is None:
+            # No desktop capability means an unauthenticated loopback
+            # listener (the `photonhub-serve-viz` CLI). Loopback is shared by
+            # every OS user on the host, so notebook cells — arbitrary code
+            # executed in this process — stay disabled unless the operator
+            # opted in explicitly (``--enable-notebook``).
+            if (scope_type == "http" and not self.notebook_enabled
+                    and path.startswith("/api/notebook")):
+                payload = (b'{"detail":"notebook execution is disabled in '
+                           b'photonhub-serve-viz; restart with '
+                           b'--enable-notebook on a single-user machine"}')
+                await send({
+                    "type": "http.response.start",
+                    "status": 403,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length",
+                         str(len(payload)).encode("ascii")),
+                        (b"cache-control", b"no-store"),
+                    ],
+                })
+                await send({"type": "http.response.body", "body": payload})
+                return
+            await self.app(scope, receive, send)
+            return
+        if not protected or scope_type not in {"http", "websocket"}:
             await self.app(scope, receive, send)
             return
 
@@ -201,7 +227,8 @@ def create_app(result_dir: Optional[str | Path] = None,
                run_root: Optional[str | Path] = None,
                launch_token: Optional[str] = None,
                shutdown_callback: Optional[Callable[[], None]] = None,
-               release_identity: Optional[dict] = None):
+               release_identity: Optional[dict] = None,
+               notebook_enabled: bool = True):
     """Build the FastAPI app. The loaded bundle lives in a mutable holder so the UI
     can open a different result dir without restarting; ``result_dir`` is optional —
     the app launches empty (Open a bundle or use Preview). If ``ui_dir`` is given the
@@ -482,7 +509,7 @@ def create_app(result_dir: Optional[str | Path] = None,
         External/legacy bundles retain their existing best-effort behavior.  A
         ledger-backed result is different: every provenance or numerical read
         checks the sealed record and the selected artifact before using the
-        already-open ``SimulationData`` object.
+        already-open ``RunResult`` object.
         """
         data, result_id, run_id = state["result"]
         if data is None:
@@ -629,7 +656,7 @@ def create_app(result_dir: Optional[str | Path] = None,
                     f"open historical run {run_id} failed integrity checks: {exc}",
                 ) from exc
 
-        # An external cached request gets a fresh, identity-bound SimulationData
+        # An external cached request gets a fresh, identity-bound RunResult
         # below while holding the single-flight lock. Sealed runs and uncached
         # callers can resolve names from their immutable open snapshot here.
         external_cached = (
@@ -689,7 +716,7 @@ def create_app(result_dir: Optional[str | Path] = None,
                 cache_lock.acquire()
                 cache_guard = True
             if external_cached:
-                # The open SimulationData intentionally caches monitor arrays.
+                # The open RunResult intentionally caches monitor arrays.
                 # Re-open its cheap manifest/HDF5 envelope for each identity
                 # check so a replaced blob can never be recomputed through the
                 # old object's DataArray cache.
@@ -1178,7 +1205,7 @@ def create_app(result_dir: Optional[str | Path] = None,
                         f"refinement region {index + 1} requires hi > lo and dl > 0")
                 regions.append((axis, lo, hi, dl))
 
-            meshed = sim.with_auto_grid(
+            meshed = sim.with_auto_mesh(
                 wavelength_um=wavelength_nm / 1000.0,
                 steps_per_wvl=steps_per_wvl,
                 max_grading=max_grading,
@@ -1192,7 +1219,7 @@ def create_app(result_dir: Optional[str | Path] = None,
             )
         except (TypeError, ValueError) as exc:
             raise HTTPException(422, {"message": str(exc), "issues": [
-                {"loc": ["auto_grid"], "msg": str(exc), "type": "value_error"}
+                {"loc": ["auto_mesh"], "msg": str(exc), "type": "value_error"}
             ]})
 
         return _workspace_payload(_update_workspace_sim(
@@ -2722,7 +2749,7 @@ def create_app(result_dir: Optional[str | Path] = None,
                     cloud_job["status"] = "running"
 
         try:
-            handle = cloud_web.run_async(
+            handle = cloud_web.submit(
                 sim, name=cloud_job["name"], device=accepted.device,
                 solver=accepted.solver, quote_id=accepted.quote_id,
                 progress=on_progress,
@@ -3481,6 +3508,7 @@ def create_app(result_dir: Optional[str | Path] = None,
     # future streaming responses, or future WebSockets) can run first.
     app.add_middleware(
         _DesktopCapabilityMiddleware, launch_capability=launch_token,
+        notebook_enabled=notebook_enabled,
     )
     return app
 
@@ -3542,7 +3570,8 @@ def serve_viz(result_dir: Optional[str | Path] = None, *, port: int = 8765,
               watch_parent: bool = False,
               run_root: Optional[str | Path] = None,
               launch_token: Optional[str] = None,
-              release_manifest: Optional[str | Path] = None) -> None:
+              release_manifest: Optional[str | Path] = None,
+              notebook_enabled: bool = True) -> None:
     """Start the local viz server on 127.0.0.1 and (optionally) open a browser."""
     import uvicorn
 
@@ -3558,6 +3587,7 @@ def serve_viz(result_dir: Optional[str | Path] = None, *, port: int = 8765,
     )
     app = create_app(
         result_dir, ui_dir=ui_dir, run_root=_persistent_run_root(run_root),
+        notebook_enabled=notebook_enabled,
         launch_token=launch_token, shutdown_callback=request_shutdown,
         release_identity=release_identity)
     config = uvicorn.Config(
@@ -3580,6 +3610,12 @@ def _main(argv=None) -> int:
                          "launch empty and Open/Preview in the app")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-open", action="store_true", help="don't open a browser")
+    ap.add_argument(
+        "--enable-notebook", action="store_true",
+        help="allow notebook code cells (arbitrary Python in this process). "
+             "The listener is unauthenticated on loopback, which every OS "
+             "user on the host shares — enable only on a single-user machine.",
+    )
     ap.add_argument("--ui-dir", default=None, help="serve a built web UI at / (packaged app)")
     ap.add_argument(
         "--run-root", default=None,
@@ -3606,6 +3642,7 @@ def _main(argv=None) -> int:
             ui_dir=a.ui_dir, watch_parent=a.watch_parent,
             run_root=a.run_root, launch_token=launch_capability,
             release_manifest=a.release_manifest,
+            notebook_enabled=bool(a.launch_capability_stdin or a.enable_notebook),
         )
     except (OSError, ValueError) as exc:
         if a.release_manifest:

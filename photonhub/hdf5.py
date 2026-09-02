@@ -14,13 +14,13 @@ Layout — deliberately "the output directory in one file":
 
 Everything else (run/grid/provenance metadata, monitor shapes/dims/coords,
 the section-12 complex64 reconstruction and normalization) is carried by the
-embedded ``manifest_json`` and rebuilt by :class:`photonhub.data.SimulationData`
+embedded ``manifest_json`` and rebuilt by :class:`photonhub.data.RunResult`
 using the exact same code path as the raw directory — so an HDF5 load is
 bit-identical to a raw-directory load, by construction.
 
     from photonhub import convert_to_hdf5
     h5 = convert_to_hdf5("out/")            # -> out/simulation.h5
-    data = SimulationData(h5)               # same DataArrays as SimulationData("out/")
+    data = RunResult(h5)               # same DataArrays as RunResult("out/")
 """
 
 import errno

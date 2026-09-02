@@ -1,7 +1,7 @@
 """Grating diffraction-order decomposition of a periodic DFT plane.
 
 Pure post-processing, no engine support required: a full-plane
-``FieldDftMonitor`` recording the four tangential components over a
+``ProfileMonitor`` recording the four tangential components over a
 transverse-PERIODIC unit cell is decomposed into its discrete plane-wave
 (grating) orders — complex s/p amplitudes per order and direction, per-order
 power, propagation angles, and the propagating/evanescent mask.
@@ -273,9 +273,9 @@ def diffraction_orders(
         ``n_medium`` is not given — the analytic cross-section all come from
         it).
     data:
-        The run's ``SimulationData`` (or any ``name -> DataArray`` mapping).
+        The run's ``RunResult`` (or any ``name -> DataArray`` mapping).
     monitor:
-        The full-plane ``FieldDftMonitor`` (or its name) recording all four
+        The full-plane ``ProfileMonitor`` (or its name) recording all four
         tangential components of the plane normal to its zero-size axis.
     n_medium:
         Refractive index of the homogeneous region containing the plane.

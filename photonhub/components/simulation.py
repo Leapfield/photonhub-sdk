@@ -11,7 +11,7 @@ from typing import Optional, Tuple, Union
 
 from pydantic import Field, field_validator, model_validator
 
-from ..cost import CostEstimate, estimate_cost
+from ..cost import CostEstimate, quote
 from .base import (
     MAX_INT32,
     DftPrecisionName,
@@ -22,7 +22,7 @@ from .base import (
     _monitor_name_key,
 )
 from .grid import (
-    GridSpecType,
+    MeshType,
     axis_min_cells,
     graded_primary_spacings,
     quarter_snap_dft_face,
@@ -34,8 +34,8 @@ from .grid import (
 )
 from .medium import Background, Boundaries
 from .monitors import (
-    FieldDftMonitor,
-    FluxMonitor,
+    ProfileMonitor,
+    PowerMonitor,
     MonitorType,
     mode_port_physical_polarization,
 )
@@ -141,7 +141,7 @@ def _quarter_snapped_dft_monitors(monitors, *, size_um, grid):
     Pure function of ``(monitors, size_um, grid)``: returns ``(new_monitors,
     notes)`` where ``notes`` carries one line per ADJUSTED monitor (empty =
     nothing moved and ``new_monitors`` is the input, element-identical). For
-    each :class:`FieldDftMonitor` and each axis whose listed components mix
+    each :class:`ProfileMonitor` and each axis whose listed components mix
     Yee offsets, both box faces are put through
     :func:`~photonhub.components.grid.quarter_snap_dft_face`: a face whose
     per-component engine snap already agrees — including domain-edge faces
@@ -165,7 +165,7 @@ def _quarter_snapped_dft_monitors(monitors, *, size_um, grid):
 
     out, notes = [], []
     for m in monitors:
-        if not isinstance(m, FieldDftMonitor):
+        if not isinstance(m, ProfileMonitor):
             out.append(m)
             continue
         lo = [m.center_um[a] - m.size_um[a] / 2.0 for a in range(3)]
@@ -276,12 +276,12 @@ class Simulation(FrozenModel):
     field-monitor box faces are AUTO-SNAPPED at construction to §12
     quarter-cell planes wherever the engine's per-component region snap would
     reject them or pass on float rounding luck (see
-    :class:`~photonhub.components.monitors.FieldDftMonitor`); ingestion via
+    :class:`~photonhub.components.monitors.ProfileMonitor`); ingestion via
     ``from_wire_json``/``from_file`` never adjusts a document."""
 
     schema_version: str = SCHEMA_VERSION
     size_um: Tuple[PositiveUm, PositiveUm, PositiveUm]
-    grid: GridSpecType
+    grid: MeshType
     run: RunSpec
     background: Background = Background()
     # NUMERICS.md section 11: layer count for every "pml" boundary axis. The
@@ -290,11 +290,10 @@ class Simulation(FrozenModel):
     # remain consumable by schema-1.0 parsers that reject unknown keys.
     #
     # 4 is a hard FLOOR, not a recommendation. Measured spurious reflection of
-    # a normally incident pulse (benchmarks/meep n07, vs a reflection-free
-    # reference domain): 1.9e-05 at 4 layers, 5.5e-09 at 8, 2.2e-10 at 12,
-    # 4.0e-11 at 16. The default of 12 is quiet; 8 is the practical minimum for
-    # a clean boundary; 4 reflects ~250x more than the equivalent Meep PML and
-    # should be treated as "cheap and lossy" (FINDINGS.md F17).
+    # a normally incident pulse (vs a reflection-free reference domain):
+    # 1.9e-05 at 4 layers, 5.5e-09 at 8, 2.2e-10 at 12, 4.0e-11 at 16. The
+    # default of 12 is quiet; 8 is the practical minimum for a clean boundary;
+    # 4 should be treated as "cheap and lossy".
     pml_num_layers: int = Field(default=12, ge=4, le=MAX_INT32)
     # NUMERICS.md §11 CPML profile (Roden–Gedney) tuning knobs. The defaults
     # reproduce the historically-hardcoded profile BIT-FOR-BIT, so an UNSET
@@ -350,7 +349,7 @@ class Simulation(FrozenModel):
     # guard, see that validator). An UNSET value is omitted from the wire format
     # (see _wire_exclude) so documents stay byte-identical and consumable by
     # parsers from earlier minors that reject unknown keys. Box (exact) and
-    # curved (Cylinder/PolySlab/Sphere, supersampled §16.7) interfaces are
+    # curved (Cylinder/Polygon/Sphere, supersampled §16.7) interfaces are
     # smoothed on BOTH uniform and graded meshes (CPU, single GPU, and multi-GPU).
     # Only the off-diagonal ``tensor_full`` on a graded mesh remains deferred
     # (§16.6; engine reference_solver.cpp / gpu_solver.hip reject it). Uniform
@@ -360,7 +359,7 @@ class Simulation(FrozenModel):
     # NUMERICS.md §16.5/§16.8/§16.11: which smoothing to apply when ``subpixel``
     # is on. Six operators: "volume" (isotropic volume average, bit-identical to
     # schema < 1.7.0); "tensor" (diagonal anisotropic KFJ); "tensor_full" (full
-    # off-diagonal KFJ); "contour" (diagonal KFJ fed the exact §16.10 PolySlab
+    # off-diagonal KFJ); "contour" (diagonal KFJ fed the exact §16.10 Polygon
     # fill == standard polarized averaging plus the exact vertical-wall
     # fill — the DEFAULT); and the rigorous contour-path EPs (Mohammadi-Nadgaran-
     # Agio 2005, contour-path averaging): "contour_diag" (the paper's
@@ -645,7 +644,7 @@ class Simulation(FrozenModel):
         # per monitor on this module's DEBUG log.
         if (info.context or {}).get("wire_ingest"):
             return self
-        if not any(isinstance(m, FieldDftMonitor) for m in self.monitors):
+        if not any(isinstance(m, ProfileMonitor) for m in self.monitors):
             return self
         snapped, notes = _quarter_snapped_dft_monitors(
             self.monitors, size_um=self.size_um, grid=self.grid)
@@ -673,7 +672,7 @@ class Simulation(FrozenModel):
         realized = self._realized_um()
         port_monitors = [
             monitor for monitor in self.monitors
-            if isinstance(monitor, FieldDftMonitor)
+            if isinstance(monitor, ProfileMonitor)
             and monitor.mode_port is not None
         ]
         if not port_monitors:
@@ -849,7 +848,7 @@ class Simulation(FrozenModel):
 
     def _axis_coords_um(self, axis_index: int):
         """The graded coordinate array (microns) for an axis, or None when
-        that axis is uniform (UniformGridSpec, or a GradedGridSpec axis not
+        that axis is uniform (UniformMesh, or a GradedMesh axis not
         listed in ``coords``)."""
         coords = getattr(self.grid, "coords", None)
         if coords is None:
@@ -1032,40 +1031,40 @@ class Simulation(FrozenModel):
                                   context={"wire_ingest": True})
         return new
 
-    def with_auto_grid(
+    def with_auto_mesh(
         self,
         *,
         wavelength_um: Optional[float] = None,
         steps_per_wvl: float = 20.0,
-        **auto_grid_kwargs,
+        **auto_mesh_kwargs,
     ) -> "Simulation":
         """Return a COPY of this simulation whose ``grid`` is replaced by an
-        auto-meshed :class:`GradedGridSpec` derived from this scene — its
+        auto-meshed :class:`GradedMesh` derived from this scene — its
         domain ``size_um``, ``structures``, ``background`` index, and (if
         ``wavelength_um`` is omitted) the wavelength inferred from the first
-        source. A convenience wrapper over :func:`photonhub.auto_grid`; extra
+        source. A convenience wrapper over :func:`photonhub.auto_mesh`; extra
         keyword arguments (``max_grading``, ``axes``, ``dl_min_um``,
         ``refine_regions``, ...) pass straight through.
 
-        Opt-in only: the default :class:`UniformGridSpec` is unchanged, so no
+        Opt-in only: the default :class:`UniformMesh` is unchanged, so no
         existing scene's wire output moves. Use this when you want per-medium
         per-medium refinement without hand-building coordinate arrays::
 
-            sim = sim.with_auto_grid(steps_per_wvl=20)
+            sim = sim.with_auto_mesh(steps_per_wvl=20)
 
-        Axes whose boundary is PERIODIC are passed to :func:`auto_grid` as
+        Axes whose boundary is PERIODIC are passed to :func:`auto_mesh` as
         ``periodic_axes`` (unless you override it explicitly), so a graded
         periodic axis is generated seam-symmetrically — equal first/last
         primary spacings, the §15.2 closure requirement the engine hard-checks.
         Non-periodic scenes are byte-identical to before.
         """
-        from .grid import auto_grid as _auto_grid  # local: avoid import cycle
+        from .grid import auto_mesh as _auto_grid  # local: avoid import cycle
 
         bg_index = float(self.background.permittivity) ** 0.5
         src = self.sources[0] if self.sources else None
-        if "periodic_axes" not in auto_grid_kwargs:
+        if "periodic_axes" not in auto_mesh_kwargs:
             kinds = (self.boundaries.x, self.boundaries.y, self.boundaries.z)
-            auto_grid_kwargs["periodic_axes"] = "".join(
+            auto_mesh_kwargs["periodic_axes"] = "".join(
                 _AXES[a] for a in range(3) if kinds[a] == "periodic")
         spec = _auto_grid(
             size_um=tuple(self.size_um),
@@ -1074,7 +1073,7 @@ class Simulation(FrozenModel):
             structures=self.structures,
             background_index=bg_index,
             steps_per_wvl=steps_per_wvl,
-            **auto_grid_kwargs,
+            **auto_mesh_kwargs,
         )
         update: dict = {"grid": spec}
         # Re-run the §12 quarter-snap against the NEW cell ladder: the
@@ -1096,7 +1095,7 @@ class Simulation(FrozenModel):
         *overrides,
         wavelength_um: Optional[float] = None,
         steps_per_wvl: float = 20.0,
-        **auto_grid_kwargs,
+        **auto_mesh_kwargs,
     ) -> "Simulation":
         """Return a COPY whose ``grid`` is auto-meshed with one or more
         geometry-based :class:`photonhub.MeshOverride` regions applied — the mesh
@@ -1104,7 +1103,7 @@ class Simulation(FrozenModel):
         override's geometry regardless of the local material, on top of the
         ordinary per-medium refinement.
 
-        A thin wrapper over :meth:`with_auto_grid` that forwards the overrides as
+        A thin wrapper over :meth:`with_auto_mesh` that forwards the overrides as
         ``mesh_overrides=``; all other auto-mesh knobs (``max_grading``, ``axes``,
         ``dl_min_um``, ``refine_pad_um``, ...) pass straight through — including
         the periodic-boundary seam handling: axes whose boundary is periodic get
@@ -1119,9 +1118,9 @@ class Simulation(FrozenModel):
                              dl_um=(0.02, 0.02, None)),
                 steps_per_wvl=20)
         """
-        return self.with_auto_grid(
+        return self.with_auto_mesh(
             wavelength_um=wavelength_um, steps_per_wvl=steps_per_wvl,
-            mesh_overrides=overrides, **auto_grid_kwargs)
+            mesh_overrides=overrides, **auto_mesh_kwargs)
 
     def with_stabilized_pml(
         self,
@@ -1355,8 +1354,8 @@ class Simulation(FrozenModel):
                     "closure is only correct at a periodic seam when they "
                     "match, and phsolver validate rejects the scene "
                     "(NUMERICS.md §15.2). Regenerate the mesh seam-"
-                    "symmetrically — auto_grid(periodic_axes=...); "
-                    "with_auto_grid/with_mesh_overrides pass it from the "
+                    "symmetrically — auto_mesh(periodic_axes=...); "
+                    "with_auto_mesh/with_mesh_overrides pass it from the "
                     "boundaries automatically — or make that axis boundary "
                     "non-periodic (pml/absorber/pec)."
                 )
@@ -1626,6 +1625,40 @@ class Simulation(FrozenModel):
             )
         return self
 
+    def point_sources_in_boundary_layers(self) -> list:
+        """Point dipoles whose centre lies inside the PML/absorber band.
+
+        The engine accepts such a source and runs it, but the boundary layers
+        absorb it in place, so every recorded spectrum comes out physically
+        meaningless and near zero with no diagnostic. Construction does NOT
+        warn (geometry-only *shell* simulations legitimately carry a
+        placeholder dipole that is never run); :func:`photonhub.run_local`
+        warns before launching. Uniform grids only (the band is
+        ``layers * dl``). Returns ``[(source_index, axis_name, band_um), ...]``
+        (empty when every point source is interior).
+        """
+        dl = getattr(self.grid, "dl_um", None)
+        if dl is None or not self.sources:
+            return []
+        kinds = (self.boundaries.x, self.boundaries.y, self.boundaries.z)
+        realized = self._realized_um()
+        hits = []
+        for i, src in enumerate(self.sources):
+            center = getattr(src, "center_um", None)
+            if center is None or getattr(src, "type", "") != "point_dipole":
+                continue
+            for a in range(3):
+                if kinds[a] == "pml":
+                    band = self.pml_num_layers * dl
+                elif kinds[a] == "absorber":
+                    band = self.absorber_num_layers * dl
+                else:
+                    continue
+                if center[a] < band or center[a] > realized[a] - band:
+                    hits.append((i, _AXES[a], band))
+                    break
+        return hits
+
     @model_validator(mode="after")
     def _auto_stabilize_dispersive_pml(self, info) -> "Simulation":
         # A dispersive (Lorentz) scene with ANY PML face and the default
@@ -1704,7 +1737,7 @@ class Simulation(FrozenModel):
         # remains authoritative at exact half-cell positions.
         dl = self.grid.dl_um
         for m in self.monitors:
-            if not isinstance(m, FluxMonitor):
+            if not isinstance(m, PowerMonitor):
                 continue
             axis = _AXES.index(m.axis)
             # Graded axis: the coordinate-based plane snap (NUMERICS.md
@@ -1916,7 +1949,7 @@ class Simulation(FrozenModel):
     ) -> "CostEstimate":
         """Pure-Python dollar / memory / output / wall-time estimate (the
         plan's "estimate in dollars before you press run"). See
-        :func:`photonhub.cost.estimate_cost`. Cell count, dt and step count
+        :func:`photonhub.cost.quote`. Cell count, dt and step count
         match the engine's resolve.cpp, so the dollar figure tracks what
         ``phsolver`` will run; it is exact for a full-duration run (auto-shutoff
         can only make it cheaper)."""
@@ -1927,4 +1960,4 @@ class Simulation(FrozenModel):
             kwargs["rate_usd_per_tcell_step"] = rate_usd_per_tcell_step
         if throughput_gcells_per_s is not ...:
             kwargs["throughput_gcells_per_s"] = throughput_gcells_per_s
-        return estimate_cost(self, **kwargs)
+        return quote(self, **kwargs)

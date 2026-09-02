@@ -12,7 +12,7 @@ Design notes (see ``desktop/PLAN.md``):
   ``manifest.json``, so the scene + overlays are reconstructed from there.
 - The slider *catalog* is manifest-only (no blob load). Raw ``.bin`` monitor
   arrays are exposed through a read-only ``numpy.memmap`` by
-  ``SimulationData[name]``, so plane/frequency selections page in only the
+  ``RunResult[name]``, so plane/frequency selections page in only the
   requested data. HDF5-backed results remain eager because their dataset
   lifetime is currently scoped to a short-lived file handle.
 """
@@ -31,7 +31,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-from ..data import SimulationData
+from ..data import RunResult
 
 # complex -> real reducers for the `val` control
 _REDUCE = {"real": np.real, "imag": np.imag, "abs": np.abs, "phase": np.angle}
@@ -51,11 +51,11 @@ _SIM_CACHE: dict[str, tuple[tuple[int, int, int, int, int], Any]] = {}
 # Loading + catalog
 # --------------------------------------------------------------------------- #
 
-def load_result(path: str | Path) -> SimulationData:
+def load_result(path: str | Path) -> RunResult:
     """Open a result bundle (a dir with ``manifest.json``, a ``manifest.json``, or a
     ``.h5``). Cheap to open; a monitor's blob is read on first access (see the
     module memmap caveat)."""
-    return SimulationData(path)
+    return RunResult(path)
 
 
 def _kind(monitor_manifest: dict) -> str:
@@ -79,7 +79,7 @@ def _kind(monitor_manifest: dict) -> str:
     return "timeseries"
 
 
-def session(data: SimulationData, result_id: Optional[str] = None,
+def session(data: RunResult, result_id: Optional[str] = None,
             run_id: Optional[str] = None) -> dict:
     """Top-level metadata for the UI/agent: run stats, grid, provenance, monitor
     catalog, abort state, and whether a 3D scene is available."""
@@ -110,7 +110,7 @@ def session(data: SimulationData, result_id: Optional[str] = None,
     return payload
 
 
-def geometry_status(data: SimulationData) -> dict:
+def geometry_status(data: RunResult) -> dict:
     """Trust state for geometry overlays reconstructed from sibling ``sim.json``.
 
     A modified spec beside immutable field binaries is worse than no overlay: it
@@ -143,7 +143,7 @@ def geometry_status(data: SimulationData) -> dict:
             "actual_sha256": actual}
 
 
-def recorded_spec(data: SimulationData) -> dict:
+def recorded_spec(data: RunResult) -> dict:
     """The raw input document this result actually ran (sibling ``sim.json``).
 
     Gated on geometry provenance exactly like the scene overlays: a
@@ -186,7 +186,7 @@ def recorded_spec(data: SimulationData) -> dict:
             "mode_source_statuses": mode_source_statuses(sim)}
 
 
-def monitor_catalog(data: SimulationData) -> list[dict]:
+def monitor_catalog(data: RunResult) -> list[dict]:
     """Per-monitor slider metadata, read from the MANIFEST only (no blob load)."""
     cat = []
     for m in data.manifest.get("monitors", []):
@@ -241,7 +241,7 @@ def _component_array(da, field: str):
     return da.sel(component=field)
 
 
-def meta(data: SimulationData, monitor: str) -> dict:
+def meta(data: RunResult, monitor: str) -> dict:
     """Full slider ranges for a monitor — kind, components, value reducers, freqs,
     times, and per-axis spatial coords (for the cut-plane). Loads the DataArray
     (cached) to read its real coords; the UI fetches this once on selection."""
@@ -298,7 +298,7 @@ def _isel_nearest(array, dim: str, value: float):
     index = int(np.argmin(np.abs(coords - float(value))))
     return array.isel({dim: index})
 
-def slice_plane(data: SimulationData, monitor: str, *, field: str = "Ex",
+def slice_plane(data: RunResult, monitor: str, *, field: str = "Ex",
                 val: str = "real", freq: Optional[float] = None,
                 time: Optional[float] = None, axis: Optional[str] = None,
                 pos: Optional[float] = None):
@@ -342,7 +342,7 @@ def slice_plane(data: SimulationData, monitor: str, *, field: str = "Ex",
     return arr, z, spatial[0], spatial[1], resolved
 
 
-def field_stats(data: SimulationData, monitor: str, *, field: str = "Ex",
+def field_stats(data: RunResult, monitor: str, *, field: str = "Ex",
                 val: str = "abs", freq: Optional[float] = None,
                 time: Optional[float] = None, axis: Optional[str] = None,
                 pos: Optional[float] = None) -> dict:
@@ -379,7 +379,7 @@ def field_stats(data: SimulationData, monitor: str, *, field: str = "Ex",
     return out
 
 
-def spectrum_values(data: SimulationData, monitor: str) -> dict:
+def spectrum_values(data: RunResult, monitor: str) -> dict:
     """A flux/DFT monitor's spectrum as plain numbers (wavelength_nm + value),
     sorted by wavelength."""
     da = data[monitor]
@@ -533,7 +533,7 @@ def _json_safe_vector(values: Any) -> list[Optional[float]]:
     return out
 
 
-def _monitor_map(data: SimulationData) -> dict[str, dict]:
+def _monitor_map(data: RunResult) -> dict[str, dict]:
     monitors = data.manifest.get("monitors", [])
     if not isinstance(monitors, list):
         return {}
@@ -543,10 +543,10 @@ def _monitor_map(data: SimulationData) -> dict[str, dict]:
     }
 
 
-def _field_grid(data: SimulationData, name: str) -> dict:
+def _field_grid(data: RunResult, name: str) -> dict:
     """Manifest-derived field signature; never opens the monitor binary.
 
-    ``SimulationData[name]`` currently materializes the complete raw array, so a
+    ``RunResult[name]`` currently materializes the complete raw array, so a
     comparison eligibility check must reconstruct only its coordinate contract
     from the already-verified manifest.  The historical field endpoint performs
     the actual artifact checksum before any numerical slice is loaded.
@@ -654,7 +654,7 @@ def _monitor_semantics(monitor: dict, requested: dict) -> dict:
 
 
 def compare_run_data(a_record: dict, b_record: dict,
-                     a_data: SimulationData, b_data: SimulationData, *,
+                     a_data: RunResult, b_data: RunResult, *,
                      include_numerical: bool = True,
                      include_specs: bool = True) -> dict:
     """Compare two sealed runs without changing the viewer's current result.
@@ -819,7 +819,7 @@ def compare_run_data(a_record: dict, b_record: dict,
             f"/api/runs/{b_record['run_id']}/monitor/{name}/field" if bm else None)
         fields.append(entry)
 
-    def public_record(record: dict, data: SimulationData) -> dict:
+    def public_record(record: dict, data: RunResult) -> dict:
         out = {key: record.get(key) for key in (
             "run_id", "created_at", "started_at", "finished_at", "status",
             "device", "output_dir", "spec_sha256", "summary", "integrity",
@@ -885,7 +885,7 @@ def compare_run_data(a_record: dict, b_record: dict,
     }
 
 
-def timeseries_values(data: SimulationData, monitor: str, *, field: str = "Ex",
+def timeseries_values(data: RunResult, monitor: str, *, field: str = "Ex",
                       val: str = "real") -> dict:
     """A point/time monitor's component vs time as plain numbers."""
     da = _component_array(data[monitor], field)
@@ -899,7 +899,7 @@ def timeseries_values(data: SimulationData, monitor: str, *, field: str = "Ex",
             "time_s": t.tolist(), "value": np.asarray(y, dtype=float).tolist()}
 
 
-def timeseries_fft_values(data: SimulationData, monitor: str, *,
+def timeseries_fft_values(data: RunResult, monitor: str, *,
                           field: str = "Ex") -> dict:
     """Discrete power spectrum of a recorded time series, in dB re its peak.
 
@@ -944,7 +944,7 @@ def timeseries_fft_values(data: SimulationData, monitor: str, *,
     }
 
 
-def line_profile_values(data: SimulationData, monitor: str, *, field: str = "Ex",
+def line_profile_values(data: RunResult, monitor: str, *, field: str = "Ex",
                         val: str = "real", freq: Optional[float] = None,
                         time: Optional[float] = None) -> dict:
     """A rank-1 field monitor as coordinate/value arrays.
@@ -981,7 +981,7 @@ def line_profile_values(data: SimulationData, monitor: str, *, field: str = "Ex"
     }
 
 
-def field_spectrum_values(data: SimulationData, monitor: str, *, field: str = "Ex",
+def field_spectrum_values(data: RunResult, monitor: str, *, field: str = "Ex",
                           val: str = "abs") -> dict:
     """A rank-0 field DFT monitor as field amplitude/phase versus wavelength."""
     arr = data[monitor]
@@ -1020,14 +1020,14 @@ _PORT_DB_FLOOR = 1.0e-30  # finite JSON/plot value for an exactly zero channel
 
 
 def _modal_port_entries(sim) -> list[tuple[Any, Any, str]]:
-    """``[(FieldDftMonitor, ModePort, normal_axis)]`` in monitor order."""
+    """``[(ProfileMonitor, ModePort, normal_axis)]`` in monitor order."""
     if sim is None:
         return []
-    from ..components.monitors import FieldDftMonitor
+    from ..components.monitors import ProfileMonitor
 
     entries = []
     for monitor in sim.monitors:
-        if not isinstance(monitor, FieldDftMonitor) or monitor.mode_port is None:
+        if not isinstance(monitor, ProfileMonitor) or monitor.mode_port is None:
             continue
         zero_axes = [
             axis for axis, size in enumerate(monitor.size_um)
@@ -1185,7 +1185,7 @@ def modal_port_summaries_from_sim(sim) -> list[dict]:
     return summaries
 
 
-def modal_port_monitor_names(data: SimulationData) -> list[str]:
+def modal_port_monitor_names(data: RunResult) -> list[str]:
     """Names of every result artifact needed by :func:`modal_port_results`."""
     sim = sim_for(data)
     if sim is None:
@@ -1197,7 +1197,7 @@ def modal_port_monitor_names(data: SimulationData) -> list[str]:
     return names
 
 
-def modal_port_results(data: SimulationData) -> dict:
+def modal_port_results(data: RunResult) -> dict:
     """Resolve every saved modal port into one complex driven S-column.
 
     A schema-1.16 modal port remains an ordinary four-tangential-field DFT
@@ -1413,7 +1413,7 @@ def modal_port_results(data: SimulationData) -> dict:
 # Geometry (sim.json) — data only; figures.py turns outlines into traces
 # --------------------------------------------------------------------------- #
 
-def sim_for(data: SimulationData):
+def sim_for(data: RunResult):
     """The Simulation parsed from the bundle's identity-cached ``sim.json``, or
     None when the bundle carries no geometry."""
     p = data.output_dir / "sim.json"
@@ -1502,7 +1502,7 @@ def eps_plane_sim(sim, axis: str = "z", value: float = 0.0) -> dict:
     }
 
 
-def eps_plane(data: SimulationData, axis: str = "z", value: float = 0.0) -> dict:
+def eps_plane(data: RunResult, axis: str = "z", value: float = 0.0) -> dict:
     """Permittivity cut plane of a result bundle's geometry (via its ``sim.json``)."""
     sim = sim_for(data)
     if sim is None:
@@ -2017,7 +2017,7 @@ def solve_mode_source(sim, source_index: int, settings: dict):
     # the physical port plane untouched and explicitly unbind it; silently
     # rotating a measurement plane would be a much more surprising edit.
     from ..components.monitors import (
-        FieldDftMonitor,
+        ProfileMonitor,
         mode_port_physical_polarization,
         mode_port_required_trial_modes,
     )
@@ -2026,7 +2026,7 @@ def solve_mode_source(sim, source_index: int, settings: dict):
     unlinked_ports = []
     monitors = []
     for monitor in sim.monitors:
-        if (not isinstance(monitor, FieldDftMonitor)
+        if (not isinstance(monitor, ProfileMonitor)
                 or monitor.mode_port is None
                 or monitor.mode_port.source_index != source_index):
             monitors.append(monitor)
@@ -2186,8 +2186,8 @@ _FRESNEL_SLAB_STARTER = {
         "and transmittance — the classic textbook interference spectrum."
     ),
     "provenance": (
-        "PhotonHub notebook gallery scene — examples/notebooks/"
-        "02_fresnel_slab.ipynb and 10_cloud_gpu_run.ipynb"
+        "PhotonHub worked-example gallery scene — Fresnel slab "
+        "(examples 02 and 10)"
     ),
     "fidelity_note": (
         "5,120 cells, seconds on any laptop CPU. The transverse span is four "
@@ -2223,8 +2223,8 @@ _MODE_CONVERTER_STARTER = {
         "Design and Results; o3 resolves both TE0 and TE1 from one raw DFT plane."
     ),
     "reference": (
-        "Matched res25 headline at 1550 nm: 45.74% TE0→TE1 conversion, within "
-        "0.05 percentage points of an independent FDTD reference."
+        "Matched res25 headline at 1550 nm: 45.74% TE0→TE1 conversion "
+        "(converged benchmark result)."
     ),
 }
 

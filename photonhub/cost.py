@@ -107,7 +107,7 @@ class CostEstimate:
 
 def _axis_coords_um(grid, axis_index: int) -> Optional[Tuple[float, ...]]:
     """Graded primary-node coordinates (microns) for an axis, or None when
-    that axis is uniform (UniformGridSpec, or a GradedGridSpec axis omitted
+    that axis is uniform (UniformMesh, or a GradedMesh axis omitted
     from ``coords``). Mirrors Simulation._axis_coords_um without importing it."""
     coords = getattr(grid, "coords", None)
     if coords is None:
@@ -139,7 +139,7 @@ def _dt_seconds(sim: "Simulation", counts, min_spacing_um) -> float:
     """dt exactly as resolve.cpp computes it: the §2 uniform limit
     ``C*dl/(c0*sqrt(D))`` over the D ACTIVE axes (n > 1; a 1-cell plain
     periodic axis carries no curl term and leaves the Courant sum) for a
-    UniformGridSpec, else the §15.5 graded limit over the active axes' minimum
+    UniformMesh, else the §15.5 graded limit over the active axes' minimum
     spacings (a graded grid whose axes happen to be uniform reduces to the §2
     form, as the engine's graded_courant_dt does)."""
     courant = sim.run.courant
@@ -223,7 +223,7 @@ def _monitor_bytes(sim: "Simulation", num_steps: int, cells_per_axis):
     return resident, output
 
 
-def estimate_cost(
+def quote(
     sim: "Simulation",
     *,
     rate_usd_per_tcell_step: float = DEFAULT_RATE_USD_PER_TCELL_STEP,

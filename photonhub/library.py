@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Tuple
 
 from .components.base import AxisName, Vec3Um
-from .components.structures import Box, Cylinder, Medium, PolySlab, Structure
+from .components.structures import Box, Cylinder, Medium, Polygon, Structure
 
 __all__ = [
     "Port",
@@ -225,7 +225,7 @@ def _bend_plane_axes(thickness_axis: AxisName) -> Tuple[AxisName, AxisName]:
 
 
 # ---------------------------------------------------------------------------
-# 3. taper (trapezoidal PolySlab)
+# 3. taper (trapezoidal Polygon)
 # ---------------------------------------------------------------------------
 
 
@@ -240,11 +240,11 @@ def taper(
     axis: AxisName = "x",
     thickness_axis: AxisName = "z",
 ) -> Component:
-    """A linear width taper: a trapezoidal ``PolySlab`` (4 vertices) whose
+    """A linear width taper: a trapezoidal ``Polygon`` (4 vertices) whose
     cross-section width grows ``width1_um`` -> ``width2_um`` along ``axis``.
     Ports at each end with the local widths."""
     width_axis, thickness_axis = _planar_axes(axis, thickness_axis)
-    # PolySlab vertices are (u, v) in the two transverse axes of the EXTRUSION
+    # Polygon vertices are (u, v) in the two transverse axes of the EXTRUSION
     # axis (= thickness_axis): u = lower-indexed, v = higher-indexed. Here the
     # in-plane polygon lives in (prop, width) so we map those two roles onto
     # (u, v) by axis index, then emit vertices in increasing-index order.
@@ -271,7 +271,7 @@ def taper(
         vertices.append((u, v))
     t_center = center_um[_INDEX[thickness_axis]]
     slab_bounds = (t_center - thickness_um / 2.0, t_center + thickness_um / 2.0)
-    geometry = PolySlab(
+    geometry = Polygon(
         axis=thickness_axis,
         vertices_um=tuple(vertices),
         slab_bounds_um=slab_bounds,
@@ -285,7 +285,7 @@ def taper(
 
 
 # ---------------------------------------------------------------------------
-# 3b. cosine taper (curved-sidewall "beam shaping" PolySlab)
+# 3b. cosine taper (curved-sidewall "beam shaping" Polygon)
 # ---------------------------------------------------------------------------
 
 
@@ -326,7 +326,7 @@ def cosine_taper(
     axis: AxisName = "x",
     thickness_axis: AxisName = "z",
 ) -> Component:
-    """A cosine ("beam shaping") width taper: a curved-sidewall ``PolySlab``
+    """A cosine ("beam shaping") width taper: a curved-sidewall ``Polygon``
     whose full width follows ``W(x) = W_m*cos(pi*x/(2*L0))`` from ``width1_um`` to
     ``width2_um`` along ``axis`` (Chandran et al., Opt. Lett. 45, 6230 (2020)).
     ``peak_width_um`` (``W_m``) is the maximum width reached inside the taper —
@@ -363,7 +363,7 @@ def cosine_taper(
 
     t_center = center_um[_INDEX[thickness_axis]]
     slab_bounds = (t_center - thickness_um / 2.0, t_center + thickness_um / 2.0)
-    geometry = PolySlab(
+    geometry = Polygon(
         axis=thickness_axis,
         vertices_um=tuple(vertices),
         slab_bounds_um=slab_bounds,
@@ -888,7 +888,7 @@ def y_branch(
         poly_pw = _ribbon_polygon(cl, wg_width_um)
         verts = [_to_uv(px, py) for px, py in poly_pw]
         structures.append(Structure(
-            geometry=PolySlab(axis=thickness_axis, vertices_um=tuple(verts),
+            geometry=Polygon(axis=thickness_axis, vertices_um=tuple(verts),
                               slab_bounds_um=slab_bounds), medium=medium))
 
     def _region_outer(radii, straight, sign):
@@ -973,7 +973,7 @@ def y_branch(
         poly_pw = outer + inner[::-1]
         verts = [_to_uv(px, py) for px, py in poly_pw]
         structures.append(Structure(
-            geometry=PolySlab(axis=thickness_axis, vertices_um=tuple(verts),
+            geometry=Polygon(axis=thickness_axis, vertices_um=tuple(verts),
                               slab_bounds_um=slab_bounds), medium=medium))
 
     def _add_access_arm(sign):
@@ -988,7 +988,7 @@ def y_branch(
         poly_pw = _ribbon_polygon(cl, wg_width_um)
         verts = [_to_uv(px, py) for px, py in poly_pw]
         structures.append(Structure(
-            geometry=PolySlab(axis=thickness_axis, vertices_um=tuple(verts),
+            geometry=Polygon(axis=thickness_axis, vertices_um=tuple(verts),
                               slab_bounds_um=slab_bounds), medium=medium))
 
     if solid_junction:

@@ -34,8 +34,8 @@ from ..components.simulation import Simulation
 from ..components.source_time import GaussianPulse
 from ..components.sources import PointDipole
 from ..components.structures import Medium, Structure
-from ..components.grid import UniformGridSpec, realized_cells
-from ..components.monitors import FieldDftMonitor
+from ..components.grid import UniformMesh, realized_cells
+from ..components.monitors import ProfileMonitor
 from .. import materials as _materials
 from ..plugins.mode_devices import ModeMonitor, mode_launch, mode_monitor, transmission
 from ..plugins.yee_mode import solve_yee_mode
@@ -171,7 +171,7 @@ class BuiltSim:
 
     def run(self, *, device: Optional[str] = None, **run_kwargs):
         """Run locally / on ``device`` via :func:`photonhub.run_local` and return
-        the ``SimulationData``. A thin convenience; hand ``self.sim`` to any
+        the ``RunResult``. A thin convenience; hand ``self.sim`` to any
         runner (cloud GPU) instead if you prefer."""
         from ..runners.local import run_local
 
@@ -335,7 +335,7 @@ def build_simulation(
 
     # Solve the routing-waveguide TE0 mode once (square-ish core -> same mode on
     # x- and y-normal planes; resampled per plane).
-    grid = UniformGridSpec(dl_um=dl)
+    grid = UniformMesh(dl_um=dl)
     boundaries = Boundaries(x="pml", y="pml", z="pml")
     method = subpixel_method or spec.convergence.subpixel_method
 
@@ -502,7 +502,7 @@ def build_simulation(
             return 0.5 * (lo + hi), hi - lo
         fxc, fxs = _slice_span(realized_cells(size_x, dl))
         fyc, fys = _slice_span(realized_cells(size_y, dl))
-        monitors = monitors + (FieldDftMonitor(
+        monitors = monitors + (ProfileMonitor(
             name="field_xy", center_um=(fxc, fyc, z_plane),
             size_um=(fxs, fys, 0.0), fields=("Ex", "Ey", "Ez"),
             freqs_hz=(field_slice_cf,)),)

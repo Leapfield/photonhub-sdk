@@ -13,14 +13,16 @@ Python 3.11+:
 python -m pip install photonhub
 ```
 
-(From a monorepo checkout: `python -m pip install ./photonhub`.)
+(From a monorepo checkout: `python -m pip install -e ./photonhub`.)
 
 That installs the full scripting client: build simulations, estimate cost,
-run on the **cloud GPU** (`ph.web.run(sim)` with your beta API key), and read
-results — no compiler, no engine build. **Local** runs (`ph.run_local`) also
-need the `phsolver` engine binary, which pip does not ship: the desktop
-Workbench install bundles one (point `$PHOTONHUB_SOLVER` at it or put it on
-`PATH`), and developers with the monorepo build it with
+run on the **cloud GPU** (`ph.web.run_quoted(sim, max_usd=...)` with your beta
+API key), and read results — no compiler, no engine build. **Local** runs
+(`ph.run_local`) also need the `phsolver` engine binary, which pip does not
+ship: invited beta participants receive the standalone headless solver
+archive (point `$PHOTONHUB_SOLVER` at it or put it on `PATH`; the copy inside
+the desktop app is locked to that app and is not a standalone command), and
+developers with the monorepo build it with
 `cmake -S engine -B build && cmake --build build`.
 
 Optional extras: `photonhub[viz]` (interactive/3D plots), `[gds]` (GDSII
@@ -32,7 +34,7 @@ import photonhub as ph
 
 sim = ph.Simulation(
     size_um=(4.0, 4.0, 4.0),
-    grid=ph.UniformGridSpec(dl_um=0.05),
+    grid=ph.UniformMesh(dl_um=0.05),
     run=ph.RunSpec(run_time_s=8.0e-14),
     sources=[
         ph.PointDipole(
@@ -42,8 +44,8 @@ sim = ph.Simulation(
         )
     ],
     monitors=[
-        ph.FieldTimeMonitor(name="probe", center_um=(3.0, 2.0, 2.0), fields=["Ez"]),
-        ph.FieldSnapshotMonitor(name="final", fields=["Ex", "Ey", "Ez"]),
+        ph.TimeMonitor(name="probe", center_um=(3.0, 2.0, 2.0), fields=["Ez"]),
+        ph.SnapshotMonitor(name="final", fields=["Ex", "Ey", "Ez"]),
     ],
 )
 
@@ -58,11 +60,12 @@ python -m pip install 'photonhub[mcp]'
 photonhub-mcp                    # optionally pass a result directory to preload
 
 python -m pip install 'photonhub[server]'
-photonhub-serve-viz              # local result/preview HTTP service
+photonhub-serve-viz              # local result/preview HTTP service (loopback, unauthenticated:
+                                 # single-user machines only; --enable-notebook opts into code cells)
 ```
 
 The `photonhub[app]` extra includes both service dependency sets plus the
-Workbench file-format integrations.
+desktop app's file-format integrations.
 
 ## See your simulation before you run it
 
@@ -71,29 +74,30 @@ Every `Simulation` plots itself — geometry, sources, monitors, PML, and the
 for 3D). `grid=True` overlays the Yee cell edges so you can check resolution:
 
 ```python
-sim.plot(z=0.11)                  # scene cross-section
-sim.plot_eps(z=0.11, grid=True)   # rasterized ε + the Yee mesh overlay
+sim.plot(z=2.0)                   # scene cross-section through the source
+sim.plot_eps(z=2.0, grid=True)    # rasterized ε + the Yee mesh overlay
 sim.plot_3d()                     # interactive 3D  (pip install photonhub[viz])
 ```
 
 ## What you can do today
 
-Shipped surface as of schema **v1.20.0-alpha.1** (validated dispersive solver
-core — multi-pole Lorentz + Drude ADE with a fitted metals library (Au/Ag/Cu/Al)
-and PEC structures, with recorded MI300X CPU↔GPU equivalence for the pre-1.18
-surface under the numerical contract's tolerances — plus full-vector mode
+Shipped surface as of schema **v1.20.0-alpha.1** (a dispersive solver core
+cross-checked against analytic references — multi-pole Lorentz + Drude ADE
+with a fitted metals library (Au/Ag/Cu/Al) and PEC structures, with recorded
+MI300X CPU↔GPU equivalence (full inventory 475/475 on 2026-08-27, a dated
+pre-merge record) under the numerical contract's tolerances — plus full-vector mode
 injection, GDS import (`ph.import_gds`), adjoint gradients, and the silicon-PIC
 MVP):
 
 - **Run a simulation:** `ph.run_local(sim)` (subprocess + file protocol;
-  `device="cpu"|"gpu"|"gpu:N"`), `ph.run_async(sim)` and `ph.Batch(...)` for many
+  `device="cpu"|"gpu"|"gpu:N"`), `ph.submit(sim)` and `ph.Batch(...)` for many
   sims in flight.
-- **Know the cost first:** `sim.cost_estimate()` (or `ph.estimate_cost(sim)`)
+- **Know the cost first:** `sim.cost_estimate()` (or `ph.quote(sim)`)
   returns a dollar estimate
   from an overridable Tcell-step planning rate *before* you press run; the
   default is an estimator input, not a production billing commitment.
 - **Geometry:** `Box`, `Sphere`, `Cylinder` (full, or an annular sector / ring
-  via `inner_radius_um` + `angle_start` / `angle_stop`), and `PolySlab` (an
+  via `inner_radius_um` + `angle_start` / `angle_stop`), and `Polygon` (an
   extruded polygon — e.g. a taper).
 - **Sources:** `PointDipole`, `PlaneWave` (normal-incidence TF/SF; oblique
   via `Simulation.with_oblique_plane_wave` + Bloch boundaries, schema 1.18),
@@ -102,8 +106,8 @@ MVP):
   driven by a `GaussianPulse` or a steady-state `CW` carrier. The
   `ModeSource` wire type remains for legacy scalar and continuous-adjoint
   compatibility.
-- **Monitors:** `FieldTimeMonitor`, `FieldSnapshotMonitor`, `FieldDftMonitor`,
-  and `FluxMonitor` — fp64 DFT field and flux power. A DFT plane may carry the
+- **Monitors:** `TimeMonitor`, `SnapshotMonitor`, `ProfileMonitor`,
+  and `PowerMonitor` — fp64 DFT field and flux power. A DFT plane may carry the
   optional `ModePort` authoring recipe; the engine strictly validates and then
   ignores that metadata while recording the same raw fields, and result
   post-processing performs the requested modal projection. Workbench keeps one
@@ -113,7 +117,7 @@ MVP):
   so an unevaluable S-column is rejected before the time-domain run.
 - **Component library:** `ph.library.straight / bend / taper / crossing /
   coupler / ring` — each returns a `Component` (structures + ports) in ~one line.
-- **Material library:** `ph.materials` — 16 literature materials (cSi, SiO2,
+- **Material library:** `ph.materials` — 20 literature materials (cSi, SiO2,
   Si3N4, GaAs, InP, Ge, LiNbO3, sapphire, AlN, TiO2, MgF2, CaF2, PMMA, ...)
   with cited dispersion data and validity ranges. `cSi.medium(1.55)` freezes
   the index at one wavelength; `cSi.medium(band_um=(1.5, 1.6))` least-squares
@@ -128,7 +132,7 @@ MVP):
   compatibility. Full complex multiport S-matrices:
   `plugins.smatrix` (`SPort` + `assemble_smatrix`, one run per driven port —
   a multi-port S-parameter driver).
-- **Meshing:** `UniformGridSpec`, or `GradedGridSpec` + `auto_grid` for a
+- **Meshing:** `UniformMesh`, or `GradedMesh` + `auto_mesh` for a
   cells-per-λ graded mesh; `MeshOverride` (a per-structure mesh override) forces
   a target spacing inside a geometry regardless of material —
   `sim.with_mesh_overrides(MeshOverride(geometry=Box(...), dl_um=(0.02,0.02,None)))`.
@@ -139,25 +143,26 @@ MVP):
   `ModeSolver` and the full-vector `VectorModeSolver`, including bent/leaky
   modes with complex `n_eff` and bend-loss readout.
 - **Visualization:** `Simulation.plot` / `plot_eps` (draws Box / Sphere /
-  Cylinder / PolySlab; `grid=True` overlays the Yee mesh) / `plot_3d`,
-  `SimulationData.plot_field`, and the module-level `photonhub.viz.plot_mode`
+  Cylinder / Polygon; `grid=True` overlays the Yee mesh) / `plot_3d`,
+  `RunResult.plot_field`, and the module-level `photonhub.viz.plot_mode`
   (FDE mode heatmap) and `photonhub.viz.plot_spectrum` (`T` vs λ).
 - **Export:** HDF5 converter for the parsed results.
 - **Correctness aids:** pydantic models reject structural errors at
   construction, the capability manifest catches client/engine drift, and
   `phsolver validate` is authoritative for grid/device constraints. Subpixel
-  smoothing supports Box / Sphere / Cylinder / PolySlab; non-dispersive scenes
+  smoothing supports Box / Sphere / Cylinder / Polygon; non-dispersive scenes
   default to contour smoothing, while dispersive scenes default off unless the
   user opts in.
 
 ### Limits (today)
 
-This is a validated **dispersive** solver core plus the silicon-PIC MVP:
+This is a **dispersive** solver core cross-checked against analytic references,
+plus the silicon-PIC MVP:
 
 - Dispersion is **multi-pole ADE** — up to 6 Lorentz + Drude poles per medium
-  (metals/plasmonics; numerical definition in `engine/NUMERICS.md` §19; the
-  single-pole paths are in the recorded MI300X equivalence suite under §8
-  tolerances, the multi-pole/Drude scenes await their first hardware run) on
+  (metals/plasmonics; numerical definition in the numerics reference, §19; the
+  single- and multi-pole/Drude scenes are in the recorded MI300X equivalence
+  inventory under §8 tolerances, dated 2026-08-27) on
   top of relative permittivity + Ohmic conductivity; a passivity-enforced
   CCPR fitter and anisotropic poles are still open. Explicit
   subpixel + Lorentz runs are supported and equivalence-tested, but the client
@@ -177,5 +182,6 @@ eigenmode, inject it with `mode_launch`, ratio two `mode_monitor` planes, and pl
 - [PhotonHub product overview](https://leapfield.app/#product)
 - [Request beta access or support](https://leapfield.app/#request)
 
-The project source tree also includes an end-to-end quickstart, examples index,
-and **twenty-six-notebook** gallery.
+The worked-example gallery (twenty-six executed notebooks) lives in the
+project source tree and is summarized on the documentation site's examples
+page.

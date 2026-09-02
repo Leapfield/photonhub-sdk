@@ -9,7 +9,7 @@ layer ``run_local`` uses) so the JSON-lines event stream, error handling, and
 
 The bundle is the shared :mod:`photonhub.bundle` format — the exact executed
 ``sim.json``, ``manifest.json``, and monitor ``*.bin`` files in one gzip tar
-— that ``web/cache.py`` extracts and ``SimulationData`` reads.
+— that ``web/cache.py`` extracts and ``RunResult`` reads.
 """
 
 from __future__ import annotations

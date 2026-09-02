@@ -40,7 +40,7 @@ planes into a dense smooth-section EME model, including each mode's full complex
 propagation constant. See :mod:`photonhub.plugins.cvcs`.
 
 ``SpectrumCompleter`` — analytic completion of a truncated resonator spectrum:
-fit the ringdown's poles (via ``ResonanceFinder``), validate the model on a
+fit the ringdown's poles (via ``ResonanceAnalysis``), validate the model on a
 held-out window, and add the closed-form remainder of the DFT sum, so a high-Q
 run can stop after a few resolved ringdown periods instead of stepping the
 spectrum to convergence. Point-probe spectra only in v1; CPU only. See
@@ -104,7 +104,7 @@ from .modes import Mode, ModeSolver
 from .near_field import FarField, equivalent_currents, far_field
 from .propagate import FocalScan, focal_scan, propagate_plane
 from .thin_lens import thin_lens_beam, thin_lens_source
-from .resonance import ResonanceFinder, select_resonances
+from .resonance import ResonanceAnalysis, select_resonances
 from .spectral_completion import CompletionRejected, SpectrumCompleter
 from .yee_mode import (
     sample_staggered_eps,
@@ -149,7 +149,7 @@ __all__ = [
     "ModeMonitor",
     "ModeOverlap",
     "ModeSolver",
-    "ResonanceFinder",
+    "ResonanceAnalysis",
     "SMatrixPlan",
     "SMatrixPort",
     "SMatrixResult",

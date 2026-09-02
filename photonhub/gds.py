@@ -8,9 +8,9 @@ fixed z-thickness filled with one material — the "layer stack".
 
 :func:`import_gds` reads the file (via the optional ``gdstk`` dependency),
 flattens any cell hierarchy into a flat polygon list, and emits one
-:class:`~photonhub.PolySlab` :class:`~photonhub.Structure` per polygon on each
+:class:`~photonhub.Polygon` :class:`~photonhub.Structure` per polygon on each
 requested layer, using that layer's z-extent and medium. Polygon winding is
-normalized to counter-clockwise (the orientation :class:`PolySlab` and the
+normalized to counter-clockwise (the orientation :class:`Polygon` and the
 rasterizer expect).
 
 It pairs a GDS layout with a layer stack: each layer becomes an extruded
@@ -30,7 +30,7 @@ build devices from the JPPhotonics ``fdtd-pipeline`` layouts (arXiv:2506.16665).
 Limitations (v1). Each polygon is extruded independently; polygons with holes
 (even-odd fill) are not specially handled — for the strip/rib SOI layouts this
 targets, every drawn shape is a simple filled region. Curved sidewalls are a
-single global ``sidewall_angle`` per layer (matching ``PolySlab``); arbitrary
+single global ``sidewall_angle`` per layer (matching ``Polygon``); arbitrary
 per-edge tapering is out of scope.
 """
 
@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence, Tuple, Union
 
 from .components.base import AxisName
-from .components.structures import Box, Cylinder, Medium, PolySlab, Sphere, Structure
+from .components.structures import Box, Cylinder, Medium, Polygon, Sphere, Structure
 
 __all__ = ["GdsLayer", "import_gds", "export_gds", "read_gds_cell_names"]
 
@@ -55,8 +55,8 @@ class GdsLayer:
     ``zmin_um`` / ``thickness_um`` give the slab extent along the extrusion axis
     (the :func:`import_gds` ``axis``, default ``z``); the slab spans
     ``[zmin_um, zmin_um + thickness_um]``. ``sidewall_angle`` (radians) and
-    ``reference_plane`` are forwarded to every :class:`PolySlab` emitted for this
-    layer (see :class:`~photonhub.PolySlab`)."""
+    ``reference_plane`` are forwarded to every :class:`Polygon` emitted for this
+    layer (see :class:`~photonhub.Polygon`)."""
 
     layer: Tuple[int, int]
     medium: Medium
@@ -183,7 +183,7 @@ def import_gds(
     Returns
     -------
     tuple[Structure, ...]
-        One :class:`PolySlab` structure per polygon, grouped in the given
+        One :class:`Polygon` structure per polygon, grouped in the given
         ``layers`` order (file order within a layer). Paint order is last-wins
         (NUMERICS.md §9); same-material overlaps from a flattened hierarchy are
         therefore harmless.
@@ -223,7 +223,7 @@ def import_gds(
                 continue
             if min_area_um2 > 0.0 and abs(_signed_area(ring)) < min_area_um2:
                 continue
-            geometry = PolySlab(
+            geometry = Polygon(
                 axis=axis,
                 vertices_um=tuple(ring),
                 slab_bounds_um=slab_bounds,
@@ -259,10 +259,10 @@ def _slab_bounds_of(geometry, axis_i: int, axis: AxisName) -> Tuple[float, float
         c = geometry.center_um[axis_i]
         h = geometry.size_um[axis_i] / 2.0
         return (c - h, c + h)
-    if isinstance(geometry, PolySlab):
+    if isinstance(geometry, Polygon):
         if geometry.axis != axis:
             raise ValueError(
-                f"PolySlab extruded along {geometry.axis!r} cannot be exported on "
+                f"Polygon extruded along {geometry.axis!r} cannot be exported on "
                 f"the {axis!r} drawing plane (its cross-section is not in-plane)"
             )
         return geometry.slab_bounds_um
@@ -277,7 +277,7 @@ def _slab_bounds_of(geometry, axis_i: int, axis: AxisName) -> Tuple[float, float
         return (c - h, c + h)
     raise ValueError(
         f"export_gds cannot represent geometry {type(geometry).__name__} as a "
-        "top-down layer polygon (only Box, PolySlab, Cylinder)"
+        "top-down layer polygon (only Box, Polygon, Cylinder)"
     )
 
 
@@ -288,7 +288,7 @@ def _to_gds_polygons(gdstk, geometry, u: int, v: int, tol_um: float):
         cu, cv = geometry.center_um[u], geometry.center_um[v]
         hu, hv = geometry.size_um[u] / 2.0, geometry.size_um[v] / 2.0
         return [gdstk.rectangle((cu - hu, cv - hv), (cu + hu, cv + hv))]
-    if isinstance(geometry, PolySlab):
+    if isinstance(geometry, Polygon):
         # vertices_um are (lower-index, higher-index) transverse coords = (u, v)
         return [gdstk.Polygon([(float(a), float(b)) for a, b in geometry.vertices_um])]
     if isinstance(geometry, Cylinder):
@@ -328,7 +328,7 @@ def export_gds(
     ``structures`` is a sequence of :class:`Structure` or a
     :class:`~photonhub.library.Component`. Each structure's in-plane cross-section
     on the ``axis`` drawing plane becomes one polygon: a :class:`Box` -> a
-    rectangle, a :class:`PolySlab` -> its vertex polygon, a :class:`Cylinder` ->
+    rectangle, a :class:`Polygon` -> its vertex polygon, a :class:`Cylinder` ->
     a faceted (annular/wedge) polygon at ``cylinder_tolerance_um``. Structures
     are grouped into GDS layers by their ``(z-extent, medium)``:
 

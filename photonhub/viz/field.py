@@ -1,7 +1,7 @@
 """``plot_field()`` — a field-component heatmap on a 2D slice of a monitor's
 DataArray (design §3, §7, §9).
 
-Consumes the ``xarray.DataArray`` that ``SimulationData[monitor]`` returns
+Consumes the ``xarray.DataArray`` that ``RunResult[monitor]`` returns
 (already in µm coordinates). Supports the raw components Ex..Hz plus derived
 ``"E"`` (vector magnitude), ``"intensity"`` (|E|²) and ``"H"``; ``freq=`` is
 required for a multi-frequency DFT monitor; ``val`` in real/imag/abs/phase
@@ -182,7 +182,7 @@ def plot_field(data, monitor, field="Ex", x=None, y=None, z=None, *,
                simulation=None, ax=None, cmap=None, legend=True, **kw):
     """Heatmap of a field component on a 2D slice of ``data[monitor]``.
 
-    ``data`` is a :class:`SimulationData`; ``monitor`` is its key. ``freq=``
+    ``data`` is a :class:`RunResult`; ``monitor`` is its key. ``freq=``
     picks a frequency on a DFT monitor; ``time=`` (seconds) picks a recorded
     sample on a time/snapshot monitor (default: the last frame). See the module
     docstring and design §3 for the rest. Returns the matplotlib ``Axes``."""

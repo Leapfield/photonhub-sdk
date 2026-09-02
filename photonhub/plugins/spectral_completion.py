@@ -1,7 +1,7 @@
 """Analytic completion of truncated resonator spectra (Prony / FDM tail).
 
 A high-Q resonator forces a painful trade in FDTD: the spectrum of a
-:class:`~photonhub.components.FieldTimeMonitor` signal is the integral
+:class:`~photonhub.components.TimeMonitor` signal is the integral
 :math:`F(f) = \\int_0^T u(t) e^{2\\pi i f t} dt`, and for a cavity whose energy
 decays like :math:`e^{-2\\alpha t}` the integral converges only on the ringdown
 timescale :math:`1/\\alpha = Q/(\\pi f_r)` — so the run length scales with Q,
@@ -25,7 +25,7 @@ completed analytically instead of stepped to convergence.
 recorded time series (the plugin contract: nowhere near the engine or the
 wire format):
 
-1. **Poles** come from :class:`~photonhub.plugins.ResonanceFinder` (filter
+1. **Poles** come from :class:`~photonhub.plugins.ResonanceAnalysis` (filter
    diagonalization), fitted on the late, source-free part of the record.
 2. **Amplitudes** are re-fit by linear least squares of the *real* recorded
    signal against those poles — a deliberately transparent step, so the model
@@ -76,7 +76,7 @@ True
 
 After a real run::
 
-    data = ph.run_local(sim)          # sim has a FieldTimeMonitor "probe"
+    data = ph.run_local(sim)          # sim has a TimeMonitor "probe"
     sc = SpectrumCompleter(freq_window=(1.8e14, 2.1e14), fit_start=2.0e-13)
     out = sc.complete(data, "probe", freqs=np.linspace(1.9e14, 2.0e14, 201))
     out["spectrum"]                   # completed complex spectrum over 'freq'
@@ -96,7 +96,7 @@ import numpy as np
 import xarray as xr
 
 from .resonance import (
-    ResonanceFinder,
+    ResonanceAnalysis,
     _combine_time_series,
     select_resonances,
 )
@@ -115,7 +115,7 @@ class SpectrumCompleter:
     ----------
     freq_window : (float, float)
         Frequency band (Hz) searched for resonant poles — passed to
-        :class:`ResonanceFinder`. Should generously cover the band of
+        :class:`ResonanceAnalysis`. Should generously cover the band of
         ``freqs`` you will complete.
     fit_start : float, optional
         Absolute time (seconds, on the record's own time axis) where the
@@ -145,7 +145,7 @@ class SpectrumCompleter:
     strict : bool, default False
         If True, a rejected gate raises :class:`CompletionRejected` instead
         of warning and returning the truncated spectrum.
-    resonance_finder : ResonanceFinder, optional
+    resonance_analysis : ResonanceAnalysis, optional
         Pre-configured pole finder; by default one is built from
         ``freq_window`` with its default basis size.
     """
@@ -160,7 +160,7 @@ class SpectrumCompleter:
         min_amplitude_rel: float = 1e-3,
         min_decay_resolved: float = 0.1,
         strict: bool = False,
-        resonance_finder: Optional[ResonanceFinder] = None,
+        resonance_analysis: Optional[ResonanceAnalysis] = None,
     ):
         if not (0.0 < holdout_fraction < 0.9):
             raise ValueError(
@@ -183,7 +183,7 @@ class SpectrumCompleter:
         self.min_amplitude_rel = float(min_amplitude_rel)
         self.min_decay_resolved = float(min_decay_resolved)
         self.strict = bool(strict)
-        self._rf = resonance_finder or ResonanceFinder(freq_window=freq_window)
+        self._rf = resonance_analysis or ResonanceAnalysis(freq_window=freq_window)
 
     # -- public entry points -------------------------------------------------
 
@@ -194,9 +194,9 @@ class SpectrumCompleter:
         freqs: Sequence[float],
         fields: Optional[Sequence[str]] = None,
     ) -> xr.Dataset:
-        """Complete the spectrum of a ``FieldTimeMonitor`` output.
+        """Complete the spectrum of a ``TimeMonitor`` output.
 
-        Parameters mirror :meth:`ResonanceFinder.run`; the monitor's own time
+        Parameters mirror :meth:`ResonanceAnalysis.run`; the monitor's own time
         coordinate supplies both the sample times and the spacing, so a
         decimated probe (``interval_steps > 1``) is handled consistently.
         """

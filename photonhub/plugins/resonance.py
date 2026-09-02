@@ -7,14 +7,14 @@ a short pulse rings down as a sum of decaying complex exponentials,
 
     f(t) = \\sum_k a_k e^{i \\phi_k} e^{-2\\pi i f_k t - \\alpha_k t},
 
-one term per resonant mode. :class:`ResonanceFinder` recovers the per-mode
+one term per resonant mode. :class:`ResonanceAnalysis` recovers the per-mode
 frequency :math:`f_k`, decay rate :math:`\\alpha_k`, quality factor
 :math:`Q_k = \\pi |f_k| / \\alpha_k`, amplitude :math:`a_k` and phase
-:math:`\\phi_k` from a :class:`~photonhub.components.FieldTimeMonitor` time series.
+:math:`\\phi_k` from a :class:`~photonhub.components.TimeMonitor` time series.
 
 This is a CPU-only post-processing plugin (the plugin contract in
 ``photonhub.plugins``): it consumes the raw ``E(t)`` already recorded by a
-``FieldTimeMonitor`` and runs nowhere near the engine or the wire format.
+``TimeMonitor`` and runs nowhere near the engine or the wire format.
 
 Algorithm
 ---------
@@ -39,21 +39,21 @@ oracle in the test suite.
 Example
 -------
 >>> import numpy as np
->>> from photonhub.plugins import ResonanceFinder, select_resonances
+>>> from photonhub.plugins import ResonanceAnalysis, select_resonances
 >>> dt = 1.0
 >>> t = np.arange(8000) * dt
 >>> sig = 2.0 * np.exp((-2j*np.pi*0.10 - 0.002) * t) \\
 ...     + 3.0 * np.exp((-2j*np.pi*0.20 - 0.0005) * t)
->>> rf = ResonanceFinder(freq_window=(0.05, 0.25))
+>>> rf = ResonanceAnalysis(freq_window=(0.05, 0.25))
 >>> modes = select_resonances(rf.run_raw_signal(sig, dt), min_amplitude=0.1)
 >>> round(float(modes["Q"].sel(freq=0.10, method="nearest")))  # pi*0.10/0.002 = 157.08
 157  # doctest: +SKIP
 
 After a real run::
 
-    data = ph.run_local(sim)                       # sim has a FieldTimeMonitor "probe"
+    data = ph.run_local(sim)                       # sim has a TimeMonitor "probe"
     window = (1.9e14, 2.0e14)
-    rf = ResonanceFinder(freq_window=window)
+    rf = ResonanceAnalysis(freq_window=window)
     resonances = rf.run(data, "probe")             # xr.Dataset over 'freq'
     modes = select_resonances(resonances, freq_window=window,
                               min_amplitude=1e-3)
@@ -73,7 +73,7 @@ from typing import Mapping, Optional, Sequence, Tuple, Union
 import numpy as np
 import xarray as xr
 
-__all__ = ["ResonanceFinder", "select_resonances"]
+__all__ = ["ResonanceAnalysis", "select_resonances"]
 
 _ELECTRIC = ("Ex", "Ey", "Ez")
 _MAGNETIC = ("Hx", "Hy", "Hz")
@@ -81,7 +81,7 @@ _TIME_STEP_RTOL = 1e-5
 _MIN_SAMPLES = 8  # need half_len = n//2 - 2 >= 2 for the U-matrix sums
 
 
-class ResonanceFinder:
+class ResonanceAnalysis:
     """Extract resonances (f, decay, Q, amplitude, phase) from a time signal.
 
     Parameters
@@ -194,7 +194,7 @@ class ResonanceFinder:
         return _resonance_dataset(eigvals, amplitudes, errors, dt)
 
     def run_time_series(self, dataarray: xr.DataArray) -> xr.Dataset:
-        """Find resonances in a ``FieldTimeMonitor`` :class:`xarray.DataArray`.
+        """Find resonances in a ``TimeMonitor`` :class:`xarray.DataArray`.
 
         ``dt`` is derived from the ``t`` coordinate (which must be uniformly
         spaced). If the array has a ``component`` dimension, the electric
@@ -211,11 +211,11 @@ class ResonanceFinder:
         monitors: Union[str, Sequence[str]],
         fields: Optional[Sequence[str]] = None,
     ) -> xr.Dataset:
-        """Find resonances in one or more ``FieldTimeMonitor`` outputs.
+        """Find resonances in one or more ``TimeMonitor`` outputs.
 
         Parameters
         ----------
-        sim_data : SimulationData or mapping ``name -> DataArray``
+        sim_data : RunResult or mapping ``name -> DataArray``
             The run output (anything indexable by monitor name).
         monitors : str or sequence of str
             Monitor name(s) to read. Multiple monitors are summed into one
@@ -261,7 +261,7 @@ def select_resonances(
     Parameters
     ----------
     resonances : xarray.Dataset
-        Output of :meth:`ResonanceFinder.run_raw_signal` / ``run``.
+        Output of :meth:`ResonanceAnalysis.run_raw_signal` / ``run``.
     freq_window : (float, float), optional
         Keep only resonances with ``f_min <= freq <= f_max``.
     min_amplitude, min_q, max_error : float, optional
@@ -533,13 +533,13 @@ def _signal_from_dataarray(
     if "t" not in da.dims:
         raise ValueError(
             f"DataArray has no time dimension 't' (dims={da.dims}); resonance "
-            "extraction needs a FieldTimeMonitor output"
+            "extraction needs a TimeMonitor output"
         )
     extra = set(da.dims) - {"t", "component"}
     if extra:
         raise ValueError(
             f"DataArray has non-time dimensions {sorted(extra)}; resonance "
-            "extraction needs a point FieldTimeMonitor (dims ('t',) or "
+            "extraction needs a point TimeMonitor (dims ('t',) or "
             "('t', 'component')), not a snapshot/DFT monitor"
         )
     dt = _uniform_dt(da.coords["t"].values)
@@ -627,3 +627,16 @@ def _matrix_pencil_poles(
     freqs = np.real(complex_omega / (2 * np.pi)) / dt
     decays = -np.imag(complex_omega) / dt
     return freqs, decays
+
+
+def __getattr__(name):
+    if name == "ResonanceFinder":
+        warnings.warn(
+            "ResonanceFinder was renamed to ResonanceAnalysis; "
+            "the old alias will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return ResonanceAnalysis
+    raise AttributeError(
+        f"module 'photonhub.plugins.resonance' has no attribute {name!r}")

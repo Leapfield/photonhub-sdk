@@ -264,7 +264,7 @@ def smatrix(
     driven:
         The driven port — an :class:`SPort` or its ``name``. Must be in ``ports``.
     data:
-        The run's ``SimulationData`` (or any mapping ``name -> DataArray``) for the
+        The run's ``RunResult`` (or any mapping ``name -> DataArray``) for the
         run that drove ``driven``. Every port monitor's data must be present.
 
     Returns

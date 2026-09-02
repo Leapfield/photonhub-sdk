@@ -11,11 +11,11 @@ project the scene's analytic geometry onto the two in-plane axes:
 - :func:`point_in_plane` — a point feature (e.g. ``PointDipole.center_um``)
   drawn when it lies within ~half a cell of the plane.
 - :func:`axis_line_in_plane` — an axis-aligned line feature (``PlaneWave`` /
-  ``FluxMonitor``: ``axis`` + ``position_um``) drawn only when its own axis is
+  ``PowerMonitor``: ``axis`` + ``position_um``) drawn only when its own axis is
   one of the two in-plane axes.
 
 :class:`Box` and :class:`Sphere` are exact on every cut; the extruded
-:class:`PolySlab` / :class:`Cylinder` (added at the documented seam) are exact
+:class:`Polygon` / :class:`Cylinder` (added at the documented seam) are exact
 on the cut perpendicular to their extrusion ``axis`` and approximated by a
 bounding rectangle on a parallel cut (see :func:`polyslab_cross_section` /
 :func:`cylinder_cross_section`). Each new geometry adds one ``*_cross_section``
@@ -27,7 +27,7 @@ either. The recognized patch-spec kinds are:
 
 - ``("rect", (x0, y0, w, h))`` — Box, or a parallel-cut bounding box.
 - ``("circle", (cx, cy, r))`` — Sphere, or a full solid Cylinder disk.
-- ``("polygon", ((h0, v0), (h1, v1), ...))`` — PolySlab cross-section, or a
+- ``("polygon", ((h0, v0), (h1, v1), ...))`` — Polygon cross-section, or a
   Cylinder wedge/annular-sector approximated by an arc polygon.
 - ``("annulus", (cx, cy, r_outer, r_inner))`` — a full Cylinder ring.
 """
@@ -112,7 +112,7 @@ def sphere_circle(
 
 
 def _slab_extent(slab_bounds_um: Tuple[float, float]) -> Tuple[float, float]:
-    """``(lo, hi)`` axial extent of a PolySlab from its (lo, hi) bounds (already
+    """``(lo, hi)`` axial extent of a Polygon from its (lo, hi) bounds (already
     ordered lo<hi by the model validator)."""
     lo, hi = slab_bounds_um
     return (lo, hi)
@@ -125,7 +125,7 @@ def polyslab_section(
     cut_axis: str,
     value: float,
 ):
-    """Cut-plane spec of a PolySlab extruded along ``geom_axis``;
+    """Cut-plane spec of a Polygon extruded along ``geom_axis``;
     ``cut_axis``/``value`` is the cut plane.
 
     - Cut PERPENDICULAR to the extrusion axis (``cut_axis == geom_axis`` and
@@ -136,7 +136,7 @@ def polyslab_section(
       the ``(h, v)`` in-plane order this module uses, so no swap is needed.
       ``sidewall_angle`` is NOT applied — the reference polygon is drawn as-is
       (the slanted-wall taper to the cut height is deferred; see the caveat in
-      :class:`~photonhub.components.structures.PolySlab`).
+      :class:`~photonhub.components.structures.Polygon`).
     - Cut PARALLEL to the extrusion axis (the cut axis is one of the two
       transverse axes): the EXACT crossing intervals of the reference polygon
       with the cut line — one rectangle per interval, each spanning
@@ -326,7 +326,7 @@ def axis_line_in_plane(
     cut_axis: str,
 ) -> Optional[Tuple[str, float]]:
     """A feature that is a full plane perpendicular to ``feature_axis`` at
-    ``position_um`` (PlaneWave / FluxMonitor) appears as a full-span LINE in a
+    ``position_um`` (PlaneWave / PowerMonitor) appears as a full-span LINE in a
     cut only when ``feature_axis`` lies in the cut plane — i.e. is one of the
     two in-plane axes. Returns ``(orientation_axis, position)`` where
     ``orientation_axis`` is the in-plane axis the line is constant along, or

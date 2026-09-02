@@ -5,7 +5,7 @@ Both the local runner (``run_local``) and the cloud executor
 the run-command grammar (``device_args`` / ``phsolver_run_cmd``), and the
 subprocess + JSON-lines event stream + stderr/timeout/exit-code contract
 (``run_phsolver``). Driving the solver through here keeps those semantics
-byte-identical local vs cloud; output interpretation (load a ``SimulationData``
+byte-identical local vs cloud; output interpretation (load a ``RunResult``
 vs package a result bundle) is the caller's job.
 
 phsolver streams JSON-lines on stdout (NUMERICS.md section 7): ``start`` →

@@ -13,16 +13,16 @@ from .components import (
     Boundaries,
     Box,
     Cylinder,
-    FieldDftMonitor,
-    FieldSnapshotMonitor,
-    FieldTimeMonitor,
-    FluxMonitor,
+    ProfileMonitor,
+    SnapshotMonitor,
+    TimeMonitor,
+    PowerMonitor,
     CW,
     GaussianPulse,
     DrudePole,
     LorentzPole,
     Medium,
-    PermittivityData,
+    PermittivityArray,
     ModePort,
     ModeSolveProvenance,
     ModeSource,
@@ -30,30 +30,30 @@ from .components import (
     TfsfBox,
     PointDipole,
     PortMode,
-    PolySlab,
+    Polygon,
     RunSpec,
     Simulation,
     Sphere,
     Structure,
-    GradedAxisCoords,
-    GradedGridSpec,
+    GradedMeshAxis,
+    GradedMesh,
     MeshOverride,
-    UniformGridSpec,
-    auto_grid,
+    UniformMesh,
+    auto_mesh,
 )
 from . import library
 from . import materials
-from .cost import CostEstimate, estimate_cost
-from .data import SimulationData
+from .cost import CostEstimate, quote
+from .data import RunResult
 from .gds import GdsLayer, export_gds, import_gds, read_gds_cell_names
 from .hdf5 import convert_to_hdf5
 from .runners import (
     Batch,
-    BatchData,
+    BatchResults,
     Job,
     SolverRunError,
     find_solver,
-    run_async,
+    submit,
     run_local,
 )
 from . import web
@@ -78,15 +78,15 @@ __all__ = [
     "Apodization",
     "Background",
     "Batch",
-    "BatchData",
+    "BatchResults",
     "Boundaries",
     "Box",
     "CostEstimate",
     "Cylinder",
-    "FieldDftMonitor",
-    "FieldSnapshotMonitor",
-    "FieldTimeMonitor",
-    "FluxMonitor",
+    "ProfileMonitor",
+    "SnapshotMonitor",
+    "TimeMonitor",
+    "PowerMonitor",
     "CW",
     "GaussianPulse",
     "GdsLayer",
@@ -96,7 +96,7 @@ __all__ = [
     "DrudePole",
     "LorentzPole",
     "Medium",
-    "PermittivityData",
+    "PermittivityArray",
     "ModePort",
     "ModeSolveProvenance",
     "ModeSource",
@@ -106,26 +106,26 @@ __all__ = [
     "TfsfBox",
     "PointDipole",
     "PortMode",
-    "PolySlab",
+    "Polygon",
     "read_gds_cell_names",
     "RunSpec",
     "SCHEMA_VERSION",
     "Simulation",
     "web",
-    "SimulationData",
+    "RunResult",
     "SolverRunError",
     "Sphere",
     "Structure",
-    "GradedAxisCoords",
-    "GradedGridSpec",
+    "GradedMeshAxis",
+    "GradedMesh",
     "MeshOverride",
-    "UniformGridSpec",
-    "auto_grid",
+    "UniformMesh",
+    "auto_mesh",
     "convert_to_hdf5",
-    "estimate_cost",
+    "quote",
     "find_solver",
     "gpus",
-    "run_async",
+    "submit",
     "run_local",
     # inverse design (adjoint topology optimization)
     "inverse_design",
@@ -141,3 +141,37 @@ __all__ = [
     "optimize_parametric",
     "__version__",
 ]
+
+
+# --- deprecated aliases (2026-09 cross-solver rename; remove in 0.2) ---------
+_RENAMED = {
+    "PolySlab": "Polygon",
+    "FluxMonitor": "PowerMonitor",
+    "FieldTimeMonitor": "TimeMonitor",
+    "FieldDftMonitor": "ProfileMonitor",
+    "FieldSnapshotMonitor": "SnapshotMonitor",
+    "SimulationData": "RunResult",
+    "BatchData": "BatchResults",
+    "PermittivityData": "PermittivityArray",
+    "UniformGridSpec": "UniformMesh",
+    "GradedGridSpec": "GradedMesh",
+    "GradedAxisCoords": "GradedMeshAxis",
+    "auto_grid": "auto_mesh",
+    "run_async": "submit",
+    "estimate_cost": "quote",
+}
+
+
+def __getattr__(name):
+    replacement = _RENAMED.get(name)
+    if replacement is not None:
+        import warnings
+
+        warnings.warn(
+            f"photonhub.{name} was renamed to photonhub.{replacement}; "
+            "the old alias will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return globals()[replacement]
+    raise AttributeError(f"module 'photonhub' has no attribute {name!r}")

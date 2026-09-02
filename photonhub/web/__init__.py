@@ -1,12 +1,12 @@
 """Cloud client for the PhotonHub metered compute API.
 
-Reads identically to the local path — same ``Job`` / ``SimulationData`` /
+Reads identically to the local path — same ``Job`` / ``RunResult`` /
 ``SolverRunError`` — only the namespace differs:
 
 >>> import photonhub as ph
 >>> ph.web.configure(api_key="ph_live_...", url="https://<api-host>")
->>> job = ph.web.run_quoted_async(sim, max_usd=5.00)
->>> data = job.result()             # SimulationData, same as local
+>>> job = ph.web.submit_quoted(sim, max_usd=5.00)
+>>> data = job.result()             # RunResult, same as local
 >>> probe = data["probe"]           # xarray.DataArray
 """
 
@@ -29,9 +29,9 @@ from .run import (
     WebJobTimeout,
     resume,
     run,
-    run_async,
+    submit,
     run_quoted,
-    run_quoted_async,
+    submit_quoted,
 )
 
 __all__ = [
@@ -43,9 +43,9 @@ __all__ = [
     "CloudPreflight",
     "HttpClient",
     "run",
-    "run_async",
+    "submit",
     "run_quoted",
-    "run_quoted_async",
+    "submit_quoted",
     "resume",
     "WebJobTimeout",
     "Batch",
@@ -59,3 +59,22 @@ __all__ = [
     "list_jobs",
     "job_status",
 ]
+
+
+# --- deprecated aliases (2026-09 cross-solver rename; remove in 0.2) ---------
+_RENAMED = {"run_async": "submit", "run_quoted_async": "submit_quoted"}
+
+
+def __getattr__(name):
+    replacement = _RENAMED.get(name)
+    if replacement is not None:
+        import warnings
+
+        warnings.warn(
+            f"photonhub.web.{name} was renamed to photonhub.web.{replacement}; "
+            "the old alias will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return globals()[replacement]
+    raise AttributeError(f"module 'photonhub.web' has no attribute {name!r}")

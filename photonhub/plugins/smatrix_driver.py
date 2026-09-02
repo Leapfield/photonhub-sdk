@@ -216,7 +216,7 @@ class SMatrixResult:
     ``S`` is the complex :class:`xarray.DataArray` from
     :func:`~photonhub.plugins.smatrix.assemble_smatrix` — dims
     ``(port_out, port_in, f)``, ``|S_ij|^2`` a power ratio. ``data`` maps each
-    DRIVEN port name to its run's ``SimulationData``; ``errors`` carries
+    DRIVEN port name to its run's ``RunResult``; ``errors`` carries
     per-drive failures when ``allow_partial=True`` let the assembly proceed
     (those columns are NaN)."""
 
@@ -273,7 +273,7 @@ class SMatrixResult:
 class SMatrixPlan:
     """A fully-prepared S-matrix extraction: the driven simulations, the port
     readers, and the run method. Built by :func:`plan_smatrix`; inspect
-    ``simulations`` / ``sports`` (or ``estimate_cost()``) before committing
+    ``simulations`` / ``sports`` (or ``quote()``) before committing
     compute, then call :meth:`run`."""
 
     base: Any
@@ -283,11 +283,11 @@ class SMatrixPlan:
     simulations: Mapping[str, Any]     # driven-port name -> Simulation
     sports: Tuple[SPort, ...]          # readers, one per port (all ports)
 
-    def estimate_cost(self, **kwargs):
+    def quote(self, **kwargs):
         """Per-drive :class:`~photonhub.cost.CostEstimate` + batch total USD,
-        via :meth:`~photonhub.runners.batch.Batch.estimate_cost`."""
+        via :meth:`~photonhub.runners.batch.Batch.quote`."""
         from ..runners.batch import Batch
-        return Batch(dict(self.simulations)).estimate_cost(**kwargs)
+        return Batch(dict(self.simulations)).quote(**kwargs)
 
     def run(
         self,
@@ -311,7 +311,7 @@ class SMatrixPlan:
             (``max_workers`` and extra kwargs such as ``device=`` forwarded;
             ``path_dir`` is not a web concept and must be None). Any other
             callable is invoked as ``runner(simulations_dict)`` and must
-            return a mapping ``driven-port name -> SimulationData`` (or any
+            return a mapping ``driven-port name -> RunResult`` (or any
             ``name -> DataArray`` mapping per run) — the injection point for
             custom backends and tests.
         colocate:

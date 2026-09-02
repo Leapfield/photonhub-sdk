@@ -1,5 +1,5 @@
 """Cloud batch — submit N simulations and assemble the SAME
-:class:`~photonhub.runners.batch.BatchData` the local path returns, so per-name
+:class:`~photonhub.runners.batch.BatchResults` the local path returns, so per-name
 partial failures (``batch_data.errors[name]``) work identically. This realizes
 the local-backend docstring's promise that on the cloud a Batch "becomes a
 fan-out across GPUs": each name is an independent job the coordinator spreads
@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Mapping, Optional
 
 from ..components import Simulation
-from ..runners.batch import BatchData, _check_batch_name
+from ..runners.batch import BatchResults, _check_batch_name
 from ..runners.local import SolverRunError
 from .client import HttpClient
 from .config import WebError, get_config
@@ -106,7 +106,7 @@ class Batch:
             validated[name] = sim
         self.simulations = validated
 
-    def estimate_cost(self, **kwargs):
+    def quote(self, **kwargs):
         """Per-name CostEstimate + the batch total (local, deterministic)."""
         per = {name: sim.cost_estimate(**kwargs)
                for name, sim in self.simulations.items()}
@@ -114,7 +114,7 @@ class Batch:
         return per, total
 
     def run(self, *, device=None, max_workers: int = 4,
-            timeout: Optional[float] = None, max_usd=None) -> BatchData:
+            timeout: Optional[float] = None, max_usd=None) -> BatchResults:
         """Quote every entry, then submit within its accepted spend limit.
 
         ``max_usd`` is required and is either one per-job limit applied to all
@@ -151,5 +151,5 @@ class Batch:
                 else:
                     errors[name] = err
 
-        return BatchData(results, errors, cfg.cache_dir,
+        return BatchResults(results, errors, cfg.cache_dir,
                          list(self.simulations))

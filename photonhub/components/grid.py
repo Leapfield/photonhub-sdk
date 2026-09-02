@@ -69,7 +69,12 @@ def realized_cells(length_um: float, dl_um: float, min_cells: int = 4) -> int:
     ZERO — NOT Python's built-in banker's rounding, which would disagree with
     the engine's ``std::llround`` at exact halves. ``min_cells`` is the
     boundary-aware section 1 floor (:func:`axis_min_cells`); the default 4 is
-    the non-periodic floor."""
+    the non-periodic floor.
+
+    The ratio is formed in METRES, exactly as the engine does (it scales each
+    micron value by 1e-6 before dividing): ``1.03/0.02`` is ``51.5`` in
+    microns but ``51.4999…`` in metres, and the two would otherwise round to
+    different counts at such decimal half-cell ties."""
     if (
         not math.isfinite(length_um)
         or not math.isfinite(dl_um)
@@ -79,7 +84,10 @@ def realized_cells(length_um: float, dl_um: float, min_cells: int = 4) -> int:
         raise ValueError(
             "grid resolution requires finite positive domain length and dl"
         )
-    x = length_um / dl_um
+    dl_m = dl_um * 1e-6
+    # A subnormal dl underflows to 0 m; treat it as an infinite ratio so it
+    # reports the same actionable bound error as any other absurd grid.
+    x = math.inf if dl_m == 0.0 else (length_um * 1e-6) / dl_m
     # Mirrors resolve_cell_count's exclusive upper bound. Check before floor so
     # an extremely fine but finite grid reports a validation error instead of
     # leaking Python's OverflowError for floor(inf).
@@ -195,7 +203,7 @@ def snap_mixed_plane(sim, axis_index: int, position_um: float):
     ``q_k + 0.25 * dq_k`` of the cell whose quarter point lies nearest the
     request, and ``local_dl = dq_k`` — the LOCAL spacing, which is also the
     E-to-H plane distance the longitudinal mode-readout de-stagger needs
-    (using the grid's base ``dl_um`` there is silently wrong: GradedGridSpec
+    (using the grid's base ``dl_um`` there is silently wrong: GradedMesh
     carries a ``dl_um`` too, so a truthy check does not detect grading)."""
     q = sim._axis_coords_um(axis_index) if hasattr(sim, "_axis_coords_um") \
         else None
@@ -344,7 +352,7 @@ def quarter_snap_dft_face(
     return coords_um[best] + 0.25 * spacings[best]
 
 
-class UniformGridSpec(FrozenModel):
+class UniformMesh(FrozenModel):
     """Uniform Cartesian grid, single spacing for all axes.
     n_axis = max(n_min, round(L_axis / dl)), round half away from zero, with
     n_min = 1 on a plain periodic axis (quasi-2D reduction) and 4 otherwise
@@ -354,37 +362,37 @@ class UniformGridSpec(FrozenModel):
     dl_um: float = Field(gt=0)
 
 
-class GradedAxisCoords(FrozenModel):
+class GradedMeshAxis(FrozenModel):
     """Per-axis primary-node coordinate arrays (microns) for the graded axes.
     An omitted axis is uniform at the parent ``dl_um``. At least one must be
-    present (otherwise use :class:`UniformGridSpec`)."""
+    present (otherwise use :class:`UniformMesh`)."""
 
     x: Optional[Tuple[float, ...]] = None
     y: Optional[Tuple[float, ...]] = None
     z: Optional[Tuple[float, ...]] = None
 
 
-class GradedGridSpec(FrozenModel):
+class GradedMesh(FrozenModel):
     """Per-axis nonuniform (graded) grid — NUMERICS.md section 15. Each listed
     axis carries absolute primary-node coordinates in microns (strictly
     increasing, coords[0] == 0, >= 4 entries); the realized domain length and
     last cell width follow the section-15.1 replicate-last rule. Any axis NOT
     listed in ``coords`` is uniform at ``dl_um`` (identical to
-    :class:`UniformGridSpec`). Users supply coordinates manually, or generate
-    them from a physical target with the client-side :func:`auto_grid` resolver
+    :class:`UniformMesh`). Users supply coordinates manually, or generate
+    them from a physical target with the client-side :func:`auto_mesh` resolver
     (which returns exactly this model — no new wire member)."""
 
     type: Literal["graded"] = "graded"
     dl_um: float = Field(gt=0)  # base spacing for any axis not in coords.
-    coords: GradedAxisCoords
+    coords: GradedMeshAxis
 
     @model_validator(mode="after")
-    def _check_coords(self) -> "GradedGridSpec":
+    def _check_coords(self) -> "GradedMesh":
         present = {a: getattr(self.coords, a)
                    for a in "xyz" if getattr(self.coords, a) is not None}
         if not present:
             raise ValueError(
-                "GradedGridSpec.coords lists no axis; use UniformGridSpec for a "
+                "GradedMesh.coords lists no axis; use UniformMesh for a "
                 "fully uniform grid")
         for axis, q in present.items():
             if len(q) < 4:
@@ -407,22 +415,22 @@ class GradedGridSpec(FrozenModel):
         return self
 
 
-GridSpecType = Annotated[
-    Union[UniformGridSpec, GradedGridSpec], Field(discriminator="type")]
+MeshType = Annotated[
+    Union[UniformMesh, GradedMesh], Field(discriminator="type")]
 
 
 # --------------------------------------------------------------------------- #
 # Auto-mesh (Track E): a CLIENT-SIDE resolver from a physical target to a valid
-# GradedGridSpec. This is a PURE FUNCTION of its inputs (no schema change, no
+# GradedMesh. This is a PURE FUNCTION of its inputs (no schema change, no
 # iteration/optimizer state) — the roadmap's mesh-freeze requirement ("auto-
 # meshing must not make optimization objectives discontinuous between adjoint
 # iterations") is met by determinism: identical inputs => byte-identical coords.
-# The engine still consumes the ordinary GradedGridSpec it produces (§15.10); we
+# The engine still consumes the ordinary GradedMesh it produces (§15.10); we
 # add no new wire member, so there is nothing for phsolver to learn.
 #
-# OPT-IN by design. ``auto_grid`` (and ``Simulation.with_auto_grid``) are never
+# OPT-IN by design. ``auto_mesh`` (and ``Simulation.with_auto_mesh``) are never
 # the DEFAULT grid: a fresh Simulation still uses whatever GridSpec the caller
-# passes (typically UniformGridSpec). This is deliberate — making auto_grid the
+# passes (typically UniformMesh). This is deliberate — making auto_mesh the
 # default would change the byte-output (the realized coordinate arrays, hence the
 # wire JSON and every golden) of EVERY existing scene, which is golden churn and
 # a product decision, not a numerics one.
@@ -445,18 +453,18 @@ _AUTO_COORD_DECIMALS = 7
 
 # The grading ratio the roadmap asks for is the CELL-TO-CELL growth limit
 # (1.2-1.4). It is intentionally well below GRADED_RATIO_GUARD = 10 (the
-# max/min GLOBAL guard the GradedGridSpec validator enforces); keeping the local
+# max/min GLOBAL guard the GradedMesh validator enforces); keeping the local
 # growth small is what keeps the global ratio under the guard too.
 _DEFAULT_MAX_GRADING = 1.4
 
 # Speed of light (m/s) — used only to convert a source frequency to a free-space
-# wavelength when ``auto_grid`` infers the wavelength from a source.
+# wavelength when ``auto_mesh`` infers the wavelength from a source.
 _C0_M_PER_S = 2.99792458e8
 
 
 def _wavelength_from_source(source) -> float:
     """Free-space wavelength (microns) implied by a source's time profile —
-    ``c / freq0_hz`` of its :class:`GaussianPulse`. Used by ``auto_grid`` when
+    ``c / freq0_hz`` of its :class:`GaussianPulse`. Used by ``auto_mesh`` when
     no explicit ``wavelength_um`` is given (automatic meshers infer their target
     frequency from the source the same way). Raises if the source has no
     readable ``source_time.freq0_hz``."""
@@ -475,11 +483,11 @@ def _geometry_axis_span(geom, axis: int) -> Optional[Tuple[float, float]]:
     bounded by its enclosing box — a safe OVER-estimate of where the fine mesh
     is needed, so the resolver never UNDER-refines around a structure.
 
-    Curved / extruded shapes (Cylinder, PolySlab) report their *bounding box*
+    Curved / extruded shapes (Cylinder, Polygon) report their *bounding box*
     here: the curvature is exactly where subpixel pays off, so the auto-grid
     must still pack fine cells around them even though the closed-form interface
     is faceting-free downstream. The transverse extent of a partial-angle
-    cylinder sector is bounded by the full disk; a slanted PolySlab by its
+    cylinder sector is bounded by the full disk; a slanted Polygon by its
     reference-plane polygon bbox DILATED by the sidewall widening at the
     furthest face (see the polyslab branch — the reference bbox alone is only
     an over-estimate for ``reference_plane="bottom"`` with a positive angle),
@@ -571,7 +579,7 @@ def _structure_index_intervals(
     structure occupies, paired with its refractive index (the in-band
     :func:`_structure_index` at the target wavelength), or ``None`` if the
     structure does not intersect the domain on this axis. Boxes give an exact
-    span; Sphere / Cylinder / PolySlab are bounded by their enclosing box (a
+    span; Sphere / Cylinder / Polygon are bounded by their enclosing box (a
     safe OVER-estimate of where the fine mesh is needed — never under-refines),
     so CURVED structures — where subpixel matters most — are refined too."""
     geom = structure.geometry
@@ -1096,11 +1104,11 @@ class MeshOverride(FrozenModel):
     refractive index alone would call for (a feature edge, a resonant gap, a
     field hotspot an adjoint run wants resolved). It acts through the geometry's
     per-axis bounding span, so a :class:`Box` gives an exact axis-aligned region
-    and a :class:`Sphere` / :class:`Cylinder` / :class:`PolySlab` act through
+    and a :class:`Sphere` / :class:`Cylinder` / :class:`Polygon` act through
     their enclosing box (a safe OVER-refinement, never under).
 
-    Consumed by :func:`auto_grid` (``mesh_overrides=``) and
-    :meth:`photonhub.Simulation.with_mesh_overrides`. Like every auto_grid input it
+    Consumed by :func:`auto_mesh` (``mesh_overrides=``) and
+    :meth:`photonhub.Simulation.with_mesh_overrides`. Like every auto_mesh input it
     is a pure value, so identical overrides produce byte-identical coordinates —
     the mesh stays frozen across adjoint iterations (the §15.10 mesh-freeze
     contract).
@@ -1135,9 +1143,9 @@ class MeshOverride(FrozenModel):
     def axis_regions(self) -> list[Tuple[str, float, float, float]]:
         """Project this override onto each axis as an enforced-refinement region
         ``(axis_letter, lo_um, hi_um, dl_um)`` — exactly the form
-        :func:`auto_grid` consumes via ``refine_regions``. An axis whose target
+        :func:`auto_mesh` consumes via ``refine_regions``. An axis whose target
         ``dl`` is ``None``, or one the geometry does not bound, yields nothing.
-        The spans are unclamped (auto_grid clamps them to the domain), so an
+        The spans are unclamped (auto_mesh clamps them to the domain), so an
         override partly outside the domain still refines the in-domain part."""
         out: list[Tuple[str, float, float, float]] = []
         for a, letter in enumerate("xyz"):
@@ -1152,7 +1160,7 @@ class MeshOverride(FrozenModel):
         return out
 
 
-def auto_grid(
+def auto_mesh(
     *,
     size_um: Tuple[float, float, float],
     wavelength_um: Optional[float] = None,
@@ -1170,8 +1178,8 @@ def auto_grid(
     snap_interfaces: bool = True,
     periodic_axes: str = "",
     feature_ceil: bool = True,
-) -> GradedGridSpec:
-    """Auto-mesh resolver (Track E): generate a VALID :class:`GradedGridSpec`
+) -> GradedMesh:
+    """Auto-mesh resolver (Track E): generate a VALID :class:`GradedMesh`
     from a physical target — minimum steps-per-wavelength per medium, a maximum
     cell-to-cell grading ratio, the wavelength, the domain size, and the scene's
     structures (to find the high-index regions / material boundaries where the
@@ -1212,14 +1220,16 @@ def auto_grid(
         dispersive (Lorentz) one n = sqrt(Re eps(omega)) evaluated at this
         wavelength via the §19 pole model (meshing at eps_inf alone would
         under-refine; see :func:`_structure_index`).
-        Box / Sphere / Cylinder / PolySlab are all supported (curved
+        Box / Sphere / Cylinder / Polygon are all supported (curved
         and extruded shapes are bounded by their enclosing box — refined, never
         under-refined). Geometries may extend beyond the domain — only the
         in-domain part drives the mesh (NUMERICS.md section 9).
     background_index : refractive index of the background medium
         (= sqrt(background.permittivity)); sets the coarse, far-from-structure
         cell size.
-    steps_per_wvl : minimum cells per wavelength IN EACH MEDIUM. A finer target
+    steps_per_wvl : target cells per wavelength IN EACH MEDIUM (honoured
+        inside structures; the background spacing can end up ~2 % coarser
+        after interface snapping). A finer target
         (larger value) yields more cells / a smaller minimum spacing.
     max_grading : maximum cell-to-cell spacing growth ratio (the roadmap's
         1.2-1.4). Must be > 1 and <= GRADED_RATIO_GUARD; the GLOBAL max/min
@@ -1267,9 +1277,9 @@ def auto_grid(
         seam cells (never coarsening a structure, at most a few extra cells)
         and the seam pair is kept exactly equal through snapping and the
         coordinate quantization. Axes listed here but not in ``axes`` stay
-        uniform (trivially seam-equal). :meth:`Simulation.with_auto_grid` /
+        uniform (trivially seam-equal). :meth:`Simulation.with_auto_mesh` /
         ``with_mesh_overrides`` fill this in from ``sim.boundaries``
-        automatically; only direct ``auto_grid`` callers pass it by hand.
+        automatically; only direct ``auto_mesh`` callers pass it by hand.
     feature_ceil : when True (default), quantize each structure's target cell so
         an INTEGER number of cells spans the feature at a size <= the requested
         ``lambda/(n*steps_per_wvl)`` — ``eff = width / ceil(width/dl)``, as standard meshers do.
@@ -1284,9 +1294,9 @@ def auto_grid(
 
     Returns
     -------
-    GradedGridSpec whose listed axes carry the generated coordinate arrays and
+    GradedMesh whose listed axes carry the generated coordinate arrays and
     whose ``dl_um`` is the background spacing (used for any non-graded axis).
-    The returned spec is run through GradedGridSpec validation here, so the
+    The returned spec is run through GradedMesh validation here, so the
     GRADED_RATIO_GUARD and the section-15.1 invariants (coords[0]=0, strictly
     increasing, >= 4 nodes) are guaranteed before it is handed back.
 
@@ -1295,7 +1305,7 @@ def auto_grid(
     ValueError on invalid targets (no/non-positive wavelength, both/neither of
     wavelength & source, non-positive steps, grading <= 1, bad axis letters,
     non-positive ``dl_min_um``, malformed ``refine_regions``) or if a generated
-    array somehow fails GradedGridSpec validation.
+    array somehow fails GradedMesh validation.
     """
     if wavelength_um is not None and source is not None:
         raise ValueError(
@@ -1410,7 +1420,7 @@ def auto_grid(
         # rounding is the only remaining (documented) wobble.
         realized = raw[-1] + (raw[-1] - raw[-2])
         assert abs(realized - domain) <= 1e-9 * max(domain, 1.0), (
-            f"auto_grid internal error: axis '{axis_letter}' realized length "
+            f"auto_mesh internal error: axis '{axis_letter}' realized length "
             f"{realized!r} != requested {domain!r}")
         rounded = [round(float(c), _AUTO_COORD_DECIMALS) for c in raw]
         if seam:
@@ -1430,7 +1440,7 @@ def auto_grid(
             rounded[-1] = realized - s0
         coords_kwargs[axis_letter] = tuple(rounded)
 
-    spec = GradedGridSpec(
+    spec = GradedMesh(
         dl_um=round(float(bg_dl), _AUTO_COORD_DECIMALS),
-        coords=GradedAxisCoords(**coords_kwargs))
+        coords=GradedMeshAxis(**coords_kwargs))
     return spec

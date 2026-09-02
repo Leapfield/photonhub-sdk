@@ -5,7 +5,7 @@ produces a bundle) and the cloud result cache (:mod:`photonhub.web.cache`, which
 consumes one), so the two ends of the format can never drift apart.
 
 Members are flat (arcnamed by filename, no parent dirs) so a bundle extracts
-straight into a directory :class:`~photonhub.SimulationData` reads.
+straight into a directory :class:`~photonhub.RunResult` reads.
 """
 
 from __future__ import annotations

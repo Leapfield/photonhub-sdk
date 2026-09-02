@@ -50,7 +50,7 @@ still write a complete manifest with truncated monitor data; loading one
 emits a ``UserWarning`` and surfaces ``aborted`` / ``abort_reason`` here and
 in every DataArray's attrs, so partial fields are never silently presented
 as healthy data. (``run_local`` raises before loading; the direct
-``SimulationData(path)`` post-mortem path warns instead so diverged runs
+``RunResult(path)`` post-mortem path warns instead so diverged runs
 stay inspectable.)
 
 Snapshot binaries are de-pitched (rows of exactly nx), sample-major order
@@ -84,7 +84,7 @@ _RESERVED_RESULT_FILES = {"sim.json", "manifest.json", "solver-events.jsonl"}
 
 # NUMERICS.md section 12 normalization, surfaced on every frequency-domain
 # DataArray so absolute-magnitude use is never silent. NOTE for apodized
-# monitors (FieldDftMonitor(apodization=...), §12): the phasors are a WINDOWED
+# monitors (ProfileMonitor(apodization=...), §12): the phasors are a WINDOWED
 # DFT but are still normalized by the FULL-pulse A0*S(f) — the window is not
 # divided out — so their absolute magnitudes are NOT comparable to an
 # unapodized monitor's (or to another window's); only ratios within the same
@@ -388,7 +388,7 @@ def validate_result_manifest_contract(
 ) -> list[dict]:
     """Validate the reader-visible v1 manifest envelope and monitor identity.
 
-    This is shared by :class:`SimulationData` and the durable ledger seal so a
+    This is shared by :class:`RunResult` and the durable ledger seal so a
     completed run cannot be published with a manifest the reader would reject.
     Raw result directories additionally require unique, safe, non-reserved blob
     filenames; HDF5 stores monitor arrays by group name instead.
@@ -449,7 +449,7 @@ def validate_result_manifest_contract(
     return monitors
 
 
-class SimulationData:
+class RunResult:
     """Lazy, dict-like view of one solver output directory.
 
     ``data["probe"]`` returns an :class:`xarray.DataArray`:
@@ -648,7 +648,7 @@ class SimulationData:
         return self._cache[name]
 
     def __repr__(self) -> str:
-        return f"SimulationData({str(self.output_dir)!r}, monitors={self.monitor_names})"
+        return f"RunResult({str(self.output_dir)!r}, monitors={self.monitor_names})"
 
     # -- visualization (photonhub.viz; docs/viz-layer-design.md) ------------
 

@@ -1,6 +1,6 @@
-"""Cloud run entry points — the prime directive: ``ph.web.run_async`` returns the
+"""Cloud run entry points — the prime directive: ``ph.web.submit`` returns the
 **same** :class:`~photonhub.runners.batch.Job` as the local path, so
-``job = ph.web.run_async(sim); data = job.result()`` reads identically whether
+``job = ph.web.submit(sim); data = job.result()`` reads identically whether
 local or cloud, and a server-side failure surfaces as the same
 :class:`SolverRunError`.
 """
@@ -13,7 +13,7 @@ import time
 from typing import Callable, Optional
 
 from ..bundle import BundleError
-from ..data import SimulationData
+from ..data import RunResult
 from ..runners.batch import Job
 from ..runners.local import SolverRunError
 from . import cache
@@ -156,7 +156,7 @@ def _poll_and_download(http: HttpClient, cfg: WebConfig, job_id: str, *,
 
 def _finish_cloud_job(http: HttpClient, cfg: WebConfig, job_id: str, *,
                       progress: ProgressCb = None,
-                      timeout: Optional[float] = None) -> SimulationData:
+                      timeout: Optional[float] = None) -> RunResult:
     # A validated, sealed cache entry is exactly what a successful poll +
     # download would produce, so an already-fetched result loads without the
     # service round-trip. This keeps a paid, downloaded run loadable through
@@ -164,7 +164,7 @@ def _finish_cloud_job(http: HttpClient, cfg: WebConfig, job_id: str, *,
     cached = cache.completed_result(cfg, job_id)
     if cached is not None:
         try:
-            return SimulationData(cached)
+            return RunResult(cached)
         except (OSError, ValueError, KeyError, TypeError):
             # Corruption the structural seal cannot see: drop the entry and
             # re-fetch this already-paid job from the service.
@@ -179,7 +179,7 @@ def _finish_cloud_job(http: HttpClient, cfg: WebConfig, job_id: str, *,
             exc.job_id = job_id
         raise
     try:
-        return SimulationData(bundle_dir)
+        return RunResult(bundle_dir)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         # Do not preserve a completion marker for outputs the public reader
         # rejects; resume can safely re-fetch this already-paid job.
@@ -193,7 +193,7 @@ def _cloud_run(sim, *, name=None, device=None, solver=None,
                progress: ProgressCb = None,
                timeout: Optional[float] = None,
                quote_id: Optional[str] = None,
-               cfg: Optional[WebConfig] = None) -> SimulationData:
+               cfg: Optional[WebConfig] = None) -> RunResult:
     device = _validate_web_device(device)
     timeout = _poll_timeout(timeout)
     quote_id = _validate_quote_id(quote_id)
@@ -209,9 +209,9 @@ def _cloud_run(sim, *, name=None, device=None, solver=None,
 
 def run(sim, *, name=None, device=None, solver=None, progress: ProgressCb = None,
         timeout: Optional[float] = None,
-        quote_id: Optional[str] = None) -> SimulationData:
+        quote_id: Optional[str] = None) -> RunResult:
     """Submit ``sim`` to the cloud and block until its result is ready. Returns a
-    :class:`SimulationData`; raises :class:`SolverRunError` if the run fails,
+    :class:`RunResult`; raises :class:`SolverRunError` if the run fails,
     :class:`WebError` for transport/auth/result-transfer problems. ``solver`` pins
     a specific solver version/commit (default: latest). Pass the ``quote_id`` from
     a device-matched server estimate to bind the submission to that accepted quote."""
@@ -221,7 +221,7 @@ def run(sim, *, name=None, device=None, solver=None, progress: ProgressCb = None
 
 def run_quoted(sim, *, max_usd: float = 5.0, name=None, device: str = "gpu",
                solver=None, progress: ProgressCb = None,
-               timeout: Optional[float] = None) -> SimulationData:
+               timeout: Optional[float] = None) -> RunResult:
     """Preflight and submit one quote-bound job under a hard dollar ceiling.
 
     Unlike the compatibility-level :func:`run`, this helper cannot submit an
@@ -240,12 +240,12 @@ def run_quoted(sim, *, max_usd: float = 5.0, name=None, device: str = "gpu",
         progress=progress, timeout=timeout, quote_id=accepted.quote_id)
 
 
-def run_async(sim, *, name=None, device=None, solver=None,
+def submit(sim, *, name=None, device=None, solver=None,
               progress: ProgressCb = None,
               timeout: Optional[float] = None,
               quote_id: Optional[str] = None) -> Job:
     """Submit ``sim`` and return the same :class:`Job` handle type as local
-    ``ph.run_async`` once the service accepts the job. Polling and download
+    ``ph.submit`` once the service accepts the job. Polling and download
     continue in the background; collect with ``job.result()``. ``solver`` pins a
     specific solver version/commit (default: latest). Pass the ``quote_id`` from a
     server estimate to bind the submission to that quote."""
@@ -267,7 +267,7 @@ def run_async(sim, *, name=None, device=None, solver=None,
         name=name, job_id=job_id)
 
 
-def run_quoted_async(sim, *, max_usd: float = 5.0, name=None,
+def submit_quoted(sim, *, max_usd: float = 5.0, name=None,
                      device: str = "gpu", solver=None,
                      progress: ProgressCb = None,
                      timeout: Optional[float] = None) -> Job:
@@ -277,7 +277,7 @@ def run_quoted_async(sim, *, max_usd: float = 5.0, name=None,
     accepted = preflight(
         sim, device=device, solver=solver, max_usd=max_usd,
     )
-    return run_async(
+    return submit(
         sim, name=name, device=accepted.device, solver=accepted.solver,
         progress=progress, timeout=timeout, quote_id=accepted.quote_id)
 

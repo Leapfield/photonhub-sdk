@@ -27,7 +27,7 @@ from benchmarks.gds.framework.profile import load_profile
 from benchmarks.gds.framework.scene import build_ph_scene
 from benchmarks.gds.framework.spec import load_spec
 from photonhub import (
-    FieldDftMonitor, ModePort, ModeSolveProvenance, ModeSource, PortMode,
+    ProfileMonitor, ModePort, ModeSolveProvenance, ModeSource, PortMode,
     SCHEMA_VERSION,
 )
 from photonhub.viz.service import mode_source_input_sha256
@@ -72,7 +72,7 @@ for monitor in sim.monitors:
         monitors.append(monitor)
         continue
     name, outward, center, size, modes, source_index = port_defs[monitor.name]
-    monitors.append(FieldDftMonitor.model_validate({
+    monitors.append(ProfileMonitor.model_validate({
         **monitor.model_dump(mode="python"),
         "name": name,
         "mode_port": ModePort(

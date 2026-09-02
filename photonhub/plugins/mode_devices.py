@@ -6,7 +6,7 @@ readout.
 onto a simulation's transverse grid plane and returns a
 :class:`~photonhub.components.sources.ModeSource` the engine injects via TF/SF.
 ``mode_monitor`` returns a :class:`ModeMonitor`, which carries a 4-tangential
-``FieldDftMonitor`` to add to the simulation and a ``.transmission(data)``
+``ProfileMonitor`` to add to the simulation and a ``.transmission(data)``
 post-process that overlaps the recorded plane onto the mode (forward/backward
 power ``T``) via :func:`photonhub.plugins.mode_overlap.mode_transmission`.
 
@@ -28,7 +28,7 @@ from ..viz import _geometry as _geom
 from ..components.grid import (graded_primary_spacings, realized_cells,
                                sim_axis_min_cells,
                                snap_mixed_plane)
-from ..components.monitors import FieldDftMonitor
+from ..components.monitors import ProfileMonitor
 from ..components.sources import ModeSource
 from ..components.source_time import SourceTimeType
 # C0 maps a monitor/source frequency (Hz) to the FDE solver's wavelength
@@ -54,7 +54,7 @@ _AXIS_IDX = {"x": 0, "y": 1, "z": 2}
 def _axis_cell_centers(simulation, axis_name: str) -> np.ndarray:
     """Transverse cell-center coordinates (microns) along one axis.
 
-    A uniform axis uses ``(i + 0.5)·dl``. A GRADED axis (GradedGridSpec coords)
+    A uniform axis uses ``(i + 0.5)·dl``. A GRADED axis (GradedMesh coords)
     uses the midpoints of its primary-node cells (the §15.2 dual nodes), so the
     mode profile is sampled at the TRUE cell centers — this is what lets a mode
     source / monitor live on a transverse-graded mesh. The §18 auxiliary line
@@ -63,7 +63,7 @@ def _axis_cell_centers(simulation, axis_name: str) -> np.ndarray:
     defined on that plane."""
     idx = _AXIS_IDX[axis_name]
     q = simulation._axis_coords_um(idx)
-    if q is None:  # uniform axis (UniformGridSpec, or a non-graded graded axis)
+    if q is None:  # uniform axis (UniformMesh, or a non-graded graded axis)
         dl = simulation.grid.dl_um
         size = simulation.size_um[idx]
         n = realized_cells(size, dl, sim_axis_min_cells(simulation, idx))
@@ -401,8 +401,12 @@ def mode_launch(
     ``launch='aux'`` forces §18. ``center_um`` is the transverse waveguide
     location in the cut's ``(horizontal, vertical)`` in-plane-axis order
     (default: the domain centre); it is reordered internally for the §18
-    builder's own convention. ``power_watts`` is the launched modal power
-    (into the HALF domain when a §20 symmetry plane is present). The window
+    builder's own convention. ``power_watts`` sets the launched modal power
+    (into the HALF domain when a §20 symmetry plane is present) by scaling
+    the sheet's dipole amplitudes; because every DFT/flux/mode-power output is
+    normalized per unit source amplitude, it does NOT change ``transmission``,
+    ``mode_power`` or flux readouts — use it only when you need the raw
+    time-domain fields at a physical level. The window
     the sheet stamps is recovered from the mode's own recorded placement, so
     the launch registers on the solve grid with nothing to thread through.
 
@@ -669,11 +673,11 @@ _DESTAGGER_AUTO = object()
 
 @dataclass(frozen=True)
 class ModeMonitor:
-    """A mode-resolved transmission monitor: a 4-tangential ``FieldDftMonitor``
+    """A mode-resolved transmission monitor: a 4-tangential ``ProfileMonitor``
     (add ``.field_monitor`` to the simulation) plus a ``.transmission(data)``
     post-process that overlaps the recorded plane onto ``mode``."""
 
-    field_monitor: FieldDftMonitor
+    field_monitor: ProfileMonitor
     mode: Mode
     axis: str
     center_um: Optional[Tuple[float, float]] = None
@@ -802,7 +806,7 @@ class ModeMonitor:
         |a_pm|²/P_mode · 1e-12}`` on this plane — the actual power carried by
         ``mode`` through it, in the run's (source-spectrum-normalized) SI flux
         units. The value is **flux-commensurate**: it shares both the §12
-        normalization and the SI (m²) area element with a ``FluxMonitor``, so
+        normalization and the SI (m²) area element with a ``PowerMonitor``, so
         ``mode_power / flux`` on one plane is the modal power fraction (~the
         modal confinement, O(1)) — see
         :func:`~photonhub.plugins.mode_overlap.mode_transmission`
@@ -816,7 +820,7 @@ class ModeMonitor:
         per-mode ``P_mode`` differs and must not cancel). For same-mode ratios (a
         uniform-width straight, or a reflection ``-``/``+`` at one plane) the
         ``P_mode`` cancels, so those readings are unchanged. ``data`` is the
-        ``SimulationData`` from the run; ``data[self.name]`` is the recorded DFT
+        ``RunResult`` from the run; ``data[self.name]`` is the recorded DFT
         plane. Pass ``modes_by_freq`` (``{freq_hz: Mode}``) to project each
         frequency onto its own per-λ mode instead of the frozen ``self.mode``
         (overrides the monitor's stored ``modes_by_freq`` if any).
@@ -954,7 +958,7 @@ def mode_monitor(
     mode_bank: Optional[ModeBank] = None,
     per_freq_modes: bool = True,
 ) -> ModeMonitor:
-    """Build a :class:`ModeMonitor` (a 4-tangential ``FieldDftMonitor`` on the
+    """Build a :class:`ModeMonitor` (a 4-tangential ``ProfileMonitor`` on the
     ``axis`` plane at ``position_um`` + a transmission post-process onto
     ``mode``). Add ``.field_monitor`` to the simulation's monitors, run, then
     call ``.transmission(data)``. ``thickness_axis`` is the slab-normal axis
@@ -980,7 +984,7 @@ def mode_monitor(
     # placing the plane at the §12 quarter point of ONE cell does that. The
     # snap is graded-aware: a graded normal axis snaps to its LOCAL cell's
     # quarter point and the returned local spacing (NOT the grid's base dl_um,
-    # which GradedGridSpec also carries) feeds the longitudinal de-stagger.
+    # which GradedMesh also carries) feeds the longitudinal de-stagger.
     position_um, dl = snap_mixed_plane(simulation, idx, position_um)
     # The plane spans the REALIZED domain (graded coords — and non-commensurate
     # uniform sims — can realize a hair short of the nominal size; a
@@ -999,7 +1003,7 @@ def mode_monitor(
     size[idx] = 0.0  # a plane normal to `axis`
     center = [s / 2.0 for s in extent]
     center[idx] = position_um
-    fm = FieldDftMonitor(
+    fm = ProfileMonitor(
         name=name,
         center_um=tuple(center),
         size_um=tuple(size),
@@ -1056,7 +1060,7 @@ def solve_modes_by_freq(
         by reference), so the cross-section is rasterized once.
     freqs_hz:
         The monitor frequencies (Hz). Typically the same tuple passed as the
-        ``FieldDftMonitor.freqs_hz`` / ``mode_monitor(freqs_hz=...)``.
+        ``ProfileMonitor.freqs_hz`` / ``mode_monitor(freqs_hz=...)``.
     mode_index:
         Which solved mode to keep per frequency (0 = fundamental, the
         descending-``n_eff`` order ``solve`` returns). The branch must support
@@ -1123,7 +1127,7 @@ def solve_mode_bank(
         waveguide cross-section (re-solved per frequency via ``at_wavelength``;
         the eps is shared by reference, so it is rasterized once).
     freqs_hz:
-        The monitor frequencies (Hz) — typically the ``FieldDftMonitor`` /
+        The monitor frequencies (Hz) — typically the ``ProfileMonitor`` /
         ``mode_monitor`` frequencies.
     mode_indices:
         Which solved modes to keep per frequency, in the descending-``n_eff``

@@ -59,7 +59,7 @@ class DrudePole(FrozenModel):
     linewidth_hz: float = Field(default=0.0, ge=0.0)  # gamma / 2pi
 
 
-class PermittivityData(FrozenModel):
+class PermittivityArray(FrozenModel):
     """Node-based permittivity data grid for a custom medium (NUMERICS.md
     §10.3, schema 1.18). ``shape`` = (nx, ny, nz), each >= 2; ``values`` is
     the flat C-order (x-major) array of nx*ny*nz node values, each >= 1.
@@ -71,7 +71,7 @@ class PermittivityData(FrozenModel):
     values: Tuple[float, ...] = Field(min_length=8, repr=False)
 
     @model_validator(mode="after")
-    def _consistent(self) -> "PermittivityData":
+    def _consistent(self) -> "PermittivityArray":
         if any(n < 2 for n in self.shape):
             raise ValueError(
                 f"permittivity_data shape must be >= 2 per axis (node-based "
@@ -143,7 +143,7 @@ class Medium(FrozenModel):
     # exclusions: Box geometry only, no dispersion poles, no pec, no
     # permittivity_xyz, subpixel off (Simulation auto-flips), CPU solver
     # only. None omitted from the wire (byte-back-compat).
-    permittivity_data: Optional["PermittivityData"] = None
+    permittivity_data: Optional["PermittivityArray"] = None
 
     @model_validator(mode="after")
     def _aniso_rules(self) -> "Medium":
@@ -202,7 +202,7 @@ class Medium(FrozenModel):
         return cls(
             permittivity=max(1.0, float(arr.mean())),
             conductivity_s_per_m=conductivity_s_per_m,
-            permittivity_data=PermittivityData(
+            permittivity_data=PermittivityArray(
                 shape=tuple(int(n) for n in arr.shape),
                 values=tuple(float(v) for v in arr.reshape(-1))),
         )
@@ -329,7 +329,7 @@ class Cylinder(FrozenModel):
         return self
 
 
-class PolySlab(FrozenModel):
+class Polygon(FrozenModel):
     """Polygon cross-section extruded along ``axis`` with optional slanted
     sidewalls (NUMERICS.md §17). ``vertices_um`` are the ordered (u, v) polygon
     in the two transverse axes (u = lower-indexed, v = higher-indexed),
@@ -345,7 +345,7 @@ class PolySlab(FrozenModel):
     reference_plane: Literal["bottom", "middle", "top"] = "middle"
 
     @model_validator(mode="after")
-    def _check(self) -> "PolySlab":
+    def _check(self) -> "Polygon":
         lo, hi = self.slab_bounds_um
         if not (hi > lo):
             raise ValueError(f"slab_bounds_um hi ({hi}) must be > lo ({lo})")
@@ -358,7 +358,7 @@ class PolySlab(FrozenModel):
 
 
 GeometryType = Annotated[
-    Union[Box, Sphere, Cylinder, PolySlab], Field(discriminator="type")
+    Union[Box, Sphere, Cylinder, Polygon], Field(discriminator="type")
 ]
 StructureName = Annotated[str, Field(min_length=1)]
 
