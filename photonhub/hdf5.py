@@ -146,7 +146,13 @@ def convert_to_hdf5(src: Union[str, Path],
     """Pack the raw-output directory ``src`` (or its ``manifest.json``) into a
     single HDF5 file. ``dest`` defaults to ``<src>/simulation.h5``. Returns the
     written path. Requires ``h5py``."""
-    import h5py
+    try:
+        import h5py
+    except ImportError as exc:  # same pattern as gds._import_gdstk
+        raise ImportError(
+            "convert_to_hdf5 needs the optional 'h5py' dependency. Install "
+            "it with `pip install 'photonhub[hdf5]'` (or `pip install "
+            "h5py`).") from exc
 
     src = Path(src)
     manifest_path = _manifest_path(src)

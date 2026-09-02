@@ -41,7 +41,7 @@ from .monitors import (
 )
 from .run import RunSpec
 from .sources import ModeSource, PlaneWave, SourceType
-from .structures import Structure
+from .structures import Medium, Structure
 
 
 def _medium_poles(medium):
@@ -423,7 +423,12 @@ class Simulation(FrozenModel):
     # boundaries.<axis> = "bloch"; the engine rejects a nonzero component on a
     # non-bloch axis (silent-ignore trap). CPU solver only in this release.
     bloch_k_per_um: Optional[Tuple[float, float, float]] = None
-    sources: Tuple[SourceType, ...] = Field(min_length=1)
+    # May be EMPTY at the model level: a source-less "shell" Simulation is a
+    # legitimate authoring artifact (mode_launch/mode_monitor take one for its
+    # grid and structures; previously even the gallery resorted to placeholder
+    # dipoles). Running one is still an error — phsolver validate/run rejects
+    # an empty array with "sources: at least one source is required".
+    sources: Tuple[SourceType, ...] = ()
     monitors: Tuple[MonitorType, ...] = ()
 
     @model_validator(mode="after")
@@ -448,6 +453,36 @@ class Simulation(FrozenModel):
                             "matching bloch_k_per_um — use "
                             "Simulation.with_oblique_plane_wave(...)")
         return self
+
+    @field_validator("background", mode="before")
+    @classmethod
+    def _background_from_medium(cls, v):
+        # Beta papercut: materials.X.medium(...) hands back a Medium, and
+        # passing it as the background is the natural move. A plain
+        # dielectric Medium carries exactly the information Background holds,
+        # so coerce it losslessly; anything with more physics must fail with
+        # directions rather than pydantic's generic model_type error.
+        fitted = getattr(v, "medium", None)
+        if isinstance(fitted, Medium) and not isinstance(v, Medium):
+            v = fitted   # PoleFit/LorentzFit: fall through to the Medium rules
+        if type(v).__name__ == "Material" and callable(fitted):
+            raise ValueError(
+                f"got the materials-library entry {getattr(v, 'name', v)!r} "
+                "where a Background is required — pick the fit first, e.g. "
+                "background=ph.Background(permittivity="
+                "ph.materials.SiO2.medium(wavelength_um=1.55).permittivity)")
+        if isinstance(v, Medium):
+            if (v.conductivity_s_per_m == 0.0 and not v.lorentz
+                    and not v.poles and not v.drude
+                    and v.permittivity_xyz is None and not v.pec
+                    and v.permittivity_data is None):
+                return Background(permittivity=v.permittivity)
+            raise ValueError(
+                "background must be a homogeneous non-dispersive dielectric "
+                "(ph.Background); this Medium carries conductivity, poles, "
+                "anisotropy, PEC, or permittivity_data, which the background "
+                "cannot express — model that region as a Structure instead")
+        return v
 
     @field_validator("schema_version")
     @classmethod

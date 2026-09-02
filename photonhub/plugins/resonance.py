@@ -52,9 +52,17 @@ Example
 After a real run::
 
     data = ph.run_local(sim)                       # sim has a FieldTimeMonitor "probe"
-    rf = ResonanceFinder(freq_window=(1.9e14, 2.0e14))
+    window = (1.9e14, 2.0e14)
+    rf = ResonanceFinder(freq_window=window)
     resonances = rf.run(data, "probe")             # xr.Dataset over 'freq'
-    modes = select_resonances(resonances, min_amplitude=1e-3)
+    modes = select_resonances(resonances, freq_window=window,
+                              min_amplitude=1e-3)
+
+Always pass ``freq_window`` (and an amplitude floor) to
+:func:`select_resonances`: the FDM eigenvalue problem is merely SEEDED on
+the finder's window, so ``run`` can surface spurious poles outside it —
+including negative frequencies and negative Q — that describe the basis,
+not the physics.
 """
 
 from __future__ import annotations
@@ -269,7 +277,12 @@ def select_resonances(
         within 60 dB of the dominant one. Combines with ``min_amplitude``
         (both must pass).
     require_decay : bool, default True
-        Drop non-physical modes with ``decay <= 0`` (growing in time).
+        Drop modes with ``decay <= 0`` (growing in time). NOTE: in a CLOSED
+        lossless scene (PEC box, undamped cavity) the physical mode is
+        undamped, and its fitted decay can land at a tiny NEGATIVE value —
+        the default then drops the very mode you are after. Pass
+        ``require_decay=False`` there and treat ``|decay| * T_window << 1``
+        as "undamped within the window's resolution".
     sort_by : str or None, default "Q"
         Data variable to sort by, descending (e.g. ``"Q"`` or ``"amplitude"``).
         ``None`` leaves the ``freq`` ordering.

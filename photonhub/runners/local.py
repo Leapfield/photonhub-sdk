@@ -9,6 +9,7 @@ directory as monitor binaries plus ``manifest.json`` (photonhub.data).
 import json
 import tempfile
 import threading
+import warnings
 from pathlib import Path
 from typing import Callable, Optional, Union
 
@@ -29,6 +30,68 @@ from .progress import default_renderer
 # The --device grammar (incl. multi-GPU gpu:all / gpu:N,M,...) lives in
 # .phsolver.device_args, the single definition shared with the cloud executor.
 __all__ = ["run_local", "find_solver", "SolverRunError"]
+
+
+class _DecayTrail:
+    """Watch the engine's JSON-lines events for a field-decay PLATEAU.
+
+    A pulsed current whose spectrum has nonzero DC content (e.g. a PointDipole
+    GaussianPulse with fwidth >~ 0.25*freq0) deposits net charge on its source
+    cells; the resulting static field is not a wave, no PML drains it on run
+    timescales, and it anchors the engine's NUMERICS section-7 energy-decay
+    ratio at a level that can sit orders of magnitude above ``run.shutoff``
+    (measured: fwidth = 0.3*f0 pins decay at ~1.2e-2 vs the 1e-5 default —
+    the run silently rides its full step cap, ~25x the physical duration).
+    Perfectly trapped modes (periodic/PEC scenes, quasi-2D) produce the same
+    flat trace, and from the scalar energy alone the two cannot be told
+    apart, so the ENGINE must not stop early on its own — but the user
+    deserves to know their cap-length run was flat. This advisory is
+    diagnosis-only: it changes no run semantics."""
+
+    # A trace is "flat" when the decay improved by less than 1 % across the
+    # trailing half of the post-source progress checks, with at least 20 such
+    # checks — thousands of steps at every progress cadence, far beyond any
+    # transient dip.
+    MIN_CHECKS = 20
+    IMPROVE = 0.01
+
+    def __init__(self):
+        self.shutoff = None
+        self.decays = []
+        self.done = None
+
+    def feed(self, event: dict) -> None:
+        kind = event.get("event")
+        if kind == "start":
+            self.shutoff = event.get("shutoff")
+        elif kind == "progress":
+            d = event.get("field_decay")
+            if d is not None and event.get("phase") == "ringdown":
+                self.decays.append(float(d))
+        elif kind == "done":
+            self.done = event
+
+    def plateau_advisory(self):
+        if not self.done or self.done.get("shut_off"):
+            return None
+        shutoff = self.shutoff or 0.0
+        if shutoff <= 0.0:
+            return None          # auto-shutoff disabled: cap runs are asked-for
+        if len(self.decays) < self.MIN_CHECKS:
+            return None
+        tail = self.decays[len(self.decays) // 2:]
+        first, last = tail[0], tail[-1]
+        if not (last > 10.0 * shutoff and first > 0.0):
+            return None
+        if last < (1.0 - self.IMPROVE) * first:
+            return None          # still draining; the cap was simply short
+        return (
+            f"the field decay plateaued at {last:.2e} and never reached "
+            f"run.shutoff = {shutoff:g}, so the run used its full step cap "
+            f"({self.done.get('steps_run')} steps). Likely causes: a static "
+            "charge residue from a broadband source (narrow the pulse, e.g. "
+            "fwidth <= 0.2*freq0) or a trapped/lossless mode (set an explicit "
+            "run_time_s / n_steps, or shutoff=0 to silence this).")
 
 
 def run_local(
@@ -109,8 +172,10 @@ def run_local(
     # surface; otherwise render a default live status line unless silenced. The
     # child runs --progress none regardless, so Python is the only human surface.
     renderer = default_renderer() if (progress is None and not quiet) else None
+    decay_trail = _DecayTrail()
 
     def _on_event(event: dict) -> None:
+        decay_trail.feed(event)
         if progress is not None:
             progress(event)
         elif renderer is not None:
@@ -118,6 +183,9 @@ def run_local(
 
     run_phsolver(cmd, on_event=_on_event, timeout=timeout,
                  cancel_event=cancel_event)
+    advisory = decay_trail.plateau_advisory()
+    if advisory:
+        warnings.warn(advisory, stacklevel=2)
 
     # "Solver lies" guard: a clean exit with a missing/malformed manifest or
     # .bin is still a solver failure — surface it as SolverRunError so callers

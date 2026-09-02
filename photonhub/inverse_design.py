@@ -333,9 +333,20 @@ class PointIntensity:
 class ModePower:
     """Maximize the power coupled into a guided ``mode`` at an output port —
     ``J = |c|^2``, where ``c`` is the P_mode-normalized complex modal amplitude
-    of the recorded plane (``mode_amplitude``; ``|c|^2`` is the modal power
-    transmission). This is THE objective for waveguide inverse design: bends,
-    mode converters, (de)multiplexers, grating couplers.
+    of the recorded plane (``mode_amplitude``). This is THE objective for
+    waveguide inverse design: bends, mode converters, (de)multiplexers,
+    grating couplers.
+
+    .. warning:: ``J`` is a RELATIVE objective, not a calibrated power
+       transmission. ``|c|^2 == T`` would require the launch to read
+       ``c_in == 1`` on an input plane, but ``mode_source(power_watts=1)``
+       normalizes to SI watts, so ``J`` carries a scene/grid-dependent
+       positive scale (measured ``~4/dl_um`` on SOI strip scenes: J = 23.4
+       at dl = 0.05 um where T ~ 0.29). Maximizing J still maximizes T —
+       optimization and relative comparisons are unaffected — but do NOT
+       report J as transmission; use the S-matrix path
+       (:func:`photonhub.plugins.smatrix`), which normalizes by the driven
+       port's incident amplitude and is calibrated (|S21|^2).
 
     By reciprocity the adjoint excitation is the SAME mode launched BACKWARD from
     the output plane (a `ModeSource` with ``direction`` reversed), with the
@@ -491,6 +502,15 @@ def value_and_gradient(
     monitor_name: str = "design_region",
 ) -> GradientResult:
     """One adjoint gradient: a forward solve + an adjoint solve (2 total).
+
+    .. warning:: The gradient is validated in DIRECTION
+       (adjoint/FD cosine gate); its MAGNITUDE carries the same
+       scene/grid-dependent scale as :class:`ModePower`'s J
+       (measured ~81x vs finite differences at dl = 0.05 um).
+       Scale-adaptive optimizers (the default Adam) are
+       unaffected; line searches, custom optimizers, and
+       physical sensitivity numbers must not trust the raw
+       magnitude until the launch is c_in-calibrated.
 
     **The returned gradient is calibrated in DIRECTION only.** Its magnitude is
     uncalibrated and configuration-dependent (measured 2.2e4-3.2e4x below

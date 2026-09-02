@@ -9,7 +9,7 @@ point wins (containment is closed). Geometries may extend beyond the domain
 import math
 from typing import Annotated, Literal, Optional, Tuple, Union
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from .base import AxisName, FrozenModel, NonNegativeUm, PositiveUm, Vec3Um
 
@@ -371,6 +371,28 @@ class Structure(FrozenModel):
     geometry: GeometryType
     medium: Medium
     name: Optional[StructureName] = None
+
+    @field_validator("medium", mode="before")
+    @classmethod
+    def _medium_not_material(cls, v):
+        # Beta papercuts (duck-typed: materials.py imports Medium from here,
+        # the reverse import would cycle). A fit object (PoleFit/LorentzFit)
+        # carries its engine Medium as a property — coerce it losslessly. A
+        # Material is a fit FACTORY whose .medium needs arguments — pydantic's
+        # generic model_type error gives no way forward, so name the
+        # conversion explicitly.
+        fitted = getattr(v, "medium", None)
+        if isinstance(fitted, Medium) and not isinstance(v, Medium):
+            return fitted
+        if type(v).__name__ == "Material" and callable(fitted):
+            raise ValueError(
+                f"got the materials-library entry {getattr(v, 'name', v)!r} "
+                "where a Medium is required — pick the fit first: "
+                ".medium(wavelength_um=...) for a constant index at one "
+                "wavelength, or .medium(band_um=(lo, hi)) for a dispersive "
+                "fit over a band (e.g. "
+                "ph.materials.cSi.medium(band_um=(1.5, 1.6)))")
+        return v
 
     @model_validator(mode="after")
     def _custom_medium_needs_box(self) -> "Structure":

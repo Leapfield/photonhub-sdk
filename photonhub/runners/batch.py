@@ -51,11 +51,13 @@ class Job:
     work runs on a daemon thread so the call returns immediately."""
 
     def __init__(self, fn: Callable[[], SimulationData],
-                 name: Optional[str] = None, job_id: Optional[str] = None):
+                 name: Optional[str] = None, job_id: Optional[str] = None,
+                 cancel_event: Optional[threading.Event] = None):
         self.name = name
         # Remote jobs expose the service identifier for cancellation/resume;
         # local jobs leave this as None while retaining the same handle type.
         self.job_id = job_id
+        self._cancel_event = cancel_event
         self._done = threading.Event()
         self._data: Optional[SimulationData] = None
         self._exc: Optional[BaseException] = None
@@ -76,6 +78,13 @@ class Job:
     def done(self) -> bool:
         """True once the run has finished (successfully or not)."""
         return self._done.is_set()
+
+    def cancel(self) -> None:
+        """Ask the solver to stop. No-op when the run has already finished or
+        the job was created without a cancel event; a cancelled run raises
+        :class:`SolverRunError` from :meth:`result`."""
+        if self._cancel_event is not None:
+            self._cancel_event.set()
 
     def result(self, timeout: Optional[float] = None) -> SimulationData:
         """Block until the run finishes and return its :class:`SimulationData`,
@@ -99,18 +108,24 @@ def run_async(
     timeout: Optional[float] = None,
     name: Optional[str] = None,
     log_file: Union[str, Path, None] = None,
+    device: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Job:
     """Start ``sim`` on a background thread and return a :class:`Job` handle
-    immediately. Same arguments as :func:`run_local` (including ``log_file`` to
-    mirror the engine event stream to disk); collect the result with
-    ``job.result()``."""
-    # quiet: a background job's in-place status line would fight foreground
-    # output (and other jobs); pass progress= to consume events instead.
+    immediately; collect the result with ``job.result()``.
+
+    Takes :func:`run_local`'s arguments (``log_file`` mirrors the engine event
+    stream to disk, ``device`` selects cpu/gpu backends) EXCEPT ``quiet``: a
+    background job never draws the live status line (it would fight foreground
+    output and other jobs) — pass ``progress`` to consume events instead.
+    ``cancel_event`` (or :meth:`Job.cancel`) terminates the solver early;
+    the job then raises :class:`SolverRunError` from ``result()``."""
+    ev = cancel_event if cancel_event is not None else threading.Event()
     return Job(
         lambda: run_local(sim, output_dir=output_dir, solver_path=solver_path,
                           progress=progress, timeout=timeout, quiet=True,
-                          log_file=log_file),
-        name=name)
+                          log_file=log_file, device=device, cancel_event=ev),
+        name=name, cancel_event=ev)
 
 
 class BatchData:
@@ -211,11 +226,15 @@ class Batch:
         max_workers: int = 1,
         progress: Optional[Callable[[str, dict], None]] = None,
         timeout: Optional[float] = None,
+        device: Optional[str] = None,
     ) -> BatchData:
         """Run every simulation, writing ``<path_dir>/<name>/`` per entry, and
         block until all finish. ``max_workers`` runs that many concurrently
         (default 1 = serial). ``progress`` (if given) receives ``(name,
-        event)`` for each solver event. Per-simulation failures are captured in
+        event)`` for each solver event; the per-run live status line is
+        always suppressed (concurrent entries would interleave).
+        ``device`` selects the backend for every entry, as in
+        :func:`run_local`. Per-simulation failures are captured in
         the returned :attr:`BatchData.errors`, not raised."""
         base = (Path(path_dir) if path_dir is not None
                 else Path(tempfile.mkdtemp(prefix="photonhub-batch-")))
@@ -228,7 +247,7 @@ class Batch:
             # lines; the batch-level (name, event) callback is the surface.
             return run_local(sim, output_dir=base / name,
                              solver_path=solver_path, progress=cb,
-                             timeout=timeout, quiet=True)
+                             timeout=timeout, quiet=True, device=device)
 
         results: Dict[str, SimulationData] = {}
         errors: Dict[str, SolverRunError] = {}
