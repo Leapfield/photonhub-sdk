@@ -1164,7 +1164,7 @@ def solve_yee_mode_bank(sim, axis: str, plane_value_um: float, freqs_hz, pol: st
                         eps_of_medium: Optional[Mapping[int, float]] = None):
     """``{freq_hz: VectorMode}`` per-frequency Yee-grid readout bank — the engine-
     consistent analogue of
-    :func:`~photonhub.plugins.kfj_smoothing.mode_bank_on_cross_section` (which uses the
+    :func:`~photonhub.analysis.kfj_smoothing.mode_bank_on_cross_section` (which uses the
     node-collocated FLM ``VectorModeSolver``). The window geometry is rasterized
     ONCE; a non-dispersive cross-section shares one Yee-staggered ε for every
     frequency (λ-independent at constant n), while dispersive media are re-anchored
@@ -1216,7 +1216,7 @@ def solve_yee_multimode_bank(sim, axis: str, plane_value_um: float, freqs_hz, *,
                              eps_of_medium: Optional[Mapping[int, float]] = None):
     """``{freq_hz: {mode_index: VectorMode}}`` MULTI-mode per-frequency Yee bank —
     the engine-consistent analogue of
-    :func:`~photonhub.plugins.mode_devices.solve_mode_bank` (which needs an FLM/scalar
+    :func:`~photonhub.analysis.mode_devices.solve_mode_bank` (which needs an FLM/scalar
     solver object), ready for :meth:`ModeMonitor.mode_decomposition`.
 
     Indexing follows ``solve_mode_bank``'s convention: ``mode_indices`` count the

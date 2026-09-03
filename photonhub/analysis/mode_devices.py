@@ -2,13 +2,13 @@
 the engine's ModeSource (NUMERICS.md §18) and to a mode-resolved transmission
 readout.
 
-``mode_source`` resamples a frozen FDE :class:`~photonhub.plugins.modes.Mode`
+``mode_source`` resamples a frozen FDE :class:`~photonhub.analysis.modes.Mode`
 onto a simulation's transverse grid plane and returns a
 :class:`~photonhub.components.sources.ModeSource` the engine injects via TF/SF.
 ``mode_monitor`` returns a :class:`ModeMonitor`, which carries a 4-tangential
 ``ProfileMonitor`` to add to the simulation and a ``.transmission(data)``
 post-process that overlaps the recorded plane onto the mode (forward/backward
-power ``T``) via :func:`photonhub.plugins.mode_overlap.mode_transmission`.
+power ``T``) via :func:`photonhub.analysis.mode_overlap.mode_transmission`.
 
 The injection and the overlap share one scalar-limit modal-H convention
 (``h ≈ (n_eff/eta0) z_hat x e``), so a clean single-mode straight waveguide
@@ -155,7 +155,7 @@ def _broadband_arrays(modes_by_freq, resample, central_pol, central_major,
 
 def _is_full_vector(mode) -> bool:
     """A full-vector mode carries the true paired H (``hx``/``hy``) — e.g. a
-    :class:`~photonhub.plugins.vector_modes.VectorMode` (incl. the engine-consistent
+    :class:`~photonhub.analysis.vector_modes.VectorMode` (incl. the engine-consistent
     ``yee_mode`` discrete eigenmode). A scalar :class:`Mode` does not."""
     return getattr(mode, "hx", None) is not None and \
         getattr(mode, "hy", None) is not None
@@ -181,8 +181,8 @@ def mode_source(
     .. deprecated::
         The §18 aux-line ModeSource is deprecated in favour of the equivalence-
         current launch: prefer :func:`mode_launch` with a discrete Yee mode
-        (:func:`~photonhub.plugins.yee_mode.solve_yee_mode` /
-        :func:`~photonhub.plugins.kfj_smoothing.solve_mode_on_cross_section`). The
+        (:func:`~photonhub.analysis.yee_mode.solve_yee_mode` /
+        :func:`~photonhub.analysis.kfj_smoothing.solve_mode_on_cross_section`). The
         Huygens dipole-sheet launch works on uniform AND graded grids, supports
         broadband, and sheds less near-source radiation. Full-vector calls here
         delegate to :func:`mode_source_vector` (which emits the deprecation
@@ -190,7 +190,7 @@ def mode_source(
 
     **Full-vector launch is the default (NUMERICS.md §18.2a / launch_fidelity).**
     When ``mode`` is a full-vector mode (it carries the true paired ``H`` — e.g. a
-    :class:`~photonhub.plugins.vector_modes.VectorMode`, especially the engine's own
+    :class:`~photonhub.analysis.vector_modes.VectorMode`, especially the engine's own
     ``yee_mode`` discrete eigenmode) and ``paired_h`` is True (default), this
     delegates to :func:`mode_source_vector` so the source ships the mode's TRUE
     discrete paired-H (``profile_h``). That makes the launch the discrete
@@ -208,7 +208,7 @@ def mode_source(
     domain center, i.e. a centered guide). ``thickness_axis`` is the simulation
     axis along the guide's slab thickness; pass the slab normal (e.g. ``"z"``)
     for any non-x propagation so the mode is not rotated 90 degrees (see
-    :func:`~photonhub.plugins.mode_overlap.modal_fields`). ``None`` keeps the
+    :func:`~photonhub.analysis.mode_overlap.modal_fields`). ``None`` keeps the
     legacy thickness-on-second-transverse-axis mapping.
 
     **Broadband injection (``num_freqs`` analogue, NUMERICS.md §18.3).** Pass
@@ -292,7 +292,7 @@ def _launch_window_origin(mode, h_center, v_center):
     """The EXACT window origin ``(h_lo, v_lo)`` the mode was solved on,
     recovered from its own recorded placement so the launch registers on the
     solve grid without threading the original window through. Inverts
-    :func:`~photonhub.plugins.yee_mode._window_center_offset`
+    :func:`~photonhub.analysis.yee_mode._window_center_offset`
     (``off = lo + 0.5(n-1)dl - center``): ``lo = center + off - 0.5(n-1)dl``,
     all exact grid multiples — passed straight to the sheet builder, so no
     float-boundary-sensitive floor-snap of a reconstructed half-width. Requires
@@ -502,7 +502,7 @@ def mode_source_vector(
     components of the full-vector mode and **power-normalizes** the launch to
     ``power_watts`` (default **1 W**). Both transverse-E profiles are resampled
     onto the grid's transverse cells preserving their true component ratio (via
-    :func:`~photonhub.plugins.mode_overlap.vector_modal_fields`); the minor
+    :func:`~photonhub.analysis.mode_overlap.vector_modal_fields`); the minor
     component rides the same guided-mode aux carrier as the major (engine §18.2),
     with its own scalar-limit paired H.
 
@@ -542,7 +542,7 @@ def mode_source_vector(
 
     **Broadband injection (``num_freqs`` analogue, NUMERICS.md §18.3).** Pass
     ``modes_by_freq`` (``{freq_hz: VectorMode}`` from :func:`solve_modes_by_freq`
-    over a :class:`~photonhub.plugins.vector_modes.VectorModeSolver`) to inject a
+    over a :class:`~photonhub.analysis.vector_modes.VectorModeSolver`) to inject a
     frequency-dependent full-vector profile across the band; each carrier is
     power-normalized to ``power_watts`` and the engine partition-of-unity-windows
     them. The positional ``mode`` stays the band-centre representative and the
@@ -809,7 +809,7 @@ class ModeMonitor:
         normalization and the SI (m²) area element with a ``PowerMonitor``, so
         ``mode_power / flux`` on one plane is the modal power fraction (~the
         modal confinement, O(1)) — see
-        :func:`~photonhub.plugins.mode_overlap.mode_transmission`
+        :func:`~photonhub.analysis.mode_overlap.mode_transmission`
         ``power=True`` for the µm²→m² conversion note. This is still NOT a 0–1
         transmission on its own; ratio two planes for that (see
         :func:`transmission`).
@@ -833,7 +833,7 @@ class ModeMonitor:
         band-centre mode. Ineligible monitors keep the frozen mode silently.
 
         **De-stagger is ON by default** (the longitudinal Yee de-stagger; see
-        :func:`~photonhub.plugins.mode_overlap.mode_transmission`): when ``colocate``
+        :func:`~photonhub.analysis.mode_overlap.mode_transmission`): when ``colocate``
         is True it uses the monitor's grid ``dl_um`` automatically, matching what
         a colocating mode monitor does when it interpolates the
         staggered Yee components to common coordinates. Pass ``destagger_dl=None``
@@ -883,7 +883,7 @@ class ModeMonitor:
         ``"power"`` (``|a_pm|²/P_mode · 1e-12``, the flux-commensurate per-mode
         power to ratio across ports),
         or ``"amplitude"`` (complex ``c``, for a multimode S-matrix). See
-        :func:`~photonhub.plugins.mode_overlap.mode_decomposition`."""
+        :func:`~photonhub.analysis.mode_overlap.mode_decomposition`."""
         bank = mode_bank if mode_bank is not None else self.mode_bank
         if not bank:
             raise ValueError(
@@ -965,7 +965,7 @@ def mode_monitor(
     (pass e.g. ``"z"`` for non-x propagation so the overlap mode is not rotated
     90 degrees); ``None`` keeps the legacy mapping. Pass ``mode_bank``
     (``{freq_hz: {mode_index: Mode}}``, see :func:`solve_mode_bank` /
-    :func:`~photonhub.plugins.yee_mode.solve_yee_multimode_bank`) to enable
+    :func:`~photonhub.analysis.yee_mode.solve_yee_multimode_bank`) to enable
     :meth:`ModeMonitor.mode_decomposition` (multi-mode readout). See
     :func:`mode_source`.
 
@@ -1053,8 +1053,8 @@ def solve_modes_by_freq(
     Parameters
     ----------
     solver:
-        A :class:`~photonhub.plugins.modes.ModeSolver` or
-        :class:`~photonhub.plugins.vector_modes.VectorModeSolver` carrying the
+        A :class:`~photonhub.analysis.modes.ModeSolver` or
+        :class:`~photonhub.analysis.vector_modes.VectorModeSolver` carrying the
         waveguide cross-section. It is re-solved on the SAME geometry at each
         frequency via ``solver.at_wavelength(C0 / f * 1e6)`` (the eps is shared
         by reference), so the cross-section is rasterized once.
@@ -1122,8 +1122,8 @@ def solve_mode_bank(
     Parameters
     ----------
     solver:
-        A :class:`~photonhub.plugins.modes.ModeSolver` or
-        :class:`~photonhub.plugins.vector_modes.VectorModeSolver` carrying the
+        A :class:`~photonhub.analysis.modes.ModeSolver` or
+        :class:`~photonhub.analysis.vector_modes.VectorModeSolver` carrying the
         waveguide cross-section (re-solved per frequency via ``at_wavelength``;
         the eps is shared by reference, so it is rasterized once).
     freqs_hz:

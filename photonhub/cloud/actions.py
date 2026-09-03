@@ -14,7 +14,7 @@ from typing import Any
 
 from ._ids import validate_job_id
 from .client import HttpClient
-from .config import WebError, get_config
+from .config import CloudError, get_config
 
 
 @dataclass(frozen=True)
@@ -65,14 +65,14 @@ def _service_amount(payload: dict, key: str, *, context: str) -> float:
     if value is not None:
         if (isinstance(value, bool) or not isinstance(value, (int, float))
                 or not math.isfinite(float(value)) or float(value) < 0):
-            raise WebError(
+            raise CloudError(
                 f"service {context} {key!r} must be a finite non-negative number")
         return float(value)
 
     micros_key = key.removesuffix("_usd") + "_micros"
     value = payload.get(micros_key)
     if (isinstance(value, bool) or not isinstance(value, int) or value < 0):
-        raise WebError(
+        raise CloudError(
             f"service {context} has no usable {key!r} or {micros_key!r}")
     return value / 1_000_000
 
@@ -129,26 +129,26 @@ def preflight(
     http = HttpClient(get_config())
     account_payload = http.account()
     if not isinstance(account_payload, dict):
-        raise WebError("service account response was not an object")
+        raise CloudError("service account response was not an object")
     available = _service_amount(
         account_payload, "available_usd", context="account response")
 
     quote = http.estimate(sim.to_wire_dict(), device=device, solver=solver)
     if not isinstance(quote, dict):
-        raise WebError("service estimate response was not an object")
+        raise CloudError("service estimate response was not an object")
     quote_usd = _service_amount(quote, "usd", context="estimate")
     try:
         quote_id = _validate_quote_id(quote.get("quote_id"))
     except ValueError as exc:
-        raise WebError("service estimate has no usable 'quote_id'") from exc
+        raise CloudError("service estimate has no usable 'quote_id'") from exc
     if quote_id is None:
-        raise WebError("service estimate has no usable 'quote_id'")
+        raise CloudError("service estimate has no usable 'quote_id'")
     if quote_usd > limit:
-        raise WebError(
+        raise CloudError(
             f"server quote ${quote_usd:.6f} exceeds max_usd ${limit:.6f}; "
             "no job was submitted")
     if quote_usd > available:
-        raise WebError(
+        raise CloudError(
             f"server quote ${quote_usd:.6f} exceeds available balance "
             f"${available:.6f}; no job was submitted")
     return CloudPreflight(
@@ -188,7 +188,7 @@ def job_status(job_id: str) -> dict:
     job_id = validate_job_id(job_id)
     record = HttpClient(get_config()).get_job(job_id)
     if not isinstance(record, dict):
-        raise WebError("service job status response was not an object", job_id=job_id)
+        raise CloudError("service job status response was not an object", job_id=job_id)
     return _normalise_job_costs(record)
 
 
@@ -196,7 +196,7 @@ def gpus() -> list:
     """The curated menu of GPUs you can run on, each a dict like
     ``{"id": "mi300x", "vendor": "AMD", "arch": "gfx942",
     "gpu_mem_gb": 192}``. Pass an id to
-    ``ph.web.run(sim, device="gpu:<id>")``;
+    ``ph.cloud.run(sim, device="gpu:<id>")``;
     bare ``device="gpu"`` lets the platform pick a default. The platform manages
     which providers back each entry — that stays an internal detail."""
     return HttpClient(get_config()).list_gpus()

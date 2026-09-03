@@ -1123,7 +1123,7 @@ def assert_modal_ports_ready(sim) -> None:
     total_cell_frames = 0
     if hasattr(sim, "grid"):
         from ..components.monitors import mode_port_trial_modes
-        from ..plugins.yee_mode import window_nodes
+        from ..analysis.yee_mode import window_nodes
         for monitor, recipe, axis in entries:
             h_nodes, _, _, v_nodes, _, _ = window_nodes(
                 sim, axis,
@@ -1213,9 +1213,9 @@ def modal_port_results(data: RunResult) -> dict:
     """
     from ..components.sources import ModeSource
     from ..components.grid import snap_mixed_plane
-    from ..plugins.mode_devices import ModeMonitor
-    from ..plugins.smatrix import SPort, smatrix
-    from ..plugins.yee_mode import solve_yee_port_mode_bank
+    from ..analysis.mode_devices import ModeMonitor
+    from ..analysis.smatrix import SPort, smatrix
+    from ..analysis.yee_mode import solve_yee_port_mode_bank
     from . import _geometry as geom
 
     sim = sim_for(data)
@@ -1712,8 +1712,8 @@ def solve_mode_source(sim, source_index: int, settings: dict):
     from ..components.source_time import GaussianPulse
     from ..components.grid import (graded_primary_spacings,
                                    realized_cells, sim_axis_min_cells)
-    from ..plugins.mode_devices import mode_launch
-    from ..plugins.yee_mode import (
+    from ..analysis.mode_devices import mode_launch
+    from ..analysis.yee_mode import (
         solve_yee_mode,
         solve_yee_mode_bank,
         window_nodes,

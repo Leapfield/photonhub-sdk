@@ -29,7 +29,7 @@ def render_slice(sim, axis: str, value: float, *, eps: bool = True,
     analytic scene (``eps=False``) at ``axis=value``, optionally with the grid
     overlay. Returns the matplotlib ``Axes`` (pure — no widgets)."""
     if eps:
-        return sim.plot_eps(**{axis: value}, ax=ax, grid=grid)
+        return sim.plot_index(**{axis: value}, ax=ax, grid=grid)
     return sim.plot(**{axis: value}, ax=ax, grid=grid)
 
 

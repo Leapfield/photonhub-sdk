@@ -290,7 +290,7 @@ def solve_mode_on_cross_section(
     default reference-mode builder for both launch and readout.
 
     ``use_yee`` (default **True**) solves the **engine-consistent discrete-Yee**
-    eigenmode (:func:`~photonhub.plugins.yee_mode.solve_yee_mode`): the mode on the FDTD's
+    eigenmode (:func:`~photonhub.analysis.yee_mode.solve_yee_mode`): the mode on the FDTD's
     own Yee-staggered grid, so source and readout match the propagated field's
     discretization exactly (the discrete form of that projection).
     ``use_yee=False`` falls back to the node-collocated Fallahkhair–Li–Murphy
@@ -300,7 +300,7 @@ def solve_mode_on_cross_section(
 
     Symmetry: the Yee path honors ``sim.symmetry`` §20 planes AUTOMATICALLY
     (window clipped at the plane + the matching parity BC; see
-    :func:`~photonhub.plugins.yee_mode.window_min_face_bcs`) — nothing to pass.
+    :func:`~photonhub.analysis.yee_mode.window_min_face_bcs`) — nothing to pass.
     ``x_symmetry`` is the FLM path's MANUAL width-axis wall control only
     (``"none"`` = electric walls, ``"pmc"`` = magnetic; it is NOT read from
     the sim and does not affect the Yee path).
@@ -394,7 +394,7 @@ def mode_bank_on_cross_section(
     the material AND waveguide dispersion land in the per-λ modes.
 
     ``use_yee`` (default **True**) uses the **engine-consistent discrete-Yee** solver
-    (:func:`~photonhub.plugins.yee_mode.solve_yee_mode_bank`) so the readout reference mode
+    (:func:`~photonhub.analysis.yee_mode.solve_yee_mode_bank`) so the readout reference mode
     matches the FDTD field's discretization at every λ — the same operator the launch
     used. ``use_yee=False`` re-solves via the node-collocated FLM
     :meth:`VectorModeSolver.at_wavelength` (the prior default; kept for A/B)."""

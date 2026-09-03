@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "photonhub"
-version = "0.1.1"
+version = "0.1.2"
 description = "Python client for the PhotonHub GPU FDTD photonics solver"
 readme = "README.md"
 # 3.11 floor: the floor CI exercises is 3.12, and on 3.10 the resolver falls
@@ -29,7 +29,7 @@ dependencies = [
     "xarray",
     "matplotlib",
     # CA fallback for interpreters whose default SSL context has no roots
-    # (photonhub.web._https_context); never used when the OS store works.
+    # (photonhub.cloud._https_context); never used when the OS store works.
     "certifi",
 ]
 

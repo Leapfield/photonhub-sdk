@@ -2,7 +2,7 @@
 
 Replaces the §18 single-scalar-aux-carrier mode launch with the textbook
 equivalence-current pair built from the engine's own discrete Yee eigenmode
-(:func:`~photonhub.plugins.yee_mode.solve_yee_mode`):
+(:func:`~photonhub.analysis.yee_mode.solve_yee_mode`):
 
     J = n̂ × H_mode   stamped as electric dipoles at the E Yee points of plane k0
     M = −n̂ × E_mode  stamped as magnetic dipoles at the H Yee points half a cell

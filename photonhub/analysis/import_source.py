@@ -4,16 +4,16 @@ Any transverse field map — from another solver, an analytic model, a
 measurement, or a previous run — becomes an excitation by
 resampling it onto the simulation's Yee injection plane and stamping the
 per-cell equivalence-current sheet
-(:func:`~photonhub.plugins.eq_current_source.equivalence_current_source`,
+(:func:`~photonhub.analysis.eq_current_source.equivalence_current_source`,
 ``J = n̂ × H``, ``M = -n̂ × E``), the same machinery behind
-:func:`~photonhub.plugins.mode_devices.mode_launch` and
-:func:`~photonhub.plugins.gaussian_beam.gaussian_beam_source`.
+:func:`~photonhub.analysis.mode_devices.mode_launch` and
+:func:`~photonhub.analysis.gaussian_beam.gaussian_beam_source`.
 
 Two layers, mirroring the Gaussian-beam plugin:
 
 * :func:`import_field` — resample the user arrays onto the plane's true Yee
   sample locations and package them as a ``yee_staggered``
-  :class:`~photonhub.plugins.vector_modes.VectorMode` (also usable as a
+  :class:`~photonhub.analysis.vector_modes.VectorMode` (also usable as a
   monitor/overlap reference);
 * :func:`import_source` — that plus the sheet, returning the ``PointDipole``
   list for ``Simulation.sources``.
@@ -180,8 +180,8 @@ def import_field(
     VectorMode
         ``yee_staggered``, six components on the window (``e_a = h_a = 0``),
         transverse-E jointly L2-normalized, ready for
-        :func:`~photonhub.plugins.eq_current_source.equivalence_current_source`,
-        :func:`~photonhub.plugins.mode_devices.mode_monitor`, or overlaps.
+        :func:`~photonhub.analysis.eq_current_source.equivalence_current_source`,
+        :func:`~photonhub.analysis.mode_devices.mode_monitor`, or overlaps.
     """
     if axis not in _AXES:
         raise ValueError(f"axis must be one of x/y/z, got {axis!r}")

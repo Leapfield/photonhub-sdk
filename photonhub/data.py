@@ -852,7 +852,7 @@ class RunResult:
            colocating/destaggering them gives a systematically wrong answer
            (this exact mistake once mis-diagnosed a mode-launch 'reflection'
            that modal projection showed was 30x smaller). Use the
-           colocation/destagger handling in ``photonhub.plugins.mode_overlap``
+           colocation/destagger handling in ``photonhub.analysis.mode_overlap``
            (what ``mode_devices``' ``mode_power(..., colocate=True,
            destagger_dl=dl)`` applies) — or a flux monitor, which the engine
            computes on the staggered grid correctly — before hand-computing

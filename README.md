@@ -16,7 +16,7 @@ python -m pip install photonhub
 (From a monorepo checkout: `python -m pip install -e ./photonhub`.)
 
 That installs the full scripting client: build simulations, estimate cost,
-run on the **cloud GPU** (`ph.web.run_quoted(sim, max_usd=...)` with your beta
+run on the **cloud GPU** (`ph.cloud.run_quoted(sim, max_usd=...)` with your beta
 API key), and read results — no compiler, no engine build. **Local** runs
 (`ph.run_local`) also need the `phsolver` engine binary, which pip does not
 ship: invited beta participants receive the standalone headless solver
@@ -75,7 +75,7 @@ for 3D). `grid=True` overlays the Yee cell edges so you can check resolution:
 
 ```python
 sim.plot(z=2.0)                   # scene cross-section through the source
-sim.plot_eps(z=2.0, grid=True)    # rasterized ε + the Yee mesh overlay
+sim.plot_index(z=2.0, grid=True)    # rasterized ε + the Yee mesh overlay
 sim.plot_3d()                     # interactive 3D  (pip install photonhub[viz])
 ```
 
@@ -117,20 +117,20 @@ MVP):
   so an unevaluable S-column is rejected before the time-domain run.
 - **Component library:** `ph.library.straight / bend / taper / crossing /
   coupler / ring` — each returns a `Component` (structures + ports) in ~one line.
-- **Material library:** `ph.materials` — 20 literature materials (cSi, SiO2,
+- **Material library:** `ph.materials` — 20 literature materials (Si, SiO2,
   Si3N4, GaAs, InP, Ge, LiNbO3, sapphire, AlN, TiO2, MgF2, CaF2, PMMA, ...)
-  with cited dispersion data and validity ranges. `cSi.medium(1.55)` freezes
-  the index at one wavelength; `cSi.medium(band_um=(1.5, 1.6))` least-squares
+  with cited dispersion data and validity ranges. `Si.medium(1.55)` freezes
+  the index at one wavelength; `Si.medium(band_um=(1.5, 1.6))` least-squares
   fits the engine's single Lorentz pole over the band (Courant-safe pole
   placement, ≤1e-4 index error over 100 nm). Bring measured ellipsometry data
   via `materials.Material.from_nk_data(...)`.
-- **Mode-resolved transmission:** the recommended `photonhub.plugins` pipeline —
+- **Mode-resolved transmission:** the recommended `photonhub.analysis` pipeline —
   `solve_yee_mode` → `mode_launch` → `mode_monitor` →
   `transmission(out, in, data)` — returns `{freq_hz: T}`. Use
   `solve_yee_mode_bank` / `solve_modes_by_freq` for a broadband launch and readout;
   the legacy `ModeSolver` / `mode_source` path remains for scalar and adjoint
   compatibility. Full complex multiport S-matrices:
-  `plugins.smatrix` (`SPort` + `assemble_smatrix`, one run per driven port —
+  `analysis.smatrix` (`SPort` + `assemble_smatrix`, one run per driven port —
   a multi-port S-parameter driver).
 - **Meshing:** `UniformMesh`, or `GradedMesh` + `auto_mesh` for a
   cells-per-λ graded mesh; `MeshOverride` (a per-structure mesh override) forces
@@ -142,7 +142,7 @@ MVP):
 - **Mode solving:** the FDE plugins provide the lightweight semi-vectorial
   `ModeSolver` and the full-vector `VectorModeSolver`, including bent/leaky
   modes with complex `n_eff` and bend-loss readout.
-- **Visualization:** `Simulation.plot` / `plot_eps` (draws Box / Sphere /
+- **Visualization:** `Simulation.plot` / `plot_index` (draws Box / Sphere /
   Cylinder / Polygon; `grid=True` overlays the Yee mesh) / `plot_3d`,
   `RunResult.plot_field`, and the module-level `photonhub.viz.plot_mode`
   (FDE mode heatmap) and `photonhub.viz.plot_spectrum` (`T` vs λ).
@@ -168,12 +168,12 @@ plus the silicon-PIC MVP:
   subpixel + Lorentz runs are supported and equivalence-tested, but the client
   keeps their construction default off and warns callers to use the stabilized
   PML profile.
-- S-matrix assembly (`plugins.smatrix`) costs **one simulation per driven
+- S-matrix assembly (`analysis.smatrix`) costs **one simulation per driven
   port** — there is no single-run multiport solve.
 
 Net: shapes go in and **mode-resolved transmission** comes out — solve the
 eigenmode, inject it with `mode_launch`, ratio two `mode_monitor` planes, and plot
-`T(λ)`; or assemble the full S-matrix with `plugins.smatrix`.
+`T(λ)`; or assemble the full S-matrix with `analysis.smatrix`.
 
 ## Learn more
 

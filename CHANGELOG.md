@@ -3,7 +3,7 @@
 All notable changes to the published SDK. Dates are release dates on PyPI.
 The desktop application and the solver engine share this version number.
 
-## Unreleased
+## 0.1.2 — 2026-09-02
 
 - **Public API renamed** to cross-solver vocabulary. The wire schema is
   unchanged, and every old name remains importable as a deprecated alias that
@@ -19,6 +19,15 @@ The desktop application and the solver engine share this version number.
   `GradedGridSpec` (now `GradedMesh`), `GradedAxisCoords` (now
   `GradedMeshAxis`), `auto_grid` (now `auto_mesh`), and
   `Simulation.with_auto_grid` (now `with_auto_mesh`).
+- **Module and helper names renamed** in the same spirit, with the same
+  deprecated-alias policy: the cloud client `photonhub.web` (now
+  `photonhub.cloud`, so `ph.cloud.run(sim)`; `WebConfig`/`WebError`/
+  `WebJobTimeout` now `CloudConfig`/`CloudError`/`CloudJobTimeout`), the
+  analysis package `photonhub.plugins` (now `photonhub.analysis`; old
+  submodule paths such as `photonhub.plugins.resonance` keep importing),
+  `Simulation.plot_eps` and `viz.plot_eps` (now `plot_index`), the built-in
+  material `materials.cSi` (now `materials.Si`; `materials.get("cSi")` still
+  resolves), and the S-matrix driver's `runner="web"` (now `runner="cloud"`).
 - Actionable errors when a `Material`/`Medium` is used as the background;
   `sources=()` shell simulations accepted at the model level (the engine still
   requires a source to run); HDF5 export extra; `run_async`/`Batch.run` accept

@@ -1,80 +1,26 @@
-"""Cloud client for the PhotonHub metered compute API.
+"""Deprecated alias for :mod:`photonhub.cloud` (renamed 2026-09; removed in 0.2)."""
 
-Reads identically to the local path — same ``Job`` / ``RunResult`` /
-``SolverRunError`` — only the namespace differs:
+import importlib as _importlib
+import pkgutil as _pkgutil
+import sys as _sys
+import warnings as _warnings
 
->>> import photonhub as ph
->>> ph.web.configure(api_key="ph_live_...", url="https://<api-host>")
->>> job = ph.web.submit_quoted(sim, max_usd=5.00)
->>> data = job.result()             # RunResult, same as local
->>> probe = data["probe"]           # xarray.DataArray
-"""
-
-from .actions import (
-    CloudPreflight,
-    account,
-    cancel,
-    create_api_key,
-    estimate,
-    gpus,
-    job_status,
-    list_jobs,
-    preflight,
-    whoami,
-)
-from .batch import Batch
-from .client import HttpClient
-from .config import WebConfig, WebError, configure, get_config, reset
-from .run import (
-    WebJobTimeout,
-    resume,
-    run,
-    submit,
-    run_quoted,
-    submit_quoted,
+_warnings.warn(
+    "photonhub.web was renamed to photonhub.cloud; the old module path will be "
+    "removed in a future release.",
+    DeprecationWarning,
+    stacklevel=2,
 )
 
-__all__ = [
-    "configure",
-    "get_config",
-    "reset",
-    "WebConfig",
-    "WebError",
-    "CloudPreflight",
-    "HttpClient",
-    "run",
-    "submit",
-    "run_quoted",
-    "submit_quoted",
-    "resume",
-    "WebJobTimeout",
-    "Batch",
-    "estimate",
-    "preflight",
-    "account",
-    "whoami",
-    "create_api_key",
-    "cancel",
-    "gpus",
-    "list_jobs",
-    "job_status",
-]
+from .. import cloud as _cloud  # noqa: E402
+from ..cloud import *  # noqa: E402,F401,F403
 
+__all__ = list(_cloud.__all__) + ["WebConfig", "WebError", "WebJobTimeout"]
+WebConfig = _cloud.CloudConfig
+WebError = _cloud.CloudError
+WebJobTimeout = _cloud.CloudJobTimeout
 
-# --- deprecated aliases (2026-09 cross-solver rename; remove in 0.2) ---------
-_RENAMED = {"run_async": "submit", "run_quoted_async": "submit_quoted"}
-
-
-def __getattr__(name):
-    replacement = _RENAMED.get(name)
-    if replacement is not None:
-        import warnings
-
-        warnings.warn(
-            f"photonhub.web.{name} was renamed to photonhub.web.{replacement}; "
-            "the old alias will be removed in a future release.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return globals()[replacement]
-    raise AttributeError(f"module 'photonhub.web' has no attribute {name!r}")
+for _m in _pkgutil.iter_modules(_cloud.__path__):
+    _sys.modules[f"{__name__}.{_m.name}"] = _importlib.import_module(
+        f"{_cloud.__name__}.{_m.name}"
+    )

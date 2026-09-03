@@ -56,8 +56,8 @@ from .runners import (
     submit,
     run_local,
 )
-from . import web
-from .web import gpus  # convenience: ph.gpus() == ph.web.gpus() (the GPU menu)
+from . import cloud
+from .cloud import gpus  # convenience: ph.gpus() == ph.cloud.gpus() (the GPU menu)
 from . import inverse_design
 from .inverse_design import (
     DesignRegion,
@@ -72,7 +72,7 @@ from .inverse_design import (
     value_and_gradient,
 )
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = [
     "Apodization",
@@ -111,7 +111,7 @@ __all__ = [
     "RunSpec",
     "SCHEMA_VERSION",
     "Simulation",
-    "web",
+    "cloud",
     "RunResult",
     "SolverRunError",
     "Sphere",
@@ -145,6 +145,7 @@ __all__ = [
 
 # --- deprecated aliases (2026-09 cross-solver rename; remove in 0.2) ---------
 _RENAMED = {
+    "web": "cloud",
     "PolySlab": "Polygon",
     "FluxMonitor": "PowerMonitor",
     "FieldTimeMonitor": "TimeMonitor",

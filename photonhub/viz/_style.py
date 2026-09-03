@@ -223,7 +223,7 @@ def has_pml(sim) -> bool:
 def draw_grid(ax, sim, axis: str) -> None:
     """Overlay the realized primary-grid cell edges on a 2D cut so mesh
     resolution can be eyeballed against the geometry (the ``grid=True`` flag on
-    ``plot`` / ``plot_eps``). Uses the SAME node coordinates the solver meshes —
+    ``plot`` / ``plot_index``). Uses the SAME node coordinates the solver meshes —
     a uniform ``n*dl`` ladder or the graded cell edges — so the spacing shown is
     exactly what will run. Lines span the realized domain."""
     from .eps import axis_nodes_um  # lazy: eps imports _style (avoid a cycle)

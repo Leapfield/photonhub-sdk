@@ -1,7 +1,7 @@
 """Full-vectorial finite-difference eigenmode (FDE) solver — CPU only.
 
 This is the **full-vector** companion to the frozen semi-vectorial
-:mod:`photonhub.plugins.modes`. Where that solver carries a single dominant
+:mod:`photonhub.analysis.modes`. Where that solver carries a single dominant
 transverse field component (Ex-major quasi-TE / Ey-major quasi-TM) and drops the
 operator that couples the two transverse fields, this one solves the **coupled
 transverse-magnetic-field eigenproblem** — keeping the vectorial coupling — so
@@ -132,7 +132,7 @@ the solve cost.
 Public API
 ==========
 * ``VectorModeSolver(eps, dl_x_um, dl_y_um, wavelength_um)`` — same raw-eps
-  validation as :class:`photonhub.plugins.modes.ModeSolver`.
+  validation as :class:`photonhub.analysis.modes.ModeSolver`.
 * ``VectorModeSolver.from_rectangular_core(...)`` — the centered-rectangular-core
   rasterizer (mirrors the semi-vec), plus ``x_symmetry`` for the slab limit.
 * ``VectorModeSolver.solve(num_modes=1, n_guess=None, group_index=False,
@@ -177,7 +177,7 @@ try:  # scipy is a hard dependency of the full-vector solver (sparse eigensolve)
     import scipy.sparse.linalg as _spla
 except ImportError as exc:  # pragma: no cover - exercised only without scipy
     raise ImportError(
-        "photonhub.plugins.vector_modes requires scipy (sparse matrices + "
+        "photonhub.analysis.vector_modes requires scipy (sparse matrices + "
         "shift-invert eigensolve). Install scipy >= 1.10 to use VectorModeSolver."
     ) from exc
 
@@ -298,7 +298,7 @@ def _yblock(xcoeff_fn, q1, q2, q3, q4, n, s, e, w, k):
 
 def _odd(n: int) -> int:
     """Smallest odd integer ``>= n`` (cell-count helper so a cell center sits on
-    the cross-section origin — mirrors :mod:`photonhub.plugins.modes`)."""
+    the cross-section origin — mirrors :mod:`photonhub.analysis.modes`)."""
     return n if n % 2 == 1 else n + 1
 
 
@@ -409,7 +409,7 @@ class VectorMode:
     #: (``solve_mode_on_cross_section``): the exact solve kwargs MINUS the
     #: wavelength, so a consumer can re-solve the SAME mode identity (same
     #: window/pol/index/solver) at other frequencies —
-    #: :class:`~photonhub.plugins.mode_devices.ModeMonitor` uses it to build its
+    #: :class:`~photonhub.analysis.mode_devices.ModeMonitor` uses it to build its
     #: automatic per-frequency readout bank. ``None`` for hand-built solver
     #: modes (no auto-bank) and for dispatcher solves given an ``eps_of_medium``
     #: override (id-keyed, not replayable).
@@ -513,7 +513,7 @@ class VectorMode:
     def _node_coords_um(self) -> Tuple[np.ndarray, np.ndarray]:
         """Real-space ``(xs, ys)`` node coordinates in microns, RELATIVE to the
         requested mode centre — the SAME reconstruction
-        :func:`~photonhub.plugins.mode_overlap.vector_modal_fields` uses, so this
+        :func:`~photonhub.analysis.mode_overlap.vector_modal_fields` uses, so this
         class reports the coordinates its own overlap consumers place it at.
 
         Prefers the carried graded node ladders (:attr:`x_coords_um` /
@@ -645,8 +645,8 @@ class VectorModeSolver:
         :meth:`from_rectangular_core`).
     """
 
-    #: Speed of light in vacuum (m/s), matching :mod:`photonhub.plugins.modes`.
-    C0: float = _C0  # speed of light (m/s), shared plugins._constants value
+    #: Speed of light in vacuum (m/s), matching :mod:`photonhub.analysis.modes`.
+    C0: float = _C0  # speed of light (m/s), shared analysis._constants value
 
     #: Hard cap on ``N = nx*ny`` (the eigenproblem is ``2N``). The sparse
     #: shift-invert solve is far lighter than the semi-vec's dense path, so the
@@ -748,7 +748,7 @@ class VectorModeSolver:
 
         Rasterizes the canonical strip-waveguide cross-section onto a *square*
         uniform grid of spacing ``dl_um`` (the same rasterization as
-        :meth:`photonhub.plugins.modes.ModeSolver.from_rectangular_core`, so the
+        :meth:`photonhub.analysis.modes.ModeSolver.from_rectangular_core`, so the
         full-vector and semi-vec solvers are drop-in comparable).
 
         Parameters

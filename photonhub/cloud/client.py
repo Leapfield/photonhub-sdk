@@ -2,7 +2,7 @@
 CA-bundle fallback for root-less interpreters).
 
 Bearer-authenticated JSON requests with capped-backoff retry on 5xx/network
-errors (idempotent GETs). 4xx errors raise immediately as ``WebError`` carrying
+errors (idempotent GETs). 4xx errors raise immediately as ``CloudError`` carrying
 the parsed ``detail``. ``urllib`` transparently follows the 302 that the result
 endpoint returns in prod (to a signed object-store URL).
 """
@@ -21,7 +21,7 @@ import urllib.request
 from typing import Any, Optional
 
 from ._ids import validate_job_id
-from .config import WebConfig, WebError
+from .config import CloudConfig, CloudError
 
 _RETRIES = 3
 _DOWNLOAD_CHUNK = 1024 * 1024
@@ -73,7 +73,7 @@ def _parse_detail(body: str) -> Any:
 
 
 class HttpClient:
-    def __init__(self, cfg: WebConfig):
+    def __init__(self, cfg: CloudConfig):
         self.cfg = cfg
 
     def _open(self, method: str, path: str, *, body: Optional[dict] = None,
@@ -123,15 +123,15 @@ class HttpClient:
                     last = e
                     self._retry_sleep(0.5 * (attempt + 1), deadline)
                     continue
-                raise WebError(f"{method} {path} -> HTTP {e.code}",
+                raise CloudError(f"{method} {path} -> HTTP {e.code}",
                                status_code=e.code, body=detail)
             except urllib.error.URLError as e:
                 last = e
                 if attempt < max_attempts - 1:
                     self._retry_sleep(0.5 * (attempt + 1), deadline)
                     continue
-                raise WebError(f"{method} {path} failed: {e.reason}")
-        raise WebError(f"{method} {path} failed after retries: {last}")
+                raise CloudError(f"{method} {path} failed: {e.reason}")
+        raise CloudError(f"{method} {path} failed after retries: {last}")
 
     @staticmethod
     def _retry_sleep(delay: float, deadline: Optional[float]) -> None:
@@ -152,12 +152,12 @@ class HttpClient:
             with self._open("GET", path, deadline=deadline) as response:
                 raw = self._read_limited(
                     response, path, _MAX_JSON_BODY_BYTES, method="GET")
-        except WebError:
+        except CloudError:
             raise
         except TimeoutError:
             raise
         except (OSError, http.client.HTTPException) as exc:
-            raise WebError(f"GET {path} failed while reading: {exc}") from exc
+            raise CloudError(f"GET {path} failed while reading: {exc}") from exc
         return self._decode_json(raw, f"GET {path}")
 
     def post_json(self, path: str, body: dict) -> dict:
@@ -165,10 +165,10 @@ class HttpClient:
             with self._open("POST", path, body=body) as response:
                 raw = self._read_limited(
                     response, path, _MAX_JSON_BODY_BYTES, method="POST")
-        except WebError:
+        except CloudError:
             raise
         except (OSError, http.client.HTTPException) as exc:
-            raise WebError(f"POST {path} failed while reading: {exc}") from exc
+            raise CloudError(f"POST {path} failed while reading: {exc}") from exc
         return self._decode_json(raw, f"POST {path}")
 
     def delete(self, path: str) -> int:
@@ -184,10 +184,10 @@ class HttpClient:
         try:
             size = int(raw)
         except (TypeError, ValueError) as exc:
-            raise WebError(
+            raise CloudError(
                 f"GET {path} returned an invalid Content-Length") from exc
         if size < 0:
-            raise WebError(f"GET {path} returned an invalid Content-Length")
+            raise CloudError(f"GET {path} returned an invalid Content-Length")
         return size
 
     @staticmethod
@@ -201,7 +201,7 @@ class HttpClient:
                       method: str = "GET") -> bytes:
         declared = self._content_length(response, path)
         if declared is not None and declared > limit:
-            raise WebError(
+            raise CloudError(
                 f"{method} {path} exceeds the {limit}-byte response limit")
         output = io.BytesIO()
         total = 0
@@ -209,13 +209,13 @@ class HttpClient:
             chunk = response.read(min(_DOWNLOAD_CHUNK, limit - total + 1))
             if not chunk:
                 if declared is not None and total != declared:
-                    raise WebError(
+                    raise CloudError(
                         f"{method} {path} ended after {total} bytes; "
                         f"Content-Length declared {declared}")
                 return output.getvalue()
             total += len(chunk)
             if total > limit:
-                raise WebError(
+                raise CloudError(
                     f"{method} {path} exceeds the {limit}-byte response limit")
             output.write(chunk)
 
@@ -224,9 +224,9 @@ class HttpClient:
         try:
             value = json.loads(raw)
         except (UnicodeDecodeError, ValueError, RecursionError) as exc:
-            raise WebError(f"{operation} returned invalid JSON") from exc
+            raise CloudError(f"{operation} returned invalid JSON") from exc
         if not isinstance(value, dict):
-            raise WebError(f"{operation} returned a non-object JSON response")
+            raise CloudError(f"{operation} returned a non-object JSON response")
         return value
 
     def get_bytes(self, path: str, *, max_bytes: Optional[int] = None) -> bytes:
@@ -241,10 +241,10 @@ class HttpClient:
         try:
             with self._open("GET", path) as response:
                 return self._read_limited(response, path, limit)
-        except WebError:
+        except CloudError:
             raise
         except (OSError, http.client.HTTPException) as exc:
-            raise WebError(f"GET {path} failed while reading: {exc}") from exc
+            raise CloudError(f"GET {path} failed while reading: {exc}") from exc
 
     def get_to_file(self, path: str, dest, *,
                     max_bytes: Optional[int] = None) -> int:
@@ -260,7 +260,7 @@ class HttpClient:
             with self._open("GET", path) as response:
                 declared = self._content_length(response, path)
                 if declared is not None and declared > limit:
-                    raise WebError(
+                    raise CloudError(
                         f"GET {path} exceeds the {limit}-byte download limit")
                 total = 0
                 with dest.open("wb") as output:
@@ -269,13 +269,13 @@ class HttpClient:
                             min(_DOWNLOAD_CHUNK, limit - total + 1))
                         if not chunk:
                             if declared is not None and total != declared:
-                                raise WebError(
+                                raise CloudError(
                                     f"GET {path} ended after {total} bytes; "
                                     f"Content-Length declared {declared}")
                             return total
                         total += len(chunk)
                         if total > limit:
-                            raise WebError(
+                            raise CloudError(
                                 f"GET {path} exceeds the {limit}-byte "
                                 "download limit")
                         output.write(chunk)
@@ -284,7 +284,7 @@ class HttpClient:
                 dest.unlink()
             except FileNotFoundError:
                 pass
-            raise WebError(f"GET {path} failed while reading: {exc}") from exc
+            raise CloudError(f"GET {path} failed while reading: {exc}") from exc
         except BaseException:
             try:
                 dest.unlink()
@@ -319,7 +319,7 @@ class HttpClient:
         jobs = payload.get("jobs")
         if (not isinstance(jobs, list)
                 or any(not isinstance(record, dict) for record in jobs)):
-            raise WebError("GET /v1/jobs returned an invalid 'jobs' list")
+            raise CloudError("GET /v1/jobs returned an invalid 'jobs' list")
         return jobs
 
     def submit_job(self, spec: dict, *, name=None, device=None,

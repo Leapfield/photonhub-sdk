@@ -77,7 +77,7 @@ print("output monitors:", list(built.out_monitors))
 
 _GEOMETRY = r'''
 z = built.meta["size_um"][2] / 2
-ax = built.sim.plot_eps(z=z)
+ax = built.sim.plot_index(z=z)
 ax.set_title(f"{spec.name}: simulation geometry")
 plt.show()
 '''

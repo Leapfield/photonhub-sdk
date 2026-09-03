@@ -20,7 +20,7 @@ before public disclosure. There is no bug-bounty programme during the beta.
 
 ## Scope notes
 
-- The SDK never contacts the network unless you call `photonhub.web`; the
+- The SDK never contacts the network unless you call `photonhub.cloud`; the
   desktop application contacts only the beta identity service and, for
   cloud-entitled accounts, the cloud API.
 - The desktop application contains no automatic updater; install only signed

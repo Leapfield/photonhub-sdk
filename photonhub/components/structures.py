@@ -391,7 +391,7 @@ class Structure(FrozenModel):
                 ".medium(wavelength_um=...) for a constant index at one "
                 "wavelength, or .medium(band_um=(lo, hi)) for a dispersive "
                 "fit over a band (e.g. "
-                "ph.materials.cSi.medium(band_um=(1.5, 1.6)))")
+                "ph.materials.Si.medium(band_um=(1.5, 1.6)))")
         return v
 
     @model_validator(mode="after")

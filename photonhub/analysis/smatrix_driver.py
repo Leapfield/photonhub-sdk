@@ -1,6 +1,6 @@
 """One-call multiport S-matrix extraction — plan, run, assemble, export.
 
-This is the automation layer over :mod:`photonhub.plugins.smatrix` (the
+This is the automation layer over :mod:`photonhub.analysis.smatrix` (the
 per-column assembler): a modal multi-port
 S-parameter matrix sweep. You declare
 the device once (a :class:`~photonhub.components.simulation.Simulation` whose
@@ -8,15 +8,15 @@ sources are placeholders) and the N ports once (plane + outgoing direction +
 mode channel); the driver then
 
 1. solves each port's per-frequency Yee mode bank on the ACTUAL simulation
-   cross-section (:func:`~photonhub.plugins.yee_mode.solve_yee_mode_bank` — the
+   cross-section (:func:`~photonhub.analysis.yee_mode.solve_yee_mode_bank` — the
    same discrete operator the launch and readout use),
-2. builds one :class:`~photonhub.plugins.mode_devices.ModeMonitor` per port and
+2. builds one :class:`~photonhub.analysis.mode_devices.ModeMonitor` per port and
    one driven simulation per port (the port's mode launched INTO the device
    from just outside the port plane, all port monitors recording),
 3. runs them — locally in a :class:`~photonhub.runners.batch.Batch`, on the
-   cloud via ``ph.web.Batch``, or through any callable you inject,
+   cloud via ``ph.cloud.Batch``, or through any callable you inject,
 4. assembles the columns into the full S-matrix
-   (:func:`~photonhub.plugins.smatrix.assemble_smatrix`) with reciprocity /
+   (:func:`~photonhub.analysis.smatrix.assemble_smatrix`) with reciprocity /
    passivity checks attached, and
 5. exports Touchstone (:func:`write_touchstone`) for circuit tools.
 
@@ -29,12 +29,12 @@ drop down a layer at any point.
 Port geometry convention
 ========================
 ``SMatrixPort.position_um`` is the PORT PLANE (where S is referenced — the
-:class:`~photonhub.plugins.smatrix.SPort` monitor plane). The mode source for
+:class:`~photonhub.analysis.smatrix.SPort` monitor plane). The mode source for
 that port's drive is placed ``source_offset_um`` OUTSIDE the port plane (toward
 the domain wall, in the port's ``out_direction``) and launched INWARD, so the
 port monitor sits on the total-field side of its own source and records
 incident + reflected when driven — exactly the arrangement
-:func:`~photonhub.plugins.smatrix.smatrix` expects for ``S_jj``.
+:func:`~photonhub.analysis.smatrix.smatrix` expects for ``S_jj``.
 
 What's not handled (deferred, matching :mod:`.smatrix`)
 =======================================================
@@ -102,14 +102,14 @@ class SMatrixPort:
     half_w_um / half_v_um:
         Half-extents of the mode-solve window in the plane's natural
         (horizontal, vertical) in-plane axes — same meaning as
-        :func:`~photonhub.plugins.yee_mode.solve_yee_mode`. Choose them wide
+        :func:`~photonhub.analysis.yee_mode.solve_yee_mode`. Choose them wide
         enough that the guided mode's evanescent tail dies inside the window.
     polarization / mode_index:
         The mode channel, counted WITHIN the TE/TM family ('TE', 0 = TE0).
     center_um:
         Transverse waveguide location as (horizontal, vertical) in-plane
         coordinates; ``None`` = the domain centre (matching
-        :func:`~photonhub.plugins.mode_devices.mode_launch`).
+        :func:`~photonhub.analysis.mode_devices.mode_launch`).
     dl_um:
         Mode-solve transverse step; ``None`` = the simulation grid's ``dl_um``.
     source_offset_um:
@@ -214,7 +214,7 @@ class SMatrixResult:
     """The assembled S-matrix plus everything needed to audit it.
 
     ``S`` is the complex :class:`xarray.DataArray` from
-    :func:`~photonhub.plugins.smatrix.assemble_smatrix` — dims
+    :func:`~photonhub.analysis.smatrix.assemble_smatrix` — dims
     ``(port_out, port_in, f)``, ``|S_ij|^2`` a power ratio. ``data`` maps each
     DRIVEN port name to its run's ``RunResult``; ``errors`` carries
     per-drive failures when ``allow_partial=True`` let the assembly proceed
@@ -230,7 +230,7 @@ class SMatrixResult:
         """``S_ij(f)`` as a 1-D complex xarray slice."""
         return self.S.sel(port_out=port_out, port_in=port_in)
 
-    # -- checks (delegates to plugins.smatrix) -------------------------------
+    # -- checks (delegates to analysis.smatrix) -------------------------------
     def reciprocity_error(self) -> float:
         return reciprocity_error(self.S)
 
@@ -307,7 +307,7 @@ class SMatrixPlan:
             ``"local"`` (default) runs through
             :class:`~photonhub.runners.batch.Batch` (``path_dir`` /
             ``max_workers`` / ``solver_path`` / ``timeout`` / ``progress``
-            forwarded); ``"web"`` submits via ``ph.web.Batch``
+            forwarded); ``"cloud"`` (or the deprecated ``"web"``) submits via ``ph.cloud.Batch``
             (``max_workers`` and extra kwargs such as ``device=`` forwarded;
             ``path_dir`` is not a web concept and must be None). Any other
             callable is invoked as ``runner(simulations_dict)`` and must
@@ -315,7 +315,7 @@ class SMatrixPlan:
             ``name -> DataArray`` mapping per run) — the injection point for
             custom backends and tests.
         colocate:
-            Forwarded to :func:`~photonhub.plugins.smatrix.smatrix` — keep True
+            Forwarded to :func:`~photonhub.analysis.smatrix.smatrix` — keep True
             for real (Yee-staggered) engine output.
         allow_partial:
             When some drives fail: False (default) raises with the per-drive
@@ -332,18 +332,18 @@ class SMatrixPlan:
                                  **runner_kwargs)
             results = {name: bd[name] for name in bd.succeeded}
             errors = dict(bd.errors)
-        elif runner == "web":
+        elif runner in ("cloud", "web"):
             if path_dir is not None:
                 raise ValueError(
                     "path_dir applies to the local runner only; the web "
                     "backend manages its own artifact storage")
-            from .. import web
-            bd = web.Batch(sims).run(max_workers=max_workers, **runner_kwargs)
+            from .. import cloud
+            bd = cloud.Batch(sims).run(max_workers=max_workers, **runner_kwargs)
             results = {name: bd[name] for name in bd.succeeded}
             errors = dict(bd.errors)
         else:
             raise ValueError(
-                f"runner must be 'local', 'web', or a callable, got {runner!r}")
+                f"runner must be 'local', 'cloud', or a callable, got {runner!r}")
 
         missing = [n for n in sims if n not in results]
         for n in missing:
@@ -395,7 +395,7 @@ def plan_smatrix(
         :meth:`~photonhub.components.source_time.GaussianPulse.for_band` over
         ``freqs_hz``.
     power_watts / launch:
-        Forwarded to :func:`~photonhub.plugins.mode_devices.mode_launch`.
+        Forwarded to :func:`~photonhub.analysis.mode_devices.mode_launch`.
     drive:
         Port names to actually drive (default: all). Undriven ports still get
         monitors in every run (their rows fill; their columns stay NaN).
@@ -406,7 +406,7 @@ def plan_smatrix(
     -------
     SMatrixPlan
         With one prepared simulation per driven port and one
-        :class:`~photonhub.plugins.smatrix.SPort` reader per port.
+        :class:`~photonhub.analysis.smatrix.SPort` reader per port.
     """
     port_list = list(ports)
     if not port_list:
@@ -540,7 +540,7 @@ def write_touchstone(
     """Write an assembled S-matrix as a Touchstone v1 ``.sNp`` file.
 
     ``S`` is the :class:`xarray.DataArray` from
-    :func:`~photonhub.plugins.smatrix.assemble_smatrix` /
+    :func:`~photonhub.analysis.smatrix.assemble_smatrix` /
     :attr:`SMatrixResult.S` — dims ``(port_out, port_in, f)`` with matching
     port labels on both axes. Frequencies are written ascending in Hz,
     real/imaginary (``RI``) format, one reference resistance ``z0`` (the

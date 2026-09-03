@@ -202,7 +202,7 @@ class ModeSolver:
     """
 
     #: Speed of light in vacuum (m/s) — the one physical constant, matching
-    #: the benchmark reference solver (shared plugins._constants value).
+    #: the benchmark reference solver (shared analysis._constants value).
     C0: float = _C0
 
     #: Hard cap on N = nx*ny for the dense O(N^2)-memory / O(N^3)-time solve.
@@ -468,7 +468,7 @@ class ModeSolver:
                 "(bend_radius_um set) are out of scope for Phase 1. The "
                 "straight-waveguide n_eff error grows like (mode width / R) and "
                 "ignores bending loss entirely — use a dedicated bent-mode "
-                "solver. See photonhub.plugins.modes module docstring.")
+                "solver. See photonhub.analysis.modes module docstring.")
 
         ny, nx = self.eps.shape
         n_unknowns = nx * ny

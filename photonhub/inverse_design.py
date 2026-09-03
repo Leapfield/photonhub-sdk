@@ -71,9 +71,9 @@ from .components import (
 )
 from .data import RunResult
 from .runners import run_local
-from .plugins.mode_devices import _TANGENTIAL, mode_monitor, mode_source
-from .plugins.mode_overlap import mode_amplitude
-from .plugins.modes import Mode
+from .analysis.mode_devices import _TANGENTIAL, mode_monitor, mode_source
+from .analysis.mode_overlap import mode_amplitude
+from .analysis.modes import Mode
 
 # Complex adjoint normalization constant, pinned against central finite
 # differences (benchmarks/adjoint/gradient_check.py). The structural physics
@@ -347,7 +347,7 @@ class ModePower:
        at dl = 0.05 um where T ~ 0.29). Maximizing J still maximizes T —
        optimization and relative comparisons are unaffected — but do NOT
        report J as transmission; use the S-matrix path
-       (:func:`photonhub.plugins.smatrix`), which normalizes by the driven
+       (:func:`photonhub.analysis.smatrix`), which normalizes by the driven
        port's incident amplitude and is calibrated (|S21|^2).
 
     By reciprocity the adjoint excitation is the SAME mode launched BACKWARD from

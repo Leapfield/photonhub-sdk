@@ -1,13 +1,13 @@
 """Gaussian-beam excitation source — a free-space / lensed-fibre beam launched
 as a per-cell equivalence-current (Huygens) sheet.
 
-This is the excitation twin of :func:`~photonhub.plugins.mode_overlap.gaussian_mode`
+This is the excitation twin of :func:`~photonhub.analysis.mode_overlap.gaussian_mode`
 (which builds an *analysis-side* Gaussian for a coupling-efficiency overlap).
 Where that one is a scalar profile on its own grid, :func:`gaussian_beam` builds
 the **full-vector paraxial beam on the simulation's own Yee-staggered injection
 plane** — E and H sampled at their true intra-cell locations, with the beam's
 complex phase — so it drops straight into
-:func:`~photonhub.plugins.eq_current_source.equivalence_current_source` and
+:func:`~photonhub.analysis.eq_current_source.equivalence_current_source` and
 launches one-sided (forward only) exactly like a solved waveguide mode does.
 
 Why the Huygens sheet and not a §18 :class:`~photonhub.components.sources.ModeSource`:
@@ -51,7 +51,7 @@ see ``test_gaussian_beam.py``.
 Note that RECORDED ``field_dft`` phasors run the other way (a forward wave there
 is ``e^{+ikz}``), so comparing this beam against a recorded plane — an
 angular-spectrum check, a hand-rolled overlap — needs one conjugation.
-:func:`~photonhub.plugins.mode_overlap.mode_overlap` and the mode-monitor readout
+:func:`~photonhub.analysis.mode_overlap.mode_overlap` and the mode-monitor readout
 already handle their own conventions; this only bites hand-written analysis.
 
 Off-normal injection tilts the whole beam frame: ``β = k cos θ`` (carried as the
@@ -75,7 +75,7 @@ Usage
 -----
 ::
 
-    from photonhub.plugins import gaussian_beam_source
+    from photonhub.analysis import gaussian_beam_source
 
     sim = sim.model_copy(update={"sources": gaussian_beam_source(
         shell, axis="x", position_um=2.0, source_time=pulse,
@@ -83,8 +83,8 @@ Usage
         polarization="Ez", n=1.45, power_watts=1.0)})
 
 :func:`gaussian_beam` alone returns the beam as a
-:class:`~photonhub.plugins.vector_modes.VectorMode`, which is also what you want
-as the *reference* mode of a :func:`~photonhub.plugins.mode_devices.mode_monitor`
+:class:`~photonhub.analysis.vector_modes.VectorMode`, which is also what you want
+as the *reference* mode of a :func:`~photonhub.analysis.mode_devices.mode_monitor`
 for a chip-to-fibre coupling readout.
 """
 
@@ -124,7 +124,7 @@ def _resolve_waist(waist_um, mfd_um) -> Tuple[float, float]:
 
     ``mfd_um`` is the mode-field DIAMETER — the 1/e² *intensity* diameter fibre
     vendors quote (SMF-28 ≈ 10.4 µm at 1550 nm) — and ``w0 = MFD/2``, the same
-    relation :func:`~photonhub.plugins.mode_overlap.gaussian_mode` uses."""
+    relation :func:`~photonhub.analysis.mode_overlap.gaussian_mode` uses."""
     if (waist_um is None) == (mfd_um is None):
         raise ValueError("provide exactly one of waist_um (field 1/e radius) "
                          "or mfd_um (1/e^2 intensity mode-field diameter)")
@@ -323,7 +323,7 @@ def _resolve_window(sim, axis, center_um, half_w_um, half_v_um, *, w0h, w0v,
 def _plane_grids(sim, axis, *, h_center, v_center, half_w, half_v, dl):
     """The four Yee sampling grids of the injection-plane window.
 
-    Registration comes from :func:`~photonhub.plugins.yee_mode.window_nodes` — the
+    Registration comes from :func:`~photonhub.analysis.yee_mode.window_nodes` — the
     SAME ladder the eigensolve and the equivalence-current sheet use — so the
     analytic beam lands on exactly the cells the sheet stamps (and is clipped at
     a §20 symmetry plane the same way). The engine's in-plane Yee offsets for a
@@ -383,13 +383,13 @@ def gaussian_beam(
     window_sigmas: float = 3.0,
 ) -> VectorMode:
     """The analytic fundamental-Gaussian beam on ``sim``'s ``axis``-normal Yee
-    plane, as a full-vector :class:`~photonhub.plugins.vector_modes.VectorMode`.
+    plane, as a full-vector :class:`~photonhub.analysis.vector_modes.VectorMode`.
 
     Launch it with :func:`gaussian_beam_source` (which is this call plus the
     Huygens sheet in one step); use it directly when you want the beam object
     itself — e.g. as the reference of a
-    :func:`~photonhub.plugins.mode_devices.mode_monitor` for a chip-to-fibre
-    coupling readout, or of :func:`~photonhub.plugins.mode_overlap.mode_overlap`.
+    :func:`~photonhub.analysis.mode_devices.mode_monitor` for a chip-to-fibre
+    coupling readout, or of :func:`~photonhub.analysis.mode_overlap.mode_overlap`.
 
     Parameters
     ----------
@@ -460,9 +460,9 @@ def gaussian_beam(
     Notes
     -----
     The profile is generally COMPLEX. Launch it through :func:`gaussian_beam_source`
-    (or :func:`~photonhub.plugins.eq_current_source.equivalence_current_source`),
+    (or :func:`~photonhub.analysis.eq_current_source.equivalence_current_source`),
     which carries per-cell phase. The §18 aux-line path
-    (:func:`~photonhub.plugins.mode_devices.mode_source`) keeps only the real part
+    (:func:`~photonhub.analysis.mode_devices.mode_source`) keeps only the real part
     and would silently mis-launch anything but an at-waist, normal-incidence beam.
     """
     if axis not in ("x", "y", "z"):
@@ -584,7 +584,7 @@ def gaussian_beam_source(
 
     The beam (:func:`gaussian_beam`, whose parameters this shares) is injected as
     a per-cell equivalence-current Huygens sheet
-    (:func:`~photonhub.plugins.eq_current_source.equivalence_current_source`):
+    (:func:`~photonhub.analysis.eq_current_source.equivalence_current_source`):
     ``J = n̂ × H`` on the E plane at ``position_um`` and ``M = -n̂ × E`` on the H
     nodes half a cell upstream, each dipole carrying the beam's own complex
     amplitude and phase. That is what lets an offset waist or an off-normal beam

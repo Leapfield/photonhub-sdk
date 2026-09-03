@@ -25,7 +25,7 @@ completed analytically instead of stepped to convergence.
 recorded time series (the plugin contract: nowhere near the engine or the
 wire format):
 
-1. **Poles** come from :class:`~photonhub.plugins.ResonanceAnalysis` (filter
+1. **Poles** come from :class:`~photonhub.analysis.ResonanceAnalysis` (filter
    diagonalization), fitted on the late, source-free part of the record.
 2. **Amplitudes** are re-fit by linear least squares of the *real* recorded
    signal against those poles — a deliberately transparent step, so the model
@@ -65,7 +65,7 @@ a follow-up, not this module.
 Example
 -------
 >>> import numpy as np
->>> from photonhub.plugins import SpectrumCompleter
+>>> from photonhub.analysis import SpectrumCompleter
 >>> dt = 1.0
 >>> t = np.arange(3000) * dt
 >>> sig = np.real(2.0 * np.exp((-2j*np.pi*0.10 - 1e-3) * t))   # Q ~ 314

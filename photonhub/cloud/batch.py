@@ -16,9 +16,9 @@ from ..components import Simulation
 from ..runners.batch import BatchResults, _check_batch_name
 from ..runners.local import SolverRunError
 from .client import HttpClient
-from .config import WebError, get_config
+from .config import CloudError, get_config
 from .run import (
-    WebJobTimeout,
+    CloudJobTimeout,
     _cloud_run,
     _poll_timeout,
     _validate_quote_id,
@@ -67,26 +67,26 @@ def _accepted_quote(http: HttpClient, name: str, sim: Simulation,
     """Get and validate one server quote without submitting the job."""
     estimate = http.estimate(sim.to_wire_dict(), device=device)
     if not isinstance(estimate, dict):
-        raise WebError(
+        raise CloudError(
             f"server estimate for batch entry {name!r} was not an object")
     usd = estimate.get("usd")
     if (isinstance(usd, bool) or not isinstance(usd, (int, float))
             or not math.isfinite(float(usd)) or float(usd) < 0):
-        raise WebError(
+        raise CloudError(
             f"server estimate for batch entry {name!r} has no finite "
             f"non-negative 'usd' value (got {usd!r})")
     try:
         quote_id = _validate_quote_id(estimate.get("quote_id"))
     except ValueError as exc:
-        raise WebError(
+        raise CloudError(
             f"server estimate for batch entry {name!r} has no usable "
             "'quote_id'") from exc
     if quote_id is None:
-        raise WebError(
+        raise CloudError(
             f"server estimate for batch entry {name!r} has no usable "
             "'quote_id'")
     if float(usd) > limit:
-        raise WebError(
+        raise CloudError(
             f"server estimate for batch entry {name!r} (${float(usd):.4f}) "
             f"exceeds its max_usd limit (${limit:.4f})")
     return quote_id
@@ -141,7 +141,7 @@ class Batch:
                 return name, _cloud_run(sim, name=name, device=device,
                                         timeout=timeout, quote_id=quotes[name],
                                         cfg=cfg), None
-            except (SolverRunError, WebJobTimeout, WebError) as e:
+            except (SolverRunError, CloudJobTimeout, CloudError) as e:
                 return name, None, e
 
         with ThreadPoolExecutor(max_workers=max(1, max_workers)) as ex:

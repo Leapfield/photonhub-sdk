@@ -1,7 +1,7 @@
 """The result-bundle wire format: a gzip tar of the flat files in a run's output
 directory (``manifest.json`` + monitor ``*.bin``). One definition of pack +
 safe-extract, shared by the cloud executor (:mod:`photonhub.executor`, which
-produces a bundle) and the cloud result cache (:mod:`photonhub.web.cache`, which
+produces a bundle) and the cloud result cache (:mod:`photonhub.cloud.cache`, which
 consumes one), so the two ends of the format can never drift apart.
 
 Members are flat (arcnamed by filename, no parent dirs) so a bundle extracts

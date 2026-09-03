@@ -144,7 +144,7 @@ def run_local(
         raise SolverRunError(
             "phsolver engine binary not found. Local runs need the engine; "
             "pip installs the Python client only. Either run on the cloud "
-            "instead (ph.web.run_quoted(sim, max_usd=...) — no engine "
+            "instead (ph.cloud.run_quoted(sim, max_usd=...) — no engine "
             "needed), or point this client at an engine: pass solver_path=, "
             "set $PHOTONHUB_SOLVER, or put phsolver on PATH. Invited beta "
             "participants receive a standalone headless solver archive "

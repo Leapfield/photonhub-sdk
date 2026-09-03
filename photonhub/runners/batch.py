@@ -3,7 +3,7 @@
 The master plan pulls this surface forward to Phase 1: parameter sweeps are the
 dominant real usage pattern and the API *shape* binds to the cloud backend
 later, so designing it now is cheap and retrofitting after Phase 3 is not. The
-shape mirrors common cloud job handles / ``web.Batch`` so the local and cloud paths
+shape mirrors common cloud job handles / ``cloud.Batch`` so the local and cloud paths
 read identically::
 
     job = ph.submit(sim)                 # returns immediately

@@ -7,8 +7,8 @@ region, the modes evolve smoothly with z: solve the modes at only a few **key
 planes** and **interpolate** them onto a fine sub-slicing, so the dense cascade
 costs ``K`` eigensolves (``K << N``) plus cheap array interpolation.
 
-This is the efficiency capstone on top of :mod:`photonhub.plugins.eme` and
-:mod:`photonhub.plugins.mode_tracking`. Tracking is the prerequisite: to
+This is the efficiency capstone on top of :mod:`photonhub.analysis.eme` and
+:mod:`photonhub.analysis.mode_tracking`. Tracking is the prerequisite: to
 interpolate "the same" mode between two key planes, the modes must first be put
 in correspondence (and sign/phase aligned) — :func:`interpolate_mode` aligns the
 pair it is given, and :func:`cvcs_sections` tracks + reorders the key planes into
@@ -25,7 +25,7 @@ the mode at fractional position ``s in [0, 1]`` is the renormalized linear blend
 (and likewise for ``h``), where ``align`` is the unit phase that makes A and B
 co-phased (from their transverse-E overlap) and
 ``n_complex = n_eff + i*k_eff``. The interpolated planes feed
-:func:`photonhub.plugins.eme.run_eme` exactly like solved ones.
+:func:`photonhub.analysis.eme.run_eme` exactly like solved ones.
 
 Conversion (the fixed multimode basis)
 ======================================
@@ -47,7 +47,7 @@ varying cross-section needs few key planes; a region where the modes change quic
 needs more. The hard case is a **sharp avoided crossing** (near-degenerate modes
 swapping over a tiny z-window): interpolation cannot resolve the rapid mode
 variation there, so it needs near-staircase key-plane density — at which point the
-plain :mod:`~photonhub.plugins.eme` staircase is the simpler tool. CVCS's ``N/K``
+plain :mod:`~photonhub.analysis.eme` staircase is the simpler tool. CVCS's ``N/K``
 eigensolve saving is realized wherever the modes are smooth (the common case);
 see ``benchmarks/eme/cvcs_taper.py``.
 
@@ -248,7 +248,7 @@ def cvcs_sections(
     list[Section]
         The first/last sections are the (solved) key endpoints as length-0 ports;
         the interior is ``n_subslices`` interpolated sections. Feed directly to
-        :func:`photonhub.plugins.eme.run_eme`.
+        :func:`photonhub.analysis.eme.run_eme`.
     """
     k = len(key_planes)
     if k < 2:

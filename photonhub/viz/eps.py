@@ -1,4 +1,4 @@
-"""``plot_eps()`` — the rasterized permittivity the solver actually samples on
+"""``plot_index()`` — the rasterized permittivity the solver actually samples on
 a cut plane, as a heatmap (design §3, §9).
 
 Rebuilds the realized grid with the SAME helpers ``cost.py`` uses
@@ -337,7 +337,7 @@ def _point_in_polygon_vec(verts, pu, pv):
     return inside
 
 
-def plot_eps(sim, x=None, y=None, z=None, *, ax=None, cmap=None,
+def plot_index(sim, x=None, y=None, z=None, *, ax=None, cmap=None,
              legend=True, grid=False, **kw):
     """Render the rasterized ε heatmap on the selected cut plane. See the
     module docstring for the subpixel caveat. Returns the matplotlib ``Axes``.
@@ -390,3 +390,16 @@ def _finish_axes(ax, axis: str) -> None:
     ax.set_ylabel(f"{v_ax} (µm)")
     ax.set_aspect("equal")
     ax.set_title(f"ε  ({axis}-cut)")
+
+
+def plot_eps(*args, **kwargs):
+    """Deprecated alias for :func:`plot_index` (renamed 2026-09)."""
+    import warnings
+
+    warnings.warn(
+        "photonhub.viz.plot_eps was renamed to plot_index; the old name will be "
+        "removed in a future release.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return plot_index(*args, **kwargs)

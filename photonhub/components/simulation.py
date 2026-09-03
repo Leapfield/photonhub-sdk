@@ -1920,12 +1920,24 @@ class Simulation(FrozenModel):
         from ..viz import plot as _plot
         return _plot(self, x=x, y=y, z=z, ax=ax, legend=legend, grid=grid, **kw)
 
-    def plot_eps(self, x=None, y=None, z=None, *, ax=None, cmap=None,
+    def plot_eps(self, *args, **kwargs):
+        """Deprecated alias for :meth:`plot_index` (renamed 2026-09)."""
+        import warnings
+
+        warnings.warn(
+            "Simulation.plot_eps was renamed to plot_index; the old name will be "
+            "removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.plot_index(*args, **kwargs)
+
+    def plot_index(self, x=None, y=None, z=None, *, ax=None, cmap=None,
                  grid=False, **kw):
         """Rasterized permittivity heatmap (the §9 hard sample the solver
         takes) on a cut plane. ``grid=True`` overlays the cell edges. Returns a
-        matplotlib ``Axes``. See :func:`photonhub.viz.plot_eps`."""
-        from ..viz import plot_eps as _plot_eps
+        matplotlib ``Axes``. See :func:`photonhub.viz.plot_index`."""
+        from ..viz import plot_index as _plot_eps
         return _plot_eps(self, x=x, y=y, z=z, ax=ax, cmap=cmap, grid=grid, **kw)
 
     def plot_3d(self, **kw):

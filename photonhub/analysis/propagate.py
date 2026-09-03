@@ -41,7 +41,7 @@ _AXIS_IDX = {"x": 0, "y": 1, "z": 2}
 
 def _plane_arrays(simulation, data, monitor):
     """(e1, e2, coords1, coords2, freqs, axis, (u1, u2)) with the tangential
-    E arrays shaped (nf, n1, n2) — mirrors plugins.diffraction's extraction."""
+    E arrays shaped (nf, n1, n2) — mirrors analysis.diffraction's extraction."""
     mon = _resolve_monitor(simulation, monitor)
     size = mon.size_um
     zero_axes = [i for i, s in enumerate(size) if s == 0.0]

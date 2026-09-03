@@ -20,7 +20,7 @@ consistent at any NA.
 Two layers, mirroring :mod:`gaussian_beam`:
 
 * :func:`thin_lens_beam` — the sampled plane as a ``yee_staggered``
-  :class:`~photonhub.plugins.vector_modes.VectorMode` (transverse-E pair
+  :class:`~photonhub.analysis.vector_modes.VectorMode` (transverse-E pair
   jointly L2-normalized; also a monitor/overlap reference);
 * :func:`thin_lens_source` — that plus the per-cell equivalence-current
   sheet, returning the ``PointDipole`` list for ``Simulation.sources``.
@@ -329,7 +329,7 @@ def thin_lens_source(
     per-cell equivalence-current Huygens sheet. ``power_watts`` (default 1 W)
     normalizes the launched power on the engine's discrete Poynting
     quadrature like every other launch; parameters match
-    :func:`thin_lens_beam` / :func:`~photonhub.plugins.gaussian_beam.gaussian_beam_source`."""
+    :func:`thin_lens_beam` / :func:`~photonhub.analysis.gaussian_beam.gaussian_beam_source`."""
     if direction not in ("+", "-"):
         raise ValueError(f"direction must be '+' or '-', got {direction!r}")
     if not power_watts > 0.0:

@@ -2494,7 +2494,7 @@ def create_app(result_dir: Optional[str | Path] = None,
                 job["error"] = str(exc)
                 job["finished_at"] = time.time()
             try:
-                from .. import web as cloud_web
+                from .. import cloud as cloud_web
                 remote = cloud_web.job_status(str(job["id"]))
             except Exception as poll_exc:
                 with cloud_lock:
@@ -2519,7 +2519,7 @@ def create_app(result_dir: Optional[str | Path] = None,
             if state.get("cloud_job") is not job:
                 return
         try:
-            from .. import web as cloud_web
+            from .. import cloud as cloud_web
             final_remote = cloud_web.job_status(str(job["id"]))
         except Exception as exc:
             final_remote = None
@@ -2555,7 +2555,7 @@ def create_app(result_dir: Optional[str | Path] = None,
 
     @app.get("/api/cloud/status")
     def cloud_status():
-        from .. import web as cloud_web
+        from .. import cloud as cloud_web
 
         try:
             cloud_web.get_config()
@@ -2604,7 +2604,7 @@ def create_app(result_dir: Optional[str | Path] = None,
 
     @app.post("/api/cloud/preflight")
     def cloud_preflight(payload: dict = Body(...)):
-        from .. import web as cloud_web
+        from .. import cloud as cloud_web
 
         sim, canonical_sha = _cloud_sim(payload.get("spec"))
         limit = _cloud_limit(payload.get("max_usd", _WORKBENCH_CLOUD_MAX_USD))
@@ -2650,7 +2650,7 @@ def create_app(result_dir: Optional[str | Path] = None,
             return _start_cloud_run_locked(payload)
 
     def _start_cloud_run_locked(payload: dict):
-        from .. import web as cloud_web
+        from .. import cloud as cloud_web
 
         sim, canonical_sha = _cloud_sim(payload.get("spec"))
         token = payload.get("preflight_token")
@@ -2756,7 +2756,7 @@ def create_app(result_dir: Optional[str | Path] = None,
             )
             job_id = getattr(handle, "job_id", None)
             if not isinstance(job_id, str) or not job_id:
-                raise cloud_web.WebError("cloud submission returned no usable job id")
+                raise cloud_web.CloudError("cloud submission returned no usable job id")
             cloud_job["id"] = job_id
             cloud_job["unresolved_submission"] = False
         except Exception as exc:
@@ -2800,7 +2800,7 @@ def create_app(result_dir: Optional[str | Path] = None,
 
     @app.get("/api/cloud/run/status")
     def cloud_run_status():
-        from .. import web as cloud_web
+        from .. import cloud as cloud_web
 
         with cloud_lock:
             job = state.get("cloud_job")
@@ -2826,7 +2826,7 @@ def create_app(result_dir: Optional[str | Path] = None,
 
     @app.post("/api/cloud/run/cancel")
     def cancel_cloud_run():
-        from .. import web as cloud_web
+        from .. import cloud as cloud_web
 
         with cloud_lock:
             job = state.get("cloud_job")
@@ -2857,7 +2857,7 @@ def create_app(result_dir: Optional[str | Path] = None,
             return _resume_cloud_run_locked(payload)
 
     def _resume_cloud_run_locked(payload: dict):
-        from .. import web as cloud_web
+        from .. import cloud as cloud_web
 
         job_id = payload.get("job_id")
         if not isinstance(job_id, str) or not job_id:
@@ -2981,7 +2981,7 @@ def create_app(result_dir: Optional[str | Path] = None,
 
     @app.get("/api/cloud/jobs")
     def list_cloud_jobs():
-        from .. import web as cloud_web
+        from .. import cloud as cloud_web
 
         try:
             cloud_web.get_config()

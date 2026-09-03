@@ -3,7 +3,7 @@
 This is the Phase-2 Track-B *mode-monitor transmission* post-processor. Given a
 field plane recorded by an FDTD run (the tangential ``E`` and ``H`` DataArrays
 on a plane whose normal is the waveguide's propagation axis) and a frozen FDE
-:class:`~photonhub.plugins.modes.Mode`, it computes the **forward (or backward)
+:class:`~photonhub.analysis.modes.Mode`, it computes the **forward (or backward)
 power transmission** ``T(f)`` into that single mode. There is **NO S-matrix**
 here — this is a one-mode-at-a-time projection.
 
@@ -66,8 +66,8 @@ recovering the waveguide dispersion the frozen mode drops. A scalar per-frequenc
 Mode ⇄ mode overlap (no FDTD run)
 =================================
 :func:`mode_overlap` is the **mode-to-mode** companion: it takes two *modes* (a
-scalar :class:`~photonhub.plugins.modes.Mode`, a full-vector
-:class:`~photonhub.plugins.vector_modes.VectorMode`, or an analytic
+scalar :class:`~photonhub.analysis.modes.Mode`, a full-vector
+:class:`~photonhub.analysis.vector_modes.VectorMode`, or an analytic
 :func:`gaussian_mode`) — not a recorded plane — resamples both onto a common
 transverse grid, and returns their coupling efficiency. It answers "how much of
 mode A couples into mode B": a waveguide TE0 into a lensed-fibre / free-space
@@ -134,7 +134,7 @@ _UM2_TO_M2 = 1.0e-12
 
 # ETA0 (vacuum wave impedance, ohms) and C0 (free-space speed of light, m/s —
 # maps a monitor frequency to a wavelength for the longitudinal Yee de-stagger
-# phase beta = 2*pi*n_eff/lambda) come from the shared plugins._constants
+# phase beta = 2*pi*n_eff/lambda) come from the shared analysis._constants
 # (values matching the engine); ETA0 stays re-exported here via __all__.
 
 Axis = Literal["x", "y", "z"]
@@ -307,7 +307,7 @@ def modal_fields(
     Parameters
     ----------
     mode:
-        The frozen FDE :class:`~photonhub.plugins.modes.Mode`. Its ``.field`` is
+        The frozen FDE :class:`~photonhub.analysis.modes.Mode`. Its ``.field`` is
         the major transverse-E component (``Ex`` for TE, ``Ey`` for TM).
     t1_um, t2_um:
         The plane's two transverse coordinate axes (microns), in the order
@@ -453,7 +453,7 @@ def vector_modal_fields(
     interp_order: int = 1,
 ) -> Dict[str, np.ndarray]:
     """Assemble the FULL-VECTOR transverse fields of a
-    :class:`~photonhub.plugins.vector_modes.VectorMode` on a monitor/injection
+    :class:`~photonhub.analysis.vector_modes.VectorMode` on a monitor/injection
     plane — the full-vector analogue of :func:`modal_fields`.
 
     Unlike :func:`modal_fields` (which carries one scalar profile in the major-E
@@ -958,7 +958,7 @@ def mode_transmission(
         axis are reduced automatically; a plain 2-D ``(t2, t1)`` DataArray also
         works). The two transverse axes are ``_TRANSVERSE[axis]``.
     mode:
-        The frozen FDE :class:`~photonhub.plugins.modes.Mode` to project onto.
+        The frozen FDE :class:`~photonhub.analysis.modes.Mode` to project onto.
     axis:
         Propagation axis / plane normal, ``"x"``/``"y"``/``"z"``.
     direction:
@@ -1081,7 +1081,7 @@ def mode_decomposition(
           frequency (true ``H`` + ``n_eff(λ)``), via the same nearest-frequency
           lookup as :func:`mode_transmission`'s ``modes_by_freq``. This is the
           dispersive, accurate case; build it with
-          :func:`~photonhub.plugins.mode_devices.solve_mode_bank`. The bank must be
+          :func:`~photonhub.analysis.mode_devices.solve_mode_bank`. The bank must be
           **rectangular** — the SAME mode indices at every frequency; a ragged
           bank raises (else the nearest-frequency lookup would silently fabricate
           a reading at a frequency missing that index).
@@ -1190,8 +1190,8 @@ def mode_decomposition(
 # power a waveguide's TE0 couples into a different waveguide's TE0, or into a
 # lensed-fibre / free-space Gaussian beam (the fibre-to-chip coupling efficiency,
 # or a w1→w2 taper's intrinsic mode-mismatch loss). Either operand may be a
-# scalar :class:`~photonhub.plugins.modes.Mode`, a full-vector
-# :class:`~photonhub.plugins.vector_modes.VectorMode`, or a :func:`gaussian_mode`.
+# scalar :class:`~photonhub.analysis.modes.Mode`, a full-vector
+# :class:`~photonhub.analysis.vector_modes.VectorMode`, or a :func:`gaussian_mode`.
 # ---------------------------------------------------------------------------
 
 
@@ -1244,7 +1244,7 @@ class ModeOverlap:
 
             F = ∫ E₁* · E₂ dA / sqrt( ∫|E₁|² dA · ∫|E₂|² dA ) ,
 
-        the same quantity :func:`~photonhub.plugins.mode_tracking.transverse_overlap`
+        the same quantity :func:`~photonhub.analysis.mode_tracking.transverse_overlap`
         reports. For two full-vector modes of differing impedance this differs from
         :attr:`power`; for scalar/Gaussian modes the two coincide.
     coupling:
@@ -1384,8 +1384,8 @@ def mode_overlap(
     """Overlap / coupling efficiency between two **modes** ``mode_a`` and
     ``mode_b`` — the mode⇄mode companion to the field-plane :func:`mode_transmission`.
 
-    Each operand is a frozen FDE mode (scalar :class:`~photonhub.plugins.modes.Mode`
-    or full-vector :class:`~photonhub.plugins.vector_modes.VectorMode`) or an analytic
+    Each operand is a frozen FDE mode (scalar :class:`~photonhub.analysis.modes.Mode`
+    or full-vector :class:`~photonhub.analysis.vector_modes.VectorMode`) or an analytic
     :func:`gaussian_mode`. Both are resampled onto a **common transverse grid**, so
     they need not share resolution, window, or even a polarization branch — the
     overlap measures how much of one mode's power couples into the other. Typical
@@ -1435,7 +1435,7 @@ def mode_overlap(
         forward-vs-backward orthogonality check). **Note:** a forward mode and the
         *same* mode's backward partner are power-orthogonal, so their overlap is
         ``~0``; the reflection *amplitude* at a real junction comes from mode-matching
-        the boundary conditions (the :mod:`~photonhub.plugins.eme` interface S-matrix),
+        the boundary conditions (the :mod:`~photonhub.analysis.eme` interface S-matrix),
         not from this single-plane overlap. With a scalar / Gaussian operand the
         bounded geometric-mean power form is direction-blind, so ``"-"`` falls
         back to the two-term ``|a12|^2`` (``snyder_love``) form — which does
@@ -1588,8 +1588,8 @@ def mode_overlap_matrix(
     Parameters
     ----------
     modes_a, modes_b:
-        Sequences of modes (scalar :class:`~photonhub.plugins.modes.Mode`,
-        :class:`~photonhub.plugins.vector_modes.VectorMode`, or :func:`gaussian_mode`).
+        Sequences of modes (scalar :class:`~photonhub.analysis.modes.Mode`,
+        :class:`~photonhub.analysis.vector_modes.VectorMode`, or :func:`gaussian_mode`).
         The matrix is ``(len(modes_a), len(modes_b))``.
     quantity:
         Which :class:`ModeOverlap` field fills the matrix: ``"coupling"`` (default,
@@ -1649,7 +1649,7 @@ def gaussian_mode(
 ) -> Mode:
     """An analytic **fundamental-Gaussian** beam (a lensed-fibre / free-space
     LP₀₁ / TEM₀₀ spot at its waist) wrapped as a scalar
-    :class:`~photonhub.plugins.modes.Mode`, so it drops straight into
+    :class:`~photonhub.analysis.modes.Mode`, so it drops straight into
     :func:`mode_overlap` for a fibre-to-chip coupling efficiency.
 
     The transverse field at the waist is the real Gaussian
@@ -1692,7 +1692,7 @@ def gaussian_mode(
     Returns
     -------
     Mode
-        A scalar :class:`~photonhub.plugins.modes.Mode` whose ``.field`` is the
+        A scalar :class:`~photonhub.analysis.modes.Mode` whose ``.field`` is the
         L2-normalized Gaussian, ``.n_eff == n``, on a centered square grid.
     """
     if (mfd_um is None) == (waist_um is None):

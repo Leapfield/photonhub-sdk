@@ -16,7 +16,7 @@ modes along a track are phase-aligned — required for any interpolation between
 planes.
 
 This is the prerequisite for CVCS (continuously-varying-cross-section) modelling
-and for the per-mode interpretation of an EME (:mod:`photonhub.plugins.eme`)
+and for the per-mode interpretation of an EME (:mod:`photonhub.analysis.eme`)
 cascade. It is deliberately general: the planes can be the z-sections of an EME
 device, or the same cross-section re-solved across a wavelength band or a bend
 radius — anything that yields a sequence of mode sets **on a common transverse

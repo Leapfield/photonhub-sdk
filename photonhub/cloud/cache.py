@@ -24,13 +24,13 @@ from ..bundle import (
 )
 from ._ids import validate_job_id
 from .client import HttpClient
-from .config import WebConfig
+from .config import CloudConfig
 
 _CACHE_LOCKS = tuple(threading.Lock() for _ in range(64))
 _MAX_MANIFEST_BYTES = 64 * 1024 * 1024
 
 
-def job_dir(cfg: WebConfig, job_id: str) -> Path:
+def job_dir(cfg: CloudConfig, job_id: str) -> Path:
     return Path(cfg.cache_dir) / validate_job_id(job_id)
 
 
@@ -141,12 +141,12 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
-def invalidate(cfg: WebConfig, job_id: str) -> None:
+def invalidate(cfg: CloudConfig, job_id: str) -> None:
     """Remove an unreadable cached result so a later resume can re-fetch it."""
     _remove_path(job_dir(cfg, job_id))
 
 
-def completed_result(cfg: WebConfig, job_id: str) -> Optional[Path]:
+def completed_result(cfg: CloudConfig, job_id: str) -> Optional[Path]:
     """The validated, sealed local result directory for ``job_id``, or None.
 
     A directory is returned only when a prior download passed the full
@@ -159,7 +159,7 @@ def completed_result(cfg: WebConfig, job_id: str) -> Optional[Path]:
         return out if _is_complete(out) else None
 
 
-def _download_archive(http: HttpClient, cfg: WebConfig, job_id: str,
+def _download_archive(http: HttpClient, cfg: CloudConfig, job_id: str,
                       archive: Path) -> None:
     stream = getattr(http, "download_result_to", None)
     if callable(stream):
@@ -177,7 +177,7 @@ def _download_archive(http: HttpClient, cfg: WebConfig, job_id: str,
     archive.write_bytes(data)
 
 
-def download_bundle(http: HttpClient, cfg: WebConfig, job_id: str) -> Path:
+def download_bundle(http: HttpClient, cfg: CloudConfig, job_id: str) -> Path:
     """Return a locally cached, validated result directory for ``job_id``."""
     out = job_dir(cfg, job_id)
     parent = out.parent

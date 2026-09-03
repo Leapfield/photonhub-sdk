@@ -239,7 +239,7 @@ def _geometry_png(built: BuiltSim, path, artifacts: dict):
         return None
     try:
         cz = built.meta["size_um"][2] / 2.0
-        ax = built.sim.plot_eps(z=cz)
+        ax = built.sim.plot_index(z=cz)
         ax.set_title(f"Permittivity ε(x, y) — {built.meta.get('subpixel_method', '')} (z = core centre)")
         ax.figure.savefig(path, dpi=120, bbox_inches="tight")
         plt.close(ax.figure)

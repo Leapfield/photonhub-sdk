@@ -1,9 +1,9 @@
-"""Configuration for the cloud client (``ph.web``).
+"""Configuration for the cloud client (``ph.cloud``).
 
 ``configure(api_key=..., url=...)`` sets the active config; values fall back to
 ``$PHOTONHUB_API_KEY`` / ``$PHOTONHUB_URL``, mirroring ``find_solver``'s
 explicit→environment precedence. A missing required value is an error, not a
-silent default. ``WebError`` is raised for config/transport/auth/result-transfer
+silent default. ``CloudError`` is raised for config/transport/auth/result-transfer
 problems — distinct from ``SolverRunError``, which is reserved for a simulation
 actually failing, so the two are never confused.
 """
@@ -31,7 +31,7 @@ from ..bundle import (
 DEFAULT_URL = "http://localhost:8000"
 
 
-class WebError(RuntimeError):
+class CloudError(RuntimeError):
     """A cloud client/transport/auth/result-transfer error — NOT a simulation
     failure (that is ``SolverRunError``). Accepted jobs expose ``job_id`` for
     safe resume without a duplicate paid submission."""
@@ -48,7 +48,7 @@ class WebError(RuntimeError):
 
 
 @dataclass
-class WebConfig:
+class CloudConfig:
     url: str
     #: Kept out of the generated repr: a bare ``get_config()`` in a notebook
     #: cell would otherwise write the live key into committed output.
@@ -65,7 +65,7 @@ class WebConfig:
     def __post_init__(self) -> None:
         if (not isinstance(self.api_key, str) or not self.api_key
                 or any(ch.isspace() for ch in self.api_key)):
-            raise WebError("api_key must be a non-empty token without whitespace")
+            raise CloudError("api_key must be a non-empty token without whitespace")
         self.url = _validate_url(self.url, self.allow_insecure_http)
         self.cache_dir = Path(self.cache_dir)
         self.poll_interval_s = _finite_seconds(
@@ -85,7 +85,7 @@ class WebConfig:
             self.max_bundle_members, "max_bundle_members")
 
 
-_CONFIG: Optional[WebConfig] = None
+_CONFIG: Optional[CloudConfig] = None
 
 
 def _finite_seconds(value, label: str, *, allow_zero: bool) -> float:
@@ -165,21 +165,21 @@ def configure(api_key: Optional[str] = None, url: Optional[str] = None, *,
               allow_insecure_http: bool = False,
               max_bundle_download_bytes: int = DEFAULT_MAX_COMPRESSED_BYTES,
               max_bundle_extract_bytes: int = DEFAULT_MAX_EXPANDED_BYTES,
-              max_bundle_members: int = DEFAULT_MAX_MEMBERS) -> WebConfig:
+              max_bundle_members: int = DEFAULT_MAX_MEMBERS) -> CloudConfig:
     """Set the active cloud configuration. Returns it for inspection."""
     global _CONFIG
     key = env("API_KEY") if api_key is None else api_key
     if not key:
-        raise WebError(
+        raise CloudError(
             "no API key: pass api_key= or set $PHOTONHUB_API_KEY "
-            "(create one with ph.web.create_api_key after signing in)")
+            "(create one with ph.cloud.create_api_key after signing in)")
     base = url
     if base is None:
         # An explicitly passed (even invalid) url= falls through to
-        # WebConfig's ValueError; only a genuinely *absent* URL raises here.
+        # CloudConfig's ValueError; only a genuinely *absent* URL raises here.
         base = env("URL")
         if not base:
-            raise WebError(
+            raise CloudError(
                 "no service URL: pass url= or set $PHOTONHUB_URL. During the "
                 "beta the endpoint is issued by the operator together with "
                 "your API key (see docs/cloud.md). For a local development "
@@ -187,12 +187,12 @@ def configure(api_key: Optional[str] = None, url: Optional[str] = None, *,
         try:
             _validate_url(base, allow_insecure_http)
         except ValueError as exc:
-            raise WebError(
+            raise CloudError(
                 f"$PHOTONHUB_URL is not a usable service URL ({base!r}): {exc}. "
                 "Expected a bare https:// origin, e.g. "
                 "'https://api.example.com'.") from exc
     cache = Path(cache_dir) if cache_dir is not None else _default_cache_dir()
-    _CONFIG = WebConfig(
+    _CONFIG = CloudConfig(
         url=base, api_key=key, cache_dir=cache,
         poll_interval_s=poll_interval_s, poll_backoff_max_s=poll_backoff_max_s,
         request_timeout_s=request_timeout_s,
@@ -204,15 +204,15 @@ def configure(api_key: Optional[str] = None, url: Optional[str] = None, *,
     return _CONFIG
 
 
-def get_config() -> WebConfig:
+def get_config() -> CloudConfig:
     """The active config, building one from the environment on first use."""
     if _CONFIG is not None:
         return _CONFIG
     if env("API_KEY"):
         return configure()
-    raise WebError(
-        "photonhub.web is not configured; call "
-        "ph.web.configure(api_key=..., url=...) or set "
+    raise CloudError(
+        "photonhub.cloud is not configured; call "
+        "ph.cloud.configure(api_key=..., url=...) or set "
         "$PHOTONHUB_API_KEY + $PHOTONHUB_URL")
 
 

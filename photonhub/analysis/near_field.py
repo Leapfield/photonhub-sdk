@@ -71,7 +71,7 @@ of the dropped prefactor.
 
 **Area element.** ``dS`` is taken from each face's *real* transverse coordinate
 spacings (centered-difference cell widths, reusing
-:func:`~photonhub.plugins.mode_overlap._cell_widths`), so graded / non-uniform
+:func:`~photonhub.analysis.mode_overlap._cell_widths`), so graded / non-uniform
 meshes integrate correctly — no uniform-spacing assumption.
 
 **Yee staggering.** The engine's DFT monitor records each tangential component
@@ -81,7 +81,7 @@ both IN the plane and (for H) half a cell ALONG the normal. Combining them into
 degrades the J/M cancellation (a spurious backward lobe, and an absolute-phase
 error). ``colocate=True`` (the default, mirroring the mode-overlap readout)
 fixes the TRANSVERSE part by averaging each component to the in-plane cell node
-(:func:`~photonhub.plugins.mode_overlap._colocate_to_node`); pass
+(:func:`~photonhub.analysis.mode_overlap._colocate_to_node`); pass
 ``colocate=False`` for synthetic, already-co-located fields. The NORMAL-axis
 half-cell E/H stagger is NOT corrected: the recorded plane carries a single
 normal coordinate and no grid spacing, and the SIGN of the offset depends on
@@ -203,7 +203,7 @@ def _solid_angle_weights(theta: np.ndarray, phi: np.ndarray) -> np.ndarray:
     dtheta dphi`` for a flat list of directions that came from meshing two 1-D
     axes (``theta`` varying slowest). Recovers the 1-D axes from the flat list
     via :func:`numpy.unique` and builds centered-difference cell widths in each
-    (reusing :func:`~photonhub.plugins.mode_overlap._cell_widths`)."""
+    (reusing :func:`~photonhub.analysis.mode_overlap._cell_widths`)."""
     th_ax = np.unique(np.round(theta, 12))
     ph_ax = np.unique(np.round(phi, 12))
     dth = _cell_widths(th_ax)

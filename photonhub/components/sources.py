@@ -170,7 +170,7 @@ class ModeSource(FrozenModel):
     resampled onto the grid's transverse plane, row-major ``[v*nu + u]`` with
     ``u``/``v`` the lower/higher-indexed transverse axes. ``polarization`` is
     the major tangential E component. Build via
-    ``photonhub.plugins.mode_devices.mode_source`` (it computes ``profile``/
+    ``photonhub.analysis.mode_devices.mode_source`` (it computes ``profile``/
     ``n_eff`` from an FDE mode); hand-construction is rarely needed. Unlike the
     plane wave, the injection plane MAY cut through structures.
 

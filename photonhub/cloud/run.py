@@ -1,6 +1,6 @@
-"""Cloud run entry points — the prime directive: ``ph.web.submit`` returns the
+"""Cloud run entry points — the prime directive: ``ph.cloud.submit`` returns the
 **same** :class:`~photonhub.runners.batch.Job` as the local path, so
-``job = ph.web.submit(sim); data = job.result()`` reads identically whether
+``job = ph.cloud.submit(sim); data = job.result()`` reads identically whether
 local or cloud, and a server-side failure surfaces as the same
 :class:`SolverRunError`.
 """
@@ -19,7 +19,7 @@ from ..runners.local import SolverRunError
 from . import cache
 from ._ids import validate_job_id
 from .client import HttpClient
-from .config import WebConfig, WebError, get_config
+from .config import CloudConfig, CloudError, get_config
 
 ProgressCb = Optional[Callable[[dict], None]]
 
@@ -29,7 +29,7 @@ ProgressCb = Optional[Callable[[dict], None]]
 _GPU_ID = re.compile(r"[a-z0-9][a-z0-9._-]*")
 
 
-class WebJobTimeout(TimeoutError):
+class CloudJobTimeout(TimeoutError):
     """Polling timed out while the service job remains active."""
 
     def __init__(self, job_id: str, timeout: float):
@@ -37,8 +37,8 @@ class WebJobTimeout(TimeoutError):
         self.timeout = timeout
         super().__init__(
             f"cloud job {job_id!r} not finished after {timeout} s; "
-            "resume it with ph.web.resume(job_id) or cancel it with "
-            "ph.web.cancel(job_id)")
+            "resume it with ph.cloud.resume(job_id) or cancel it with "
+            "ph.cloud.cancel(job_id)")
 
 
 def _poll_timeout(timeout: Optional[float]) -> Optional[float]:
@@ -61,7 +61,7 @@ def _submitted_job_id(response: object) -> str:
         candidate = response["job_id"]  # type: ignore[index]
         return validate_job_id(candidate)
     except (KeyError, TypeError, ValueError) as exc:
-        raise WebError("service returned an invalid job_id") from exc
+        raise CloudError("service returned an invalid job_id") from exc
 
 
 def _validate_quote_id(quote_id: Optional[str]) -> Optional[str]:
@@ -91,34 +91,34 @@ def _validate_web_device(device: Optional[str]) -> Optional[str]:
         "(an id from ph.gpus())")
 
 
-def _poll_and_download(http: HttpClient, cfg: WebConfig, job_id: str, *,
+def _poll_and_download(http: HttpClient, cfg: CloudConfig, job_id: str, *,
                        progress: ProgressCb, timeout: Optional[float]) -> object:
     timeout = _poll_timeout(timeout)
     deadline = (time.monotonic() + timeout) if timeout is not None else None
     interval = cfg.poll_interval_s
     while True:
         if deadline is not None and time.monotonic() >= deadline:
-            raise WebJobTimeout(job_id, timeout)
+            raise CloudJobTimeout(job_id, timeout)
         try:
             st = http.get_job(job_id, deadline=deadline)
         except TimeoutError as exc:
-            raise WebJobTimeout(job_id, timeout) from exc
+            raise CloudJobTimeout(job_id, timeout) from exc
         if deadline is not None and time.monotonic() >= deadline:
-            raise WebJobTimeout(job_id, timeout)
+            raise CloudJobTimeout(job_id, timeout)
         if not isinstance(st, dict) or not isinstance(st.get("state"), str):
-            raise WebError(
+            raise CloudError(
                 f"service returned an invalid status for cloud job {job_id}")
         state = st["state"]
         if state not in (
                 "queued", "provisioning", "running", "succeeded", "failed",
                 "cancelled"):
-            raise WebError(
+            raise CloudError(
                 f"service returned unknown state {state!r} for cloud job "
                 f"{job_id}", job_id=job_id)
         if progress and st.get("progress"):
             progress(st["progress"])
             if deadline is not None and time.monotonic() >= deadline:
-                raise WebJobTimeout(job_id, timeout)
+                raise CloudJobTimeout(job_id, timeout)
         if state == "succeeded":
             break
         if state == "failed":
@@ -149,18 +149,18 @@ def _poll_and_download(http: HttpClient, cfg: WebConfig, job_id: str, *,
     try:
         return cache.download_bundle(http, cfg, job_id)
     except (BundleError, OSError) as exc:
-        raise WebError(
+        raise CloudError(
             f"cloud job {job_id} returned an invalid result bundle: {exc}",
             job_id=job_id) from exc
 
 
-def _finish_cloud_job(http: HttpClient, cfg: WebConfig, job_id: str, *,
+def _finish_cloud_job(http: HttpClient, cfg: CloudConfig, job_id: str, *,
                       progress: ProgressCb = None,
                       timeout: Optional[float] = None) -> RunResult:
     # A validated, sealed cache entry is exactly what a successful poll +
     # download would produce, so an already-fetched result loads without the
     # service round-trip. This keeps a paid, downloaded run loadable through
-    # ph.web.resume(job_id) offline and after service-side job expiry.
+    # ph.cloud.resume(job_id) offline and after service-side job expiry.
     cached = cache.completed_result(cfg, job_id)
     if cached is not None:
         try:
@@ -172,9 +172,9 @@ def _finish_cloud_job(http: HttpClient, cfg: WebConfig, job_id: str, *,
     try:
         bundle_dir = _poll_and_download(
             http, cfg, job_id, progress=progress, timeout=timeout)
-    except (SolverRunError, WebJobTimeout):
+    except (SolverRunError, CloudJobTimeout):
         raise
-    except WebError as exc:
+    except CloudError as exc:
         if exc.job_id is None:
             exc.job_id = job_id
         raise
@@ -184,7 +184,7 @@ def _finish_cloud_job(http: HttpClient, cfg: WebConfig, job_id: str, *,
         # Do not preserve a completion marker for outputs the public reader
         # rejects; resume can safely re-fetch this already-paid job.
         cache.invalidate(cfg, job_id)
-        raise WebError(
+        raise CloudError(
             f"cloud job {job_id} returned unreadable outputs: {exc}",
             job_id=job_id) from exc
 
@@ -193,7 +193,7 @@ def _cloud_run(sim, *, name=None, device=None, solver=None,
                progress: ProgressCb = None,
                timeout: Optional[float] = None,
                quote_id: Optional[str] = None,
-               cfg: Optional[WebConfig] = None) -> RunResult:
+               cfg: Optional[CloudConfig] = None) -> RunResult:
     device = _validate_web_device(device)
     timeout = _poll_timeout(timeout)
     quote_id = _validate_quote_id(quote_id)
@@ -212,7 +212,7 @@ def run(sim, *, name=None, device=None, solver=None, progress: ProgressCb = None
         quote_id: Optional[str] = None) -> RunResult:
     """Submit ``sim`` to the cloud and block until its result is ready. Returns a
     :class:`RunResult`; raises :class:`SolverRunError` if the run fails,
-    :class:`WebError` for transport/auth/result-transfer problems. ``solver`` pins
+    :class:`CloudError` for transport/auth/result-transfer problems. ``solver`` pins
     a specific solver version/commit (default: latest). Pass the ``quote_id`` from
     a device-matched server estimate to bind the submission to that accepted quote."""
     return _cloud_run(sim, name=name, device=device, solver=solver,

@@ -37,8 +37,8 @@ from ..components.structures import Medium, Structure
 from ..components.grid import UniformMesh, realized_cells
 from ..components.monitors import ProfileMonitor
 from .. import materials as _materials
-from ..plugins.mode_devices import ModeMonitor, mode_launch, mode_monitor, transmission
-from ..plugins.yee_mode import solve_yee_mode
+from ..analysis.mode_devices import ModeMonitor, mode_launch, mode_monitor, transmission
+from ..analysis.yee_mode import solve_yee_mode
 from .geometry import build_geometry
 from .spec import PaperSpec
 
@@ -67,7 +67,7 @@ def _shaped_half_extent(params: Mapping[str, object]) -> float:
 
 def _resolve_index(material: str, wavelength_um: float) -> float:
     """Refractive index of a material name at a wavelength. Accepts a
-    :mod:`photonhub.materials` entry (``"cSi"``) or an ``"n=<value>"`` literal."""
+    :mod:`photonhub.materials` entry (``"Si"``) or an ``"n=<value>"`` literal."""
     material = material.strip()
     if material.lower().startswith("n="):
         return float(material[2:])

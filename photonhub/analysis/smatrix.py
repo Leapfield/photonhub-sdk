@@ -1,7 +1,7 @@
 """Multiport scattering-matrix (S-matrix) assembler — pure Python, no engine.
 
 This assembles the multi-port scattering matrix, built entirely on top of the
-mode-resolved **complex** modal amplitude that :func:`photonhub.plugins.mode_overlap.mode_amplitude` extracts
+mode-resolved **complex** modal amplitude that :func:`photonhub.analysis.mode_overlap.mode_amplitude` extracts
 from a recorded DFT plane. Where :mod:`mode_devices` gives you single-mode power
 ``T(f) = |c|^2`` per monitor, this module keeps the *phase* of ``c`` and arranges
 the per-port amplitudes into a proper scattering matrix.
@@ -19,12 +19,12 @@ is the amplitude **scattered out** of the device at port i. Each is the
 **power-normalized wave amplitude** ``c * sqrt(|P_mode| * 1e-12)`` (µm²→m²,
 the engine's SI flux units), built from the
 normalized modal coefficient ``c = a_pm / P_mode`` of
-:func:`~photonhub.plugins.mode_overlap.mode_amplitude` and the port mode's own
+:func:`~photonhub.analysis.mode_overlap.mode_amplitude` and the port mode's own
 plane power ``P_mode`` — so
 
 * ``|a|^2`` / ``|b|^2`` is the modal **power** the wave carries through the
   port plane (the same number
-  :func:`~photonhub.plugins.mode_devices.ModeMonitor.mode_power` reports), hence
+  :func:`~photonhub.analysis.mode_devices.ModeMonitor.mode_power` reports), hence
   ``|S_ij|^2 = |b_i|^2 / |a_j|^2`` is a true power transmission / reflection
   **even when ports i and j carry different modes** (unequal widths /
   polarizations, whose per-mode ``P_mode`` differ) and a lossless reciprocal
@@ -131,7 +131,7 @@ class SPort:
     name:
         Port label (the S-matrix index). Must be unique among the ports.
     monitor:
-        The :class:`~photonhub.plugins.mode_devices.ModeMonitor` recording the
+        The :class:`~photonhub.analysis.mode_devices.ModeMonitor` recording the
         port plane (its ``mode``, ``axis``, ``center_um``, ``thickness_axis`` and
         ``modes_by_freq`` drive the overlap).
     out_direction:

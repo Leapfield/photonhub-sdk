@@ -1,8 +1,8 @@
 """``plot_spectrum()`` — transmission ``T(λ)`` from the mode-monitor pipeline.
 
 Plots the power-transmission spectrum that
-:func:`photonhub.plugins.transmission` /
-:meth:`photonhub.plugins.ModeMonitor.mode_power` produce. It accepts either:
+:func:`photonhub.analysis.transmission` /
+:meth:`photonhub.analysis.ModeMonitor.mode_power` produce. It accepts either:
 
 - a single ``{freq_hz: T}`` mapping — one trace, or
 - a ``{label: {freq_hz: T}}`` mapping — several labelled traces (e.g. a

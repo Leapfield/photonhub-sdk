@@ -94,7 +94,7 @@ class Source:
 class Layer:
     """One patterned layer of the stack (the device geometry is extruded into
     it). ``material`` is a name resolved at build time — a
-    :mod:`photonhub.materials` entry (e.g. ``"cSi"``) or an ``"n=<value>"`` literal
+    :mod:`photonhub.materials` entry (e.g. ``"Si"``) or an ``"n=<value>"`` literal
     for a constant index."""
 
     name: str

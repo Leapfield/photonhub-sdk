@@ -4,7 +4,7 @@ A rectangular-dielectric waveguide builder and the
 "draw the cross-section, press solve" FDE workflow: declare the geometry (and
 optionally the materials), get the solved mode set with the numbers designers
 actually quote — ``n_eff``, TE fraction, group index, bend loss — without
-hand-assembling a :class:`~photonhub.plugins.vector_modes.VectorModeSolver`.
+hand-assembling a :class:`~photonhub.analysis.vector_modes.VectorModeSolver`.
 
 Two extras beyond a bare solver call:
 
@@ -188,7 +188,7 @@ def rectangular_waveguide(
         Core width and total height (rib: measured from the slab bottom).
     core, clad:
         Refractive indices as floats, or :mod:`photonhub.materials` entries /
-        names (``"cSi"``, ``"SiO2"``) evaluated at ``wavelength_um``.
+        names (``"Si"``, ``"SiO2"``) evaluated at ``wavelength_um``.
     slab_h_um:
         Rib slab thickness (0 = strip).
     dl_um:

@@ -1,6 +1,6 @@
 """PhotonHub visualization layer (design doc: docs/viz-layer-design.md).
 
-The rendering engine behind ``Simulation.plot``/``plot_eps``/``plot_3d`` and
+The rendering engine behind ``Simulation.plot``/``plot_index``/``plot_3d`` and
 ``RunResult.plot_field``. All 2D methods return a matplotlib ``Axes``,
 accept ``ax=``, and never call ``plt.show()``; ``plot_3d`` returns a plotly
 ``Figure`` (the optional ``photonhub[viz]`` extra, lazy-imported).
@@ -14,7 +14,8 @@ No UI/event-loop assumptions live here, so the future standalone viewer and the
 Phase-4 GUI can call these headless (design §12).
 """
 
-from .eps import plot_eps
+from .eps import plot_index
+from .eps import plot_eps  # deprecated alias
 from .field import plot_field
 from .interactive import (interactive_field, interactive_preview,
                           render_field_slice, render_slice)
@@ -24,7 +25,7 @@ from .scene3d import plot_3d
 from .source import plot_source_time
 from .spectrum import plot_spectrum
 
-__all__ = ["plot", "plot_eps", "plot_field", "plot_3d", "plot_mode",
+__all__ = ["plot", "plot_index", "plot_field", "plot_3d", "plot_mode",
            "plot_overlap", "plot_source_time", "plot_spectrum",
            "interactive_preview", "render_slice", "interactive_field",
            "render_field_slice"]

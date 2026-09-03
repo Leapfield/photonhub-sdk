@@ -20,8 +20,8 @@ converts it to what the engine can run:
   fit diagnostics (band error, pole placement, ADE-stability margin).
 
 >>> import photonhub as ph
->>> from photonhub.materials import cSi, SiO2
->>> core = ph.Structure(geometry=box, medium=cSi.medium(band_um=(1.5, 1.6)))
+>>> from photonhub.materials import Si, SiO2
+>>> core = ph.Structure(geometry=box, medium=Si.medium(band_um=(1.5, 1.6)))
 >>> n_clad = SiO2.n(1.55)                      # 1.4440
 
 Bring your own measured (ellipsometer) data — the right path for
@@ -83,7 +83,7 @@ __all__ = [
     "get",
     # built-in materials (registry attributes)
     "Vacuum",
-    "cSi",
+    "Si",
     "SiO2",
     "Si3N4",
     "GaAs",
@@ -287,9 +287,9 @@ class LorentzFit:
         estimate — ``validate()`` remains authoritative there."""
         if self.resonance_frequency_hz is None:
             return 0.0
-        # lazy import: plugins.__init__ is heavy and materials must stay
+        # lazy import: analysis.__init__ is heavy and materials must stay
         # importable standalone; _constants itself imports nothing.
-        from .plugins._constants import engine_dt_s
+        from .analysis._constants import engine_dt_s
 
         return 2.0 * math.pi * self.resonance_frequency_hz \
             * engine_dt_s(dl_um, courant)
@@ -836,8 +836,8 @@ Vacuum = Material(
 # H. H. Li, J. Phys. Chem. Ref. Data 9, 561-658 (1993 review), 293 K —
 # tabulated n, transparent range (the same source the gds benchmark's
 # dispersive-Si pole is anchored to).
-cSi = Material(
-    name="cSi",
+Si = Material(
+    name="Si",
     model=TabulatedNK(
         wavelength_um=(
             1.20, 1.22, 1.24, 1.26, 1.28, 1.30, 1.32, 1.34, 1.36, 1.38,
@@ -1276,7 +1276,7 @@ MATERIALS = {
     m.name: m
     for m in (
         Vacuum,
-        cSi,
+        Si,
         SiO2,
         Si3N4,
         GaAs,
@@ -1301,9 +1301,38 @@ MATERIALS = {
 
 def get(name: str) -> Material:
     """Look up a built-in material by name (see ``MATERIALS`` for the list)."""
+    if name in _RENAMED_MATERIALS:
+        import warnings
+
+        warnings.warn(
+            f"material {name!r} was renamed to {_RENAMED_MATERIALS[name]!r}; the old "
+            "name will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        name = _RENAMED_MATERIALS[name]
     try:
         return MATERIALS[name]
     except KeyError:
         raise KeyError(
             f"unknown material {name!r}; available: {sorted(MATERIALS)}"
         ) from None
+
+
+# --- deprecated aliases (2026-09 rename; remove in 0.2) ---------------------
+_RENAMED_MATERIALS = {"cSi": "Si"}
+
+
+def __getattr__(name):
+    replacement = _RENAMED_MATERIALS.get(name)
+    if replacement is not None:
+        import warnings
+
+        warnings.warn(
+            f"photonhub.materials.{name} was renamed to photonhub.materials."
+            f"{replacement}; the old name will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return globals()[replacement]
+    raise AttributeError(f"module 'photonhub.materials' has no attribute {name!r}")

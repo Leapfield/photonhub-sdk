@@ -13,7 +13,7 @@ frequency :math:`f_k`, decay rate :math:`\\alpha_k`, quality factor
 :math:`\\phi_k` from a :class:`~photonhub.components.TimeMonitor` time series.
 
 This is a CPU-only post-processing plugin (the plugin contract in
-``photonhub.plugins``): it consumes the raw ``E(t)`` already recorded by a
+``photonhub.analysis``): it consumes the raw ``E(t)`` already recorded by a
 ``TimeMonitor`` and runs nowhere near the engine or the wire format.
 
 Algorithm
@@ -39,7 +39,7 @@ oracle in the test suite.
 Example
 -------
 >>> import numpy as np
->>> from photonhub.plugins import ResonanceAnalysis, select_resonances
+>>> from photonhub.analysis import ResonanceAnalysis, select_resonances
 >>> dt = 1.0
 >>> t = np.arange(8000) * dt
 >>> sig = 2.0 * np.exp((-2j*np.pi*0.10 - 0.002) * t) \\
@@ -639,4 +639,4 @@ def __getattr__(name):
         )
         return ResonanceAnalysis
     raise AttributeError(
-        f"module 'photonhub.plugins.resonance' has no attribute {name!r}")
+        f"module 'photonhub.analysis.resonance' has no attribute {name!r}")
