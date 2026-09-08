@@ -257,6 +257,17 @@ periods add coherently, producing a reflection stopband and transmission notch."
 
 The cosine tapers expand and collimate the guided mode through the crossing.
 The key observables are through-port insertion loss and cross-port crosstalk."""
+    if kind == "spline_taper_crossing":
+        return r"""## Key physics
+
+Two strip waveguides crossing directly lose about 1 dB and leak roughly
+$-10$ dB into the crossing arms, because the tightly confined TE0 mode diffracts
+into the unconfined junction. Each arm here is a 4.5 µm taper whose width follows
+a spline through 13 optimized knots: it widens the mode, lets it beat between the
+TE0 and TE2-like modes of the wide section, and re-focuses a near-replica of the
+input mode exactly at the crossing centre (multimode self-imaging). The two
+readouts are the through-port insertion loss (a few hundredths of a dB) and the
+TE0 crosstalk into the cross arms (below $-50$ dB in the paper's FDTD)."""
     return """## Key physics
 
 The field plot explains how the device operates; the integrated paper metric

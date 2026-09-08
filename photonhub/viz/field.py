@@ -221,7 +221,19 @@ def plot_field(data, monitor, field="Ex", x=None, y=None, z=None, *,
         elif slice_axis is not None:
             drew_structure = _draw_outlines(ax, sim, slice_axis, slice_val)
 
-    ax.set_aspect("equal")
+    # Crop to the recorded slice. Outlines of structures that extend past the
+    # monitor plane — or past a §20 symmetry face, where the mirrored half is
+    # not simulated at all — would otherwise stretch the frame around empty
+    # space; the field's own extent is the picture.
+    ax.set_xlim(float(np.min(h_coord)), float(np.max(h_coord)))
+    ax.set_ylim(float(np.min(v_coord)), float(np.max(v_coord)))
+
+    # Equal aspect shows the true proportions. A plane more than eight times
+    # longer than it is wide (a 460 µm adiabatic device on an 8 µm strip) would
+    # collapse to a hairline, so such planes are stretched to fill the axes.
+    span_h = float(np.max(h_coord) - np.min(h_coord))
+    span_v = float(np.max(v_coord) - np.min(v_coord))
+    ax.set_aspect("equal" if span_v <= 0 or span_h / span_v <= 8.0 else "auto")
     ax.set_xlabel(f"{h_letter} (µm)")
     ax.set_ylabel(f"{v_letter} (µm)")
     ax.set_title(f"{monitor}: {field} ({used_val})")

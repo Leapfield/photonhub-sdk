@@ -127,7 +127,7 @@ _STABLE_PML_ALPHA_SCALE = 0.9
 # that reference value — so 0.1 keeps ~3x that margin (rod probe: stable through
 # 294k steps at alpha 3e4-1e5 S/m; CFS-inert diverges @197k) while restoring
 # low reflection (crossing R: 3e4 -> 1e-4, 1e5 -> 0.024, vs 0.35 at the 0.9
-# dose). Measured 2026-07-17 on MI300X gfx942:
+# dose). Measured 2026-07-17 on the cloud GPU:
 # engine/docs/subpixel-dispersion-instability.md, final section.
 _AUTO_PML_ALPHA_SCALE = 0.1
 # CFS-inert threshold: an alpha below this fraction of the sigma peak leaves the
@@ -352,7 +352,7 @@ class Simulation(FrozenModel):
     # curved (Cylinder/Polygon/Sphere, supersampled §16.7) interfaces are
     # smoothed on BOTH uniform and graded meshes (CPU, single GPU, and multi-GPU).
     # Only the off-diagonal ``tensor_full`` on a graded mesh remains deferred
-    # (§16.6; engine reference_solver.cpp / gpu_solver.hip reject it). Uniform
+    # (§16.6; the engine's reference and GPU solvers reject it). Uniform
     # ``tensor_full`` is available on GPU subject to its engine-wide
     # lossless/non-dispersive combination rules.
     subpixel: bool = False
@@ -997,7 +997,10 @@ class Simulation(FrozenModel):
             for a in range(3):
                 lo, hi = bb[a]
                 L = realized[a]
-                if lo < band or hi > L - band:
+                # NUMERICS §20: a symmetry plane replaces the minimum face's
+                # absorbing band (geometry past it is the mirror image), so
+                # only the far face is stretched there.
+                if (self.symmetry[a] == 0 and lo < band) or hi > L - band:
                     out[a] = True
         return tuple(out)
 
@@ -1634,7 +1637,9 @@ class Simulation(FrozenModel):
         warn (geometry-only *shell* simulations legitimately carry a
         placeholder dipole that is never run); :func:`photonhub.run_local`
         warns before launching. Uniform grids only (the band is
-        ``layers * dl``). Returns ``[(source_index, axis_name, band_um), ...]``
+        ``layers * dl``). On a §20 symmetry axis the band is one-sided: the
+        min face is the mirror, not an absorber, so only the far face is
+        tested there. Returns ``[(source_index, axis_name, band_um), ...]``
         (empty when every point source is interior).
         """
         dl = getattr(self.grid, "dl_um", None)
@@ -1654,7 +1659,14 @@ class Simulation(FrozenModel):
                     band = self.absorber_num_layers * dl
                 else:
                     continue
-                if center[a] < band or center[a] > realized[a] - band:
+                # NUMERICS.md §20: a symmetry plane replaces the MIN-face
+                # absorbing slab (the PML on that axis is built one-sided;
+                # same rule as _nonabsorbing_bounds_um's lower_layers), so
+                # only the far face can absorb the source there. A folded
+                # mode launch legitimately puts its equivalence-current
+                # dipoles a fraction of a cell from the mirror.
+                lower = 0.0 if self.symmetry[a] != 0 else band
+                if center[a] < lower or center[a] > realized[a] - band:
                     hits.append((i, _AXES[a], band))
                     break
         return hits

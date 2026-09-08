@@ -4,7 +4,7 @@ Phase-1a HDF5 migration (master plan): the engine emits raw little-endian
 float32 ``.bin`` monitors plus ``manifest.json`` (photonhub.data); this
 packs that directory into one ``.h5`` so Phase-0/1a golden outputs survive
 into HDF5 without an engine rebuild. The engine-native HighFive writer is
-deferred to the Linux/ROCm box where libhdf5 is a package install.
+deferred to the Linux GPU box where libhdf5 is a package install.
 
 Layout — deliberately "the output directory in one file":
 

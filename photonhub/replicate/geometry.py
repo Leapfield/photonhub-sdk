@@ -18,7 +18,14 @@ import math
 from typing import Any, Callable, Dict, List, Mapping, Tuple
 
 from ..components.structures import Box, Cylinder, Medium, Structure
-from ..library import Component, Port, bragg_grating, cosine_taper_crossing, y_branch
+from ..library import (
+    Component,
+    Port,
+    bragg_grating,
+    cosine_taper_crossing,
+    spline_taper_crossing,
+    y_branch,
+)
 
 __all__ = [
     "register",
@@ -208,6 +215,35 @@ def _cosine_taper_crossing(
         taper_length_um=float(params["taper_length_um"]),
         arm_length_um=float(params["arm_length_um"]),
         n_points=int(params.get("n_points", 48)),
+        thickness_um=thickness_um,
+        medium=medium,
+        center_um=center_um,
+    )
+
+
+@geometry_builder("spline_taper_crossing")
+def _spline_taper_crossing(
+    params: Mapping[str, Any],
+    *,
+    medium: Medium,
+    thickness_um: float,
+    center_um: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> Component:
+    """Single-etch crossing of four identical knot-defined tapers (Ma et al.,
+    Opt. Express 21, 29374 (2013), Table 1). Params: ``wg_width_um`` (the
+    routing width = w1 = wN), ``taper_length_um`` (L), ``widths_um`` (the
+    equally spaced knot widths, w1 at the waveguide end ... wN at the
+    centre), ``arm_length_um``; optional ``interpolation`` (``natural`` |
+    ``not-a-knot`` | ``pchip`` | ``linear``, default ``natural``) and
+    ``n_points`` (sidewall samples per taper). ``shaped_half_extent_um`` (read
+    by the simulation builder) is the taper length."""
+    return spline_taper_crossing(
+        wg_width_um=float(params["wg_width_um"]),
+        taper_length_um=float(params["taper_length_um"]),
+        widths_um=[float(w) for w in params["widths_um"]],
+        arm_length_um=float(params["arm_length_um"]),
+        interpolation=str(params.get("interpolation", "natural")),
+        n_points=int(params.get("n_points", 121)),
         thickness_um=thickness_um,
         medium=medium,
         center_um=center_um,

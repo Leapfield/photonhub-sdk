@@ -317,6 +317,12 @@ def build_markdown_report(
                     "light stays collimated through the junction; the dark "
                     "cross-arms are the low crosstalk"
                 )
+            elif spec.device.kind == "spline_taper_crossing":
+                field_caption = (
+                    "the mode expands along the input taper, beats in the wide "
+                    "section and re-focuses at the junction; the dark cross-arms "
+                    "are the low crosstalk"
+                )
             elif spec.device.kind == "y_branch":
                 field_caption = (
                     "the input mode expands through the solid junction and divides "

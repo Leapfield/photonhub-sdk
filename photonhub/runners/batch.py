@@ -16,7 +16,7 @@ read identically::
     batch_data.errors                       # {name: exception} failures
 
 Local backend: each simulation is an independent :func:`run_local` subprocess
-(ROCm-crash isolation; identical local/cloud file protocol). ``max_workers``
+(GPU-driver-crash isolation; identical local/cloud file protocol). ``max_workers``
 multiplexes the subprocesses — on the cloud this becomes a fan-out across GPUs;
 locally it defaults to 1 (serial) so a CPU box is not oversubscribed. A failed
 simulation is captured per-name (partial-failure semantics) and never aborts

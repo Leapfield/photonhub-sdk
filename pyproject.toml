@@ -52,8 +52,9 @@ test = [
     "h5py",
     "mcp>=1,<2",
     "nbformat",
+    "shapely",
 ]  # complete offline package suite used by CI
-viz = ["plotly", "ipywidgets"]              # plotly = 3D; ipywidgets = interactive_preview
+viz = ["plotly", "ipywidgets", "shapely"]   # plotly = 3D; ipywidgets = interactive_preview; shapely = featured-figure scene export
 mcp = ["mcp>=1,<2"]                                # photonhub-mcp agent-tool server
 server = ["fastapi", "uvicorn"]              # photonhub-serve-viz HTTP facade
 app = ["plotly", "fastapi", "uvicorn", "mcp>=1,<2", "h5py", "gdstk"]  # desktop opens bundles + HDF5 results and imports GDSII layouts

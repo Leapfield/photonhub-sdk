@@ -1458,7 +1458,7 @@ def waveguide_section(
 #
 # This is the CPU "expose the batch" prerequisite for any GPU port: once the F×Z
 # eigensolves are collected as one independent set, the same set is what a batched
-# GPU eigensolver (CuPy-for-ROCm / rocSOLVER on the MI300X) would consume. See
+# GPU eigensolver would consume. See
 # ``docs/eme-gpu-acceleration-design.md``.
 #
 # Multiprocessing note: on macOS/Windows the default start method is *spawn*,
@@ -1640,8 +1640,8 @@ def run_eme_band(
         raise ValueError(
             f"backend must be auto/process/thread/serial, got {backend!r}")
     if backend == "auto":
-        # Process pools shine where the platform *forks* (Linux/CI/the MI300X
-        # cloud box): ~0 startup, ~3.5x measured. Under *spawn* (macOS/Windows)
+        # Process pools shine where the platform *forks* (Linux/CI/the cloud
+        # GPU box): ~0 startup, ~3.5x measured. Under *spawn* (macOS/Windows)
         # the per-worker re-import tax sinks small sweeps and needs a __main__
         # guard, so fall back to threads — a safe, steady ~1.7x with no pickling.
         # Override with backend="process" for big spawn-platform sweeps.

@@ -79,7 +79,8 @@ class HttpClient:
     def _open(self, method: str, path: str, *, body: Optional[dict] = None,
               deadline: Optional[float] = None):
         url = self.cfg.url + path
-        data = json.dumps(body).encode() if body is not None else None
+        # compact separators: a large launch profile is a fifth smaller on the wire
+        data = json.dumps(body, separators=(",", ":")).encode() if body is not None else None
         headers = {}
         if data is not None:
             headers["Content-Type"] = "application/json"

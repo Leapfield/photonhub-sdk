@@ -84,7 +84,7 @@ sim.plot_3d()                     # interactive 3D  (pip install photonhub[viz])
 Shipped surface as of schema **v1.20.0-alpha.1** (a dispersive solver core
 cross-checked against analytic references — multi-pole Lorentz + Drude ADE
 with a fitted metals library (Au/Ag/Cu/Al) and PEC structures, with recorded
-MI300X CPU↔GPU equivalence (full inventory 475/475 on 2026-08-27, a dated
+CPU↔GPU equivalence (full inventory 475/475 on 2026-08-27, a dated
 pre-merge record) under the numerical contract's tolerances — plus full-vector mode
 injection, GDS import (`ph.import_gds`), adjoint gradients, and the silicon-PIC
 MVP):
@@ -161,7 +161,7 @@ plus the silicon-PIC MVP:
 
 - Dispersion is **multi-pole ADE** — up to 6 Lorentz + Drude poles per medium
   (metals/plasmonics; numerical definition in the numerics reference, §19; the
-  single- and multi-pole/Drude scenes are in the recorded MI300X equivalence
+  single- and multi-pole/Drude scenes are in the recorded GPU equivalence
   inventory under §8 tolerances, dated 2026-08-27) on
   top of relative permittivity + Ohmic conductivity; a passivity-enforced
   CCPR fitter and anisotropic poles are still open. Explicit
@@ -182,6 +182,6 @@ eigenmode, inject it with `mode_launch`, ratio two `mode_monitor` planes, and pl
 - [PhotonHub product overview](https://leapfield.app/#product)
 - [Request beta access or support](https://leapfield.app/#request)
 
-The worked-example gallery (twenty-six executed notebooks) lives in the
+The worked-example gallery (thirty-one executed notebooks) lives in the
 project source tree and is summarized on the documentation site's examples
 page.

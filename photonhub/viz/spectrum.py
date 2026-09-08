@@ -1,4 +1,5 @@
-"""``plot_spectrum()`` — transmission ``T(λ)`` from the mode-monitor pipeline.
+"""``plot_spectrum()`` — transmission ``T(λ)`` from the mode-monitor pipeline —
+and ``plot_comparison()`` — an observable against the paper's extracted series.
 
 Plots the power-transmission spectrum that
 :func:`photonhub.analysis.transmission` /
@@ -80,4 +81,62 @@ def plot_spectrum(spectra, *, ax=None, ymax=1.05, **kw):
     ax.grid(True, alpha=0.3)
     if drew_label:
         ax.legend(loc="best", fontsize="small", framealpha=0.9)
+    return ax
+
+
+def plot_comparison(x_nm, values, *, reference=None, reference_scale=1.0,
+                    stated=None, ylabel="", xlabel="wavelength (nm)",
+                    label="PhotonHub", ax=None, ylim=None, **kw):
+    """The result figure of an example: our observable against wavelength as
+    a line, the paper's extracted series as markers.
+
+    ``x_nm`` / ``values`` are our curve, in whatever unit the observable has
+    (dB, a ratio, a Q). ``reference`` is one series or a list of series from a
+    reference file — ``{"x": [...], "y": [...], "label": "..."}`` with ``x`` in
+    nm — drawn as markers, each ``y`` multiplied by ``reference_scale``
+    (``-1`` turns a digitized transmittance in dB into an insertion loss).
+    ``stated`` draws the paper's *stated* value as a dashed line instead:
+    ``(value, label)`` or a list of them — the form a page uses when the
+    paper's license does not allow its figure to be re-plotted. ``ylim``
+    fixes the y-range so the agreement is visible. Returns the matplotlib
+    ``Axes`` and never calls ``plt.show()``."""
+    import matplotlib.pyplot as plt
+
+    x = np.asarray(x_nm, dtype=np.float64)
+    y = np.asarray(values, dtype=np.float64)
+    if x.ndim != 1 or x.shape != y.shape or x.size == 0:
+        raise ValueError(
+            "x_nm and values must be non-empty 1-D arrays of the same length"
+        )
+    if reference is None:
+        refs = []
+    elif isinstance(reference, dict):
+        refs = [reference]
+    else:
+        refs = list(reference)
+
+    if ax is None:
+        _, ax = plt.subplots()
+    ax.plot(x, y, "-", label=label, **kw)
+    for ref in refs:
+        try:
+            rx = np.asarray(ref["x"], dtype=np.float64)
+            ry = np.asarray(ref["y"], dtype=np.float64) * float(reference_scale)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "each reference series needs numeric 'x' (nm) and 'y' arrays"
+            ) from exc
+        if rx.shape != ry.shape:
+            raise ValueError("a reference series' x and y differ in length")
+        ax.plot(rx, ry, "o", ms=3, label=str(ref.get("label", "paper")))
+    if stated is not None:
+        lines = [stated] if len(stated) == 2 and not isinstance(stated[0], (list, tuple)) else list(stated)
+        for value, text in lines:
+            ax.axhline(float(value), ls="--", lw=1.2, color="0.3", label=str(text))
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best", fontsize="small", framealpha=0.9)
     return ax

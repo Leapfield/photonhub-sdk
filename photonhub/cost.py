@@ -41,7 +41,7 @@ TCELL = 1.0e12
 DEFAULT_RATE_USD_PER_TCELL_STEP = 0.40
 
 #: Throughput for the WALL-TIME estimate only (dollars do not depend on it).
-#: The conservative Phase-1 acceptance FLOOR (>=20 Gcells/s vacuum on MI300X),
+#: The conservative Phase-1 acceptance FLOOR (>=20 Gcells/s vacuum on the cloud GPU),
 #: not the measured untuned 49.6 — a defensible lower bound so the time figure
 #: never over-promises. Realistic dielectric/PML scenes run slower; pass a
 #: scene/device-specific value to override.

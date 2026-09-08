@@ -37,6 +37,8 @@ __all__ = [
     "cosine_taper",
     "crossing",
     "cosine_taper_crossing",
+    "spline_taper_crossing",
+    "spline_width_profile",
     "coupler",
     "ring",
     "bragg_grating",
@@ -513,6 +515,170 @@ def cosine_taper_crossing(
                         center=stub_center,
                         prop_axis=prop_axis,
                         width_axis=_third_axis(prop_axis, thickness_axis),
+                        thickness_axis=thickness_axis,
+                        length_um=stub_len,
+                        width_um=wg_width_um,
+                        thickness_um=thickness_um,
+                        medium=medium,
+                    )
+                )
+            port_name = f"{prop_axis}{'+' if sign > 0 else '-'}"
+            port_center = _vec(center_um, **{prop_axis: sign * arm_length_um})
+            ports.append(Port(port_name, port_center, prop_axis, wg_width_um))
+    return Component(structures=tuple(structures), ports=tuple(ports))
+
+
+# ---------------------------------------------------------------------------
+# 4c. spline-taper crossing (Ma et al. 2013, the PSO-optimized single-etch
+#     crossing: four identical tapers whose width is a spline through a table
+#     of knot widths)
+# ---------------------------------------------------------------------------
+
+
+_SPLINE_INTERPOLATIONS = ("natural", "not-a-knot", "pchip", "linear")
+
+
+def spline_width_profile(
+    widths_um,
+    length_um: float,
+    *,
+    interpolation: str = "natural",
+):
+    """The width-vs-position function ``w(s)`` of a knot-defined taper.
+
+    ``widths_um`` are ``N >= 2`` knot widths equally spaced along the taper,
+    listed from the routing-waveguide end (``s = 0``) to the far end
+    (``s = length_um``). ``interpolation`` is the curve drawn through them:
+    ``"natural"`` (cubic spline, zero end curvature — the default and the
+    classic "spline interpolation" of the Ma et al. crossing), ``"not-a-knot"``
+    (SciPy's default cubic end condition), ``"pchip"`` (shape-preserving,
+    never overshoots a knot) or ``"linear"`` (straight segments — the
+    13-segment convention of the classic Y-junction example). Returns a callable
+    ``w(s)`` accepting a scalar or an array of positions in ``[0, length_um]``."""
+    import numpy as np
+
+    knots = [float(w) for w in widths_um]
+    if len(knots) < 2:
+        raise ValueError("widths_um needs at least two knot widths")
+    if any(w <= 0.0 for w in knots):
+        raise ValueError(f"every knot width must be positive; got {knots}")
+    if length_um <= 0.0:
+        raise ValueError(f"length_um must be positive; got {length_um}")
+    if interpolation not in _SPLINE_INTERPOLATIONS:
+        raise ValueError(
+            f"interpolation {interpolation!r} not in {_SPLINE_INTERPOLATIONS}"
+        )
+    s_knots = np.linspace(0.0, length_um, len(knots))
+    if interpolation == "linear":
+        return lambda s: np.interp(s, s_knots, knots)
+    if interpolation == "pchip":
+        from scipy.interpolate import PchipInterpolator
+
+        return PchipInterpolator(s_knots, knots)
+    from scipy.interpolate import CubicSpline
+
+    return CubicSpline(s_knots, knots, bc_type=interpolation)
+
+
+def spline_taper_crossing(
+    *,
+    wg_width_um: float,
+    taper_length_um: float,
+    widths_um,
+    arm_length_um: float,
+    interpolation: str = "natural",
+    n_points: int = 121,
+    thickness_um: float = DEFAULT_THICKNESS_UM,
+    medium: Medium = SILICON,
+    center_um: Vec3Um = (0.0, 0.0, 0.0),
+    thickness_axis: AxisName = "z",
+) -> Component:
+    """A single-etch waveguide crossing made of four identical knot-defined
+    tapers that share a centre point (Ma et al., Opt. Express 21, 29374
+    (2013), and the Sanchis et al. 2009 / Zhang et al. 2013 designs it
+    descends from).
+
+    Each arm runs centre -> port along one in-plane axis: a taper of
+    ``taper_length_um`` (= L) whose full width is the ``interpolation`` curve
+    (see :func:`spline_width_profile`) through the equally spaced knots
+    ``widths_um`` — listed the paper's way, ``w1`` at the routing-waveguide end
+    and ``wN`` at the crossing centre — followed by a straight routing stub of
+    ``wg_width_um`` out to the port at ``arm_length_um`` from centre. The four
+    tapers overlap at the centre; their union is the device (the wide knots next
+    to the centre "merge into the cross-sectional region", as the paper puts
+    it), so the near-centre width profile is buried inside the junction and
+    only the outer profile is a visible sidewall. Each taper sidewall is
+    sampled at ``n_points`` positions. Four ports (``x-``, ``x+``, ``y-``,
+    ``y+``), each ``wg_width_um`` wide. The paper's footprint is
+    ``2 * taper_length_um``."""
+    import numpy as np
+
+    knots = [float(w) for w in widths_um]
+    if arm_length_um < taper_length_um - 1e-9:
+        raise ValueError(
+            f"arm_length_um ({arm_length_um}) must be >= taper_length_um "
+            f"({taper_length_um})"
+        )
+    if n_points < 2:
+        raise ValueError(f"n_points must be >= 2; got {n_points}")
+    profile = spline_width_profile(knots, taper_length_um, interpolation=interpolation)
+    # s = distance from the routing-waveguide end (the paper's w1 side) ...
+    s = np.linspace(0.0, taper_length_um, int(n_points))
+    half = 0.5 * np.asarray(profile(s), dtype=float)
+    if np.any(half <= 0.0):
+        raise ValueError(
+            "the interpolated width profile goes non-positive between knots; "
+            "use interpolation='pchip' or 'linear', or adjust the knots"
+        )
+    # ... so the along-arm coordinate from the CENTRE is taper_length - s.
+    dist = taper_length_um - s
+
+    a_axis, b_axis = _bend_plane_axes(thickness_axis)  # the two in-plane axes
+    poly_axes = [ax for ax in _AXES if ax != thickness_axis]  # (u, v)
+    t_center = center_um[_INDEX[thickness_axis]]
+    slab_bounds = (t_center - thickness_um / 2.0, t_center + thickness_um / 2.0)
+
+    structures: list[Structure] = []
+    ports: list[Port] = []
+    for prop_axis in (a_axis, b_axis):
+        width_axis = _third_axis(prop_axis, thickness_axis)
+        for sign in (-1.0, +1.0):
+            # one sidewall outward from the centre, the other back: CCW after
+            # the winding normalization below.
+            along = sign * dist
+            corners_pw = list(zip(along, -half)) + list(zip(along[::-1], half[::-1]))
+            vertices = []
+            for prop_off, width_off in corners_pw:
+                role = {prop_axis: float(prop_off), width_axis: float(width_off)}
+                u = role[poly_axes[0]] + center_um[_INDEX[poly_axes[0]]]
+                v = role[poly_axes[1]] + center_um[_INDEX[poly_axes[1]]]
+                vertices.append((u, v))
+            area2 = sum(
+                x1 * y2 - x2 * y1
+                for (x1, y1), (x2, y2) in zip(vertices, vertices[1:] + vertices[:1])
+            )
+            if area2 < 0.0:
+                vertices.reverse()
+            structures.append(
+                Structure(
+                    geometry=Polygon(
+                        axis=thickness_axis,
+                        vertices_um=tuple(vertices),
+                        slab_bounds_um=slab_bounds,
+                    ),
+                    medium=medium,
+                )
+            )
+            stub_len = arm_length_um - taper_length_um
+            if stub_len > 1e-9:
+                stub_center = _vec(
+                    center_um, **{prop_axis: sign * (taper_length_um + stub_len / 2.0)}
+                )
+                structures.append(
+                    _slab_box(
+                        center=stub_center,
+                        prop_axis=prop_axis,
+                        width_axis=width_axis,
                         thickness_axis=thickness_axis,
                         length_um=stub_len,
                         width_um=wg_width_um,

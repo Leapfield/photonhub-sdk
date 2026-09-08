@@ -23,7 +23,7 @@ from .config import CloudConfig, CloudError, get_config
 
 ProgressCb = Optional[Callable[[dict], None]]
 
-# A curated-GPU id in `device="gpu:<id>"` (the beta uses "mi300x"). Lowercase
+# A curated-GPU id in `device="gpu:<id>"` (ids come from `ph.cloud.gpus()`). Lowercase
 # slug, distinct from the local path's numeric `gpu:N` device index; legacy or
 # development catalogs may expose other ids.
 _GPU_ID = re.compile(r"[a-z0-9][a-z0-9._-]*")

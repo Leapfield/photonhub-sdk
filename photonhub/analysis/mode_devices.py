@@ -368,6 +368,23 @@ def _solved_center_um(mode) -> Optional[Tuple[float, float]]:
     return float(h), float(v)
 
 
+def _solved_center_in_plane_frame(mode, axis: str) -> Optional[Tuple[float, float]]:
+    """:func:`_solved_center_um` re-ordered into the readout plane's
+    ``(t1, t2) = _TRANSVERSE[axis]`` frame. The solve provenance records the
+    centre in the solve window's ``(h, v) = in_plane_axes(axis)`` order; the
+    two frames coincide for an x- or z-cut but SWAP for a y-cut (``(x, z)`` vs
+    ``(z, x)``), so handing the raw pair to a y-normal monitor placed the mode
+    at ``(t1=x_c, t2=z_c)`` — off the plane entirely (a zero-power reference
+    mode, or a plausible-looking wrong overlap on a taller domain)."""
+    solved = _solved_center_um(mode)
+    if solved is None:
+        return None
+    h_name, v_name = _geom.in_plane_axes(axis)
+    by_name = {h_name: solved[0], v_name: solved[1]}
+    t1, t2 = _TRANSVERSE[axis]
+    return (by_name[t1], by_name[t2])
+
+
 def mode_launch(
     simulation,
     mode,
@@ -1019,7 +1036,7 @@ def mode_monitor(
         # centre produce a plausible-looking but wrong transmission, which is
         # exactly how the 1.96 energy sum arose.
         center_um=center_um if center_um is not None
-        else _solved_center_um(mode),
+        else _solved_center_in_plane_frame(mode, axis),
         direction=direction,
         thickness_axis=thickness_axis,
         modes_by_freq=modes_by_freq,

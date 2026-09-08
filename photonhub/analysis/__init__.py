@@ -102,7 +102,7 @@ from .kfj_smoothing import (
 )
 from .modes import Mode, ModeSolver
 from .near_field import FarField, equivalent_currents, far_field
-from .propagate import FocalScan, focal_scan, propagate_plane
+from .propagate import FocalScan, focal_scan, propagate_plane, FocalMetrics, focal_metrics
 from .thin_lens import thin_lens_beam, thin_lens_source
 from .resonance import ResonanceAnalysis, select_resonances
 from .spectral_completion import CompletionRejected, SpectrumCompleter
@@ -142,6 +142,7 @@ __all__ = [
     "EMEConvergenceReport",
     "EMEResult",
     "FarField",
+    "FocalMetrics",
     "FocalScan",
     "InterfaceDiagnostics",
     "Mode",
@@ -171,6 +172,7 @@ __all__ = [
     "equivalence_current_source",
     "equivalent_currents",
     "far_field",
+    "focal_metrics",
     "focal_scan",
     "gaussian_beam",
     "gaussian_beam_source",

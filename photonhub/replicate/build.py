@@ -34,8 +34,9 @@ from ..components.simulation import Simulation
 from ..components.source_time import GaussianPulse
 from ..components.sources import PointDipole
 from ..components.structures import Medium, Structure
-from ..components.grid import UniformMesh, realized_cells
-from ..components.monitors import ProfileMonitor
+from ..components.grid import (UniformMesh, auto_mesh, graded_primary_spacings,
+                               realized_cells, resolved_cell_counts)
+from ..components.monitors import PowerMonitor, ProfileMonitor
 from .. import materials as _materials
 from ..analysis.mode_devices import ModeMonitor, mode_launch, mode_monitor, transmission
 from ..analysis.yee_mode import solve_yee_mode
@@ -62,6 +63,10 @@ def _shaped_half_extent(params: Mapping[str, object]) -> float:
     taper_length`` (its shaped region), kept for back-compatibility."""
     if "shaped_half_extent_um" in params:
         return float(params["shaped_half_extent_um"])
+    if "junction_width_um" not in params:
+        # a knot-defined (spline) taper crossing: the tapers meet at the centre,
+        # so the shaped region is exactly one taper length from it
+        return float(params["taper_length_um"])
     return 0.5 * float(params["junction_width_um"]) + float(params["taper_length_um"])
 
 
@@ -142,6 +147,42 @@ class BuiltSim:
         return {f: p_back[f] / p_fwd[f]
                 for f in p_fwd if f in p_back and p_fwd[f] > 0}
 
+    def total_transmissions(self, data) -> Dict[str, Dict[float, float]]:
+        """``{role: {freq_hz: T_total}}`` — each output port's TOTAL power
+        (Poynting flux through the port plane) relative to the input plane,
+        i.e. every mode plus radiation, not just the reference mode.
+
+        This is the quantity a paper usually plots as "Total" alongside its
+        modal curve, and the only one comparable to a measured crosstalk: a
+        cross arm can carry far more total power than TE0 power. Empty unless
+        the sim was built with ``flux_monitors=True``."""
+        names = self.meta.get("flux_monitor_names") or {}
+        if not names:
+            return {}
+        def _flux(name, sign):
+            """``{freq_hz: signed flux}`` for one flux plane. A flux monitor is
+            1-D over frequency; the engine names that dimension ``f`` (not
+            ``freq``), so take the array's own single dimension rather than
+            pattern-matching the name."""
+            da = data[name]
+            v = np.asarray(da.values, dtype=float).ravel()
+            dim = da.dims[0] if da.dims else None
+            if dim is not None and dim in da.coords:
+                fr = np.asarray(da.coords[dim].values, dtype=float).ravel()
+            else:  # no coordinate: fall back to the requested band order
+                fr = np.asarray(self.freqs_hz, dtype=float)
+            return {float(a): float(sign * b) for a, b in zip(fr, v)}
+        in_name, in_sign = names["in"]
+        p_in = _flux(in_name, in_sign)
+        out: Dict[str, Dict[float, float]] = {}
+        for role, (nm, sign) in names.items():
+            if role == "in":
+                continue
+            p_out = _flux(nm, sign)
+            out[role] = {f: p_out[f] / p_in[f] for f in p_in
+                         if f in p_out and p_in[f] > 0}
+        return out
+
     def metrics_db(self, data) -> Dict[str, object]:
         """Insertion loss (dB, through port) and crosstalk (dB, each cross port)
         as arrays over :attr:`wavelengths_um`, plus the raw transmissions."""
@@ -161,6 +202,15 @@ class BuiltSim:
             for role, t in trans.items()
             if role != through
         }
+        tot = self.total_transmissions(data)
+        if tot:
+            out["total_transmission"] = {r: [t[f] for f in freqs] for r, t in tot.items()}
+            if through in tot:
+                out["total_insertion_loss_db"] = [
+                    -10.0 * math.log10(max(tot[through][f], 1e-300)) for f in freqs]
+            out["total_crosstalk_db"] = {
+                role: [10.0 * math.log10(max(t[f], 1e-300)) for f in freqs]
+                for role, t in tot.items() if role != through}
         refl = self.reflection(data)
         if refl:
             out["reflection"] = [refl.get(f, float("nan")) for f in freqs]
@@ -206,8 +256,59 @@ def _outward_sign(port_name: str) -> float:
 _AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
 
 
+def _quarter_points(sim, axis_index: int, length_um: float, dl_um: float):
+    """The ``(k + 1/4)``-cell positions along one axis of ``sim`` — the §12
+    positions every Yee component snaps into the same cell. Uniform axis:
+    ``(k + 0.25) * dl``; graded axis: ``q_k + 0.25 * dq_k`` from the grid's own
+    coordinate array. Returns ``(positions, n_cells)``."""
+    q = sim._axis_coords_um(axis_index) if hasattr(sim, "_axis_coords_um") else None
+    if q is None:
+        n = realized_cells(length_um, dl_um)
+        return [(k + 0.25) * dl_um for k in range(n)], n
+    dq = graded_primary_spacings(tuple(q))
+    return [qi + 0.25 * di for qi, di in zip(q, dq)], len(q)
+
+
+def _inset_span(sim, axis_index: int, length_um: float, dl_um: float,
+                pml_layers: int) -> Tuple[float, float]:
+    """``(centre, extent)`` of a plane face pulled inside the PML on one axis,
+    from quarter point ``pml_layers + 2`` to quarter point ``n - (pml_layers + 3)``
+    (uniform or graded grid)."""
+    quarters, n = _quarter_points(sim, axis_index, length_um, dl_um)
+    lo = quarters[pml_layers + 2]
+    hi = quarters[n - (pml_layers + 3)]
+    return 0.5 * (lo + hi), hi - lo
+
+
+def _window_span(sim, axis_index: int, length_um: float, dl_um: float,
+                 pml_layers: int, centre_um: float, half_um: float,
+                 margin_cells: int) -> Tuple[float, float]:
+    """``(centre, extent)`` of a plane face sized to the reference MODE WINDOW
+    (``centre_um ± half_um`` plus ``margin_cells`` of slack), quarter-snapped
+    and clipped inside the PML.
+
+    The projected mode is identically zero outside its own solve window, so
+    plane area beyond it contributes nothing to either the overlap integral or
+    ``P_mode`` — it only costs DFT accumulation, device memory and output bytes
+    (the crossing's full-domain planes were ~8x wider than the 1.5 µm window
+    they project onto). Falls back to the full inset span if the window does
+    not fit inside the absorbers."""
+    quarters, n = _quarter_points(sim, axis_index, length_um, dl_um)
+    lo_i, hi_i = pml_layers + 2, n - (pml_layers + 3)
+    below = [k for k in range(lo_i, hi_i + 1) if quarters[k] <= centre_um - half_um]
+    above = [k for k in range(lo_i, hi_i + 1) if quarters[k] >= centre_um + half_um]
+    i_lo = max(lo_i, (max(below) if below else lo_i) - margin_cells)
+    i_hi = min(hi_i, (min(above) if above else hi_i) + margin_cells)
+    if i_hi <= i_lo:
+        return _inset_span(sim, axis_index, length_um, dl_um, pml_layers)
+    lo, hi = quarters[i_lo], quarters[i_hi]
+    return 0.5 * (lo + hi), hi - lo
+
+
 def _snap_transverse_faces(
-    mode_monitor: ModeMonitor, *, dl_um: float, pml_layers: int
+    mode_monitor: ModeMonitor, *, dl_um: float, pml_layers, sim=None,
+    window: Optional[Mapping[int, Tuple[float, float]]] = None,
+    margin_cells: int = 3,
 ) -> ModeMonitor:
     """Pull a mode monitor's TRANSVERSE plane faces inside the PML and land each
     on a ``(k + 1/4)*dl`` position (NUMERICS.md §12).
@@ -217,21 +318,30 @@ def _snap_transverse_faces(
     different Yee components (Ey vs Ez) snap to opposite cells (rejected as an
     ambiguous per-component region). Quarter-cell faces are unambiguous — every
     component snaps to the same cell — and clear the absorbing layers. The mode
-    window (centered on the guide) is unchanged; only the plane extent shrinks."""
+    window (centered on the guide) is unchanged; only the plane extent shrinks.
+    With ``sim`` given, a graded axis snaps to ITS OWN cell ladder.
+
+    ``window`` maps a transverse axis index to the reference mode's
+    ``(centre_um, half_um)`` on that axis; each face is then sized to that
+    window plus ``margin_cells`` rather than spanning the whole domain (see
+    :func:`_window_span`). Omit it to keep the full inset span."""
     fm = mode_monitor.field_monitor
     ai = _AXIS_INDEX[mode_monitor.axis]
     center = list(fm.center_um)
     size = list(fm.size_um)
+    # ``pml_layers`` may be one count for every axis or a per-axis triple (a
+    # dispersive scene carries a thicker absorber on the arm axes than the PML
+    # that stays on z).
+    layers = tuple(pml_layers) if isinstance(pml_layers, (tuple, list)) else (pml_layers,) * 3
     for i in range(3):
         if i == ai:
             continue
-        n = realized_cells(fm.size_um[i], dl_um)  # transverse extent = domain size
-        k_lo = pml_layers + 2
-        k_hi = n - (pml_layers + 3)
-        lo = (k_lo + 0.25) * dl_um
-        hi = (k_hi + 0.25) * dl_um
-        center[i] = 0.5 * (lo + hi)
-        size[i] = hi - lo
+        if window and i in window:
+            c, half = window[i]
+            center[i], size[i] = _window_span(
+                sim, i, fm.size_um[i], dl_um, layers[i], c, half, margin_cells)
+        else:  # transverse extent = domain size
+            center[i], size[i] = _inset_span(sim, i, fm.size_um[i], dl_um, layers[i])
     new_fm = fm.model_copy(update={"center_um": tuple(center), "size_um": tuple(size)})
     return dataclasses.replace(mode_monitor, field_monitor=new_fm)
 
@@ -246,9 +356,43 @@ def build_simulation(
     shutoff: float = 1e-7,
     dispersive: Optional[bool] = None,
     field_slice: bool = False,
+    mesh: str = "uniform",
+    core_dl_um: Optional[float] = None,
+    max_grading: float = 1.4,
+    monitor_span: str = "mode_window",
+    flux_monitors: bool = False,
+    flux_window_um: Optional[Tuple[float, float]] = None,
+    subpixel: bool = True,
+    absorber_num_layers: int = 40,
 ) -> BuiltSim:
     """Assemble a :class:`BuiltSim` for ``spec`` at ``cells_per_wavelength``
     (cells per wavelength IN THE CORE — the convergence-ladder knob).
+
+    ``mesh="auto"`` replaces the uniform grid by a graded :func:`ph.auto_mesh`
+    grid targeting the same cells-per-wavelength IN EACH MEDIUM (so the core
+    keeps ``dl`` while the cladding coarsens to ``dl * n_core / n_clad``, within
+    a ``max_grading`` cell-to-cell ratio); the mode planes are then snapped on
+    the graded cell ladder. ``core_dl_um`` states the core cell directly
+    (e.g. ``0.025`` for 25 nm in silicon) and overrides ``cells_per_wavelength``.
+
+    ``subpixel=False`` rasterizes the geometry as a plain staircase instead of
+    smoothing the cell that a sidewall cuts. That is a deliberate degradation,
+    useful for reproducing what a coarse un-smoothed mesh does to a curved
+    sidewall (extra scattering loss and back-reflection).
+
+    ``flux_monitors`` adds a :class:`PowerMonitor` beside every mode plane, so
+    the TOTAL power (all modes plus radiation) through each port is recorded
+    next to the modal power — the quantity papers plot as "Total".
+    ``flux_window_um`` is its ``(in-plane transverse, thickness)`` window in
+    microns, centred on the guide (a paper often states one, e.g. 4 x 2 um);
+    ``None`` integrates the full plane. The sub-region window is schema 1.17;
+    a solver older than that rejects it (the beta cloud worker answers HTTP 422
+    on estimate), so pass ``None`` there and window on a current local build.
+
+    ``monitor_span`` sizes each mode-monitor plane: ``"mode_window"`` (default)
+    covers the reference mode's own solve window plus a few cells — the mode is
+    identically zero outside it, so a wider plane adds no signal and only costs
+    DFT work; ``"domain"`` keeps the historical full-width plane.
 
     ``subpixel_method`` overrides ``spec.convergence.subpixel_method`` (the
     contour operator for the curved walls). ``shutoff`` is set low by default
@@ -258,8 +402,14 @@ def build_simulation(
     ``dispersive`` (defaults to ``spec.optical.dispersive``) fits the CORE
     material to a single-pole Lorentz over the band so the index tracks its true
     wavelength dependence — needed to reproduce a paper's IL(λ) *slope*, not just
-    its band-centre level. A dispersive scene is switched to a stabilized CFS-PML
-    (the dispersive-pole × CFS-inert-PML late-time instability).
+    its band-centre level. A dispersive scene gets two boundary changes: the
+    routing arms carry the dispersive core THROUGH the in-plane walls, which is
+    the regime where a stretched-coordinate PML diverges (NUMERICS.md §21), so
+    those axes switch to the adiabatic absorber (``with_auto_boundaries``) of
+    ``absorber_num_layers`` cells, and the remaining PML axes get the
+    stabilized CFS profile. Every wall clearance (mode planes, arm length,
+    field slice) is then sized from the absorber thickness, not the thinner
+    PML, so no plane sits inside an absorbing slab.
     """
     opt = spec.optical
     lam_c = opt.center_um
@@ -278,8 +428,21 @@ def build_simulation(
         core_layer.material, lam_c, band_um=opt.band_um if dispersive else None)
 
     # Grid from cells-per-wavelength in the core (the highest-index medium).
+    if mesh not in ("uniform", "auto"):
+        raise ValueError(f"mesh must be 'uniform' or 'auto', got {mesh!r}")
+    if core_dl_um is not None:
+        cells_per_wavelength = lam_c / (float(core_dl_um) * n_core)
     dl = lam_c / (cells_per_wavelength * n_core)
-    pml_um = pml_num_layers * dl
+    # PML thickness in microns: ``pml_num_layers`` boundary cells. On a graded
+    # grid the boundary cells are (at most) background-spaced, so size the
+    # clearances with the background spacing — conservative on an axis the
+    # routing stubs keep fine right through the PML.
+    dl_bg = dl * n_core / n_clad if mesh == "auto" else dl
+    # The wall the clearances must clear: the PML, or on a dispersive scene the
+    # (thicker) absorber that replaces it on the arm axes.
+    wall_layers = absorber_num_layers if dispersive else pml_num_layers
+    pml_um = wall_layers * dl_bg                 # in-plane (arm) walls
+    wall_um_z = pml_num_layers * dl_bg           # z keeps its PML either way
 
     # Device parameters. Extend the routing arm so a mode plane fits in straight
     # guide between the shaped region and the PML.
@@ -312,7 +475,7 @@ def build_simulation(
 
     size_x = realized_cells(2.0 * _half_extent(0), dl) * dl
     size_y = realized_cells(2.0 * _half_extent(1), dl) * dl
-    size_z = realized_cells(thickness + 2.0 * _CLAD_PAD_Z_UM + 2.0 * pml_um, dl) * dl
+    size_z = realized_cells(thickness + 2.0 * _CLAD_PAD_Z_UM + 2.0 * wall_um_z, dl) * dl
     cx, cy, cz = size_x / 2.0, size_y / 2.0, size_z / 2.0
 
     geom = build_geometry(
@@ -335,7 +498,16 @@ def build_simulation(
 
     # Solve the routing-waveguide TE0 mode once (square-ish core -> same mode on
     # x- and y-normal planes; resampled per plane).
-    grid = UniformMesh(dl_um=dl)
+    if mesh == "auto":
+        # Per-medium target at the band centre: dl in the core, dl*n_core/n_clad
+        # in the cladding, graded between (interfaces snapped, feature-ceiled).
+        grid = auto_mesh(
+            size_um=(size_x, size_y, size_z), wavelength_um=lam_c,
+            structures=tuple(structures), background_index=n_clad,
+            steps_per_wvl=cells_per_wavelength, max_grading=max_grading,
+        )
+    else:
+        grid = UniformMesh(dl_um=dl)
     boundaries = Boundaries(x="pml", y="pml", z="pml")
     method = subpixel_method or spec.convergence.subpixel_method
 
@@ -346,7 +518,7 @@ def build_simulation(
     shell = Simulation(
         size_um=(size_x, size_y, size_z), grid=grid, run=RunSpec(n_steps=1),
         background=Background(permittivity=n_clad ** 2), boundaries=boundaries,
-        pml_num_layers=pml_num_layers, subpixel=True, subpixel_method=method,
+        pml_num_layers=pml_num_layers, subpixel=subpixel, subpixel_method=method,
         structures=tuple(structures),
         sources=(PointDipole(center_um=(cx, cy, cz), polarization="Ex", source_time=pulse),),
     )
@@ -409,7 +581,7 @@ def build_simulation(
             h_center_um=port.center_um[wi],
             v_center_um=cz,
             half_w_um=min(port.width_um / 2 + 0.5, _sizes[wi] / 2 - pml_um - 2 * dl),
-            half_v_um=min(thickness / 2 + 0.6, size_z / 2 - pml_um - 2 * dl),
+            half_v_um=min(thickness / 2 + 0.6, size_z / 2 - wall_um_z - 2 * dl),
             dl_um=dl,
         )
 
@@ -419,10 +591,28 @@ def build_simulation(
         width_ax = "y" if port.axis == "x" else "x"
         key = (port.axis, round(port.center_um[_AXIS_INDEX[width_ax]] / dl))
         if key not in yee_cache:
-            yee_cache[key] = solve_yee_mode(
-                shell, port.axis, at_plane, lam_c, opt.polarization, opt.mode_index,
-                **yee_window(port))
+            if mesh == "auto":
+                # A graded-window mode must carry its solve provenance
+                # (solve_params) for the equivalence-current sheet to re-derive
+                # the exact window ladder; solve_mode_on_cross_section records
+                # it around the same Yee solve. (The uniform path stays on the
+                # bare solve so its committed results are byte-identical.)
+                from ..analysis.kfj_smoothing import solve_mode_on_cross_section
+
+                yee_cache[key] = solve_mode_on_cross_section(
+                    shell, port.axis, at_plane, lam_c, opt.polarization,
+                    opt.mode_index, **yee_window(port))
+            else:
+                yee_cache[key] = solve_yee_mode(
+                    shell, port.axis, at_plane, lam_c, opt.polarization,
+                    opt.mode_index, **yee_window(port))
         return yee_cache[key]
+
+    # Read every plane with the FROZEN band-centre mode on both grids (the
+    # provenance the graded path records would otherwise switch the monitors
+    # to a per-frequency re-solved bank — a different readout from the
+    # uniform ladder's).
+    monitor_kwargs = {"per_freq_modes": False} if mesh == "auto" else {}
 
     in_port = ports[spec.ports.input]
     in_axis = in_port.axis
@@ -447,7 +637,7 @@ def build_simulation(
         shell, in_mode, axis=in_axis,
         position_um=plane_pos(in_port, _SRC_CLEARANCE_UM + _MON_GAP_UM),
         freqs_hz=freqs_hz, name="in", direction=inward_dir,
-        center_um=monitor_center(in_port),
+        center_um=monitor_center(in_port), **monitor_kwargs,
     )
 
     out_monitors: Dict[str, ModeMonitor] = {}
@@ -465,15 +655,36 @@ def build_simulation(
             shell, yee_mode(p, pos), axis=p.axis, position_um=pos,
             freqs_hz=freqs_hz, name=f"out_{monitor_index}",
             direction="+" if _sign(p) > 0 else "-",
-            center_um=monitor_center(p),
+            center_um=monitor_center(p), **monitor_kwargs,
         )
 
     # Pull every monitor plane's transverse faces inside the PML, onto (k+1/4)*dl
     # positions so they never touch the boundary or a cell edge (NUMERICS.md §12).
-    in_mon = _snap_transverse_faces(in_mon, dl_um=dl, pml_layers=pml_num_layers)
+    if monitor_span not in ("mode_window", "domain"):
+        raise ValueError(
+            f"monitor_span must be 'mode_window' or 'domain', got {monitor_span!r}")
+
+    def _mode_window(port) -> Optional[Dict[int, Tuple[float, float]]]:
+        """The port's reference-mode window as ``{axis_index: (centre, half)}``:
+        the in-plane transverse axis from the mode's own solve window, z from
+        its vertical half-height."""
+        if monitor_span != "mode_window":
+            return None
+        w = yee_window(port)
+        width_ax = "y" if port.axis == "x" else "x"
+        return {
+            _AXIS_INDEX[width_ax]: (w["h_center_um"], w["half_w_um"]),
+            2: (w["v_center_um"], w["half_v_um"]),
+        }
+
+    wall_per_axis = (wall_layers, wall_layers, pml_num_layers)
+    in_mon = _snap_transverse_faces(in_mon, dl_um=dl, pml_layers=wall_per_axis,
+                                    sim=shell, window=_mode_window(in_port))
     out_monitors = {
-        r: _snap_transverse_faces(m, dl_um=dl, pml_layers=pml_num_layers)
-        for r, m in out_monitors.items()
+        role: _snap_transverse_faces(
+            out_monitors[role], dl_um=dl, pml_layers=wall_per_axis, sim=shell,
+            window=_mode_window(ports[port_name]))
+        for port_name, role in role_of.items()
     }
 
     # Run duration: cover several transits of the domain in the core (the longest
@@ -483,6 +694,40 @@ def build_simulation(
     run_time_s = run_periods * transit_s
 
     monitors = tuple(m.field_monitor for m in (in_mon, *out_monitors.values()))
+
+    # Optional total-power (Poynting flux) plane beside each mode plane. The
+    # window is given as (in-plane transverse, thickness) and converted to the
+    # engine's CYCLIC (u, v) order per axis: x-normal -> (y, z),
+    # y-normal -> (z, x).
+    flux_names: Dict[str, Tuple[str, float]] = {}
+    if flux_monitors:
+        # ``role`` may be paper notation such as "y+", which is not a portable
+        # filename token; keep it as the mapping key and give the monitor a
+        # deterministic ordinal name (the same rule the mode monitors use).
+        def _flux_for(idx, role, port, plane, direction_sign):
+            axis = port.axis
+            width_ax = "y" if axis == "x" else "x"
+            guide = (port.center_um[_AXIS_INDEX[width_ax]], cz)
+            if flux_window_um is None:
+                centre = size = None
+            elif axis == "x":                      # (u, v) = (y, z)
+                centre, size = guide, flux_window_um
+            else:                                   # y-normal -> (u, v) = (z, x)
+                centre = (guide[1], guide[0])
+                size = (flux_window_um[1], flux_window_um[0])
+            name = "flux_in" if idx is None else f"flux_out_{idx}"
+            flux_names[role] = (name, direction_sign)
+            return PowerMonitor(name=name, axis=axis, position_um=plane,
+                                freqs_hz=freqs_hz, center_um=centre, size_um=size)
+
+        flux = [_flux_for(None, "in", in_port,
+                          plane_pos(in_port, _SRC_CLEARANCE_UM + _MON_GAP_UM),
+                          1.0 if inward_dir == "+" else -1.0)]
+        for idx, (port_name, role) in enumerate(role_of.items()):
+            p = ports[port_name]
+            flux.append(_flux_for(idx, role, p, plane_pos(p, _SRC_CLEARANCE_UM),
+                                  1.0 if _sign(p) > 0 else -1.0))
+        monitors = monitors + tuple(flux)
     # Optional xy field slice (for the |E|^2 intensity figure): a band-centre DFT
     # over the whole in-plane at the core mid-height. Its z-plane is snapped to
     # (k+1/4)*dl so every Yee component lands in one cell (NUMERICS.md §12).
@@ -490,18 +735,15 @@ def build_simulation(
     field_slice_cf = None
     if field_slice:
         field_slice_cf = min(freqs_hz, key=lambda f: abs(f - _C0 / (lam_c * 1e-6)))
-        z_plane = (round(cz / dl - 0.25) + 0.25) * dl
+        z_quarters, _ = _quarter_points(shell, 2, size_z, dl)
+        z_plane = min(z_quarters, key=lambda zq: abs(zq - cz))
         # Pull the in-plane slice faces to (k+1/4)*dl inside the PML — the same
         # §12 snap the mode monitors use. A full-domain plane both pokes past the
         # realized boundary (non-dl-commensurate rectangular box) AND lands on cell
         # edges where Ex/Ey snap to different cells (rejected); quarter-cell faces
         # avoid both and the slice covers the physical (non-PML) region.
-        def _slice_span(n_cells: int):
-            k_lo, k_hi = pml_num_layers + 2, n_cells - (pml_num_layers + 3)
-            lo, hi = (k_lo + 0.25) * dl, (k_hi + 0.25) * dl
-            return 0.5 * (lo + hi), hi - lo
-        fxc, fxs = _slice_span(realized_cells(size_x, dl))
-        fyc, fys = _slice_span(realized_cells(size_y, dl))
+        fxc, fxs = _inset_span(shell, 0, size_x, dl, wall_layers)
+        fyc, fys = _inset_span(shell, 1, size_y, dl, wall_layers)
         monitors = monitors + (ProfileMonitor(
             name="field_xy", center_um=(fxc, fyc, z_plane),
             size_um=(fxs, fys, 0.0), fields=("Ex", "Ey", "Ez"),
@@ -514,7 +756,8 @@ def build_simulation(
         background=Background(permittivity=n_clad ** 2),
         boundaries=boundaries,
         pml_num_layers=pml_num_layers,
-        subpixel=True,
+        absorber_num_layers=absorber_num_layers,
+        subpixel=subpixel,
         subpixel_method=method,
         structures=tuple(structures),
         sources=tuple(launch_sources),
@@ -529,11 +772,18 @@ def build_simulation(
     # keeping our layer count (with_stabilized_pml's default 40-layer slab would
     # collide with the monitor planes).
     if dispersive:
-        sim = sim.with_stabilized_pml(num_layers=pml_num_layers)
+        # absorber on every axis the dispersive core crosses (the arm axes), the
+        # stabilized CFS profile on the PML axes that remain (z).
+        sim = sim.with_auto_boundaries().with_stabilized_pml(num_layers=pml_num_layers)
 
     meta = {
         "dl_um": dl,
         "cells_per_wavelength": cells_per_wavelength,
+        "mesh": mesh,
+        "dl_background_um": dl_bg,
+        "max_grading": max_grading if mesh == "auto" else None,
+        "n_cells": tuple(int(n) for n in resolved_cell_counts(
+            (size_x, size_y, size_z), grid)),
         "n_core": n_core,
         "n_clad": n_clad,
         "n_box": n_box,
@@ -545,12 +795,19 @@ def build_simulation(
         "in_forward_dir": inward_dir,
         "in_backward_dir": outward_dir,
         "dispersive_core": bool(dispersive),
+        "wall_layers": wall_layers,
+        "wall_layers_z": pml_num_layers,
+        "boundaries": (sim.boundaries.x, sim.boundaries.y, sim.boundaries.z),
         "field_slice_name": field_slice_name,
         "field_slice_freq_hz": field_slice_cf,
         "launch": "eq_current_yee",
         "n_launch_sources": len(launch_sources),
         "through_role": "through",
         "subpixel_method": method,
+        "subpixel": subpixel,
+        "monitor_span": monitor_span,
+        "flux_monitor_names": flux_names or None,
+        "flux_window_um": flux_window_um,
     }
     return BuiltSim(sim=sim, in_monitor=in_mon, out_monitors=out_monitors,
                     freqs_hz=freqs_hz, meta=meta)

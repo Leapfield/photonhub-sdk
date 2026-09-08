@@ -194,8 +194,7 @@ def job_status(job_id: str) -> dict:
 
 def gpus() -> list:
     """The curated menu of GPUs you can run on, each a dict like
-    ``{"id": "mi300x", "vendor": "AMD", "arch": "gfx942",
-    "gpu_mem_gb": 192}``. Pass an id to
+    ``{"id": ..., "vendor": ..., "arch": ..., "gpu_mem_gb": ...}``. Pass an id to
     ``ph.cloud.run(sim, device="gpu:<id>")``;
     bare ``device="gpu"`` lets the platform pick a default. The platform manages
     which providers back each entry — that stays an internal detail."""

@@ -18,7 +18,7 @@ per-cell discrete Huygens construction proven clean in
 translated onto engine dipole conventions (NUMERICS §§ dipoles: E −= (dt/ε)·A·g,
 H −= (dt/μ0)·A·g, g = env·cos(2πf0(t−t0)+phase)).
 
-Measured vs the §18 aux-line launch (straight Si strip, MI300X):
+Measured vs the §18 aux-line launch (straight Si strip, GPU):
 flux loss 0.44→0.09 % @20 nm (and FALLING with resolution where §18 floors),
 backward 0.20→0.003 %, near-source p_in placement wobble 0.24→0.11 %.
 

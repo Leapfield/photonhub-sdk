@@ -125,16 +125,15 @@ def run_local(
     ``"gpu:N"``, ``"gpu:all"``, or ``"gpu:N,M,..."`` (multi-GPU z-decomposition;
     see ``engine/docs/multi-gpu-decomposition.md``); it is passed to ``phsolver
     --device``. Selection is vendor-neutral: ``"gpu"`` runs on whichever GPU the
-    ``phsolver`` binary was built for — AMD (HIP/ROCm) or NVIDIA (native CUDA) —
-    so running on NVIDIA is just a matter of pointing ``$PHOTONHUB_SOLVER`` at a
-    CUDA build (see ``docs/nvidia-gpu.md``). GPU↔CPU equivalence follows the
-    tolerances in NUMERICS §8 (including ``ModeSource`` §18), not a blanket
-    bit-exact guarantee. Hardware records are dated snapshots: the then-current
-    suite passed 29/29 on an NVIDIA RTX A4000 on 2026-06-27 and 47/47 on an AMD
-    MI300X on 2026-07-12. Those counts do not attest a newer source inventory;
-    current refresh status is tracked in ``GPU_TODO.md`` and
-    ``MI300X_VERIFY.md``. CI compiles both GPU paths; hardware equivalence needs
-    the ``nvidia-equivalence`` workflow or a GPU box.
+    ``phsolver`` binary was built for, so switching hardware is a matter of
+    pointing ``$PHOTONHUB_SOLVER`` at the matching build. GPU↔CPU equivalence
+    follows the tolerances in NUMERICS §8 (including ``ModeSource`` §18), not a
+    blanket bit-exact guarantee. Hardware records are dated snapshots: the then-current
+    suite passed 29/29 on a workstation GPU on 2026-06-27 and 47/47 on a
+    data-center GPU on 2026-07-12. Those counts do not attest a newer source
+    inventory; current refresh status is tracked in the internal GPU
+    verification records. CI compiles both GPU paths; hardware equivalence needs
+    the GPU-equivalence workflow or a GPU box.
     ``cancel_event`` is an optional :class:`threading.Event`; setting it
     terminates the solver subprocess and raises :class:`SolverRunError`.  It is
     used by interactive callers such as the desktop Stop button.
@@ -156,10 +155,13 @@ def run_local(
 
     for index, axis, band in sim.point_sources_in_boundary_layers():
         center = tuple(sim.sources[index].center_um)
+        # NUMERICS.md §20: on a symmetry axis only the far face is a slab.
+        faces = ("on the far face; the min face is a symmetry plane"
+                 if sim.symmetry["xyz".index(axis)] != 0 else "on each side")
         warnings.warn(
             f"sources[{index}] (point_dipole at {center} um) lies inside the "
-            f"boundary layers on axis '{axis}' ({band:g} um thick on each "
-            "side): the engine will run it, but the boundary absorbs the "
+            f"boundary layers on axis '{axis}' ({band:g} um thick {faces}): "
+            "the engine will run it, but the boundary absorbs the "
             "source in place and the recorded spectra are physically "
             "meaningless. Move the source into the interior or thin the "
             "boundary layers.",

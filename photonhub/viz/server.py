@@ -2342,7 +2342,7 @@ def create_app(result_dir: Optional[str | Path] = None,
         try:
             source_spec.lstat()
         except FileNotFoundError:
-            # Current Hot Aisle bundles predate carrying sim.json, but the
+            # Older cloud bundles predate carrying sim.json, but the
             # coordinator contract is deterministic: it stores and executes
             # these exact no-newline bytes.  The digest check below makes this
             # compatibility reconstruction fail closed if that contract drifts.
