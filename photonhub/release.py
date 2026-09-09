@@ -736,7 +736,7 @@ def desktop_release_schema() -> dict[str, Any]:
     }
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://photonhub.dev/schemas/desktop_release_v1.json",
+        "$id": "https://leapfield.app/schemas/desktop_release_v1.json",
         "title": "PhotonHub desktop release manifest v1",
         "type": "object",
         "additionalProperties": False,

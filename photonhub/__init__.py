@@ -72,7 +72,7 @@ from .inverse_design import (
     value_and_gradient,
 )
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 __all__ = [
     "Apodization",

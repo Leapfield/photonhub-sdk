@@ -359,7 +359,7 @@ def _clipped_prism(go, axis, verts, lo, hi, color, name, bounds,
 
 
 def _polyslab_mesh(go, g, color, name, bounds=None, lighting=None):
-    """PolySlab -> extruded-polygon prism. ``slab_bounds_um`` are the axial
+    """Polygon -> extruded-polygon prism. ``slab_bounds_um`` are the axial
     (lo, hi); the polygon lives in the two transverse axes. Vertical walls
     (sidewall_angle approximated as 0)."""
     lo, hi = g.slab_bounds_um
@@ -700,7 +700,7 @@ def plot_3d(sim, show_pml=False, **kw):
 
 def _plane_mesh(go, axis, position, bounds, color, name):
     """A translucent plane perpendicular to ``axis`` at ``position``, spanning
-    the per-axis ``(lo, hi)`` ``bounds`` (PlaneWave source / FluxMonitor)."""
+    the per-axis ``(lo, hi)`` ``bounds`` (PlaneWave source / PowerMonitor)."""
     ai = "xyz".index(axis)
     size = [hi - lo for lo, hi in bounds]
     center = [0.5 * (lo + hi) for lo, hi in bounds]
