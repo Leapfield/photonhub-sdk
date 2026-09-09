@@ -101,7 +101,8 @@ from .kfj_smoothing import (
     solve_mode_on_cross_section,
 )
 from .modes import Mode, ModeSolver
-from .near_field import FarField, equivalent_currents, far_field
+from .near_field import (FarField, equivalent_currents, far_field,
+                         unfold_symmetry)
 from .propagate import FocalScan, focal_scan, propagate_plane, FocalMetrics, focal_metrics
 from .thin_lens import thin_lens_beam, thin_lens_source
 from .resonance import ResonanceAnalysis, select_resonances
@@ -172,6 +173,7 @@ __all__ = [
     "equivalence_current_source",
     "equivalent_currents",
     "far_field",
+    "unfold_symmetry",
     "focal_metrics",
     "focal_scan",
     "gaussian_beam",

@@ -249,39 +249,62 @@ def _structures(sim, dl3, lo, hi, periodic_extent_um: float, origin, simplify_um
     sym = _symmetry(sim)
     by_extent: dict[tuple[float, float], list] = {}
     eps_by_extent: dict[tuple[float, float], float] = {}
-    for s in sim.structures:
-        if _is_air(s.medium):
-            continue                      # a carve-out of the background, not a body
-        poly, z0, z1 = _footprint(s)
-        poly = _extend_periodic(poly, sim, dl3, periodic_extent_um)
-        # A half-domain build may hold only the half of a structure on the
-        # simulated side; its mirror image completes it (a structure drawn
-        # whole across the face is unchanged by the union).
+    last_body: dict[tuple[float, float], int] = {}
+    carves: list[tuple[float, float, Any, int]] = []
+
+    def _mirrored(poly):
+        """The structure completed across whichever symmetry faces the run used
+        (a structure drawn whole across a face is unchanged by the union)."""
         from shapely import affinity
         if sym[0]:
             poly = unary_union([poly, affinity.scale(poly, xfact=-1.0, yfact=1.0, origin=(0.0, 0.0, 0.0))])
         if sym[1]:
             poly = unary_union([poly, affinity.scale(poly, xfact=1.0, yfact=-1.0, origin=(0.0, 0.0, 0.0))])
+        return poly
+
+    for idx, s in enumerate(sim.structures):
+        poly, z0, z1 = _footprint(s)
+        poly = _mirrored(_extend_periodic(poly, sim, dl3, periodic_extent_um))
+        if _is_air(s.medium):
+            # An air structure carves whatever it sits in: a hole etched through
+            # a membrane, a trench in a slab. Where it hangs in the background
+            # instead (an air box above a substrate) nothing shares its extent
+            # and it draws nothing, as before.
+            carves.append((z0, z1, poly, idx))
+            continue
         key = (round(z0, 6), round(z1, 6))
         by_extent.setdefault(key, []).append(poly)
         eps_by_extent[key] = float(getattr(s.medium, "permittivity", 1.0))
+        last_body[key] = idx
     out = []
     for (z0, z1), polys in sorted(by_extent.items()):
         merged = unary_union(polys).intersection(clip)
+        # §9 last-wins: only an air structure listed AFTER the body it overlaps
+        # replaces its material, and only where their z extents meet.
+        cut = [p for (a0, a1, p, i) in carves
+               if i > last_body[(round(z0, 6), round(z1, 6))]
+               and a1 > z0 + 1e-9 and a0 < z1 - 1e-9]
+        if cut and not merged.is_empty:
+            merged = merged.difference(unary_union(cut))
         if merged.is_empty:
             continue
         merged = merged.simplify(simplify_um)
         geoms = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
-        rings = []
+        rings, holes = [], []
         for g in geoms:
             if g.is_empty or g.geom_type != "Polygon":
                 continue
             rings.append([[round(x - origin[0], 4), round(y - origin[1], 4)]
                           for x, y in g.exterior.coords])
+            holes.append([[[round(x - origin[0], 4), round(y - origin[1], 4)]
+                           for x, y in r.coords] for r in g.interiors])
         if rings:
-            out.append({"rings": rings, "z0": round(z0 - origin[2], 4),
-                            "z1": round(z1 - origin[2], 4), "kind": "core",
-                            "eps": eps_by_extent[(z0, z1)]})
+            body = {"rings": rings, "z0": round(z0 - origin[2], 4),
+                    "z1": round(z1 - origin[2], 4), "kind": "core",
+                    "eps": eps_by_extent[(z0, z1)]}
+            if any(holes):        # optional: a viewer without hole support still draws the bodies
+                body["holes"] = holes
+            out.append(body)
     return out
 
 

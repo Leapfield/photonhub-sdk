@@ -1,6 +1,9 @@
 # Changelog — `photonhub` Python SDK
 
-### Unreleased
+All notable changes to the published SDK. Dates are release dates on PyPI.
+The desktop application and the solver engine share this version number.
+
+## 0.1.3 — 2026-09-08
 
 - `photonhub.analysis.focal_metrics` / `FocalMetrics`: focal-spot readout of a recorded
   transmitted plane with the Poynting flux (plane-wave decomposition with the paired H):
@@ -17,12 +20,6 @@
   are no longer drawn as bodies. New `propagate_um=` (and `propagate_extent_um=`) draws the
   recorded plane's field reconstructed that far downstream (`propagate_plane`) as a plane
   floating at that height — a lens's focal spot above the device.
-
-All notable changes to the published SDK. Dates are release dates on PyPI.
-The desktop application and the solver engine share this version number.
-
-## Unreleased
-
 - `photonhub.viz.export_scene` unfolds a §20 symmetry plane: a half-domain
   run with a mirror on an in-plane minimum face is exported as the whole
   device — interior and structure outlines mirrored about the face, the
@@ -44,6 +41,10 @@ The desktop application and the solver engine share this version number.
   `Simulation.point_sources_in_boundary_layers` now tests only the far face
   on a symmetry axis; the far face and the other axes' faces are unchanged.
 - `photonhub.viz.plot_comparison(x_nm, values, reference=..., ylabel=..., ylim=...)`: the example notebooks' result figure — an observable against wavelength as a line with a paper's digitized series (from `examples/notebooks/refs/`) as markers; `reference_scale` flips a transmittance in dB into a loss.
+- Public text no longer names hardware vendors, competing tools or the
+  suppliers behind the cloud service: the package, its README, the landing
+  page and the documentation site say "GPU". `scripts/check_repo.py` keeps
+  it that way. No behaviour changes.
 
 ## 0.1.2 — 2026-09-02
 

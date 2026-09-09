@@ -118,6 +118,7 @@ __all__ = [
     "FarField",
     "far_field",
     "equivalent_currents",
+    "unfold_symmetry",
 ]
 
 Axis = Literal["x", "y", "z"]
@@ -461,6 +462,92 @@ def _project_one_face(
     return tuple(out)  # type: ignore[return-value]
 
 
+
+# --- NUMERICS §20 symmetry: unfolding a reduced domain's plane ----------------
+
+def _mirror_parity(component: str, axis: str, symmetry: int) -> int:
+    """Sign a field component picks up on reflection through a symmetry plane
+    normal to ``axis`` (NUMERICS.md §20).
+
+    A PEC plane (``symmetry = -1``) pins the tangential E and passes the normal
+    component; a PMC plane (``+1``) does the opposite. H is a pseudovector, so
+    each of its components takes the opposite sign of the E component with the
+    same index."""
+    normal = component[1] == axis
+    if component[0] == "E":
+        return -symmetry if normal else symmetry
+    return symmetry if normal else -symmetry
+
+
+def _half_offset(component: str, axis: str) -> bool:
+    """Whether ``component`` sits half a cell past the primary node along
+    ``axis`` (the §1.1 Yee stagger): ``E_c`` is offset along ``c``, ``H_c``
+    along the two axes that are not ``c``."""
+    if component[0] == "E":
+        return component[1] == axis
+    return component[1] != axis
+
+
+def unfold_symmetry(field: xr.DataArray, simulation) -> xr.DataArray:
+    """Mirror a plane recorded on a symmetry-reduced domain into the full plane.
+
+    A run with ``Simulation.symmetry`` solves a fraction of the domain and
+    records only that fraction. This returns the plane the full domain would
+    have recorded: each component is reflected through every symmetry plane
+    that cuts the monitor, with the sign that plane gives it
+    (:func:`_mirror_parity`), and the mirrored coordinates run negative.
+
+    The symmetry planes sit on the domain's minimum faces, at coordinate 0, so
+    the recorded region has to start there; a monitor that stops short of a
+    symmetry plane cannot be unfolded and raises ``ValueError``.
+
+    Components that are half a cell off the node along a mirrored axis are
+    averaged onto the node first (they have no sample on the plane itself), so
+    **the result is node-centred**: pass ``colocate=False`` if you hand it to
+    :func:`far_field` yourself, or let ``far_field(..., simulation=...)`` do
+    both steps. A run with no symmetry is returned unchanged.
+    """
+    sym = tuple(getattr(simulation, "symmetry", (0, 0, 0)) or (0, 0, 0))
+    if not any(sym):
+        return field
+    if "component" not in getattr(field, "dims", ()):
+        raise ValueError(
+            "unfold_symmetry needs the monitor's 'component' dim to know each "
+            f"component's parity; got dims {tuple(getattr(field, 'dims', ()))}")
+    comps = [str(c) for c in np.asarray(field.coords["component"].values).ravel()]
+    out = field
+    for a in ("x", "y", "z"):
+        s = int(sym["xyz".index(a)])
+        if s == 0 or a not in out.dims or out.sizes[a] < 2:
+            continue
+        coord = np.asarray(out.coords[a].values, dtype=np.float64)
+        step = float(coord[1] - coord[0])
+        if abs(float(coord[0])) > 0.5 * abs(step):
+            raise ValueError(
+                f"the monitor starts at {a} = {float(coord[0]):g} um, away from "
+                f"the symmetry plane at {a} = 0; a plane that does not reach the "
+                "symmetry plane cannot be unfolded")
+        rest = [d for d in out.dims if d not in ("component", a)]
+        t = out.transpose("component", a, *rest)
+        v = np.asarray(t.values)
+        n = coord.size
+        full = np.empty((v.shape[0], 2 * n - 1) + v.shape[2:], dtype=v.dtype)
+        for k, name in enumerate(comps):
+            p = _mirror_parity(name, a, s)
+            col = v[k]
+            if _half_offset(name, a):
+                node = np.empty_like(col)
+                node[1:] = 0.5 * (col[1:] + col[:-1])
+                node[0] = 0.5 * (col[0] + p * col[0])  # the ghost below is its image
+                col = node
+            full[k] = np.concatenate([p * col[1:][::-1], col], axis=0)
+        coords = {d: t.coords[d] for d in t.dims if d != a and d in t.coords}
+        coords[a] = np.concatenate([-coord[1:][::-1], coord])
+        out = xr.DataArray(full, dims=t.dims, coords=coords, attrs=dict(out.attrs),
+                           name=out.name)
+    return out.transpose(*field.dims)   # the caller's dim order, unchanged
+
+
 def far_field(
     data,
     monitor_name: str,
@@ -473,6 +560,7 @@ def far_field(
     mesh: bool = True,
     faces: Optional[Sequence[Tuple[str, str, float]]] = None,
     colocate: bool = True,
+    simulation=None,
 ) -> FarField:
     """Project a recorded near-field surface onto the far field.
 
@@ -519,6 +607,12 @@ def far_field(
         readout's convention). Pass ``False`` for synthetic already-co-located
         fields. See the module docstring's "Yee staggering" for what remains
         uncorrected (the normal-axis E/H half-cell stagger).
+    simulation:
+        The :class:`~photonhub.Simulation` the data came from. Required only
+        when it used ``symmetry``: the recorded fraction of the plane is then
+        mirrored into the full plane first (:func:`unfold_symmetry`), which is
+        what the radiation integral has to see, and the co-location that
+        unfolding performs replaces ``colocate``.
 
     Returns
     -------
@@ -538,6 +632,15 @@ def far_field(
     for _, ax, _ in face_specs:
         if ax not in _TRANSVERSE:
             raise ValueError(f"axis must be one of x/y/z, got {ax!r}")
+
+    # §20: a symmetry-reduced run recorded only its fraction of the plane. Mirror
+    # it back before integrating; that step co-locates, so it takes over from
+    # `colocate` (applying both would average the same half cell twice).
+    if simulation is not None and any(
+            tuple(getattr(simulation, "symmetry", (0, 0, 0)) or (0, 0, 0))):
+        face_specs = [(unfold_symmetry(fd, simulation), ax, sg)
+                      for fd, ax, sg in face_specs]
+        colocate = False
 
     # Frequencies: default to the monitor's own.
     ref_da = face_specs[0][0]
