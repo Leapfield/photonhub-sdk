@@ -54,15 +54,17 @@ After a real run::
     data = ph.run_local(sim)                       # sim has a TimeMonitor "probe"
     window = (1.9e14, 2.0e14)
     rf = ResonanceAnalysis(freq_window=window)
-    resonances = rf.run(data, "probe")             # xr.Dataset over 'freq'
+    # simulation= starts the fit where the last source ends: the ring-down
+    # model has no term for the pulse itself
+    resonances = rf.run(data, "probe", simulation=sim)   # xr.Dataset over 'freq'
     modes = select_resonances(resonances, freq_window=window,
-                              min_amplitude=1e-3)
+                              min_amplitude_rel=1e-3)   # strongest first
 
 Always pass ``freq_window`` (and an amplitude floor) to
 :func:`select_resonances`: the FDM eigenvalue problem is merely SEEDED on
-the finder's window, so ``run`` can surface spurious poles outside it —
-including negative frequencies and negative Q — that describe the basis,
-not the physics.
+the finder's window, so ``run`` can surface spurious poles outside it, including negative frequencies and negative Q, that describe the basis,
+not the physics. A real probe signal also carries the mirror pole at ``-f``
+of every mode.
 """
 
 from __future__ import annotations
@@ -95,28 +97,40 @@ class ResonanceAnalysis:
     init_num_freqs : int, default 200
         Number of trial frequencies. Larger finds more (and fainter)
         resonances at higher cost; the number returned is typically smaller.
-    rcond : float, default 1e-4
-        Relative cutoff for the generalized-eigenproblem conditioning: singular
-        values of the overlap matrix below ``rcond * max`` are dropped. Closer
-        to zero returns more (and more spurious) resonances.
+    rcond : float, default 1e-8
+        Relative cutoff for the generalized-eigenproblem conditioning: basis
+        directions whose overlap-matrix eigenvalue magnitude is below
+        ``rcond * max`` are dropped. A real probe signal carries each mode's
+        mirror pole at ``-f``, outside the seeded window; the kept directions
+        must be able to model it, or it leaks into the in-window pole. At the
+        former default of 1e-4 that leak moved a high-Q fit by up to 36 % in
+        Q, erratically with the record length, and dropped a mode 60 dB
+        below a neighbour; at 1e-8 the high-Q fit holds to about 1e-6 and
+        the weak mode is returned to about 1e-3 on float32 probe signals.
+        Larger values return fewer poles: on a record dominated by noise
+        (white noise of 1e-2 of the peak or more) a larger ``rcond`` returns
+        fewer spurious in-window poles and, on longer records, less scatter
+        in Q.
 
     Notes
     -----
     The input signal must be **uniformly sampled** and should begin *after the
     sources have turned off* -- the source-injection transient is not part of
-    the ring-down model and degrades the fit.
+    the ring-down model and degrades the fit. :meth:`run` and
+    :meth:`run_time_series` gate it with ``t_start=`` or ``simulation=`` and
+    warn when the first sample fitted precedes the end of the last source.
     """
 
     def __init__(
         self,
         freq_window: Tuple[float, float],
         init_num_freqs: int = 200,
-        rcond: float = 1e-4,
+        rcond: float = 1e-8,
     ):
         f_min, f_max = float(freq_window[0]), float(freq_window[1])
-        if f_max < f_min:
+        if not f_max > f_min:
             raise ValueError(
-                f"freq_window must be (f_min, f_max) with f_max >= f_min; got "
+                f"freq_window must be (f_min, f_max) with f_max > f_min; got "
                 f"({f_min}, {f_max})"
             )
         if int(init_num_freqs) < 1:
@@ -193,16 +207,30 @@ class ResonanceAnalysis:
 
         return _resonance_dataset(eigvals, amplitudes, errors, dt)
 
-    def run_time_series(self, dataarray: xr.DataArray) -> xr.Dataset:
+    def run_time_series(
+        self,
+        dataarray: xr.DataArray,
+        *,
+        t_start: Optional[float] = None,
+        simulation=None,
+    ) -> xr.Dataset:
         """Find resonances in a ``TimeMonitor`` :class:`xarray.DataArray`.
 
-        ``dt`` is derived from the ``t`` coordinate (which must be uniformly
-        spaced). If the array has a ``component`` dimension, the electric
-        components are summed, falling back to the magnetic ones if no E field
-        is present (the standard convention -- never E and H mixed); pass a
-        single-component array to control this exactly.
+        ``dt`` is derived from the ``t`` coordinate, which must be uniformly
+        spaced -- except for the one short final interval the engine's monitor
+        cadence produces when ``n_steps`` is not a multiple of
+        ``interval_steps`` (``engine/NUMERICS.md`` section 6); that extra final
+        sample is dropped with a warning.
+
+        If the array has a ``component`` dimension, the electric components are
+        summed, falling back to the magnetic ones if no E field is present (the
+        standard convention -- never E and H mixed); pass a single-component
+        array to control this exactly.
+
+        ``t_start`` and ``simulation`` gate the fit as in :meth:`run`.
         """
-        signal, dt = _signal_from_dataarray(dataarray, fields=None)
+        arrays = _gate_time_series([dataarray], t_start, simulation, None)
+        signal, dt = _combine_time_series(arrays, None)
         return self.run_raw_signal(signal, dt)
 
     def run(
@@ -210,6 +238,9 @@ class ResonanceAnalysis:
         sim_data: Mapping[str, xr.DataArray],
         monitors: Union[str, Sequence[str]],
         fields: Optional[Sequence[str]] = None,
+        *,
+        t_start: Optional[float] = None,
+        simulation=None,
     ) -> xr.Dataset:
         """Find resonances in one or more ``TimeMonitor`` outputs.
 
@@ -218,12 +249,25 @@ class ResonanceAnalysis:
         sim_data : RunResult or mapping ``name -> DataArray``
             The run output (anything indexable by monitor name).
         monitors : str or sequence of str
-            Monitor name(s) to read. Multiple monitors are summed into one
-            signal (more independent probes improve conditioning).
+            Monitor name(s) to read. Multiple monitors are summed sample by
+            sample into one signal; they must share one time axis. Summing
+            can also cancel a mode (one antisymmetric between two probes
+            vanishes from their sum), so check a mode you miss on each probe
+            alone.
         fields : sequence of str, optional
             Field components to use (e.g. ``["Ez"]``). Default: sum the electric
             components present, falling back to the magnetic ones -- the standard
             convention.
+        t_start : float, optional
+            Fit only the samples at ``t >= t_start`` (seconds). The ring-down
+            model has no term for the source pulse, so the fit should start
+            after the last source ends.
+        simulation : Simulation, optional
+            The run's simulation. Without ``t_start``, the fit starts at the
+            end of its last source (``max source_end_time_s``, the instant
+            ``engine/NUMERICS.md`` section 7 uses). A fit whose first sample
+            precedes that instant warns; the check also uses the simulation a
+            ``RunResult`` carries when none is passed.
 
         Returns
         -------
@@ -234,6 +278,7 @@ class ResonanceAnalysis:
         if not names:
             raise ValueError("monitors must name at least one monitor")
         arrays = [sim_data[name] for name in names]
+        arrays = _gate_time_series(arrays, t_start, simulation, sim_data)
         signal, dt = _combine_time_series(arrays, fields)
         return self.run_raw_signal(signal, dt)
 
@@ -250,7 +295,7 @@ def select_resonances(
     min_q: Optional[float] = None,
     max_error: Optional[float] = None,
     require_decay: bool = True,
-    sort_by: Optional[str] = "Q",
+    sort_by: Optional[str] = "amplitude",
 ) -> xr.Dataset:
     """Filter and rank a raw resonance :class:`xarray.Dataset`.
 
@@ -266,26 +311,28 @@ def select_resonances(
         Keep only resonances with ``f_min <= freq <= f_max``.
     min_amplitude, min_q, max_error : float, optional
         Lower bound on amplitude / Q, upper bound on ``error``.
-        **``min_amplitude`` is in RAW FIELD UNITS** — a unit ``PointDipole``
+        **``min_amplitude`` is in RAW FIELD UNITS**, a unit ``PointDipole``
         ring-down probes at ~1e-6 V/m scale, so an absolute threshold that
         looks small (1e-3) can silently reject every physical mode. Unless the
         signal was pre-normalized, prefer ``min_amplitude_rel``.
     min_amplitude_rel : float, optional
         Lower amplitude bound as a FRACTION of the strongest mode in the
-        (freq_window-restricted) set — scale-free, so it works on raw probe
+        (freq_window-restricted) set, scale-free, so it works on raw probe
         signals without knowing the field magnitude. E.g. ``1e-3`` keeps modes
         within 60 dB of the dominant one. Combines with ``min_amplitude``
         (both must pass).
     require_decay : bool, default True
         Drop modes with ``decay <= 0`` (growing in time). NOTE: in a CLOSED
         lossless scene (PEC box, undamped cavity) the physical mode is
-        undamped, and its fitted decay can land at a tiny NEGATIVE value —
-        the default then drops the very mode you are after. Pass
+        undamped, and its fitted decay can land at a tiny NEGATIVE value, the default then drops the very mode you are after. Pass
         ``require_decay=False`` there and treat ``|decay| * T_window << 1``
         as "undamped within the window's resolution".
-    sort_by : str or None, default "Q"
-        Data variable to sort by, descending (e.g. ``"Q"`` or ``"amplitude"``).
-        ``None`` leaves the ``freq`` ordering.
+    sort_by : str or None, default "amplitude"
+        Data variable to sort by, descending (e.g. ``"amplitude"`` or
+        ``"Q"``). ``None`` leaves the ``freq`` ordering. The strongest mode
+        comes first by default: a spurious pole fitted to noise can carry a
+        higher Q than any physical mode, so ranking by Q over a broad window
+        can put it first.
 
     Returns
     -------
@@ -487,21 +534,125 @@ def _resonance_dataset(
     return ds.sortby("freq")
 
 
+# -- source gating -------------------------------------------------------------
+
+
+def _last_source_end_s(simulation) -> Optional[float]:
+    """The instant the last source stops injecting, ``max (t0 + 8 tau)`` over
+    the sources (``engine/NUMERICS.md`` section 7); ``inf`` when a source never
+    ends (CW); ``None`` when there is no simulation or no source with a time
+    dependence."""
+    sources = getattr(simulation, "sources", None) if simulation is not None else None
+    ends = [float(getattr(st, "source_end_time_s", float("inf")))
+            for st in (getattr(src, "source_time", None) for src in (sources or ()))
+            if st is not None]
+    return max(ends) if ends else None
+
+
+def _gate_time_series(arrays, t_start, simulation, sim_data):
+    """The arrays cut to ``t >= t_start`` (or, with only ``simulation``, to
+    ``t >=`` its last source's end), with a warning when the first sample
+    kept still precedes the last source's end."""
+    from .._compat import caller_stacklevel
+
+    known = simulation
+    if known is None and sim_data is not None:
+        try:
+            known = getattr(sim_data, "simulation", None)
+        except (OSError, ValueError):
+            known = None
+    src_end = _last_source_end_s(known)
+    if t_start is None and simulation is not None:
+        if src_end is None:
+            raise ValueError(
+                "simulation= has no sources to derive the fit start from; "
+                "pass t_start")
+        if not np.isfinite(src_end):
+            raise ValueError(
+                "simulation= drives a source that never ends (CW): there is "
+                "no ring-down to fit")
+        t_start = src_end
+    out = []
+    for da in arrays:
+        if "t" not in da.dims:
+            out.append(da)   # rejected with its own message downstream
+            continue
+        t = np.asarray(da.coords["t"].values, dtype=float)
+        if t_start is not None:
+            keep = np.flatnonzero(t >= float(t_start) * (1.0 - 1e-12))
+            if keep.size < _MIN_SAMPLES:
+                raise ValueError(
+                    f"t_start = {float(t_start):.6g} s leaves {keep.size} "
+                    f"samples of a record ending at {t[-1]:.6g} s; need >= "
+                    f"{_MIN_SAMPLES}")
+            da = da.isel(t=keep)
+            t = t[keep]
+        out.append(da)
+        # a source that never ends (CW) has no ring-down to gate to: the
+        # simulation= path raises for it, and a warning here could not be
+        # cleared by any t_start
+        if (src_end is not None and np.isfinite(src_end) and t.size
+                and t[0] < src_end * (1.0 - 1e-9)):
+            warnings.warn(
+                f"the fit starts at t = {t[0]:.4g} s, before the last source "
+                f"ends at {src_end:.4g} s: the ring-down model has no term for "
+                "the pulse, which biases Q and can return the pulse itself as "
+                "a pole. Pass t_start= (or simulation=) to fit the ring-down "
+                "only.", UserWarning, stacklevel=caller_stacklevel())
+            src_end = None   # once per call
+    return out
+
+
 # -- time-series ingestion --------------------------------------------------
 
 
-def _uniform_dt(t: np.ndarray) -> float:
-    """Sample spacing of a uniformly-spaced time coordinate (validated)."""
+def _uniform_dt(t: np.ndarray) -> Tuple[float, int]:
+    """``(dt, n_usable)`` for a time coordinate on a uniform stride.
+
+    ``n_usable`` is the number of LEADING samples that share that stride, which
+    is every sample except in one case. A monitor with ``interval_steps = K``
+    records at steps where ``(s+1) % K == 0`` "plus the final step
+    ``s = n_steps-1`` if not already recorded" (``engine/NUMERICS.md`` section
+    6). When ``n_steps`` is not a multiple of ``K`` that final sample lands
+    fewer than ``K`` steps after its predecessor, so the axis ends on a single
+    SHORT interval. That is the engine's normative cadence, not corrupt data,
+    so the extra sample is dropped with a warning instead of rejected.
+
+    Every other non-uniformity -- an interior irregular step, or a final gap
+    LONGER than the stride -- is still an error: nothing in the monitor
+    contract produces those, so they signal a genuinely malformed axis.
+    """
     t = np.asarray(t, dtype=float)
     if t.size < 2:
         raise ValueError("time coordinate needs at least two samples")
     diffs = np.diff(t)
     dt = float(diffs[0])
-    if dt <= 0 or not np.allclose(diffs, dt, rtol=_TIME_STEP_RTOL, atol=0):
+    if dt <= 0:
         raise ValueError(
             "time coordinate must be uniformly spaced to extract resonances"
         )
-    return dt
+    if np.allclose(diffs, dt, rtol=_TIME_STEP_RTOL, atol=0):
+        return dt, int(t.size)
+    if np.allclose(diffs[:-1], dt, rtol=_TIME_STEP_RTOL, atol=0) and (
+        0 < diffs[-1] < dt * (1.0 - _TIME_STEP_RTOL)
+    ):
+        warnings.warn(
+            f"time coordinate ends on a short interval ({diffs[-1]:.6g} vs "
+            f"{dt:.6g}): the run's n_steps is not a multiple of the monitor's "
+            "interval_steps, so the engine recorded an extra final sample "
+            "(NUMERICS.md section 6). Dropping that one sample to keep the "
+            "analysis on a uniform grid.",
+            UserWarning,
+            # _uniform_dt <- _signal_from_dataarray <- _combine_time_series <-
+            # the public entry point <- the caller. Every public path
+            # (run, run_time_series, SpectrumCompleter.complete) goes through
+            # _combine_time_series, so this depth reaches user code from all of them.
+            stacklevel=5,
+        )
+        return dt, int(t.size) - 1
+    raise ValueError(
+        "time coordinate must be uniformly spaced to extract resonances"
+    )
 
 
 def _components_of(da: xr.DataArray) -> list:
@@ -542,7 +693,9 @@ def _signal_from_dataarray(
             "extraction needs a point TimeMonitor (dims ('t',) or "
             "('t', 'component')), not a snapshot/DFT monitor"
         )
-    dt = _uniform_dt(da.coords["t"].values)
+    dt, n_usable = _uniform_dt(da.coords["t"].values)
+    if n_usable < da.sizes["t"]:
+        da = da.isel(t=slice(0, n_usable))
     comps = _components_of(da)
     if not comps:
         if fields is not None:
@@ -582,14 +735,21 @@ def _combine_time_series(
     total = None
     dt_ref = None
     length = None
+    t0_ref = None
     for da in arrays:
         signal, dt = _signal_from_dataarray(da, chosen)
+        t0 = float(np.asarray(da.coords["t"].values)[0])
         if dt_ref is None:
-            dt_ref, length = dt, signal.size
+            dt_ref, length, t0_ref = dt, signal.size, t0
         elif abs(dt - dt_ref) > _TIME_STEP_RTOL * dt_ref:
             raise ValueError("monitors have different time steps")
         elif signal.size != length:
             raise ValueError("monitors have different numbers of samples")
+        elif abs(t0 - t0_ref) > _TIME_STEP_RTOL * dt_ref:
+            raise ValueError(
+                f"monitors start at different times ({t0_ref:.6g} s and "
+                f"{t0:.6g} s): summing them sample by sample would mix "
+                "different instants")
         total = signal if total is None else total + signal
     return total, dt_ref
 

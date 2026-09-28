@@ -46,6 +46,14 @@ _DIFF_ENTRY_LIMIT = 2000
 # is deliberately preserved. Keyed by resolved path string.
 _SIM_CACHE: dict[str, tuple[tuple[int, int, int, int, int], Any]] = {}
 
+# A cloud job's stored wire spec -> (file identity, Simulation, canonical
+# SHA-256). Same identity discipline as _SIM_CACHE, and it also keeps the
+# digest: the numerical endpoints re-open the bundle on every read, and
+# re-serializing a spec that carries mode-source arrays to hash it again would
+# be paid per request.
+_STORED_SPEC_CACHE: dict[
+    str, tuple[tuple[int, int, int, int, int], Any, str]] = {}
+
 
 # --------------------------------------------------------------------------- #
 # Loading + catalog
@@ -54,8 +62,126 @@ _SIM_CACHE: dict[str, tuple[tuple[int, int, int, int, int], Any]] = {}
 def load_result(path: str | Path) -> RunResult:
     """Open a result bundle (a dir with ``manifest.json``, a ``manifest.json``, or a
     ``.h5``). Cheap to open; a monitor's blob is read on first access (see the
-    module memmap caveat)."""
-    return RunResult(path)
+    module memmap caveat).
+
+    A cloud job's downloaded result carries no ``sim.json``, so nothing in the
+    directory says what amplitude the engine normalized by (NUMERICS.md
+    section 12) and the Workbench would show unit-amplitude flux and phasors
+    for the very job ``ph.cloud.run`` reads in watts and V/m. For a cloud cache
+    entry the spec the client stored when it submitted that job is recovered
+    and handed to the reader — see :func:`_restorable_cloud_simulation` for
+    what has to be true first. When nothing can be recovered the arrays keep
+    the engine's values and say so in their ``normalization`` attr, exactly as
+    before.
+
+    The viewer reads in the wire's corner frame (``client_state=False``): its
+    structure outlines, permittivity planes and port summaries are drawn from
+    ``sim.json`` in that frame, so the client state a run recorded beside it
+    (the origin of a fitted domain, a symmetry fold, declared ports) is left
+    aside here, where ``RunResult(path)`` in a script restores it.
+    """
+    data = RunResult(path, client_state=False)
+    sim = _restorable_cloud_simulation(data)
+    if sim is None:
+        return data
+    # Re-open through the documented ``simulation=`` seam instead of reaching
+    # into the reader. Nothing has been read yet, so this costs one more
+    # manifest parse, and only for a cloud cache entry whose stored spec
+    # proved to be the executed input.
+    return RunResult(path, simulation=sim, client_state=False)
+
+
+def _restorable_cloud_simulation(data: RunResult):
+    """The simulation a cloud result ran, recovered from the spec its client
+    stored at submit time, or None when this is not that case.
+
+    Four things have to hold, and the last is the one that matters. The bundle
+    must be a raw directory (an HDF5 bundle carries its own spec or none) with
+    no sibling ``sim.json`` (that file IS the executed input, and
+    :class:`~photonhub.data.RunResult` already reads it); the directory must be
+    a cloud job entry with a spec kept beside it; and that spec must
+    canonicalize to the exact bytes the manifest's ``provenance.input_sha256``
+    names. A directory name is not evidence on its own — a copied cache, or an
+    unrelated directory that happens to sit beside a ``.specs`` store, would
+    otherwise rescale every absolute number this restores. The digest is the
+    same check the Workbench already applies before sealing a paid result whose
+    bundle carried no ``sim.json`` (``_archive_cloud_result``).
+
+    Only the amplitude is taken from the recovered document. Geometry overlays
+    and the recorded-spec panel stay gated on a sibling ``sim.json``
+    (:func:`geometry_status`), which this bundle still does not have.
+    """
+    output_dir = getattr(data, "output_dir", None)
+    if (output_dir is None or data.manifest_path is None
+            or (output_dir / "sim.json").is_file()):
+        return None
+    provenance = data.manifest.get("provenance")
+    expected = (provenance.get("input_sha256")
+                if isinstance(provenance, dict) else None)
+    if not isinstance(expected, str) or not expected:
+        return None
+    from ..cloud.cache import stored_spec_for_result
+
+    spec = stored_spec_for_result(output_dir)
+    if spec is None:
+        return None
+    try:
+        sim, digest = _parse_stored_spec(spec)
+    except Exception as exc:
+        warnings.warn(
+            f"the cloud spec cached for {output_dir.name} did not parse "
+            f"({exc}); this result's frequency-domain arrays keep the "
+            "engine's unit-amplitude normalization", UserWarning, stacklevel=3)
+        return None
+    if digest != expected.lower():
+        warnings.warn(
+            f"the cloud spec cached for {output_dir.name} is not the input "
+            "this result recorded running; its frequency-domain arrays keep "
+            "the engine's unit-amplitude normalization", UserWarning,
+            stacklevel=3)
+        return None
+    return sim
+
+
+def _parse_stored_spec(path: Path):
+    """``(Simulation, canonical SHA-256)`` of a stored cloud spec, cached on
+    the file's identity. The digest is over ``to_wire_json(indent=0)``, the
+    deterministic document the service stores and executes, so it is
+    comparable with a manifest's ``provenance.input_sha256``.
+
+    The digest is computed from the object returned beside it, so unlike
+    ``sim.json`` (hashed by :func:`geometry_status`, re-read by
+    :func:`sim_for`) there is no window in which a file swapped between the
+    check and the read could be served as verified. ``_SIM_CACHE``'s eviction
+    hook has no counterpart here for the same reason.
+    """
+    key = str(path.resolve())
+    identity = _stat_identity(path.stat())
+    hit = _STORED_SPEC_CACHE.get(key)
+    if hit is not None and hit[0] == identity:
+        return hit[1], hit[2]
+    sim = load_sim_file(path)
+    digest = hashlib.sha256(
+        sim.to_wire_json(indent=0).encode("utf-8")).hexdigest()
+    if len(_STORED_SPEC_CACHE) >= 8 and key not in _STORED_SPEC_CACHE:
+        # bound: drop the oldest. The endpoints run in a thread pool, so two
+        # requests may pick the same victim; the loser's pop must not raise.
+        oldest = next(iter(dict(_STORED_SPEC_CACHE)), None)
+        _STORED_SPEC_CACHE.pop(oldest, None)
+    _STORED_SPEC_CACHE[key] = (identity, sim, digest)
+    return sim, digest
+
+
+def _stat_identity(stat) -> tuple[int, int, int, int, int]:
+    """Identity of the exact file bytes behind a stat, so a replacement under
+    the same path is picked up even when its mtime is deliberately preserved."""
+    return (
+        int(stat.st_dev),
+        int(stat.st_ino),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        int(stat.st_ctime_ns),
+    )
 
 
 def _kind(monitor_manifest: dict) -> str:
@@ -183,7 +309,7 @@ def recorded_spec(data: RunResult) -> dict:
     # so the read-only Sources page reports the truth (a recorded source with
     # a matching solve recipe is "fresh", never "legacy · unverified").
     return {"available": True, "geometry_status": status, "spec": raw,
-            "mode_source_statuses": mode_source_statuses(sim)}
+            "mode_source_statuses": mode_source_statuses(sim, recorded=True)}
 
 
 def monitor_catalog(data: RunResult) -> list[dict]:
@@ -207,9 +333,9 @@ def monitor_catalog(data: RunResult) -> list[dict]:
         if "axis" in m:
             e["axis"] = m["axis"]
         if m.get("type") == "field_dft":
-            e["normalization"] = "phasor / (first-source A0*S(f))"
+            e["normalization"] = "CW phasor of the declared sources (engine A0*S(f)-normalized, A0 restored by RunResult)"
         elif m.get("type") == "flux":
-            e["normalization"] = "signed power / |first-source A0*S(f)|²"
+            e["normalization"] = "signed power, W, of the declared sources (engine 1/|A0*S(f)|^2-normalized, A0^2 restored by RunResult)"
             e["sign_convention"] = f"positive toward +{m.get('axis', '?')}"
         elif m.get("type") in {"field_time", "field_snapshot"}:
             e["timing_convention"] = "H samples lag E by dt/2"
@@ -635,14 +761,14 @@ def _monitor_semantics(monitor: dict, requested: dict) -> dict:
     if mtype == "flux":
         return {
             "normalization": monitor.get("normalization")
-            or "signed power / |first-source A0*S(f)|^2",
+            or "signed power, W, of the declared sources (engine 1/|A0*S(f)|^2-normalized, A0^2 restored by RunResult)",
             "sign_convention": monitor.get("sign_convention")
             or f"positive toward +{monitor.get('axis', '?')}",
         }
     if mtype == "field_dft":
         return {
             "normalization": monitor.get("normalization")
-            or "phasor / (first-source A0*S(f))",
+            or "CW phasor of the declared sources (engine A0*S(f)-normalized, A0 restored by RunResult)",
             "apodization": requested.get("apodization"),
         }
     if mtype in {"field_time", "field_snapshot"}:
@@ -1279,7 +1405,7 @@ def modal_port_results(data: RunResult) -> dict:
             f"driven port {driven_monitor.name!r} must reference a solved "
             "ModeSource with mode_solve provenance")
     source_status = next((
-        item for item in mode_source_statuses(sim)
+        item for item in mode_source_statuses(sim, recorded=True)
         if item["source_index"] == source_index
     ), None)
     if source_status is not None and source_status["status"] == "stale":
@@ -1420,14 +1546,7 @@ def sim_for(data: RunResult):
     if geometry_status(data)["status"] not in {"matched", "unverified"}:
         return None
     key = str(p.resolve())
-    stat = p.stat()
-    identity = (
-        int(stat.st_dev),
-        int(stat.st_ino),
-        int(stat.st_size),
-        int(stat.st_mtime_ns),
-        int(stat.st_ctime_ns),
-    )
+    identity = _stat_identity(p.stat())
     hit = _SIM_CACHE.get(key)
     if hit is None or hit[0] != identity:
         from ..components.simulation import Simulation
@@ -1547,14 +1666,23 @@ def parse_sim_spec(spec: Any):
     return sim, messages
 
 
-def mode_source_input_sha256(sim, source_index: int, recipe=None) -> str:
+#: The resolved-profile fingerprint. 2: the profile is sampled at each
+#: component's own Yee position (NUMERICS §18.2) and its normalization reads
+#: the boundaries (a pmc wall row counts half); a version-1 profile was sampled
+#: at cell centres, half a cell off.
+MODE_SOURCE_FINGERPRINT_VERSION = 2
+
+
+def mode_source_input_sha256(sim, source_index: int, recipe=None, *,
+                             fingerprint_version: int = MODE_SOURCE_FINGERPRINT_VERSION) -> str:
     """Hash the canonical inputs that can change a solved mode profile.
 
     This is intentionally conservative: renaming or changing any structure can
     mark the profile stale even when that structure is far from the source
     plane.  A false-positive re-solve is safe; silently reusing a profile from
     different material/grid inputs is not.  Numerically irrelevant run,
-    monitor, PML, and source-amplitude settings are excluded.
+    monitor and source-amplitude settings are excluded; the boundary kinds
+    are included (version 2), the PML layer count is not.
     """
     from ..components.sources import ModeSource
 
@@ -1597,6 +1725,9 @@ def mode_source_input_sha256(sim, source_index: int, recipe=None) -> str:
         ],
         "symmetry": [int(value) for value in sim.symmetry],
     }
+    if fingerprint_version >= 2:
+        material_inputs["boundaries"] = sim.boundaries.model_dump(
+            mode="json", by_alias=True, exclude_none=True)
     source_inputs = {
         "axis": source.axis,
         "position_um": float(source.position_um),
@@ -1607,7 +1738,7 @@ def mode_source_input_sha256(sim, source_index: int, recipe=None) -> str:
     }
     canonical = json.dumps(
         {
-            "fingerprint_version": 1,
+            "fingerprint_version": int(fingerprint_version),
             "simulation": material_inputs,
             "source": source_inputs,
             "mode_solve": recipe_data,
@@ -1618,8 +1749,13 @@ def mode_source_input_sha256(sim, source_index: int, recipe=None) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
-def mode_source_statuses(sim) -> list[dict]:
-    """Fresh/stale/legacy provenance for every ModeSource in source order."""
+def mode_source_statuses(sim, *, recorded: bool = False) -> list[dict]:
+    """Fresh/stale/legacy provenance for every ModeSource in source order.
+
+    A profile solved by an earlier release (an older fingerprint version) is
+    stale for a document about to run, since the solver now samples it
+    differently. For a ``recorded`` result it is fresh: the run used the
+    profile as solved, and its recorded data stay valid."""
     from ..components.sources import ModeSource
 
     statuses = []
@@ -1641,15 +1777,27 @@ def mode_source_statuses(sim) -> list[dict]:
         expected = provenance.input_sha256
         actual = mode_source_input_sha256(sim, source_index, provenance)
         fresh = expected == actual
+        earlier = not fresh and any(
+            expected == mode_source_input_sha256(
+                sim, source_index, provenance, fingerprint_version=version)
+            for version in range(1, MODE_SOURCE_FINGERPRINT_VERSION))
+        if fresh:
+            message = "Solved profile matches the current geometry and grid."
+        elif earlier and recorded:
+            fresh = True
+            message = ("Solved by an earlier release; this run used the profile "
+                       "as solved, so its recorded results stand.")
+        elif earlier:
+            message = ("Solved by an earlier release, which sampled the profile "
+                       "differently (release notes: mode source). Solve it again "
+                       "before running.")
+        else:
+            message = ("Geometry, grid, source placement/carrier, or solve settings "
+                       "changed after this profile was solved. Re-solve it before running.")
         statuses.append({
             "source_index": source_index,
             "status": "fresh" if fresh else "stale",
-            "message": (
-                "Solved profile matches the current geometry and grid."
-                if fresh else
-                "Geometry, grid, source placement/carrier, or solve settings "
-                "changed after this profile was solved. Re-solve it before running."
-            ),
+            "message": message,
             "expected_sha256": expected,
             "actual_sha256": actual,
         })
@@ -1965,8 +2113,11 @@ def solve_mode_source(sim, source_index: int, settings: dict):
 
     # Keep the Workbench document compact: use the auxiliary ModeSource rather
     # than expanding a full Huygens sheet into thousands of PointDipoles.  The
-    # solved profile is always normalized at 1 W; amplitude stays the explicit
-    # top-level multiplier it was before re-solving.
+    # solved profile is always normalized at 1 W of the whole, unfolded device
+    # (NUMERICS §20.8): on a folded document a profile centred on k symmetry
+    # planes carries 1/2^k W in the modeled part, and a full-plane PowerMonitor
+    # and the port read 1 W. Amplitude stays the explicit top-level multiplier
+    # it was before re-solving.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         solved_sources = mode_launch(
@@ -2389,7 +2540,7 @@ def sim_overview(sim) -> dict:
 GDS_MAX_BYTES = 64 * 1024 * 1024
 
 
-class GdsImportError(ValueError):
+class GDSImportError(ValueError):
     """A user-correctable GDS import problem, tagged for the HTTP facade."""
 
     def __init__(self, message: str, code: str = "gds_invalid"):
@@ -2402,12 +2553,12 @@ def _gds_module():
     try:
         gds._import_gdstk()
     except ImportError as exc:
-        raise GdsImportError(str(exc), code="gds_reader_missing") from exc
+        raise GDSImportError(str(exc), code="gds_reader_missing") from exc
     return gds
 
 
 def _gds_read_cell(gds, gds_path: str, cell_name: Optional[str]):
-    """Read + flatten the requested cell; map reader errors to GdsImportError.
+    """Read + flatten the requested cell; map reader errors to GDSImportError.
 
     Unlike :func:`photonhub.gds.import_gds`, a file with several top-level cells
     is not an error here: inspection defaults to the first top-level cell and
@@ -2419,18 +2570,18 @@ def _gds_read_cell(gds, gds_path: str, cell_name: Optional[str]):
     try:
         lib = gdstk.read_gds(gds_path, unit=1e-6)
     except Exception as exc:
-        raise GdsImportError(f"not a readable GDSII file: {exc}") from exc
+        raise GDSImportError(f"not a readable GDSII file: {exc}") from exc
     tops = {c.name for c in lib.top_level()}
     cells = [c.name for c in lib.cells if c.name in tops]
     cells += [c.name for c in lib.cells if c.name not in tops]
     if not cells:
-        raise GdsImportError("the GDS file contains no cells")
+        raise GDSImportError("the GDS file contains no cells")
     chosen = cells[0] if cell_name is None else cell_name
     for cell in lib.cells:
         if cell.name == chosen:
             return cell.copy(cell.name + "__phinspect").flatten(), chosen, cells
     have = ", ".join(repr(name) for name in cells)
-    raise GdsImportError(
+    raise GDSImportError(
         f"cell {chosen!r} not found; cells: {have}", code="gds_cell_not_found")
 
 
@@ -2485,7 +2636,7 @@ def gds_import_structures(
 ) -> dict:
     """Convert selected GDS layers into editable structure wire dicts.
 
-    ``layers`` entries are dicts mirroring :class:`photonhub.gds.GdsLayer` plus a
+    ``layers`` entries are dicts mirroring :class:`photonhub.gds.GDSLayer` plus a
     medium: ``{"layer": [l, d], "zmin_um", "thickness_um", "permittivity",
     "conductivity_s_per_m"?, "sidewall_angle"? (rad), "reference_plane"?}``.
     ``offset_um`` translates every polygon on the drawing plane (u, v) — the
@@ -2496,25 +2647,25 @@ def gds_import_structures(
 
     gds = _gds_module()
     if axis not in ("x", "y", "z"):
-        raise GdsImportError(f"axis must be one of x/y/z, got {axis!r}")
+        raise GDSImportError(f"axis must be one of x/y/z, got {axis!r}")
     if not isinstance(layers, list) or not layers:
-        raise GdsImportError("select at least one GDS layer to import")
+        raise GDSImportError("select at least one GDS layer to import")
     try:
         du, dv = (float(offset_um[0]), float(offset_um[1]))
     except (TypeError, ValueError, IndexError) as exc:
-        raise GdsImportError("offset_um must be a [du, dv] pair of numbers") from exc
+        raise GDSImportError("offset_um must be a [du, dv] pair of numbers") from exc
     if not (math.isfinite(du) and math.isfinite(dv)):
-        raise GdsImportError("offset_um must be finite")
+        raise GDSImportError("offset_um must be finite")
     prefix = str(name_prefix or "gds").strip() or "gds"
 
-    def _layer_spec(index: int, raw) -> "gds.GdsLayer":
+    def _layer_spec(index: int, raw) -> "gds.GDSLayer":
         if not isinstance(raw, dict):
-            raise GdsImportError(f"layer {index + 1} must be an object")
+            raise GDSImportError(f"layer {index + 1} must be an object")
         pair = raw.get("layer")
         if (not isinstance(pair, (list, tuple)) or len(pair) != 2
                 or not all(isinstance(v, (int, float)) and float(v).is_integer()
                            for v in pair)):
-            raise GdsImportError(
+            raise GDSImportError(
                 f"layer {index + 1} needs a [layer, datatype] integer pair")
         try:
             permittivity = float(raw.get("permittivity", 1.0))
@@ -2523,22 +2674,22 @@ def gds_import_structures(
             thickness = float(raw.get("thickness_um", 0.0))
             sidewall = float(raw.get("sidewall_angle", 0.0))
         except (TypeError, ValueError) as exc:
-            raise GdsImportError(f"layer {index + 1}: {exc}") from exc
+            raise GDSImportError(f"layer {index + 1}: {exc}") from exc
         if not all(map(math.isfinite, (permittivity, conductivity, zmin,
                                        thickness, sidewall))):
-            raise GdsImportError(f"layer {index + 1} contains a non-finite value")
+            raise GDSImportError(f"layer {index + 1} contains a non-finite value")
         if permittivity < 1.0:
-            raise GdsImportError(
+            raise GDSImportError(
                 f"layer {index + 1} permittivity must be >= 1 (vacuum)")
         if conductivity < 0.0:
-            raise GdsImportError(f"layer {index + 1} conductivity must be >= 0")
+            raise GDSImportError(f"layer {index + 1} conductivity must be >= 0")
         if thickness <= 0.0:
-            raise GdsImportError(f"layer {index + 1} thickness must be > 0 µm")
+            raise GDSImportError(f"layer {index + 1} thickness must be > 0 µm")
         reference_plane = raw.get("reference_plane", "middle")
         if reference_plane not in ("bottom", "middle", "top"):
-            raise GdsImportError(
+            raise GDSImportError(
                 f"layer {index + 1} reference plane must be bottom/middle/top")
-        return gds.GdsLayer(
+        return gds.GDSLayer(
             layer=(int(pair[0]), int(pair[1])),
             medium=Medium(permittivity=permittivity,
                           conductivity_s_per_m=conductivity),
@@ -2565,7 +2716,7 @@ def gds_import_structures(
         except (ValueError, OSError) as exc:
             # gdstk reports malformed GDSII as a bare OSError; FileNotFoundError
             # is its subclass and shares the user-facing mapping.
-            raise GdsImportError(str(exc) or "not a readable GDSII file") from exc
+            raise GDSImportError(str(exc) or "not a readable GDSII file") from exc
         layer_tag = f"L{spec.layer[0]}_{spec.layer[1]}"
         dumped = []
         for i, structure in enumerate(imported):
@@ -2583,8 +2734,17 @@ def gds_import_structures(
                           "count": len(dumped)})
 
     if not structures:
-        raise GdsImportError(
+        raise GDSImportError(
             "the selected layers contain no polygons in this cell",
             code="gds_empty")
     return {"structures": structures, "per_layer": per_layer,
             "count": len(structures)}
+
+
+def __getattr__(name):
+    if name == "GdsImportError":
+        warnings.warn("photonhub.viz.service.GdsImportError was renamed to GDSImportError; "
+                      "the old name will be removed in a future release",
+                      DeprecationWarning, stacklevel=2)
+        return GDSImportError
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

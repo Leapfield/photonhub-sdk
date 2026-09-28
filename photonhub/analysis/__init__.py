@@ -79,7 +79,10 @@ from .mode_devices import (
     mode_source_vector,
     solve_mode_bank,
     solve_modes_by_freq,
+    reflection,
+    reflection_spectrum,
     transmission,
+    transmission_spectrum,
 )
 from .mode_overlap import (
     ModeBank,
@@ -93,7 +96,7 @@ from .mode_overlap import (
     vector_modal_fields,
 )
 from .eq_current_source import equivalence_current_source
-from .gaussian_beam import gaussian_beam, gaussian_beam_source
+from .gaussian_beam import gaussian_beam, gaussian_beam_source, scalar_beam
 from .import_source import import_field, import_source
 from .kfj_smoothing import (
     mode_bank_on_cross_section,
@@ -177,6 +180,7 @@ __all__ = [
     "focal_metrics",
     "focal_scan",
     "gaussian_beam",
+    "scalar_beam",
     "gaussian_beam_source",
     "gaussian_mode",
     "import_field",
@@ -224,7 +228,10 @@ __all__ = [
     "thin_lens_beam",
     "thin_lens_source",
     "track_modes",
+    "reflection",
+    "reflection_spectrum",
     "transmission",
+    "transmission_spectrum",
     "transverse_overlap",
     "vector_modal_fields",
     "waveguide_section",

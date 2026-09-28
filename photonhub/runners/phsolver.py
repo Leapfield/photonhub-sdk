@@ -1,4 +1,4 @@
-"""The phsolver process layer — single source of truth for invoking phsolver.
+"""The phsolver process layer, single source of truth for invoking phsolver.
 
 Both the local runner (``run_local``) and the cloud executor
 (``photonhub.executor``) sit on this module: solver discovery (``find_solver``),
@@ -19,8 +19,9 @@ import shutil
 import signal
 import subprocess
 import threading
+import warnings
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Tuple, Union
 
 from .._env import env, without_credentials
 
@@ -50,7 +51,7 @@ def _solver_subprocess_env() -> dict:
 
     The solver's launch authorization is the one deliberate exception: without
     it, every SDK-spawned invocation of an installed (auth-required) solver is
-    denied — which surfaced in the candidate gate as ``--capabilities``
+    denied, which surfaced in the candidate gate as ``--capabilities``
     denials, four ``run_local`` failures, and preflight 422s, all one bug.
     """
     scrubbed = without_credentials(os.environ)
@@ -261,13 +262,13 @@ def device_args(device: Union[str, None]) -> list:
     """Validate a device selector and map it to the phsolver ``--device`` flag,
     or ``[]`` when unset (the solver then defaults to CPU). Accepts ``"cpu"``,
     ``"gpu"``, ``"gpu:N"`` (N a local device index), ``"gpu:all"`` (every visible
-    GPU), or ``"gpu:N,M,..."`` (an explicit multi-GPU set — the engine splits the
-    grid along z across those devices) — the engine CLI grammar
+    GPU), or ``"gpu:N,M,..."`` (an explicit multi-GPU set, the engine splits the
+    grid along z across those devices), the engine CLI grammar
     (engine/src/main/phsolver.cpp). Rejected here so a typo fails fast with a
     clear message rather than at the solver. Shared by the local runner and the
     cloud executor so the device grammar has one definition.
 
-    (The cloud ``device="gpu:<target>"`` form — a curated GPU id, not an index —
+    (The cloud ``device="gpu:<target>"`` form, a curated GPU id, not an index ,
     is resolved to a plain ``gpu`` on the worker by the platform; only ``cpu`` /
     ``gpu`` ever reach this on a worker.)
     """
@@ -294,27 +295,72 @@ def _as_executable(path) -> Optional[Path]:
     return p if p.is_file() and os.access(p, os.X_OK) else None
 
 
+def _source_match_required() -> bool:
+    return os.environ.get("PHOTONHUB_REQUIRE_SOURCE_MATCH") == "1"
+
+
 def _repo_build_if_current(repo_root: Path) -> Optional[Path]:
     """Return the implicit in-tree solver, optionally requiring HEAD parity.
 
     Test suites set ``PHOTONHUB_REQUIRE_SOURCE_MATCH=1`` so an ignored binary from
     another checkout/commit cannot create convincing integration failures. An
     explicit ``solver_path``, environment override, or PATH entry remains the
-    caller's deliberate choice and is never filtered here.
+    caller's deliberate choice and is never filtered here. A solver recorded by
+    ``photonhub install-solver`` is filtered the same way (see ``find_solver``).
     """
     solver = _as_executable(repo_root / "build" / "phsolver")
-    if solver is None or os.environ.get("PHOTONHUB_REQUIRE_SOURCE_MATCH") != "1":
+    if solver is None or not _source_match_required():
         return solver
+    return solver if _built_from_checkout(solver, repo_root) else None
+
+
+def _built_from_checkout(solver: Path, repo_root: Path) -> bool:
+    """Whether ``solver info`` reports the revision checked out at ``repo_root``.
+
+    The reported ``git_sha`` must equal ``HEAD`` exactly, in either form a
+    build stamps: the 12 characters cmake records from the checkout, or the
+    full SHA a ``PHCORE_GIT_SHA_OVERRIDE`` build records (release
+    candidates, container images, GPU boxes). Anything else never matches, a
+    binary configured from a dirty tree (``<sha>-dirty``) included: its
+    sources are not the commit's, and the edits it was built from may since
+    have been reverted.
+
+    False when either side cannot be read: no git, not a checkout, or a binary
+    that does not answer ``info`` with a ``git_sha``.
+    """
+    heads = _checkout_git_shas(repo_root)
+    reported = _solver_git_sha(solver)
+    return bool(heads) and reported in heads
+
+
+def _checkout_git_shas(repo_root: Path) -> Tuple[str, ...]:
+    """``HEAD`` at ``repo_root`` in both forms an engine build stamps into its
+    ``info``: ``git rev-parse --short=12`` first, then the full SHA. Empty
+    outside a checkout."""
+    shas = []
+    for args in (["--short=12", "HEAD"], ["HEAD"]):
+        try:
+            sha = subprocess.run(
+                ["git", "rev-parse", *args],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env=_solver_subprocess_env(),
+            ).stdout.strip()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return ()
+        if not sha:
+            return ()
+        shas.append(sha)
+    return tuple(shas)
+
+
+def _solver_git_sha(solver: Path) -> Optional[str]:
+    """The ``git_sha`` a solver binary reports through ``info``, verbatim (a
+    ``-dirty`` suffix kept), or None when it does not answer with one."""
     try:
-        expected = subprocess.run(
-            ["git", "rev-parse", "--short=12", "HEAD"],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            env=_solver_subprocess_env(),
-        ).stdout.strip()
         info = subprocess.run(
             [str(solver), "info"],
             check=True,
@@ -323,19 +369,121 @@ def _repo_build_if_current(repo_root: Path) -> Optional[Path]:
             timeout=5,
             env=_solver_subprocess_env(),
         )
-        actual = str(json.loads(info.stdout).get("git_sha", ""))[:12]
-    except (OSError, ValueError, subprocess.SubprocessError, json.JSONDecodeError):
+        sha = json.loads(info.stdout).get("git_sha")
+    except (OSError, ValueError, AttributeError, subprocess.SubprocessError,
+            json.JSONDecodeError):
         return None
-    return solver if actual == expected else None
+    return str(sha) if sha else None
+
+
+def source_match_status(repo_root) -> dict:
+    """Which solver :func:`find_solver` resolves, and whether it is the build of
+    the revision checked out at ``repo_root``.
+
+    Returns ``{"solver", "git_sha", "checkout", "matched", "note"}``:
+    ``solver`` is the resolved path or None, ``git_sha`` what it reports,
+    ``checkout`` the ``HEAD`` it is compared with (short form), and
+    ``matched`` whether the solver reports ``HEAD`` exactly, short or full.
+    When nothing resolves, ``note`` says why, naming an in-repository build
+    that the source-match guard set aside. The test suites print this in their
+    header and, when a caller asks for the guard, fail the session on it
+    instead of letting every solver-backed test skip.
+    """
+    repo_root = Path(repo_root)
+    heads = _checkout_git_shas(repo_root)
+    checkout = heads[0] if heads else None
+    status = {"solver": None, "git_sha": None, "checkout": checkout,
+              "matched": False, "note": None}
+    try:
+        solver = find_solver()
+    except SolverRunError as exc:
+        status["note"] = str(exc)
+        return status
+    if solver is None:
+        build = _as_executable(repo_root / "build" / "phsolver")
+        if build is not None:
+            status["note"] = (
+                f"{build} reports git_sha {_solver_git_sha(build)!r}, not the "
+                f"checkout's {checkout!r}; rebuild it (reconfigure first: the "
+                "revision is stamped when cmake configures)")
+        else:
+            status["note"] = "no phsolver binary found (build the engine first)"
+        return status
+    status["solver"] = solver
+    status["git_sha"] = _solver_git_sha(solver)
+    status["matched"] = bool(heads) and status["git_sha"] in heads
+    return status
+
+
+def source_match_summary(status: dict) -> str:
+    """One line for a :func:`source_match_status` result: the solver path and
+    the revision it reports against the checkout's, or why none resolved."""
+    if status["solver"] is None:
+        return f"none ({status['note']})"
+    verdict = "source-matched" if status["matched"] else "NOT source-matched"
+    return (f"{status['solver']} git_sha {status['git_sha']} "
+            f"(checkout {status['checkout']}: {verdict})")
+
+
+# --- the test suites' session gate (photonhub/tests and validation conftests)
+
+_GATE_CALLER = "_PHOTONHUB_SOURCE_MATCH_CALLER"
+
+
+def record_source_match_caller() -> None:
+    """Record whether the caller set ``PHOTONHUB_REQUIRE_SOURCE_MATCH``, before
+    a test conftest defaults it to ``1`` for discovery filtering. Kept in the
+    environment so both conftests of one run read one answer, and scoped to
+    this process: a record inherited from another process (a parent pytest)
+    is replaced by this process's own reading of the variable."""
+    mine = f"{os.getpid()}:"
+    if not os.environ.get(_GATE_CALLER, "").startswith(mine):
+        os.environ[_GATE_CALLER] = mine + os.environ.get(
+            "PHOTONHUB_REQUIRE_SOURCE_MATCH", "")
+
+
+def source_match_gate(repo_root) -> Optional[str]:
+    """Why a test session must stop, or None. Every solver-backed test skips
+    when no source-matched solver is found, and a skip exits 0, so a gate run
+    against a stale build would report green with no engine test executed.
+    The session stops instead when the caller set
+    ``PHOTONHUB_REQUIRE_SOURCE_MATCH=1`` (the conftests' own default only
+    filters discovery) and the solver the run would use, however it was
+    selected, is not a build of the checkout. ``PHOTONHUB_ALLOW_NO_SOLVER=1``
+    runs the session anyway."""
+    if os.environ.get(_GATE_CALLER) != f"{os.getpid()}:1":
+        return None
+    if os.environ.get("PHOTONHUB_ALLOW_NO_SOLVER") == "1":
+        return None
+    status = source_match_status(repo_root)
+    if status["matched"]:
+        return None
+    return ("PHOTONHUB_REQUIRE_SOURCE_MATCH=1 and the solver is not a build of "
+            f"this checkout: {source_match_summary(status)}. Every solver-backed "
+            "test would skip. Rebuild build/phsolver from a clean tree, or set "
+            "PHOTONHUB_ALLOW_NO_SOLVER=1 to run without one.")
 
 
 def find_solver(solver_path=None) -> Optional[Path]:
     """Locate the phsolver binary.
 
-    Resolution order is an explicit argument, ``$PHOTONHUB_SOLVER``, ``PATH``,
-    then the in-repository build directory. An explicit argument or environment
-    override that does not exist is an error, not a fallthrough. Returns
-    ``None`` only when nothing is configured and no binary is found.
+    Resolution order is an explicit argument, ``$PHOTONHUB_SOLVER``, a solver
+    recorded by ``photonhub install-solver`` or ``photonhub link-solver``,
+    ``PATH``, then the in-repository build directory. An explicit argument or
+    environment override that does not exist is an error, not a fallthrough.
+    Returns ``None`` only when nothing is configured and no binary is found.
+
+    A recorded install beats ``PATH`` because recording one is a deliberate
+    act, and someone who has run the installer should not be silently served a
+    different binary that happens to be earlier on the path. The environment
+    variable still beats both, so a one-off override needs no uninstall.
+
+    With ``PHOTONHUB_REQUIRE_SOURCE_MATCH=1`` a recorded install is used only
+    when its ``info`` reports the revision this source tree has checked out,
+    the same test the in-repository build gets. The record lives in the
+    user's cache, so to a test run it is discovered, not chosen, and a released
+    binary there must not stand in for the build under test. Skipped, the
+    lookup carries on to ``PATH`` and the in-repository build.
     """
     if solver_path is not None:
         p = _as_executable(solver_path)
@@ -350,16 +498,24 @@ def find_solver(solver_path=None) -> Optional[Path]:
             raise SolverRunError(
                 f"$PHOTONHUB_SOLVER is not an executable file: {override}")
         return p
+    from ..solver_install import installed_solver
+
+    repo_root = Path(__file__).resolve().parents[3]
+    recorded = installed_solver()
+    if recorded is not None and (
+            not _source_match_required()
+            or _built_from_checkout(recorded, repo_root)):
+        return recorded
     on_path = shutil.which("phsolver")
     if on_path:
         return Path(on_path)
     # repo root / build / phsolver, for in-tree development checkouts
-    return _repo_build_if_current(Path(__file__).resolve().parents[3])
+    return _repo_build_if_current(repo_root)
 
 
 def phsolver_run_cmd(solver, spec_path, out_dir, device=None, log_file=None) -> list:
     """Build the ``phsolver run ...`` argv shared by the local runner and the
-    cloud executor — one definition of the engine CLI invocation, so a flag
+    cloud executor, one definition of the engine CLI invocation, so a flag
     change can't silently diverge between the two paths. ``--progress none`` is
     forced (Python is the only human surface); ``device`` and ``log_file`` are
     appended when given."""
@@ -474,7 +630,8 @@ def run_phsolver(cmd: list, *, on_event: EventCb = None,
         # reaped. Any accidentally surviving helper is cleaned up here too.
         process_tree.close()
 
-    stderr_tail = ("".join(c for c in stderr_chunks if c))[-_STDERR_TAIL_CHARS:]
+    stderr_text = "".join(c for c in stderr_chunks if c)
+    stderr_tail = stderr_text[-_STDERR_TAIL_CHARS:]
 
     if timed_out.is_set():
         raise SolverRunError(
@@ -489,4 +646,7 @@ def run_phsolver(cmd: list, *, on_event: EventCb = None,
     if returncode != 0:
         raise SolverRunError("phsolver exited with an error",
                              returncode=returncode, stderr_tail=stderr_tail)
+    for line in stderr_text.splitlines():
+        if line.startswith("PHOTONHUB_DFT_GUARD_IGNORED: "):
+            warnings.warn(line.split(": ", 1)[1], UserWarning, stacklevel=2)
     return done_event

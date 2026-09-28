@@ -21,8 +21,18 @@ DEFAULT_SCHEMA_PATH = Path(__file__).resolve().parents[2] / "schemas" / "simulat
 
 
 def schema_text() -> str:
-    """Canonical serialization: 2-space indent, sorted keys, trailing newline."""
-    return json.dumps(Simulation.model_json_schema(), indent=2, sort_keys=True) + "\n"
+    """Canonical serialization: 2-space indent, sorted keys, trailing newline.
+
+    ``run`` is optional in Python (a simulation without one takes the transit
+    cap) and required on the wire, where the resolved ``run_time_s`` always
+    travels; the model's default would drop it from the required list, so it
+    is put back in its place (``Simulation._run_required_on_the_wire`` rejects
+    an ingested document without it)."""
+    schema = Simulation.model_json_schema()
+    required = schema.setdefault("required", [])
+    if "run" not in required:
+        required.insert(required.index("grid") + 1 if "grid" in required else len(required), "run")
+    return json.dumps(schema, indent=2, sort_keys=True) + "\n"
 
 
 def emit(path: Path) -> None:

@@ -1,11 +1,11 @@
-"""``interactive_preview()`` — a Jupyter scrubber for a :class:`Simulation`:
+"""``interactive_preview()``, a Jupyter scrubber for a :class:`Simulation`:
 slide the cut plane through the domain and watch the cross-section update live,
 with cut-axis / grid / scene-vs-ε toggles. The "see it before you run it" moment,
 interactive but fully local (no web app).
 
 ipywidgets is the optional ``photonhub[viz]`` extra and is imported LAZILY, so the
 core SDK never depends on it. The frame rendering (:func:`render_slice`) is a
-plain matplotlib call — pure and testable headless; ``interactive_preview`` just
+plain matplotlib call, pure and testable headless; ``interactive_preview`` just
 wires it to widgets.
 """
 
@@ -27,7 +27,7 @@ def render_slice(sim, axis: str, value: float, *, eps: bool = True,
                  grid: bool = True, ax=None):
     """Render one preview frame: the meshed-ε heatmap (``eps=True``) or the
     analytic scene (``eps=False``) at ``axis=value``, optionally with the grid
-    overlay. Returns the matplotlib ``Axes`` (pure — no widgets)."""
+    overlay. Returns the matplotlib ``Axes`` (pure, no widgets)."""
     if eps:
         return sim.plot_index(**{axis: value}, ax=ax, grid=grid)
     return sim.plot(**{axis: value}, ax=ax, grid=grid)
@@ -88,7 +88,7 @@ def interactive_preview(sim, *, axis: str = "z", eps: bool = True,
 def render_field_slice(data, monitor, *, field="Ex", val="real", freq=None,
                        time=None, axis=None, value=None, structures=False,
                        simulation=None, ax=None):
-    """Render one field-preview frame via :func:`plot_field` — the pure,
+    """Render one field-preview frame via :func:`plot_field`, the pure,
     testable core of :func:`interactive_field`. ``axis``/``value`` pick the cut
     plane for a volumetric monitor; ``freq=``/``time=`` pick the DFT frequency /
     time frame. Omit the cut for an already-planar monitor."""

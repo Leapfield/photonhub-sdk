@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from ..constants import c0
 from ..gds import export_gds
 from .build import BuiltSim, build_simulation
 from .convergence import ConvergenceReport, converge_through_transmission
@@ -198,7 +199,7 @@ def replicate(
             lam = None
             cf = built.meta.get("field_slice_freq_hz")
             if cf:
-                lam = 2.99792458e8 / cf * 1e6
+                lam = c0 / cf * 1e6
             out = plot_field_intensity_png(spec, *fi, outdir / "field_intensity.png",
                                            wavelength_um=lam)
             if out:

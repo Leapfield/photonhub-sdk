@@ -3,7 +3,7 @@
 Pure post-processing, no engine support required: a full-plane
 ``ProfileMonitor`` recording the four tangential components over a
 transverse-PERIODIC unit cell is decomposed into its discrete plane-wave
-(grating) orders — complex s/p amplitudes per order and direction, per-order
+(grating) orders, complex s/p amplitudes per order and direction, per-order
 power, propagation angles, and the propagating/evanescent mask.
 
 Physics
@@ -13,15 +13,15 @@ On a plane normal to ``axis`` with both in-plane axes periodic (periods
 ``(m1, m2)`` with in-plane wavevectors ``k1 = k_B1 + 2 pi m1 / L1``,
 ``k2 = k_B2 + 2 pi m2 / L2``, where ``k_B`` is the Bloch wavevector of the
 boundaries (0 on plain periodic axes; ``Simulation.bloch_k_per_um`` on
-``"bloch"`` axes — the oblique-incidence order ladder, NUMERICS.md §22).
+``"bloch"`` axes, the oblique-incidence order ladder, NUMERICS.md §22).
 The recorded field is only QUASI-periodic under a nonzero ``k_B``, so each
 component is demodulated by ``e^{-i k_B x}`` at its own sample coordinates
 before the FFT. Each order with ``|k_t|^2 < (n w / c)^2`` is a propagating
 plane wave with ``k_n = sqrt(k^2 - |k_t|^2)``; the rest are evanescent.
 
 Per order the four recorded tangential components over-determine the four
-physical unknowns — the complex s- and p-polarized amplitudes travelling
-``+axis`` and ``-axis`` — so the decomposition solves them exactly:
+physical unknowns, the complex s- and p-polarized amplitudes travelling
+``+axis`` and ``-axis``, so the decomposition solves them exactly:
 
 * FFT over the periodic cell gives per-order coefficients; each Yee
   component's half-cell in-plane offset is removed by its exact phase
@@ -32,28 +32,28 @@ physical unknowns — the complex s- and p-polarized amplitudes travelling
   in-plane pair of ``axis``),
 * the +/- split uses E (recorded on the plane) against H (recorded a half
   cell off-plane): with ``phi = k_n d_axis / 2`` the recorded pair maps to
-  the directional amplitudes through an exact 2x2 solve — the half-cell
+  the directional amplitudes through an exact 2x2 solve, the half-cell
   H offset is part of the model, not an error term. In the engine's
   ``e^{-i w t}`` phasor convention "forward" means ``e^{+i k_n a}`` along
   ``+axis``.
 
 Powers are ``P = (A/2) (n/eta0) Re(k_n/k) (|Es|^2 + |Ep|^2)`` per order and
-direction — the same source-spectrum-normalized units as the recorded
+direction, the same source-spectrum-normalized units as the recorded
 phasors, so RATIOS (diffraction efficiencies against a reference run's
 incident power, or order-vs-order splits) are the meaningful outputs.
 ``net_power()`` (= forward minus backward totals) is the physical net power
 through the plane; counter-propagating interference carries no net Poynting,
 so the sum is position-independent. ``staggered_plane_power()`` is the naive
-half-cell-staggered real-space Poynting integral of the same plane — per
+half-cell-staggered real-space Poynting integral of the same plane, per
 order it equals the net power times ``cos(Re(k_n) d_axis / 2)``, an
-under-count at coarse normal sampling — exposed as an independent
+under-count at coarse normal sampling, exposed as an independent
 bookkeeping cross-check, not a physics reference.
 
 What's not handled
 ==================
-* **Symmetry-folded planes** — a §20 symmetry plane on an in-plane axis
-  folds the recorded half-domain; rebuild is not implemented (raises).
-* **Decimated planes** — ``interval_space`` strides > 1 on an in-plane axis
+* **Symmetry-folded planes**, a §20 symmetry plane on an in-plane axis
+  reduces the recorded half-domain by symmetry; rebuild is not implemented (raises).
+* **Decimated planes**, ``interval_space`` strides > 1 on an in-plane axis
   alias high orders (raises).
 """
 
@@ -66,6 +66,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 import numpy as np
 
+from ..components import frame as _frame
 from ..components.grid import (
     realized_cells,
     sim_axis_min_cells,
@@ -113,7 +114,7 @@ class DiffractionOrders:
     amp_p_backward: np.ndarray
     power_forward: np.ndarray     # (nf, n1, n2) float
     power_backward: np.ndarray
-    n_medium: float
+    n_medium: Union[float, np.ndarray]  # float, or (nf,) in a dispersive medium
     area_um2: float
     _raw_plane_power: np.ndarray  # (nf,)
 
@@ -147,7 +148,7 @@ class DiffractionOrders:
     def theta_rad(self) -> np.ndarray:
         """Polar diffraction angle from the +axis normal, per (f, m1, m2);
         NaN for non-propagating orders."""
-        k = (2.0 * math.pi * self.n_medium / C0 * 1e-6
+        k = (2.0 * math.pi * np.asarray(self.n_medium) / C0 * 1e-6
              * self.freqs_hz)[:, None, None]
         kt = np.sqrt(self.k1[None, :, None] ** 2 + self.k2[None, None, :] ** 2)
         ratio = np.broadcast_to(kt, self.kn.shape) / k
@@ -181,11 +182,21 @@ class DiffractionOrders:
         """The naive half-cell-staggered Poynting integral of the recorded
         plane, computed directly in real space (E on-plane against H a half
         cell off-plane). Per order it equals the directional net power times
-        ``cos(Re(k_n) d_axis / 2)`` — an UNDER-count at coarse normal
-        sampling — so it serves as an independent bookkeeping cross-check
+        ``cos(Re(k_n) d_axis / 2)``, an UNDER-count at coarse normal
+        sampling, so it serves as an independent bookkeeping cross-check
         against the order decomposition, not as the physics reference
         (:meth:`net_power` is that)."""
         return self._raw_plane_power.copy()
+
+
+def _wire_position(data, name: str, axis: str) -> float:
+    """The recorded plane's coordinate along ``axis`` in the wire frame, read
+    through :func:`~photonhub.components.frame.wire_array`: a ``RunResult``
+    hands over its engine array (whatever frame its ``data[name]`` shows: a
+    fresh fitted run's user frame, or a reopened run's own), and a plain
+    mapping of arrays is in the wire frame already."""
+    da = _frame.wire_array(data, name)
+    return float(np.asarray(da.coords[axis].values).reshape(-1)[0])
 
 
 def _resolve_monitor(simulation, monitor):
@@ -242,9 +253,41 @@ def _uniform_spacing(coords: np.ndarray, letter: str,
     return float(d[0])
 
 
-def _infer_n_medium(simulation, axis: str, position_um: float) -> float:
-    """The plane must lie in a homogeneous region for plane-wave orders to be
-    well-defined; sample the analytic eps on the cut and require uniformity."""
+def _plane_media(simulation, axis: str, position_um: float) -> list:
+    """The distinct media the §9 hard sample puts on the cut's cell centres,
+    ordered by owner: ``None`` for the background, then structure media in
+    list order. Painted with each structure's list index in place of its
+    permittivity, so the owner of every cell is exact."""
+    from types import SimpleNamespace
+
+    from ..viz import _geometry as _geom
+    from ..viz.eps import axis_cell_centers_um, axis_nodes_um, eps_at_points
+    h_letter, v_letter = _geom.in_plane_axes(axis)
+    HH, VV = np.meshgrid(
+        axis_cell_centers_um(axis_nodes_um(simulation, _AXIS_IDX[h_letter])),
+        axis_cell_centers_um(axis_nodes_um(simulation, _AXIS_IDX[v_letter])))
+    tagged = SimpleNamespace(
+        background=SimpleNamespace(permittivity=0.0),
+        structures=[SimpleNamespace(
+            geometry=s.geometry,
+            medium=SimpleNamespace(permittivity=float(i + 1),
+                                   permittivity_data=None))
+            for i, s in enumerate(simulation.structures)])
+    owners = np.unique(eps_at_points(tagged, axis, HH, VV, float(position_um)))
+    return [None if o == 0 else simulation.structures[int(o) - 1].medium
+            for o in owners]
+
+
+def _infer_n_medium(simulation, axis: str, position_um: float,
+                    freqs_hz) -> Tuple[np.ndarray, bool]:
+    """``(n per frequency, dispersive)`` of the medium filling the plane.
+
+    ``position_um`` is the plane's WIRE-frame coordinate along ``axis`` (the
+    frame the structures are painted in). The plane must lie in a homogeneous
+    region for plane-wave orders to be well-defined, so the analytic eps is
+    sampled on the cut and required uniform. For a pole medium the
+    ``permittivity`` field is only eps_inf (NUMERICS.md §19), so a plane in a
+    dispersive medium takes ``Re eps(f)`` at each recorded frequency."""
     from ..viz.eps import sample_eps_plane
     _, _, eps2d = sample_eps_plane(simulation, axis, position_um)
     lo, hi = float(np.min(eps2d)), float(np.max(eps2d))
@@ -254,7 +297,50 @@ def _infer_n_medium(simulation, axis: str, position_um: float) -> float:
             f"structures (eps spans [{lo:.4g}, {hi:.4g}]) — grating orders "
             "are defined in a homogeneous region; move the plane or pass "
             "n_medium explicitly")
-    return math.sqrt(lo)
+    freqs = np.atleast_1d(np.asarray(freqs_hz, dtype=np.float64))
+    if not any(getattr(s.medium, "is_dispersive", False)
+               for s in simulation.structures):
+        return np.full(freqs.shape, math.sqrt(lo)), False
+    media = _plane_media(simulation, axis, position_um)
+    if not any(m is not None and m.is_dispersive for m in media):
+        return np.full(freqs.shape, math.sqrt(lo)), False
+    bg = float(simulation.background.permittivity)
+    eps = np.array([[bg if m is None else m.permittivity_at_hz(float(f))
+                     for m in media] for f in freqs])        # (nf, n_media)
+    lo_f, hi_f = eps.min(axis=1), eps.max(axis=1)
+    if np.any(hi_f - lo_f > 1e-9 * np.maximum(1.0, np.abs(hi_f))):
+        raise ValueError(
+            f"the monitor plane at {axis}={position_um:.4g} um crosses media "
+            "whose dispersive permittivities differ at the recorded "
+            "frequencies: move the plane or pass n_medium explicitly")
+    if np.any(lo_f <= 0.0):
+        raise ValueError(
+            f"the medium at {axis}={position_um:.4g} um has Re eps <= 0 at a "
+            "recorded frequency: no propagating plane-wave orders there")
+    return np.sqrt(lo_f), True
+
+
+def _resolve_n_medium(simulation, axis: str, position_um: float, freqs,
+                      n_medium) -> Tuple[np.ndarray, Union[float, np.ndarray]]:
+    """``(n per frequency, the value to report)``: an explicit ``n_medium``
+    (a scalar, or one value per recorded frequency) or the inferred medium,
+    reported as a float unless it is dispersive."""
+    if n_medium is None:
+        n_f, dispersive = _infer_n_medium(simulation, axis, position_um, freqs)
+        report = n_f.copy() if dispersive else float(n_f[0])
+    else:
+        arr = np.asarray(n_medium, dtype=np.float64)
+        if arr.ndim == 0:
+            n_f, report = np.full(freqs.shape, float(arr)), float(arr)
+        elif arr.shape == freqs.shape:
+            n_f, report = arr.copy(), arr.copy()
+        else:
+            raise ValueError(
+                f"n_medium must be a scalar or one value per recorded "
+                f"frequency ({freqs.size}), got shape {arr.shape}")
+    if not np.all(n_f > 0.0):
+        raise ValueError(f"n_medium must be > 0, got {report}")
+    return n_f, report
 
 
 def diffraction_orders(
@@ -262,25 +348,31 @@ def diffraction_orders(
     data,
     monitor,
     *,
-    n_medium: Optional[float] = None,
+    n_medium: Optional[Union[float, np.ndarray]] = None,
 ) -> DiffractionOrders:
     """Decompose a recorded periodic DFT plane into grating orders.
 
     Parameters
     ----------
     simulation:
-        The run's Simulation (grid spacing, boundaries, symmetry and — when
-        ``n_medium`` is not given — the analytic cross-section all come from
+        The run's Simulation (grid spacing, boundaries, symmetry and, when
+        ``n_medium`` is not given, the analytic cross-section all come from
         it).
     data:
-        The run's ``RunResult`` (or any ``name -> DataArray`` mapping).
+        The run's ``RunResult``, or any ``name -> DataArray`` mapping, whose
+        coordinates are taken as the wire frame. The plane's position is read
+        through ``frame.wire_array``, so a fitted run's user-frame
+        coordinates are handled.
     monitor:
         The full-plane ``ProfileMonitor`` (or its name) recording all four
         tangential components of the plane normal to its zero-size axis.
     n_medium:
-        Refractive index of the homogeneous region containing the plane.
-        Default: sampled from the simulation cross-section (raises if the
-        plane crosses structures).
+        Refractive index of the homogeneous region containing the plane: a
+        scalar, or one value per recorded frequency. Default: sampled from
+        the simulation cross-section at the plane (raises if the plane
+        crosses structures); in a dispersive (pole) medium it is
+        ``sqrt(Re eps(f))`` at each recorded frequency, not eps_inf, and
+        ``DiffractionOrders.n_medium`` is then that per-frequency array.
 
     Returns
     -------
@@ -342,7 +434,9 @@ def diffraction_orders(
     L1, L2 = n1 * d1, n2 * d2
     area = L1 * L2
 
-    pos_a = float(np.asarray(da.coords[axis].values).reshape(-1)[0])
+    # the plane's position in the wire frame the medium and the local cell are
+    # looked up in (a fresh fitted result's coordinates are the user's)
+    pos_a = _wire_position(data, mon.name, axis)
     # local normal-axis spacing at the plane (graded-aware), for the exact
     # half-cell H referral
     _, d_a = snap_mixed_plane(simulation, _AXIS_IDX[axis], pos_a)
@@ -406,13 +500,10 @@ def diffraction_orders(
     h2 = orders_of(h2_r, 0.5, 0.0)
 
     # --- per-order geometry ---------------------------------------------------
-    if n_medium is None:
-        n_medium = _infer_n_medium(simulation, axis, pos_a)
-    n_medium = float(n_medium)
-    if not n_medium >= 1.0:
-        raise ValueError(f"n_medium must be >= 1, got {n_medium}")
+    n_f, n_report = _resolve_n_medium(simulation, axis, pos_a, freqs, n_medium)
+    N = n_f[:, None, None]                              # (nf, 1, 1)
 
-    k = (2.0 * math.pi * n_medium / C0 * 1e-6 * freqs)  # (nf,) rad/um
+    k = (2.0 * math.pi * n_f / C0 * 1e-6 * freqs)       # (nf,) rad/um
     K1 = k1[None, :, None]
     K2 = k2[None, None, :]
     kt2 = K1 ** 2 + K2 ** 2
@@ -448,17 +539,17 @@ def diffraction_orders(
     with np.errstate(invalid="ignore", divide="ignore"):
         kr = np.where(np.abs(kn) > 0, k[:, None, None] / kn, np.inf)
         # s-pol: a = Es_rec, B = -(eta0/n)(k/kn) (kt_hat . H_rec)
-        B = -(ETA0 / n_medium) * kr * Hp_rec
+        B = -(ETA0 / N) * kr * Hp_rec
         Es_f = (Es_rec * eim + B) / (2.0 * cosphi)
         Es_b = (Es_rec * eip - B) / (2.0 * cosphi)
         # p-pol (H along s_hat): B' = (n/eta0)(k/kn)... in H units:
         # Hp+/- from a' = Hs_rec, b' = kt_hat . E, B' = (omega eps / kn) b'
         #   = (n k)/(eta0 kn) b'; report as full-E amplitude Ep = (eta0/n) Hp.
-        Bp = (n_medium / ETA0) * kr * Ep_rec
+        Bp = (N / ETA0) * kr * Ep_rec
         Hp_f = (Hs_rec + Bp * eim) / (2.0 * cosphi)
         Hp_b = (Hs_rec - Bp * eip) / (2.0 * cosphi)
-    Ep_f = (ETA0 / n_medium) * Hp_f
-    Ep_b = (ETA0 / n_medium) * Hp_b
+    Ep_f = (ETA0 / N) * Hp_f
+    Ep_b = (ETA0 / N) * Hp_b
 
     valid = propagating & ~grazing
     nanc = np.complex128(np.nan + 1j * np.nan)
@@ -468,7 +559,7 @@ def diffraction_orders(
     Ep_b = np.where(valid, Ep_b, nanc)
 
     # order powers (0 for evanescent/grazing)
-    pref = 0.5 * area * (n_medium / ETA0) * np.where(
+    pref = 0.5 * area * (N / ETA0) * np.where(
         valid, kn.real / k[:, None, None], 0.0)
     p_fwd = pref * (np.where(valid, np.abs(Es_f), 0.0) ** 2
                     + np.where(valid, np.abs(Ep_f), 0.0) ** 2)
@@ -498,7 +589,7 @@ def diffraction_orders(
         amp_p_backward=shift(Ep_b),
         power_forward=shift(p_fwd),
         power_backward=shift(p_bwd),
-        n_medium=n_medium,
+        n_medium=n_report,
         area_um2=area,
         _raw_plane_power=raw_power,
     )

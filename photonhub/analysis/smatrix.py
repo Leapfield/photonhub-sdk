@@ -1,4 +1,4 @@
-"""Multiport scattering-matrix (S-matrix) assembler — pure Python, no engine.
+"""Multiport scattering-matrix (S-matrix) assembler, pure Python, no engine.
 
 This assembles the multi-port scattering matrix, built entirely on top of the
 mode-resolved **complex** modal amplitude that :func:`photonhub.analysis.mode_overlap.mode_amplitude` extracts
@@ -20,7 +20,7 @@ is the amplitude **scattered out** of the device at port i. Each is the
 the engine's SI flux units), built from the
 normalized modal coefficient ``c = a_pm / P_mode`` of
 :func:`~photonhub.analysis.mode_overlap.mode_amplitude` and the port mode's own
-plane power ``P_mode`` — so
+plane power ``P_mode``, so
 
 * ``|a|^2`` / ``|b|^2`` is the modal **power** the wave carries through the
   port plane (the same number
@@ -36,7 +36,7 @@ plane power ``P_mode`` — so
 
 Incident vs scattered: the directional projection
 ==================================================
-Each :class:`SPort` carries the **outgoing direction** — the sign along the
+Each :class:`SPort` carries the **outgoing direction**, the sign along the
 monitor's propagation ``axis`` that points *out of* the device through that port
 (``"+"`` or ``"-"``). The two directional projections of the recorded plane are
 then:
@@ -60,18 +60,17 @@ Normalization
 amplitudes already living in the run data: the recorded phasors are divided by
 ``A0*S(f)`` (NUMERICS.md section 12), so that normalization cancels in the ratio
 ``S_ij = b_i / a_j`` and leaves a dimensionless scattering parameter. Each port's
-amplitude is the power-normalized ``c * sqrt(|P_mode| * 1e-12)`` (see above —
-the µm²→m² factor keeps ``|b|^2`` equal to the flux-commensurate
+amplitude is the power-normalized ``c * sqrt(|P_mode| * 1e-12)`` (see above, the µm²→m² factor keeps ``|b|^2`` equal to the flux-commensurate
 ``ModeMonitor.mode_power``), so
 ``|S_ij|^2`` is a power ratio for same-mode AND unequal-mode port pairs alike
 (a clean straight through-guide reads ``|S21| ≈ 1``). No de-embedding of the
-source-to-monitor or monitor-to-port reference plane is applied — ``S`` is
+source-to-monitor or monitor-to-port reference plane is applied, ``S`` is
 referenced to the monitor planes as placed (see "What's not handled").
 
 Output
 ======
 :func:`smatrix` returns **one column** of S (the column for the driven port) as
-``{(port_out, port_in): {freq_hz: S}}`` — i.e. ``S_ij`` for every port ``i`` with
+``{(port_out, port_in): {freq_hz: S}}``, i.e. ``S_ij`` for every port ``i`` with
 ``j`` fixed to the driven port. Run it once per driven port and feed the columns
 to :func:`assemble_smatrix` to get the full matrix as an :class:`xarray.DataArray`
 indexed ``(port_out, port_in, f)``. :func:`reciprocity_error` /
@@ -102,6 +101,7 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from ..components import frame as _frame
 from ._constants import _TANGENTIAL
 from .mode_devices import ModeMonitor
 from .mode_overlap import _UM2_TO_M2, _overlap_terms
@@ -136,7 +136,7 @@ class SPort:
         ``modes_by_freq`` drive the overlap).
     out_direction:
         The sign along the monitor's propagation ``axis`` ('+' or '-') that points
-        *out of the device* through this port — the direction a transmitted /
+        *out of the device* through this port, the direction a transmitted /
         scattered wave leaves. The incident (incoming) direction is the opposite.
         Defaults to the monitor's own ``direction`` (treated as the outgoing one).
     """
@@ -154,11 +154,11 @@ class SPort:
 
     @property
     def in_direction(self) -> str:
-        """The incoming (toward-device) direction — opposite the outgoing one."""
+        """The incoming (toward-device) direction, opposite the outgoing one."""
         return _OPPOSITE[self.out_direction]
 
     def _planes(self, data) -> Mapping[str, object]:
-        da = data[self.monitor.name]
+        da = _frame.wire_array(data, self.monitor.name)     # the wire frame the monitor's window is in
         ax = self.monitor.axis
         return {c: da.sel(component=c) for c in _TANGENTIAL[ax]}
 
@@ -168,7 +168,7 @@ class SPort:
         this port's mode, travelling in ``direction`` (the directional
         projection): ``c * sqrt(|P_mode|)`` with ``c = a_pm / P_mode``, so its
         squared magnitude is the modal POWER through the plane (the module
-        docstring's normalization — what makes ``|S_ij|^2`` a power ratio for
+        docstring's normalization, what makes ``|S_ij|^2`` a power ratio for
         unequal-mode port pairs). ``colocate`` Yee-co-locates the staggered E/H
         sim components before the overlap (the default; see
         :func:`mode_overlap.mode_amplitude`).
@@ -176,7 +176,7 @@ class SPort:
         The longitudinal Yee de-stagger is applied with the monitor's grid
         ``dl_um`` whenever ``colocate`` is on (mirroring
         ``mode_devices._DESTAGGER_AUTO`` / ``ModeMonitor.mode_power``): the
-        driven-port reflection ``S_jj`` is the most stagger-sensitive readout —
+        driven-port reflection ``S_jj`` is the most stagger-sensitive readout ,
         without it the incident wave leaks ``O(beta*dl/2)`` into the outgoing
         projection. Monitors built without a grid (``dl_um is None``) skip it."""
         mon = self.monitor
@@ -207,19 +207,24 @@ class SPort:
         # amplitude whose |.|^2 is the modal power in the engine's SI flux
         # units — the same flux-commensurate value ModeMonitor.mode_power
         # reports — so per-port P_mode no longer biases S. The unit factor is
-        # shared by every port, so S ratios are unchanged by it.
+        # shared by every port, so S ratios are unchanged by it. The fold
+        # factor is not shared: a port centred on a §20 symmetry plane records
+        # half its power per plane, and |.|^2 must be the whole plane's power
+        # as mode_power reports it, or S between a port on the plane and one
+        # off it reads sqrt(2) high.
+        scale = _UM2_TO_M2 * mon._fold_power_factor()
         return {
-            f: complex(a_pm / p_mode) * float(np.sqrt(abs(p_mode) * _UM2_TO_M2))
+            f: complex(a_pm / p_mode) * float(np.sqrt(abs(p_mode) * scale))
             for f, (a_pm, p_mode) in terms.items()
         }
 
     def outgoing(self, data, *, colocate: bool = True) -> Dict[float, complex]:
-        """``{freq: b}`` — the complex amplitude of the wave scattered *out* of
+        """``{freq: b}``, the complex amplitude of the wave scattered *out* of
         the device through this port."""
         return self._amplitude(data, self.out_direction, colocate=colocate)
 
     def incoming(self, data, *, colocate: bool = True) -> Dict[float, complex]:
-        """``{freq: a}`` — the complex amplitude of the wave incident *into* the
+        """``{freq: a}``, the complex amplitude of the wave incident *into* the
         device at this port (the source side at the driven port)."""
         return self._amplitude(data, self.in_direction, colocate=colocate)
 
@@ -252,7 +257,7 @@ def smatrix(
     """Assemble **one column** of the S-matrix from a single driven-port run.
 
     Drives port ``driven`` (only) and returns ``S_ij(f) = b_i / a_j`` for every
-    port ``i`` in ``ports``, with ``j = driven`` fixed — i.e. the column of the
+    port ``i`` in ``ports``, with ``j = driven`` fixed, i.e. the column of the
     full S-matrix belonging to the driven port. ``a_j`` is the amplitude incident
     on the device at the driven port (its incoming projection); ``b_i`` is the
     amplitude scattered out of the device at port ``i`` (its outgoing projection).
@@ -262,7 +267,7 @@ def smatrix(
     ports:
         The N :class:`SPort`s. Names must be unique.
     driven:
-        The driven port — an :class:`SPort` or its ``name``. Must be in ``ports``.
+        The driven port, an :class:`SPort` or its ``name``. Must be in ``ports``.
     data:
         The run's ``RunResult`` (or any mapping ``name -> DataArray``) for the
         run that drove ``driven``. Every port monitor's data must be present.

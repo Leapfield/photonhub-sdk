@@ -12,18 +12,18 @@ Kottke-Farjadpour-Johnson** effective-permittivity tensor (the same
 solver.
 
 Conventions (must match :meth:`VectorModeSolver._kfj_tensor_rect` and the overlap):
-  * grid orientation ``[iy, ix]`` = ``(row = z/height, col = width)`` — exactly what
+  * grid orientation ``[iy, ix]`` = ``(row = z/height, col = width)``, exactly what
     :func:`photonhub.viz.eps.sample_eps_plane` returns (its vertical axis is always z
     for an x- or y-normal cut), i.e. ``_asym_strip_eps``'s convention.
-  * ``eps_scalar = eps_par`` (the arithmetic average) — the solver reconstructs E by
+  * ``eps_scalar = eps_par`` (the arithmetic average), the solver reconstructs E by
     dividing by this scalar, so it must be ε‖, not ε⊥ or a tensor component.
   * tensor in the grid frame: ``exx`` along ix (width), ``eyy`` along iy (height),
     ``ezz = eps_par`` (the propagation axis is tangential to a z-invariant guide).
 
 For isotropic constituents sharing one interface normal the Kottke/KFJ construction
 (average tau(eps) over the cell, then invert) reduces EXACTLY to two sub-sample
-averages — ``eps_par = <eps>`` (arithmetic) and ``eps_perp = <1/eps>^-1``
-(harmonic) — for ANY number of media in the cell, so no foreground/surround
+averages, ``eps_par = <eps>`` (arithmetic) and ``eps_perp = <1/eps>^-1``
+(harmonic), for ANY number of media in the cell, so no foreground/surround
 bookkeeping is required for the diagonal path. (This is NOT the engine's pairing:
 ``averaged_eps_kfj`` blends the topmost-at-centre medium against a
 surround-excluding sample, a two-phase form. Do not assume the two agree cell for
@@ -39,6 +39,7 @@ import numpy as np
 from ..viz import _geometry as _geom
 from ..viz import eps as _veps
 from ._constants import C0
+from .._compat import caller_stacklevel, legacy_keywords
 
 _AXES = "xyz"
 
@@ -48,7 +49,7 @@ def _paint_indices(sim, axis: str, plane_value_um: float,
     """Last-structure-wins GEOMETRY paint on an arbitrary ``(v, h)`` center grid
     (NUMERICS §9): ``idx[iy=v, ix=h]`` with ``-1`` = background and ``i`` =
     ``sim.structures[i]``. Painting indices (not eps values) lets a per-frequency
-    consumer rasterize the geometry ONCE and re-map material values per frequency
+    consumer sample the geometry on the mesh ONCE and re-map material values per frequency
     (dispersive media, :meth:`Medium.permittivity_at_hz`)."""
     a = _geom.axis_index(axis)
     h_letter, v_letter = _geom.in_plane_axes(axis)
@@ -110,7 +111,7 @@ def _any_dispersive(sim, eps_of_medium=None) -> bool:
 def _eps_lut(sim, eps_of) -> np.ndarray:
     """The background+structures eps look-up table paired with
     :func:`_paint_indices`' convention (``lut[idx + 1]``, background at 0).
-    Rejects non-positive values — a frequency anchor that landed close enough
+    Rejects non-positive values, a frequency anchor that landed close enough
     to a Lorentz resonance to push Re eps <= 0 would silently break the mode
     eigensolve (sqrt of a negative core eps) far downstream."""
     lut = np.empty(len(sim.structures) + 1, dtype=np.float64)
@@ -128,10 +129,10 @@ def _eps_lut(sim, eps_of) -> np.ndarray:
 
 
 def _default_eps_of(eps_of_medium, freq_hz):
-    """The shared structure→eps evaluator of the cross-section rasterizers: an
+    """The shared structure→eps evaluator of the cross-section mesh samplers: an
     explicit ``eps_of_medium`` entry wins (a deliberate anchor, held at EVERY
     frequency); otherwise the medium's eps AT ``freq_hz``
-    (:meth:`Medium.permittivity_at_hz` — for a Lorentz medium the band value,
+    (:meth:`Medium.permittivity_at_hz`, for a Lorentz medium the band value,
     NOT the eps_inf that bare ``permittivity`` is); ``freq_hz=None`` falls back
     to bare ``permittivity`` (legacy, correct only for non-dispersive media)."""
     def eps_of(s):
@@ -144,9 +145,9 @@ def _default_eps_of(eps_of_medium, freq_hz):
 
 
 def _snap_window(h_lo_um, h_hi_um, v_lo_um, v_hi_um, dl_um):
-    """The grid-snapped raster window: origin floored to the sim grid, extent
-    ceil'd to cover the requested hi. Returns ``(h_lo, v_lo, nh, nv)`` — the
-    single source of truth for the window both the eps raster and the
+    """The grid-snapped sampling window: origin floored to the sim grid, extent
+    ceil'd to cover the requested hi. Returns ``(h_lo, v_lo, nh, nv)``, the
+    single source of truth for the window both the eps samples and the
     center-offset metadata use (cell ``i`` spans ``[lo + i*dl, lo + (i+1)*dl]``)."""
     h_lo_um = np.floor(h_lo_um / dl_um) * dl_um
     v_lo_um = np.floor(v_lo_um / dl_um) * dl_um
@@ -160,10 +161,10 @@ def _flm_center_offset(h_center_um, v_center_um, half_w_um, half_v_um, dl_um):
     actual position of the FLM field-array center minus the requested center.
 
     The FLM operator (:meth:`VectorModeSolver._assemble`) reads the four eps
-    quadrants of node ``(ix, iy)`` from raster cells ``{ix, ix+1} x {iy, iy+1}``,
+    quadrants of node ``(ix, iy)`` from mesh cells ``{ix, ix+1} x {iy, iy+1}``,
     i.e. the field node sits at the shared CORNER ``(h_lo + (ix+1)*dl,
     v_lo + (iy+1)*dl)`` (verified: the H-field intensity centroid of a strip
-    mode lands exactly -0.5 raster-index units from the eps centroid). The
+    mode lands exactly -0.5 mesh-index units from the eps centroid). The
     array center is therefore at ``lo + (n+1)/2*dl``."""
     h_lo, v_lo, nh, nv = _snap_window(
         h_center_um - half_w_um, h_center_um + half_w_um,
@@ -181,13 +182,12 @@ def sample_cross_section_kfj(
 ) -> Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """Diagonal KFJ tensor of the real cross-section over a window, on the sim grid.
 
-    Returns ``(eps_scalar = eps_par, (exx, eyy, ezz))`` indexed ``[iy=height, ix=width]``
-    — a drop-in for :meth:`VectorModeSolver._kfj_tensor_rect`'s output but built from
+    Returns ``(eps_scalar = eps_par, (exx, eyy, ezz))`` indexed ``[iy=height, ix=width]``, a drop-in for :meth:`VectorModeSolver._kfj_tensor_rect`'s output but built from
     the actual ``sim`` geometry. The window ``[h_lo,h_hi] x [v_lo,v_hi]`` (in the
     cut's (h, v) in-plane axes) is sampled at ``dl_um`` and supersampled ``supersample``x
     to get per-cell fill fractions. Material values: ``eps_of_medium``
     (``{id(medium): eps_value}``) overrides win; otherwise each medium is anchored
-    at ``freq_hz`` when given (:meth:`Medium.permittivity_at_hz` — REQUIRED for a
+    at ``freq_hz`` when given (:meth:`Medium.permittivity_at_hz`, REQUIRED for a
     correct dispersive solve; bare ``permittivity`` is only eps_inf there), else
     bare ``permittivity`` (legacy)."""
     sample = cross_section_kfj_sampler(
@@ -204,12 +204,12 @@ def cross_section_kfj_sampler(
     eps_of_medium: Optional[Mapping[int, float]] = None,
 ):
     """Frequency-parameterized form of :func:`sample_cross_section_kfj`: the
-    window geometry is rasterized ONCE (a structure-index paint) and the
+    window geometry is sampled on the mesh ONCE (a structure-index paint) and the
     returned ``sample(freq_hz)`` re-maps material values at that frequency and
-    reduces to the KFJ tensor — what makes a per-frequency bank over a
+    reduces to the KFJ tensor, what makes a per-frequency bank over a
     DISPERSIVE cross-section affordable (the supersampled paint is the setup
     hotspot, not the LUT re-map). When no un-overridden dispersive medium is
-    present the first result is cached and the geometry raster released."""
+    present the first result is cached and the geometry samples released."""
     # Snap the window origin to the simulation grid (whose cell centers sit at
     # (k+1/2)*dl from the domain origin 0), so the sampled cross-section's cells
     # COINCIDE with the sim's — the readout/launch mode then sees the dielectric
@@ -275,8 +275,9 @@ def _kfj_tensor_reduce(eps_fine, nh, nv, ss, dl_um):
     return epar, (exx, eyy, ezz)
 
 
+@legacy_keywords(wavelength_um="wlen_um")
 def solve_mode_on_cross_section(
-    sim, axis: str, plane_value_um: float, wavelength_um: float,
+    sim, axis: str, plane_value_um: float, wlen_um: float,
     pol: str, mode_index: int, *,
     h_center_um: float, v_center_um: float,
     half_w_um: float, half_v_um: float, dl_um: float,
@@ -300,17 +301,39 @@ def solve_mode_on_cross_section(
 
     Symmetry: the Yee path honors ``sim.symmetry`` §20 planes AUTOMATICALLY
     (window clipped at the plane + the matching parity BC; see
-    :func:`~photonhub.analysis.yee_mode.window_min_face_bcs`) — nothing to pass.
+    :func:`~photonhub.analysis.yee_mode.window_min_face_bcs`), nothing to pass.
+    A plain periodic in-plane axis is honored too: the window is the whole
+    period with the k = 0 periodic closure (the half-extent asked for on that
+    axis is not used), and a one-cell (quasi-2D) axis yields the
+    cross-section's slab modes (see
+    :func:`~photonhub.analysis.yee_mode.solve_yee_mode`). The FLM path knows
+    neither.
     ``x_symmetry`` is the FLM path's MANUAL width-axis wall control only
     (``"none"`` = electric walls, ``"pmc"`` = magnetic; it is NOT read from
     the sim and does not affect the Yee path).
+
+    **Window size on a half domain.** ``half_w_um``/``half_v_um`` mean the same
+    physical half-extent either way (on an axis with a symmetry plane the
+    mirror supplies the other half), but they do NOT buy the same accuracy.
+    Every window truncates the mode's tail against a hard wall, and the two
+    walls of a whole-domain window bias ``n_eff`` in OPPOSITE directions, so
+    their errors partly cancel; a symmetry plane replaces one of those walls
+    with the exact mirror and removes the cancellation. On a 500 x 220 nm Si
+    strip at 37 nm cells, ``half_v_um`` 0.31 reads 2.4443 on the whole domain
+    and 2.4281 on the half domain, against 2.4467 for both once the window is
+    large enough. Size the window until the reading stops moving; the solve
+    warns when the mode is still large on a wall. Note also that a half domain
+    must put the guide's mirror plane on coordinate 0, which is a grid NODE:
+    a whole domain that centres the same guide on a half-node is a different
+    discretization of that guide and legitimately reads a different
+    ``n_eff``.
 
     Dispersive media are anchored at the solve frequency automatically
     (:meth:`Medium.permittivity_at_hz`); an explicit ``eps_of_medium`` overrides
     that per medium. Unless ``eps_of_medium`` is given, the returned mode carries
     its ``solve_params`` provenance, which lets :class:`ModeMonitor` re-solve the
     SAME mode identity at every monitor frequency (the automatic per-frequency
-    readout bank)."""
+    readout mode mapping)."""
     solve_params = None
     if eps_of_medium is None:
         # Provenance for the per-frequency auto-bank: everything but the
@@ -330,7 +353,7 @@ def solve_mode_on_cross_section(
     if use_yee:
         from .yee_mode import solve_yee_mode
         mode = solve_yee_mode(
-            sim, axis, plane_value_um, wavelength_um, pol, mode_index,
+            sim, axis, plane_value_um, wlen_um, pol, mode_index,
             h_center_um=h_center_um, v_center_um=v_center_um,
             half_w_um=half_w_um, half_v_um=half_v_um, dl_um=dl_um,
             supersample=supersample, num_modes=num_modes, eps_of_medium=eps_of_medium)
@@ -344,8 +367,8 @@ def solve_mode_on_cross_section(
         h_lo_um=h_center_um - half_w_um, h_hi_um=h_center_um + half_w_um,
         v_lo_um=v_center_um - half_v_um, v_hi_um=v_center_um + half_v_um,
         dl_um=dl_um, supersample=supersample, eps_of_medium=eps_of_medium,
-        freq_hz=C0 / (wavelength_um * 1e-6))
-    solver = VectorModeSolver(eps_scalar, dl_um, dl_um, wavelength_um,
+        freq_hz=C0 / (wlen_um * 1e-6))
+    solver = VectorModeSolver(eps_scalar, dl_um, dl_um, wlen_um,
                               x_symmetry, eps_tensor=tensor)
     offset = _flm_center_offset(h_center_um, v_center_um, half_w_um, half_v_um,
                                 dl_um)
@@ -355,9 +378,9 @@ def solve_mode_on_cross_section(
 
 def _warn_flm_symmetry_blind(sim):
     """The FLM (use_yee=False) path does NOT honor §20 symmetry planes: the
-    eps paint happily rasterizes the mirror geometry below the domain min
+    eps paint happily samples the mirror geometry on the mesh below the domain min
     face, so a half-domain sim gets a FULL-cross-section mode that does not
-    match the engine's half-domain field. Warn — the Yee default handles it."""
+    match the engine's half-domain field. Warn, the Yee default handles it."""
     import warnings
 
     if any(s != 0 for s in (getattr(sim, "symmetry", None) or (0, 0, 0))):
@@ -367,7 +390,7 @@ def _warn_flm_symmetry_blind(sim):
             "cross-section — its mode does not match the engine's half-domain "
             "field. Use the Yee default (use_yee=True), which clips the window "
             "at the plane and applies the parity BC automatically.",
-            UserWarning, stacklevel=3)
+            UserWarning, stacklevel=caller_stacklevel())
 
 
 def _pick(solver, pol, mode_index, num_modes, axis, plane_value_um):
@@ -387,15 +410,15 @@ def mode_bank_on_cross_section(
     h_center_um: float, v_center_um: float, half_w_um: float, half_v_um: float,
     dl_um: float, supersample: int = 8, x_symmetry: str = "none",
     num_modes: Optional[int] = None, eps_of_medium=None, use_yee: bool = True):
-    """``{freq_hz: VectorMode}`` per-frequency readout bank for a port. The window
-    geometry is rasterized once; a NON-dispersive cross-section shares one ε for
+    """``{freq_hz: VectorMode}`` per-frequency readout mode mapping for a port. The window
+    geometry is sampled on the mesh once; a NON-dispersive cross-section shares one ε for
     every frequency (λ-independent at constant n), while dispersive media are
-    re-anchored at each bank frequency (:meth:`Medium.permittivity_at_hz`) so both
+    re-anchored at each mode mapping frequency (:meth:`Medium.permittivity_at_hz`) so both
     the material AND waveguide dispersion land in the per-λ modes.
 
     ``use_yee`` (default **True**) uses the **engine-consistent discrete-Yee** solver
     (:func:`~photonhub.analysis.yee_mode.solve_yee_mode_bank`) so the readout reference mode
-    matches the FDTD field's discretization at every λ — the same operator the launch
+    matches the FDTD field's discretization at every λ, the same operator the launch
     used. ``use_yee=False`` re-solves via the node-collocated FLM
     :meth:`VectorModeSolver.at_wavelength` (the prior default; kept for A/B)."""
     if use_yee:

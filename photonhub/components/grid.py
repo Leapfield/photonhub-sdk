@@ -1,6 +1,7 @@
 """Grid specifications (NUMERICS.md section 1, section 15)."""
 
 import math
+import warnings
 from typing import (
     TYPE_CHECKING,
     Annotated,
@@ -16,6 +17,8 @@ from pydantic import Field, model_validator
 
 from .base import MAX_INT32, FrozenModel, PositiveUm
 from .structures import GeometryType
+from .._compat import caller_stacklevel, legacy_keywords
+from ..constants import c0
 
 if TYPE_CHECKING:  # avoid an import cycle (structures imports nothing from here,
     # but simulation imports grid, and we only need these for type hints).
@@ -36,7 +39,7 @@ _FIELD_PITCH = 32
 
 def axis_min_cells(boundary_kind: str, symmetry: int = 0) -> int:
     """NUMERICS.md section 1 per-axis cell floor: 1 on a plain periodic axis
-    (no symmetry plane — the quasi-2D/1D reduction, where the ghost copies
+    (no symmetry plane, the quasi-2D/1D reduction, where the ghost copies
     make every difference across the axis identically zero), 4 on every other
     boundary kind (PML/absorber need their layer slabs, PEC/PMC mirrors need
     an interior, and Bloch keeps the historical floor)."""
@@ -66,7 +69,7 @@ def sim_axis_min_cells(sim, axis_index: int) -> int:
 def realized_cells(length_um: float, dl_um: float, min_cells: int = 4) -> int:
     """NUMERICS.md section 1 cell-count rule, shared by every client-side
     consumer: ``n = max(min_cells, round(L/dl))`` with round-half-AWAY-FROM-
-    ZERO — NOT Python's built-in banker's rounding, which would disagree with
+    ZERO, NOT Python's built-in banker's rounding, which would disagree with
     the engine's ``std::llround`` at exact halves. ``min_cells`` is the
     boundary-aware section 1 floor (:func:`axis_min_cells`); the default 4 is
     the non-periodic floor.
@@ -170,7 +173,7 @@ def snapped_plane_index(position_um: float, dl_um: float) -> int:
     """Nearest grid-plane index ``round(position / dl)``, implemented as
     round-half-UP (floor + 0.5 test). The engine snaps with ``std::llround``
     (half away from zero), which differs only at NEGATIVE exact halves
-    (-2.5 -> here -2, llround -3) — positions there are already outside the
+    (-2.5 -> here -2, llround -3), positions there are already outside the
     domain and both roundings land at ``kp < 1``, which the caller rejects,
     so the divergence is unobservable. Used by the best-effort flux-plane
     bounds check; ``phsolver validate`` remains authoritative at exact
@@ -192,6 +195,64 @@ def graded_primary_spacings(coords_um: Tuple[float, ...]) -> list[float]:
     return dq
 
 
+def axis_mirror_mismatch(
+    coords_um: Sequence[float],
+    mirror_um: float,
+    *,
+    closing_node_um: Optional[float] = None,
+) -> float:
+    """How far a graded axis is from being MIRROR-SYMMETRIC about ``mirror_um``,
+    in microns: reflect every primary node through the plane and return the
+    largest distance from a reflected node to the nearest real node.
+
+    ``0.0`` means the ladder is exactly symmetric; a value comparable to (or
+    above) the local cell size means the two sides of the plane are on
+    genuinely different discretizations. That matters whenever the DEVICE is
+    mirror-symmetric and you are reading a quantity symmetry guarantees, the
+    two arms of a splitter, the two ports of a coupler: an asymmetric ladder
+    puts each side at a different sub-cell offset, so the arms differ by a
+    grid artifact that no amount of averaging removes. Compare the number
+    against ``min(graded_primary_spacings(coords_um))`` to judge it.
+
+    ``coords_um`` is a graded axis's stored primary-node array (``spec.coords.y``
+    and friends). The §15.1 closing node, implicit in the stored array, is
+    included, since it is a real grid line: by default it is derived by the
+    replicate-last rule, or pass ``closing_node_um`` (e.g. the domain length) to
+    pin it. A uniform axis is symmetric by construction and needs no check.
+
+    Example, the y ladder of a Y-junction, against its finest cell::
+
+        q = spec.coords.y
+        mismatch = ph.axis_mirror_mismatch(q, size_um[1] / 2)
+        finest = min(ph.graded_primary_spacings(q))
+        print(f"{mismatch * 1e3:.1f} nm = {mismatch / finest:.2f} cells")
+    """
+    q = [float(c) for c in coords_um]
+    if len(q) < 2:
+        raise ValueError(
+            f"axis_mirror_mismatch needs at least 2 coordinates, got {len(q)}")
+    closing = (float(closing_node_um) if closing_node_um is not None
+               else q[-1] + (q[-1] - q[-2]))
+    nodes = q + [closing]
+    axis = float(mirror_um)
+    import bisect
+
+    worst = 0.0
+    for c in nodes:
+        r = 2.0 * axis - c
+        # Nodes are sorted, so the nearest is one of the two straddling it.
+        j = bisect.bisect_left(nodes, r)
+        best = None
+        for k in (j - 1, j):
+            if 0 <= k < len(nodes):
+                d = abs(nodes[k] - r)
+                if best is None or d < best:
+                    best = d
+        if best is not None and best > worst:
+            worst = best
+    return worst
+
+
 def snap_mixed_plane(sim, axis_index: int, position_um: float):
     """Snap a mixed-Yee-offset plane (mode source/monitor, NUMERICS section 12)
     on ANY axis and return ``(snapped_position_um, local_dl_um)``.
@@ -201,7 +262,7 @@ def snap_mixed_plane(sim, axis_index: int, position_um: float):
     the same cell. On a uniform axis that is the historical
     ``(k + 0.25) * dl`` with ``local_dl = dl``. On a GRADED axis it is
     ``q_k + 0.25 * dq_k`` of the cell whose quarter point lies nearest the
-    request, and ``local_dl = dq_k`` — the LOCAL spacing, which is also the
+    request, and ``local_dl = dq_k``, the LOCAL spacing, which is also the
     E-to-H plane distance the longitudinal mode-readout de-stagger needs
     (using the grid's base ``dl_um`` there is silently wrong: GradedMesh
     carries a ``dl_um`` too, so a truthy check does not detect grading)."""
@@ -299,7 +360,7 @@ def quarter_snap_dft_face(
     OPEN first half-cell ``(k*dl, (k+1/2)*dl)``; exact integer boundaries
     agree only via a round-half-away tie whose um->meters fp chain is
     rounding-sensitive ("float luck"), exact half-cell planes and the second
-    half-cell disagree outright — except against the domain edges, where the
+    half-cell disagree outright, except against the domain edges, where the
     engine's [0, n-1] clamp restores agreement (which is why full-domain and
     edge-shaved plugin faces are fine as authored).
 
@@ -307,8 +368,8 @@ def quarter_snap_dft_face(
     neighbor-cell spacings), this replicates the engine snap itself for every
     distinct offset at ``position_um`` and at ``position_um +- tol_frac`` of
     the local cell: a face whose indices all agree and hold under the probe is
-    left alone (``None``); anything else — a definite engine reject or a tie
-    within fp luck — returns the deterministic replacement, the nearest local
+    left alone (``None``); anything else, a definite engine reject or a tie
+    within fp luck, returns the deterministic replacement, the nearest local
     quarter point ``q_k + (1/4)*dq_k`` clamped into the grid, which every
     sublattice snaps to cell ``k`` with quarter-cell margin. A face already
     at a quarter point is stable, so the snap is idempotent. Single-offset
@@ -373,14 +434,14 @@ class GradedMeshAxis(FrozenModel):
 
 
 class GradedMesh(FrozenModel):
-    """Per-axis nonuniform (graded) grid — NUMERICS.md section 15. Each listed
+    """Per-axis nonuniform (graded) grid, NUMERICS.md section 15. Each listed
     axis carries absolute primary-node coordinates in microns (strictly
     increasing, coords[0] == 0, >= 4 entries); the realized domain length and
     last cell width follow the section-15.1 replicate-last rule. Any axis NOT
     listed in ``coords`` is uniform at ``dl_um`` (identical to
     :class:`UniformMesh`). Users supply coordinates manually, or generate
     them from a physical target with the client-side :func:`auto_mesh` resolver
-    (which returns exactly this model — no new wire member)."""
+    (which returns exactly this model, no new wire member)."""
 
     type: Literal["graded"] = "graded"
     dl_um: float = Field(gt=0)  # base spacing for any axis not in coords.
@@ -448,7 +509,7 @@ MeshType = Annotated[
 # the output is a deterministic, platform-independent (no last-bit fp wobble)
 # byte-identical array for identical inputs — the core of mesh-freeze. 1e-7 um =
 # 0.1 pm is far finer than any physical mesh, matching the round used in the
-# hand-built benchmark mesh (benchmarks/waveguide/waveguide.py).
+# hand-built benchmark mesh (validation/suites/waveguide/waveguide.py).
 _AUTO_COORD_DECIMALS = 7
 
 # The grading ratio the roadmap asks for is the CELL-TO-CELL growth limit
@@ -459,11 +520,11 @@ _DEFAULT_MAX_GRADING = 1.4
 
 # Speed of light (m/s) — used only to convert a source frequency to a free-space
 # wavelength when ``auto_mesh`` infers the wavelength from a source.
-_C0_M_PER_S = 2.99792458e8
+_C0_M_PER_S = c0
 
 
 def _wavelength_from_source(source) -> float:
-    """Free-space wavelength (microns) implied by a source's time profile —
+    """Free-space wavelength (microns) implied by a source's time profile ,
     ``c / freq0_hz`` of its :class:`GaussianPulse`. Used by ``auto_mesh`` when
     no explicit ``wavelength_um`` is given (automatic meshers infer their target
     frequency from the source the same way). Raises if the source has no
@@ -480,7 +541,7 @@ def _wavelength_from_source(source) -> float:
 def _geometry_axis_span(geom, axis: int) -> Optional[Tuple[float, float]]:
     """The axis-`axis` bounding span ``[lo, hi]`` (microns, unclamped) that a
     geometry occupies, or ``None`` for an unrecognised type. Every shape is
-    bounded by its enclosing box — a safe OVER-estimate of where the fine mesh
+    bounded by its enclosing box, a safe OVER-estimate of where the fine mesh
     is needed, so the resolver never UNDER-refines around a structure.
 
     Curved / extruded shapes (Cylinder, Polygon) report their *bounding box*
@@ -489,7 +550,7 @@ def _geometry_axis_span(geom, axis: int) -> Optional[Tuple[float, float]]:
     is faceting-free downstream. The transverse extent of a partial-angle
     cylinder sector is bounded by the full disk; a slanted Polygon by its
     reference-plane polygon bbox DILATED by the sidewall widening at the
-    furthest face (see the polyslab branch — the reference bbox alone is only
+    furthest face (see the polyslab branch, the reference bbox alone is only
     an over-estimate for ``reference_plane="bottom"`` with a positive angle),
     keeping the mesh conservatively fine."""
     gtype = getattr(geom, "type", None)
@@ -548,20 +609,22 @@ def _geometry_axis_span(geom, axis: int) -> Optional[Tuple[float, float]]:
 
 
 def _structure_index(structure: "Structure", wavelength_um: float) -> float:
-    """The refractive index that drives refinement for a structure — the
+    """The refractive index that drives refinement for a structure, the
     IN-BAND index at the auto-mesh target wavelength, not the raw
     ``permittivity`` field. For a non-dispersive medium these coincide
     (n = sqrt(eps_r)); for a dispersive (Lorentz) medium ``permittivity`` is
     the high-frequency limit eps_inf (NUMERICS.md §19), which UNDERSTATES the
-    in-band index — a Si fit with eps_inf ~ 8 would mesh at n ~ 2.8 instead of
+    in-band index, a Si fit with eps_inf ~ 8 would mesh at n ~ 2.8 instead of
     ~3.48, ~20% under-refinement, breaking the module's never-UNDER-refine
     contract. So we evaluate the §19 single-pole model at
-    omega = 2*pi*c/wavelength (:meth:`Medium.permittivity_at_hz` — the ONE
+    omega = 2*pi*c/wavelength (:meth:`Medium.permittivity_at_hz`, the ONE
     shared Re-eps evaluator, also what the mode solvers anchor to) and take
     n = sqrt(Re eps), floored at 1 (anomalous dispersion can push Re eps below
     1 near resonance; the mesh target need not chase that below the vacuum
     index)."""
     medium = structure.medium
+    if not hasattr(medium, "permittivity_at_hz") and callable(getattr(medium, "n", None)):
+        return max(float(medium.n(wavelength_um)), 1.0)     # a materials-library entry, not yet resolved
     try:
         eps = float(medium.permittivity_at_hz(
             _C0_M_PER_S / (wavelength_um * 1e-6)))
@@ -580,8 +643,8 @@ def _structure_index_intervals(
     :func:`_structure_index` at the target wavelength), or ``None`` if the
     structure does not intersect the domain on this axis. Boxes give an exact
     span; Sphere / Cylinder / Polygon are bounded by their enclosing box (a
-    safe OVER-estimate of where the fine mesh is needed — never under-refines),
-    so CURVED structures — where subpixel matters most — are refined too."""
+    safe OVER-estimate of where the fine mesh is needed, never under-refines),
+    so CURVED structures, where subpixel matters most, are refined too."""
     geom = structure.geometry
     n = _structure_index(structure, wavelength_um)
     span = _geometry_axis_span(geom, axis)
@@ -597,8 +660,8 @@ def _structure_index_intervals(
 
 def _axis_target_field(
     domain_um: float,
-    wavelength_um: float,
-    steps_per_wvl: float,
+    wlen_um: float,
+    cells_per_wlen: float,
     n_background: float,
     intervals: Sequence[Tuple[float, float, float]],
     refine_pad_um: float,
@@ -608,7 +671,7 @@ def _axis_target_field(
 ):
     """Build the per-axis piecewise target-spacing field dl_target(x) as a sorted
     list of (boundary_position, dl_target_to_the_RIGHT). The local cell size in a
-    medium of index n is dl = lambda / (n * steps_per_wvl) — finer in higher
+    medium of index n is dl = lambda / (n * cells_per_wlen), finer in higher
     index, exactly the physics of resolving a wavelength that is shorter by 1/n
     in that medium. Each structure interval is widened by ``refine_pad_um`` on
     both sides so the fine mesh BRACKETS the boundary (the evanescent field and
@@ -620,7 +683,7 @@ def _axis_target_field(
     ``eff = width / ceil(width / dl_target)`` where ``width`` is the structure's
     own extent on this axis. This is the standard graded-mesher convention
     (``num = ceil(len/dl)``) and guarantees the realized in-material resolution
-    is AT LEAST the requested steps-per-wavelength (never coarser) — where the
+    is AT LEAST the requested steps-per-wavelength (never coarser), where the
     bare marcher could land a finite feature just under the target (a partial
     last cell absorbed by the global close). ``width`` is the UNPADDED span
     because the interfaces snap to the structure edges; the finer ``eff`` is then
@@ -630,14 +693,14 @@ def _axis_target_field(
 
     ``enforced`` carries explicit ``(lo, hi, dl)`` override regions (an
     enforced-refinement box the caller wants meshed at a fixed ``dl`` regardless
-    of the local material — a per-structure mesh override); these are NOT padded
+    of the local material, a per-structure mesh override); these are NOT padded
     (the caller sized them) and compete with the material targets, finest wins.
     ``dl_min_um`` is an absolute lower bound: no segment's target may fall below
     it, so a high-index structure or an over-fine override cannot blow up the
     cell count past the requested floor (an absolute ``dl_min`` floor)."""
 
     def dl_of_index(n: float) -> float:
-        return wavelength_um / (n * steps_per_wvl)
+        return wlen_um / (n * cells_per_wlen)
 
     floor = dl_min_um if (dl_min_um is not None and dl_min_um > 0.0) else 0.0
 
@@ -702,7 +765,7 @@ def _axis_target_field(
 
 def _target_at(field: Sequence[Tuple[float, float]], x: float) -> float:
     """dl_target(x) from the piecewise field (right-continuous; last value held
-    past the final breakpoint). Linear scan — fields have O(#structures) pieces."""
+    past the final breakpoint). Linear scan, fields have O(#structures) pieces."""
     dl = field[0][1]
     for start, value in field:
         if x >= start:
@@ -718,6 +781,7 @@ def _march_axis_coords(
     max_grading: float,
     min_nodes: int,
     seam_symmetric: bool = False,
+    mirror_symmetric: bool = False,
 ) -> Tuple[float, ...]:
     """Integrate the target field into primary-node coordinates (§15.1): start at
     0 and grow cells toward the per-position target spacing, with cell-to-cell
@@ -726,25 +790,33 @@ def _march_axis_coords(
 
     ``seam_symmetric`` additionally grades BOTH walls down to the finer of the
     two seam-adjacent cells so the first and last primary spacings come out
-    EXACTLY equal — the §15.2 requirement for a PERIODIC axis, whose
+    EXACTLY equal, the §15.2 requirement for a PERIODIC axis, whose
     replicate dual-spacing closure is only correct when the seam spacings
     match (the engine hard-rejects the unequal case).
 
-    Algorithm (a pure function of its inputs — the mesh-freeze contract):
+    ``mirror_symmetric`` makes the realized node set symmetric about the domain
+    CENTRE. The march itself is one-directional, it integrates from 0, so a
+    perfectly mirror-symmetric target field still yields a ladder that is NOT
+    its own mirror image, and a mirror-symmetric device then sits on two
+    different discretizations, one per side. This flag removes that: see the
+    palindrome construction below. Mirror symmetry IMPLIES the
+    ``seam_symmetric`` property (first cell == last cell), so the two compose.
+
+    Algorithm (a pure function of its inputs, the mesh-freeze contract):
 
     1. Build the per-position target dl(x) on a fixed FINE sampling grid (step =
        the finest target / 4), so the profile is independent of any prior march.
     2. Smooth that profile with the grading limit in both directions (a cell may
        differ from each neighbour-sample by at most ``max_grading``), giving a
        graded-feasible spacing PROFILE that is fine in the structure and ramps up
-       symmetrically — the bracketing the §15.12 gate wants.
+       symmetrically, the bracketing the §15.12 gate wants.
     3. Place nodes by integrating dl(x): from each node, the next spacing is the
        smoothed profile sampled at the node, additionally clamped to
        ``prev * max_grading`` (forward grading) so the realized cell-to-cell
        ratio is guaranteed <= max_grading regardless of sampling.
     4. Rescale all cells by one common factor to close on ``domain`` exactly.
        A uniform scale preserves every cell-to-cell ratio, so the grading bound
-       (and hence the §15.10 max/min guard) survives the close — and there is no
+       (and hence the §15.10 max/min guard) survives the close, and there is no
        tiny "runt" final cell to blow up the global ratio."""
     finest = min(v for _, v in field)
     # Fine sampling grid for the profile (deterministic count).
@@ -842,6 +914,65 @@ def _march_axis_coords(
             spacings[i] = cap
             cap *= max_grading
         spacings[-1] = spacings[-2]  # re-plateau: both closing cells == t
+    if mirror_symmetric and len(spacings) >= 4:
+        # Mirror symmetry about domain/2. The REALIZED node set is the stored
+        # nodes plus the §15.1 replicate-last closing node at ``domain``, whose
+        # gaps are exactly this ``spacings`` list — so the node set is
+        # symmetric about the centre IF AND ONLY IF the list is a PALINDROME
+        # (dom - q[k] == q[n-k] follows from s[i] == s[n-1-i] by summing the
+        # tail). Two steps get there, both of which keep every cell between
+        # its own value and its mirror's, so a dl_min floor both sides already
+        # respect survives and no cell moves outside the range the plain
+        # marcher already produced somewhere on this axis:
+        #
+        # (a) s[i] <- MEAN(s[i], s[n-1-i]). Both the sequence and its reverse
+        #     are g-Lipschitz in log (the two clamp passes established that),
+        #     and the arithmetic mean of two such sequences is g-Lipschitz in
+        #     both directions — a_{k+1} <= g*a_k and b_{k+1} <= g*b_k give
+        #     (a+b)_{k+1} <= g*(a+b)_k, and likewise for the shrink bound — so
+        #     every cell-to-cell ratio stays <= max_grading and no cell falls
+        #     below a dl_min floor both sides already respect. Where the two
+        #     halves disagree the finer side gives a little and the coarser
+        #     side gains; on a symmetric scene they only disagree by the
+        #     sub-cell offset the march accumulated. The MEAN, not
+        #     the min: a min would shorten the ladder by a few percent
+        #     wherever the two halves are offset, and the closing rescale
+        #     would then stretch that loss back across EVERY cell — coarsening
+        #     the feature the mesher was asked to resolve. The mean preserves
+        #     the sum exactly, so the fine cells stay where they were.
+        #
+        # (b) replicate-last forces the last stored cell to equal the one
+        #     before it, which a palindrome turns into s[0] == s[1] as well.
+        #     Cap both walls with the g-graded envelope [t, t, t*g, t*g^2, ...]
+        #     where t = min(s[0], s[1]); that envelope is itself g-Lipschitz
+        #     (its only non-g step is the flat t -> t), and the head and tail
+        #     envelopes are mirror images, so the min preserves BOTH the
+        #     grading bound and the palindrome. It lands s[0] == s[1] ==
+        #     s[n-2] == s[n-1] == t, i.e. the plateau AND the §15.2 seam
+        #     equality, for free. The walls sit in the coarse background where
+        #     the profile is flat, so this costs a fraction of one cell.
+        #
+        # The common rescale below multiplies every cell by one factor, so the
+        # palindrome survives it.
+        n = len(spacings)
+        spacings = [0.5 * (spacings[i] + spacings[n - 1 - i]) for i in range(n)]
+        t = min(spacings[0], spacings[1])
+        cap = t
+        for i in range(n):  # head wall (flat over the first TWO cells)
+            if i >= 2:
+                cap *= max_grading
+                # Growth is bounded by max_grading too, so once the envelope
+                # clears one cell it clears every later one.
+                if cap >= spacings[i]:
+                    break
+            spacings[i] = min(spacings[i], cap)
+        cap = t
+        for i in range(n - 1, -1, -1):  # tail wall, the head's mirror image
+            if i <= n - 3:
+                cap *= max_grading
+                if cap >= spacings[i]:
+                    break
+            spacings[i] = min(spacings[i], cap)
     # Scale so the sum of all cells (the realized length) == domain_um.
     total = sum(spacings)
     scale = domain_um / total
@@ -850,11 +981,27 @@ def _march_axis_coords(
     # Stored primary nodes drop the final cell (it is the §15.1 replicate-last
     # implicit cell): q = [0, s0, s0+s1, ... , sum(s[:-1])]. Then
     # realized = q[-1] + (q[-1]-q[-2]) = sum(s[:-1]) + s[-2] == sum(s) == domain.
-    coords = [0.0]
-    acc = 0.0
-    for s in spacings[:-1]:
-        acc += s
-        coords.append(acc)
+    n_cells = len(spacings)
+    if mirror_symmetric and n_cells >= 4:
+        # Build the LOWER half by forward accumulation and reflect it into the
+        # upper half, so the two sides are mirror images to the last bit
+        # (a plain cumulative sum over a palindrome is symmetric only up to
+        # fp rounding, which would leave a ~1e-16 um wobble in the output).
+        half = n_cells // 2
+        lower = [0.0]
+        acc = 0.0
+        for k in range(half):
+            acc += spacings[k]
+            lower.append(acc)
+        coords = lower[:min(half + 1, n_cells)]
+        for k in range(len(coords), n_cells):
+            coords.append(domain_um - lower[n_cells - k])
+    else:
+        coords = [0.0]
+        acc = 0.0
+        for s in spacings[:-1]:
+            acc += s
+            coords.append(acc)
     if len(coords) < 2:  # degenerate single-cell march: fall back to a node pair
         coords = [0.0, domain_um - spacings[-1]]
 
@@ -874,9 +1021,9 @@ def _interface_targets(
     enforced: Sequence[Tuple[float, float, float]],
     domain_um: float,
 ) -> list[float]:
-    """The set of axis coordinates a primary node should land on — every
+    """The set of axis coordinates a primary node should land on, every
     structure interface (the clamped ``lo``/``hi`` of each material span) plus
-    each enforced-override-region edge — that lies STRICTLY interior to
+    each enforced-override-region edge, that lies STRICTLY interior to
     ``(0, domain)``. The domain edges 0 and ``domain`` are already exact nodes
     (the §15.1 origin and the closing node) so they are never snap targets.
 
@@ -910,16 +1057,17 @@ def _snap_axis_coords(
     max_grading: float,
     dl_min_um: Optional[float],
     preserve_first_spacing: bool = False,
+    mirror_symmetric: bool = False,
 ) -> Tuple[float, ...]:
     """Nudge the marched primary nodes so a node coincides with each structure
     interface in ``targets`` (grid-line snapping), WITHOUT
     breaking the graded mesh's invariants.
 
-    Method — a monotone PIECEWISE-LINEAR remap. For each target we pick the
+    Method, a monotone PIECEWISE-LINEAR remap. For each target we pick the
     nearest existing interior node as its *anchor* (one anchor per target,
     assigned left-to-right so anchors stay strictly increasing and never
-    collide). The anchors and the fixed breakpoints — node 0 at the origin plus
-    the LAST TWO nodes, pinned at their original positions — define segments;
+    collide). The anchors and the fixed breakpoints, node 0 at the origin plus
+    the LAST TWO nodes, pinned at their original positions, define segments;
     between consecutive breakpoints every node is mapped by the one affine
     function that carries the segment's old endpoints onto its new endpoints.
     An affine map multiplies every cell in the segment by a single constant
@@ -931,8 +1079,8 @@ def _snap_axis_coords(
 
     Invariant preservation:
 
-    * Determinism — a pure function of (coords, sorted targets): mesh-freeze.
-    * Realized length — the §15.1 realized domain length is
+    * Determinism, a pure function of (coords, sorted targets): mesh-freeze.
+    * Realized length, the §15.1 realized domain length is
       ``q[n-1] + (q[n-1] - q[n-2])`` (replicate-last closing cell), so it
       depends on the LAST TWO nodes. Neither is ever an anchor and both are
       pinned as fixed remap endpoints, preserving the marcher's exact closure
@@ -940,18 +1088,28 @@ def _snap_axis_coords(
       (1e-9 relative) before accepting any candidate, so a future edit that
       broke the pinning would fail closed (unsnapped), never emit a
       wrong-length mesh.
-    * Grading / dl_min — a candidate remap is accepted only if EVERY
+    * Grading / dl_min, a candidate remap is accepted only if EVERY
       cell-to-cell ratio (both directions) stays within ``max_grading`` and no
       cell falls below the ``dl_min_um`` floor. There is no post-remap clamp
       pass: a violating candidate is rejected wholesale and the greedy retries
       with the worst-offending target dropped, until a subset fits or none is
       left (the input is then returned unchanged). Snapping is best-effort and
       never trumps the invariants.
-    * Seam (``preserve_first_spacing``) — on a §15.2 periodic axis the marcher
+    * Seam (``preserve_first_spacing``), on a §15.2 periodic axis the marcher
       made the FIRST cell exactly equal to the last (stored + replicated)
       cell, and the remap must not disturb it: node 1 is then pinned like the
       last two (never an anchor, a fixed breakpoint), so the head segment's
       affine slope starts at node 1 and the seam pair stays bit-identical.
+    * Mirror (``mirror_symmetric``), the marcher produced a ladder symmetric
+      about the domain centre and the remap must not undo it. The tail pins
+      nodes ``n-2``/``n-1`` (plus the implicit closing node), whose mirror
+      images are nodes 2/1/0, so the head pins nodes 1 AND 2 to match: the
+      breakpoint set, and hence the whole piecewise-affine map, commutes with
+      the reflection on a mirror-symmetric ``targets`` set. The anchor-collision
+      and greedy-drop tie-breaks are still directional, so the RESULT is
+      re-measured against :func:`axis_mirror_mismatch` and the unsnapped
+      (provably symmetric) ladder is returned if symmetry was lost, snapping
+      is best-effort and never trumps an invariant.
 
     If ``targets`` is empty the input is returned unchanged."""
     if not targets:
@@ -973,7 +1131,12 @@ def _snap_axis_coords(
     # EITHER of them would change the realized domain length. On a seam-
     # preserving (periodic) axis node 1 is pinned too — moving it would change
     # the first primary spacing and break the §15.2 seam equality.
-    first_free = 2 if preserve_first_spacing else 1
+    # Pinned head nodes: the origin, plus node 1 on a seam axis, plus node 2
+    # as well on a mirror axis (mirroring the tail's n-2/n-1 pinning).
+    n_head = 3 if mirror_symmetric else (2 if preserve_first_spacing else 1)
+    if n_head >= n - 2:  # no interior room left to anchor anything
+        return coords
+    first_free = n_head
     used: set[int] = set()
     # (anchor_index, target_position) pairs, kept sorted by anchor index.
     assigned: list[Tuple[int, float]] = []
@@ -1003,8 +1166,8 @@ def _snap_axis_coords(
             continue
         if t >= coords[n - 2] - tol:
             continue
-        if preserve_first_spacing and t <= coords[1] + tol:
-            continue  # cannot be honored without moving the pinned node 1
+        if n_head > 1 and t <= coords[n_head - 1] + tol:
+            continue  # cannot be honored without moving a pinned head node
         mono.append((idx, t))
     assigned = mono
     if not assigned:
@@ -1015,11 +1178,11 @@ def _snap_axis_coords(
         each anchor index lands exactly on its target. Breakpoints are
         (0 -> 0), each (anchor_index -> target), and the PINNED last two nodes
         (n-2 -> coords[n-2], n-1 -> coords[n-1]) so the segment between the
-        last anchor and node n-2 rescales while the §15.1 closing pair — hence
-        the realized domain length — stays bit-identical. A seam-preserving
+        last anchor and node n-2 rescales while the §15.1 closing pair, hence
+        the realized domain length, stays bit-identical. A seam-preserving
         axis pins node 1 as a breakpoint too (the §15.2 first spacing)."""
-        head_idx = [0, 1] if preserve_first_spacing else [0]
-        head_pos = [0.0, coords[1]] if preserve_first_spacing else [0.0]
+        head_idx = list(range(n_head))
+        head_pos = [0.0] + [coords[i] for i in range(1, n_head)]
         bp_idx = head_idx + [i for i, _ in anchor_pairs] + [n - 2, n - 1]
         bp_pos = (head_pos + [t for _, t in anchor_pairs]
                   + [coords[n - 2], coords[n - 1]])
@@ -1039,8 +1202,8 @@ def _snap_axis_coords(
         # Exactly pin the anchors and fixed nodes (kill fp drift -> mesh-freeze
         # and the exact §15.1 closure / §15.2 seam).
         out[0] = 0.0
-        if preserve_first_spacing:
-            out[1] = coords[1]
+        for i in range(1, n_head):
+            out[i] = coords[i]
         out[n - 2] = coords[n - 2]
         out[n - 1] = coords[n - 1]
         for i, t in anchor_pairs:
@@ -1069,10 +1232,22 @@ def _snap_axis_coords(
     # Greedily snap as many interfaces as stay within the invariants: try the
     # full anchor set, and if it violates grading/floor, drop the worst-offending
     # target and retry. Deterministic (targets are sorted; we drop by index).
+    def accept(seq: list[float]) -> bool:
+        if not grading_ok(seq):
+            return False
+        if mirror_symmetric:
+            # Fail closed: the greedy's collision and drop tie-breaks are
+            # directional, so re-measure rather than reason about them.
+            centre = 0.5 * realized_in
+            if axis_mirror_mismatch(seq, centre,
+                                    closing_node_um=realized_in) > tol:
+                return False
+        return True
+
     current = assigned
     while current:
         candidate = remap(current)
-        if grading_ok(candidate):
+        if accept(candidate):
             return tuple(candidate)
         # Find the anchor whose move most stretches a neighbouring cell ratio and
         # drop it; recompute. (Deterministic: ties broken by lowest index.)
@@ -1097,6 +1272,52 @@ def _snap_axis_coords(
     return coords
 
 
+# Mirror-symmetry tolerance: the coordinate quantum. Geometry that is meant to
+# be symmetric is symmetric to fp roundoff, thousands of times tighter than
+# this; a device deliberately offset even by a picometre is thousands of times
+# looser. So the classification is never in doubt at 0.1 pm.
+_MIRROR_TOL_UM = 10.0 ** (-_AUTO_COORD_DECIMALS)
+
+
+def _field_is_mirror_symmetric(
+    field: Sequence[Tuple[float, float]], domain_um: float, tol: float
+) -> bool:
+    """Is the piecewise target-spacing field its own mirror image about
+    ``domain_um / 2``? This, not the structure list, is what drives the
+    ladder, so it is the right thing to test: a scene whose structures are
+    asymmetric but whose axis PROJECTION is symmetric still wants a symmetric
+    mesh on this axis, and one refining structure off by a nanometre does not.
+    Sub-tolerance segments are dropped from both sides before comparing."""
+    segs: list[Tuple[float, float, float]] = []
+    for k, (a, v) in enumerate(field):
+        b = field[k + 1][0] if k + 1 < len(field) else domain_um
+        if b - a > tol:
+            segs.append((a, b, v))
+    if not segs:
+        return True
+    mirrored = [(domain_um - b, domain_um - a, v)
+                for (a, b, v) in reversed(segs)]
+    for (a1, b1, v1), (a2, b2, v2) in zip(segs, mirrored):
+        if abs(a1 - a2) > tol or abs(b1 - b2) > tol:
+            return False
+        if abs(v1 - v2) > 1e-9 * max(v1, v2, 1.0):
+            return False
+    return True
+
+
+def _targets_are_mirror_symmetric(
+    targets: Sequence[float], domain_um: float, tol: float
+) -> bool:
+    """Is the snap-target set (structure interfaces + override edges) its own
+    mirror image about ``domain_um / 2``? An asymmetric target set would pull
+    a symmetric ladder off-centre during snapping."""
+    if not targets:
+        return True
+    a = sorted(float(t) for t in targets)
+    b = sorted(domain_um - t for t in a)
+    return all(abs(x - y) <= tol for x, y in zip(a, b))
+
+
 class MeshOverride(FrozenModel):
     """A geometry-based mesh-refinement override. Inside ``geometry`` the auto-mesh is forced to the
     target spacing ``dl_um`` REGARDLESS of the local material: a coarse
@@ -1109,8 +1330,7 @@ class MeshOverride(FrozenModel):
 
     Consumed by :func:`auto_mesh` (``mesh_overrides=``) and
     :meth:`photonhub.Simulation.with_mesh_overrides`. Like every auto_mesh input it
-    is a pure value, so identical overrides produce byte-identical coordinates —
-    the mesh stays frozen across adjoint iterations (the §15.10 mesh-freeze
+    is a pure value, so identical overrides produce byte-identical coordinates, the mesh stays frozen across adjoint iterations (the §15.10 mesh-freeze
     contract).
 
     ``dl_um`` is either a single spacing applied on every axis, or a per-axis
@@ -1142,7 +1362,7 @@ class MeshOverride(FrozenModel):
 
     def axis_regions(self) -> list[Tuple[str, float, float, float]]:
         """Project this override onto each axis as an enforced-refinement region
-        ``(axis_letter, lo_um, hi_um, dl_um)`` — exactly the form
+        ``(axis_letter, lo_um, hi_um, dl_um)``, exactly the form
         :func:`auto_mesh` consumes via ``refine_regions``. An axis whose target
         ``dl`` is ``None``, or one the geometry does not bound, yields nothing.
         The spans are unclamped (auto_mesh clamps them to the domain), so an
@@ -1160,13 +1380,14 @@ class MeshOverride(FrozenModel):
         return out
 
 
+@legacy_keywords(wavelength_um="wlen_um", steps_per_wvl="cells_per_wlen")
 def auto_mesh(
     *,
     size_um: Tuple[float, float, float],
-    wavelength_um: Optional[float] = None,
+    wlen_um: Optional[float] = None,
     structures: Iterable["Structure"] = (),
     background_index: float = 1.0,
-    steps_per_wvl: float = 20.0,
+    cells_per_wlen: float = 20.0,
     max_grading: float = _DEFAULT_MAX_GRADING,
     axes: str = "xyz",
     refine_pad_um: Optional[float] = None,
@@ -1177,57 +1398,58 @@ def auto_mesh(
     mesh_overrides: Iterable["MeshOverride"] = (),
     snap_interfaces: bool = True,
     periodic_axes: str = "",
+    mirror_axes: Optional[str] = None,
     feature_ceil: bool = True,
+    continuations: Iterable[Tuple["Structure", str]] = (),
 ) -> GradedMesh:
     """Auto-mesh resolver (Track E): generate a VALID :class:`GradedMesh`
-    from a physical target — minimum steps-per-wavelength per medium, a maximum
+    from a physical target, minimum steps-per-wavelength per medium, a maximum
     cell-to-cell grading ratio, the wavelength, the domain size, and the scene's
     structures (to find the high-index regions / material boundaries where the
     mesh must be fine). Refinement concentrates cells in and around high-index
-    structures (local dl = lambda / (n * steps_per_wvl)) and coarsens smoothly
+    structures (local dl = lambda / (n * cells_per_wlen)) and coarsens smoothly
     outward within ``max_grading``.
 
     This is a PURE FUNCTION (the mesh-freeze contract): identical inputs produce
     BYTE-IDENTICAL coordinate arrays, with no dependence on optimizer/iteration
     state, so an adjoint loop that calls it every iteration sees a continuous,
-    non-jittering mesh. No schema change — the result is the ordinary graded spec
+    non-jittering mesh. No schema change, the result is the ordinary graded spec
     the engine already consumes (NUMERICS.md section 15.10).
 
-    .. warning:: ACCURACY CAVEAT — only structures whose in-band index EXCEEDS
+    .. warning:: ACCURACY CAVEAT, only structures whose in-band index EXCEEDS
        ``background_index`` drive the mesh. A structure at or BELOW the
        background index (an air trench or under-etched gap in oxide, a
        low-index filler) gets NO refinement and NO interface snapping: its
        material boundary can fall mid-cell at the coarse background spacing.
        This is by design (refinement follows the shorter in-medium wavelength,
        and it keeps "no refining structures" meshes exactly uniform), but if a
-       low-index feature's interface is what you are resolving — a narrow
-       trench, a slot waveguide's gap — cover it explicitly with
+       low-index feature's interface is what you are resolving, a narrow
+       trench, a slot waveguide's gap, cover it explicitly with
        ``refine_regions=`` / ``mesh_overrides=``, which snap and refine
        regardless of index.
 
     Parameters
     ----------
     size_um : domain extents (Lx, Ly, Lz), microns.
-    wavelength_um : free-space wavelength of interest (use the SHORTEST in a
+    wlen_um : free-space wavelength of interest (use the SHORTEST in a
         band so every frequency is resolved). Pass ``c / freq`` to drive from a
         frequency. If omitted, it is INFERRED from ``source`` (``c /
-        source.source_time.freq0_hz``) — automatic meshers drive their target
-        frequency from the source the same way. Exactly one of ``wavelength_um``
+        source.source_time.freq0_hz``), automatic meshers drive their target
+        frequency from the source the same way. Exactly one of ``wlen_um``
         / ``source`` must be supplied.
     structures : the simulation's structures. Each is sampled per axis; its
-        IN-BAND index sets the local cell size inside (and just around) it —
-        n = sqrt(permittivity) for a non-dispersive medium, and for a
+        IN-BAND index sets the local cell size inside (and just around) it, n = sqrt(permittivity) for a non-dispersive medium, and for a
         dispersive (Lorentz) one n = sqrt(Re eps(omega)) evaluated at this
         wavelength via the §19 pole model (meshing at eps_inf alone would
         under-refine; see :func:`_structure_index`).
         Box / Sphere / Cylinder / Polygon are all supported (curved
-        and extruded shapes are bounded by their enclosing box — refined, never
-        under-refined). Geometries may extend beyond the domain — only the
+        and extruded shapes are bounded by their enclosing box, refined, never
+        under-refined). Geometries may extend beyond the domain, only the
         in-domain part drives the mesh (NUMERICS.md section 9).
     background_index : refractive index of the background medium
         (= sqrt(background.permittivity)); sets the coarse, far-from-structure
         cell size.
-    steps_per_wvl : target cells per wavelength IN EACH MEDIUM (honoured
+    cells_per_wlen : target cells per wavelength IN EACH MEDIUM (honoured
         inside structures; the background spacing can end up ~2 % coarser
         after interface snapping). A finer target
         (larger value) yields more cells / a smaller minimum spacing.
@@ -1239,13 +1461,12 @@ def auto_mesh(
         here are left out of ``coords`` and stay uniform at the returned
         ``dl_um`` (the background spacing).
     refine_pad_um : how far the fine mesh extends past a structure boundary
-        (microns). Defaults to one background cell — enough to bracket the
+        (microns). Defaults to one background cell, enough to bracket the
         boundary and the near evanescent field.
     min_nodes : floor on primary nodes per graded axis (>= 4 per section 15.10).
-    source : optional source object to infer ``wavelength_um`` from when it is
+    source : optional source object to infer ``wlen_um`` from when it is
         not given (reads ``source.source_time.freq0_hz``).
-    dl_min_um : absolute LOWER bound (microns) on the minimum cell spacing —
-        an absolute ``dl_min`` floor. No medium target or override may push a
+    dl_min_um : absolute LOWER bound (microns) on the minimum cell spacing, an absolute ``dl_min`` floor. No medium target or override may push a
         cell below this, so a very high-index inclusion (or an over-fine
         override) cannot explode the cell count. Must be > 0 if given.
     refine_regions : explicit enforced-refinement boxes, each
@@ -1257,12 +1478,12 @@ def auto_mesh(
     mesh_overrides : geometry-based :class:`MeshOverride` objects (a per-structure
         override). Each is projected onto every axis it governs
         (its per-axis bounding span at the override's ``dl_um``) and merged with
-        ``refine_regions`` — the convenient front-end when the refinement region
+        ``refine_regions``, the convenient front-end when the refinement region
         is a real scene geometry rather than hand-written axis intervals.
     snap_interfaces : when True (default), nudge the generated nodes so a primary
         grid line lands EXACTLY on each structure interface coordinate (every
         in-domain box face / curved-shape bbox edge / polyslab boundary) and each
-        refine-region edge — grid-line snapping, so a material
+        refine-region edge, grid-line snapping, so a material
         boundary never falls mid-cell. Snapping is a monotone piecewise-linear
         remap that PRESERVES the grading-ratio and ``dl_min`` invariants (a target
         that cannot be reconciled with ``max_grading`` / the floor is abandoned
@@ -1270,9 +1491,9 @@ def auto_mesh(
         (mesh-freeze). Set False to recover the pre-snap node positions.
     periodic_axes : axes (e.g. ``"xy"``) whose simulation boundary is PERIODIC.
         A graded periodic axis must close with EQUAL first and last primary
-        spacings — the engine's §15.2 replicate dual-spacing closure is only
+        spacings, the engine's §15.2 replicate dual-spacing closure is only
         correct at the seam when they match, and ``phsolver validate``
-        hard-rejects the unequal case — so each listed axis is generated
+        hard-rejects the unequal case, so each listed axis is generated
         seam-symmetrically: both walls grade down to the finer of the two
         seam cells (never coarsening a structure, at most a few extra cells)
         and the seam pair is kept exactly equal through snapping and the
@@ -1280,17 +1501,47 @@ def auto_mesh(
         uniform (trivially seam-equal). :meth:`Simulation.with_auto_mesh` /
         ``with_mesh_overrides`` fill this in from ``sim.boundaries``
         automatically; only direct ``auto_mesh`` callers pass it by hand.
+    mirror_axes : axes whose ladder is made MIRROR-SYMMETRIC about the domain
+        centre. The marcher integrates from 0, so a perfectly mirror-symmetric
+        target field still produces a ladder that is not its own mirror image;
+        the two halves of a symmetric device then sit at different sub-cell
+        offsets and a quantity symmetry GUARANTEES, the two arms of a
+        splitter, the two ports of a coupler, comes out unequal by a pure grid
+        artifact, typically an order of magnitude above the uniform-mesh noise.
+        ``None`` (the default) AUTO-DETECTS: an axis is symmetrized exactly
+        when its target field and its snap targets are already mirror images
+        about the domain centre, which is free (both symmetrizing steps only
+        ever SHRINK cells) and cannot be wrong, a symmetric driver set has no
+        reason to want an asymmetric mesh. Pass ``""`` to switch it off
+        everywhere, or explicit letters (``"y"``) to force those axes
+        regardless of detection. Mirror symmetry implies the §15.2 seam
+        equality, so a mirrored axis is automatically periodic-legal.
+        The mirror plane is the domain centre; for an off-centre device axis,
+        measure the realized ladder with :func:`axis_mirror_mismatch` and, if
+        it matters, re-centre the domain on the device.
     feature_ceil : when True (default), quantize each structure's target cell so
         an INTEGER number of cells spans the feature at a size <= the requested
-        ``lambda/(n*steps_per_wvl)`` — ``eff = width / ceil(width/dl)``, as standard meshers do.
+        ``lambda/(n*cells_per_wlen)``, ``eff = width / ceil(width/dl)``, as standard meshers do.
         This guarantees the realized in-material
-        resolution is AT LEAST ``steps_per_wvl`` (never coarser), matching
+        resolution is AT LEAST ``cells_per_wlen`` (never coarser), matching
         and removing the run-to-run variance of where the plain marcher
         lands a partial last cell. A feature that already holds a whole number
         of target cells (or a full-domain medium) is unchanged. False recovers
         the exact-target marcher (realized steps ~= requested, occasionally a
         hair under for a finite feature). Costs a few extra cells per graded
         axis; the accuracy is never lower.
+    continuations : ``(structure, axis_letter)`` pairs, each a structure that
+        CONTINUES another structure of the same medium along ``axis_letter``:
+        the port guide extensions a fitted :class:`Simulation` draws from one
+        cell inside each guide out through the boundary layers. A continuation
+        refines the mesh like any structure, and its faces on the other two
+        axes (the guide's sidewalls) are snap targets as usual; its two faces
+        on ``axis_letter`` are not, because a butt joint between two
+        structures of one medium is no material interface. Snapping the
+        extension's inner face beside the guide's own end face at the port
+        plane pins two nodes one background cell apart, and the irregular
+        pair of cells between them reflects the guided mode (about 4e-4 of
+        the power per port at 8 cells per wavelength; NUMERICS.md §18.7).
 
     Returns
     -------
@@ -1307,20 +1558,20 @@ def auto_mesh(
     non-positive ``dl_min_um``, malformed ``refine_regions``) or if a generated
     array somehow fails GradedMesh validation.
     """
-    if wavelength_um is not None and source is not None:
+    if wlen_um is not None and source is not None:
         raise ValueError(
-            "pass exactly one of wavelength_um / source, not both")
-    if wavelength_um is None:
+            "pass exactly one of wlen_um / source, not both")
+    if wlen_um is None:
         if source is None:
             raise ValueError(
-                "wavelength_um is required (or pass source= to infer it)")
-        wavelength_um = _wavelength_from_source(source)
-    if wavelength_um <= 0:
-        raise ValueError(f"wavelength_um must be > 0, got {wavelength_um}")
+                "wlen_um is required (or pass source= to infer it)")
+        wlen_um = _wavelength_from_source(source)
+    if wlen_um <= 0:
+        raise ValueError(f"wlen_um must be > 0, got {wlen_um}")
     if dl_min_um is not None and dl_min_um <= 0.0:
         raise ValueError(f"dl_min_um must be > 0 if given, got {dl_min_um}")
-    if steps_per_wvl <= 0:
-        raise ValueError(f"steps_per_wvl must be > 0, got {steps_per_wvl}")
+    if cells_per_wlen <= 0:
+        raise ValueError(f"cells_per_wlen must be > 0, got {cells_per_wlen}")
     if not (max_grading > 1.0):
         raise ValueError(
             f"max_grading must be > 1 (cell-to-cell growth), got {max_grading}")
@@ -1341,11 +1592,23 @@ def auto_mesh(
     if bad or len(set(periodic_axes)) != len(periodic_axes):
         raise ValueError(f"periodic_axes must be a subset of 'xyz' with no "
                          f"repeats, got {periodic_axes!r}")
+    if mirror_axes is not None:
+        bad = [a for a in mirror_axes if a not in "xyz"]
+        if bad or len(set(mirror_axes)) != len(mirror_axes):
+            raise ValueError(f"mirror_axes must be None (auto-detect) or a "
+                             f"subset of 'xyz' with no repeats, got "
+                             f"{mirror_axes!r}")
     if min_nodes < 4:
         raise ValueError(f"min_nodes must be >= 4 (section 15.10), got "
                          f"{min_nodes}")
 
     structures = list(structures)
+    continuations = list(continuations)
+    for pair in continuations:
+        if not (isinstance(pair, tuple) and len(pair) == 2 and pair[1] in ("x", "y", "z")):
+            raise ValueError(
+                "each continuations entry must be (structure, axis_letter) with "
+                f"axis_letter one of 'xyz', got {pair!r}")
     # Geometry-based mesh overrides project onto the same axis-interval form as
     # refine_regions; merge them and run the one validation/grouping path below.
     all_regions = list(refine_regions)
@@ -1374,7 +1637,7 @@ def auto_mesh(
 
     # The base/background spacing — also the dl_um for any non-graded axis. It is
     # itself clamped to the dl_min floor so a coarse background still honours it.
-    bg_dl = wavelength_um / (background_index * steps_per_wvl)
+    bg_dl = wlen_um / (background_index * cells_per_wlen)
     if dl_min_um is not None:
         bg_dl = max(bg_dl, dl_min_um)
     pad = refine_pad_um if refine_pad_um is not None else bg_dl
@@ -1387,31 +1650,44 @@ def auto_mesh(
         domain = float(size_um[axis])
         intervals = []
         for s in structures:
-            iv = _structure_index_intervals(s, axis, domain, wavelength_um)
+            iv = _structure_index_intervals(s, axis, domain, wlen_um)
             # Only intervals from media FINER than background drive refinement;
             # a structure at or below background index needs no extra mesh.
             if iv is not None and iv[2] > background_index:
                 intervals.append(iv)
+        # A continuation refines like any structure but is no interface along
+        # the axis it continues (see ``continuations``): it joins the target
+        # field and, on that axis only, stays out of the snap targets.
+        continued = []
+        for s, along in continuations:
+            iv = _structure_index_intervals(s, axis, domain, wlen_um)
+            if iv is not None and iv[2] > background_index:
+                (continued if along == axis_letter else intervals).append(iv)
         field = _axis_target_field(
-            domain_um=domain, wavelength_um=wavelength_um,
-            steps_per_wvl=steps_per_wvl, n_background=background_index,
-            intervals=intervals, refine_pad_um=pad,
+            domain_um=domain, wlen_um=wlen_um,
+            cells_per_wlen=cells_per_wlen, n_background=background_index,
+            intervals=intervals + continued, refine_pad_um=pad,
             dl_min_um=dl_min_um, enforced=overrides[axis_letter],
             feature_ceil=feature_ceil)
         seam = axis_letter in periodic_axes
+        # Snap to the interfaces that actually drive a fine mesh (the refining
+        # structures' spans) and each override-region edge. A structure
+        # at/below background index gets no refinement, so its boundary is left
+        # alone — the "no refinement -> uniform" contract holds and we only pin
+        # grid lines where the fine cells already are.
+        targets = (_interface_targets(intervals, overrides[axis_letter], domain)
+                   if snap_interfaces else [])
+        symmetric_drivers = (
+            _field_is_mirror_symmetric(field, domain, _MIRROR_TOL_UM)
+            and _targets_are_mirror_symmetric(targets, domain, _MIRROR_TOL_UM))
+        mirror = (symmetric_drivers if mirror_axes is None
+                  else axis_letter in mirror_axes)
         raw = _march_axis_coords(domain, field, max_grading, min_nodes,
-                                 seam_symmetric=seam)
+                                 seam_symmetric=seam, mirror_symmetric=mirror)
         if snap_interfaces:
-            # Snap to the interfaces that actually drive a fine mesh (the
-            # refining structures' spans) and each override-region edge. A
-            # structure at/below background index gets no refinement, so its
-            # boundary is left alone — the "no refinement -> uniform" contract
-            # holds and we only pin grid lines where the fine cells already are.
-            targets = _interface_targets(
-                intervals, overrides[axis_letter], domain)
             raw = _snap_axis_coords(
                 raw, targets, domain, max_grading, dl_min_um,
-                preserve_first_spacing=seam)
+                preserve_first_spacing=seam, mirror_symmetric=mirror)
         # §15.1 exact-closure invariant: the realized length (closing node +
         # replicate-last cell) equals the requested domain length. The marcher
         # closes exactly (one common rescale) and snapping pins the last two
@@ -1423,6 +1699,42 @@ def auto_mesh(
             f"auto_mesh internal error: axis '{axis_letter}' realized length "
             f"{realized!r} != requested {domain!r}")
         rounded = [round(float(c), _AUTO_COORD_DECIMALS) for c in raw]
+        if mirror and len(rounded) >= 4:
+            # Per-coordinate rounding moves each node INDEPENDENTLY by up to
+            # half a quantum, which would leave the reflection off by up to a
+            # full quantum. Re-derive the upper half from the already-quantized
+            # lower half so the stored array reflects EXACTLY. Node 2 is pinned
+            # at twice node 1 first: the construction made the first two cells
+            # equal, and that equality is what keeps the §15.1 closure exact
+            # once the last two nodes come from the reflection (it also
+            # reproduces the seam block below bit-for-bit, so the two agree).
+            half = len(rounded) // 2
+            rounded[2] = 2.0 * rounded[1]
+            for k in range(half + 1, len(rounded)):
+                rounded[k] = realized - rounded[len(rounded) - k]
+        if (symmetric_drivers or mirror) and len(rounded) >= 2:
+            # Fail-closed report: the drivers are symmetric (or the caller
+            # asked for symmetry) but the realized ladder is not, so a
+            # symmetric device is about to be read on two different
+            # discretizations. Never silent.
+            mismatch = axis_mirror_mismatch(rounded, 0.5 * domain,
+                                            closing_node_um=realized)
+            if mismatch > _MIRROR_TOL_UM:
+                finest = min(graded_primary_spacings(tuple(rounded)))
+                warnings.warn(
+                    f"auto_mesh: axis '{axis_letter}' has a mirror-symmetric "
+                    f"refinement set but the generated ladder is NOT symmetric "
+                    f"about the domain centre "
+                    f"({0.5 * domain:.6g} um): worst reflected node misses the "
+                    f"nearest node by {mismatch * 1e3:.3g} nm = "
+                    f"{mismatch / finest:.3g} of the finest cell. The two sides "
+                    f"of a symmetric device are then on different "
+                    f"discretizations and a quantity symmetry guarantees (a "
+                    f"splitter's arm balance) will differ by a grid artifact. "
+                    f"Pass mirror_axes='{axis_letter}' to force a symmetric "
+                    f"ladder, or measure it with "
+                    f"photonhub.axis_mirror_mismatch.",
+                    UserWarning, stacklevel=caller_stacklevel())
         if seam:
             # The per-coordinate quantization just above moves each node by up
             # to half a 1e-7 um quantum INDEPENDENTLY, so the first and last

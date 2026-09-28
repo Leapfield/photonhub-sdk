@@ -1,11 +1,11 @@
-"""Finite-difference eigenmode (FDE) solver for straight waveguides — CPU only.
+"""Finite-difference eigenmode (FDE) solver for straight waveguides, CPU only.
 
-This is the Phase-1 mode solver: it computes the guided eigenmodes of a *2-D
+This mode solver computes the guided eigenmodes of a *2-D
 dielectric cross-section* that is **invariant along the propagation axis**
 (a straight waveguide). It promotes the proven numpy reference solver in
-``benchmarks/waveguide/mode_solver.py`` — which cross-validated a silicon strip
+``validation/suites/waveguide/mode_solver.py``, which cross-validated a silicon strip
 waveguide against the FDTD engine (FDTD n_eff = 2.700 vs mode-solver 2.718,
-0.6 %; TE0 |Ex| profile overlap 0.98) — into a documented, frozen public API.
+0.6 %; TE0 |Ex| profile overlap 0.98), into a documented, frozen public API.
 
 Physics / method
 ================
@@ -14,7 +14,7 @@ For a z-invariant cross-section eps(x, y), guided modes have the separable form
     E(x, y, z, t) = e(x, y) * exp(-i (omega t - beta z))
                   = e(x, y) * exp(-i omega t) * exp(+i beta z),
 
-(the engine's ``e^{-i omega t}`` time convention — a forward wave's phasor
+(the engine's ``e^{-i omega t}`` time convention, a forward wave's phasor
 advances as ``e^{+i beta z}``; see ``mode_overlap.py``), with propagation
 constant ``beta`` and modal index ``n_eff = beta / k0``
 (``k0 = 2*pi/lambda``). The dominant transverse field component obeys a
@@ -23,27 +23,25 @@ finite differences and Dirichlet walls (the mode decays into the cladding, so
 the computational window must pad the core with enough cladding for the field
 to die off before the boundary). Two operators are provided:
 
-* ``"scalar"``  : d2/dx2 + d2/dy2 + k0^2 eps
-                  — overestimates n_eff for high-contrast SOI.
-* ``"semivec"`` : d/dx[(1/eps) d/dx (eps .)] + d2/dy2 + k0^2 eps
-                  — semi-vectorial quasi-TE, ``Ex``-major; the flux-conservative
+* ``"scalar"``  : d2/dx2 + d2/dy2 + k0^2 eps, overestimates n_eff for high-contrast SOI.
+* ``"semivec"`` : d/dx[(1/eps) d/dx (eps .)] + d2/dy2 + k0^2 eps, semi-vectorial quasi-TE, ``Ex``-major; the flux-conservative
                   x-stencil keeps Dx = eps*Ex continuous across vertical
                   interfaces, which is what makes the high-contrast n_eff right.
                   This is the default and the validated operator.
 
 The largest eigenvalues ``beta^2`` are the best-confined (highest-index) modes;
 the fundamental is the global maximum. Grids are kept modest (a dense operator
-is O(N^2) memory, O(N^3) to diagonalize) — a ~60x60 window is plenty for a
+is O(N^2) memory, O(N^3) to diagonalize), a ~60x60 window is plenty for a
 single-mode strip.
 
-SCOPE — STRAIGHT WAVEGUIDES ONLY (bent-mode exclusion)
+SCOPE, STRAIGHT WAVEGUIDES ONLY (bent-mode exclusion)
 ======================================================
 **This solver models only straight (translationally-invariant) waveguides.**
-Bent / curved waveguides are *out of scope* for Phase 1 and are not supported.
+Bent and curved waveguides are not supported by this solver.
 Physically, a bend of radius ``R`` introduces an effective index gradient
 ``n_eff(x) ~= n_eff(0) * (1 + x / R)`` across the cross-section (the conformal /
 equivalent-straight-waveguide transform): the mode shifts toward the outer wall
-and acquires radiation (bending) loss. None of that is modeled here — the
+and acquires radiation (bending) loss. None of that is modeled here, the
 operator above assumes a flat cross-section with no curvature term.
 
 Error bound if you misuse this solver on a bend: ignoring curvature, the
@@ -59,7 +57,7 @@ micron-scale radii used in ring resonators it is *not* trustworthy. Use a
 dedicated bent-mode solver there. :meth:`ModeSolver.solve` will refuse to run
 if a nonzero ``bend_radius_um`` is supplied (see that method).
 
-Public API (FROZEN — Phase 1)
+Public API
 =============================
 Pinned by ``tests/test_modesolver.py``; treat as a stable contract.
 
@@ -68,8 +66,8 @@ Pinned by ``tests/test_modesolver.py``; treat as a stable contract.
       array indexed ``[iy, ix]``, i.e. row = y, col = x) and the *uniform*
       transverse grid spacings + free-space wavelength (microns).
 * ``ModeSolver.from_rectangular_core(...)`` (classmethod)
-      Convenience builder that rasterizes a centered rectangular core in a
-      uniform cladding onto a square grid (mirrors the validated benchmark).
+      Convenience builder that samples a centered rectangular core in a
+      uniform cladding on a square mesh (mirrors the validated benchmark).
 * ``ModeSolver.solve(num_modes=1, polarization="TE", n_guess=None) -> tuple[Mode, ...]``
       Returns the ``num_modes`` best-confined guided modes, highest n_eff first.
 * ``Mode`` (frozen dataclass): ``.n_eff: float``, ``.field: np.ndarray``
@@ -78,8 +76,8 @@ Pinned by ``tests/test_modesolver.py``; treat as a stable contract.
       (xarray, real-space x/y coords in microns) and
       ``.core_fraction(...)`` (confinement in a bounding box).
 
-CPU / numpy only — no scipy, no GPU. Dispersive / magnetic / anisotropic media
-and PML-backed leaky modes are out of scope for Phase 1.
+CPU / numpy only, no scipy, no GPU. Dispersive / magnetic / anisotropic media
+and PML-backed leaky modes are not supported by this solver.
 """
 
 from __future__ import annotations
@@ -91,6 +89,8 @@ import numpy as np
 import xarray as xr
 
 from ._constants import C0 as _C0
+from .._compat import legacy_keywords
+import warnings
 
 __all__ = ["Mode", "ModeSolver"]
 
@@ -103,7 +103,7 @@ PolarizationName = Literal["TE", "TM", "scalar"]
 
 def _odd(n: int) -> int:
     """Smallest odd integer ``>= n`` (cell-count helper so a cell center sits on
-    the cross-section origin — see :meth:`ModeSolver.from_rectangular_core`)."""
+    the cross-section origin, see :meth:`ModeSolver.from_rectangular_core`)."""
     return n if n % 2 == 1 else n + 1
 
 
@@ -166,7 +166,7 @@ class Mode:
 
     def core_fraction(self, core_w_um: float, core_h_um: float) -> float:
         """Fraction of ``|field|^2`` inside a centered ``core_w_um x core_h_um``
-        bounding box — a simple confinement metric (1.0 = fully confined). The
+        bounding box, a simple confinement metric (1.0 = fully confined). The
         box is centered on the cross-section, matching
         :meth:`ModeSolver.from_rectangular_core`."""
         ny, nx = self.field.shape
@@ -183,7 +183,7 @@ class ModeSolver:
 
     Construct from a raw permittivity cross-section and the transverse grid, then
     call :meth:`solve`. See the module docstring for the physics, the operator
-    definitions, and — importantly — the **straight-waveguide-only** scope with
+    definitions, and, importantly, the **straight-waveguide-only** scope with
     the bent-mode error bound.
 
     Parameters
@@ -195,7 +195,7 @@ class ModeSolver:
         mutate it after construction.
     dl_x_um, dl_y_um:
         Uniform transverse grid spacings along x and y (microns, ``> 0``).
-        (Non-uniform transverse meshing is out of scope for Phase 1.)
+        (Non-uniform transverse meshing is not supported by this solver.)
     wavelength_um:
         Free-space wavelength (microns, ``> 0``). Use
         ``wavelength_um = c0 / freq_hz * 1e6`` to go from frequency.
@@ -211,12 +211,13 @@ class ModeSolver:
     #: window. Exceeding this raises in :meth:`solve` rather than thrashing.
     MAX_UNKNOWNS: int = 8100
 
+    @legacy_keywords(wavelength_um="wlen_um")
     def __init__(
         self,
         eps: np.ndarray,
         dl_x_um: float,
         dl_y_um: float,
-        wavelength_um: float,
+        wlen_um: float,
     ) -> None:
         eps_arr = np.asarray(eps, dtype=float)
         if eps_arr.ndim != 2:
@@ -242,30 +243,38 @@ class ModeSolver:
             raise ValueError("eps must be >= 1 everywhere (passive dielectric)")
         if not (dl_x_um > 0 and dl_y_um > 0):
             raise ValueError("dl_x_um and dl_y_um must be > 0")
-        if not (wavelength_um > 0):
-            raise ValueError("wavelength_um must be > 0")
+        if not (wlen_um > 0):
+            raise ValueError("wlen_um must be > 0")
 
         self.eps: np.ndarray = eps_arr
         self.dl_x_um: float = float(dl_x_um)
         self.dl_y_um: float = float(dl_y_um)
-        self.wavelength_um: float = float(wavelength_um)
+        self.wavelength_um: float = float(wlen_um)
 
-    def at_wavelength(self, wavelength_um: float) -> "ModeSolver":
+    def at_wlen(self, wlen_um: float) -> "ModeSolver":
         """A sibling solver on the SAME cross-section (``eps``, ``dl``) at a new
         free-space wavelength. Use this to re-solve a mode across a frequency
-        band — ``wavelength_um = C0 / freq_hz * 1e6`` — without re-rasterizing
-        the geometry (the basis for the broadband ``num_freqs`` mode solves on
+        band, ``wavelength_um = C0 / freq_hz * 1e6``, without repeating mesh sampling
+        of the geometry (the basis for the broadband ``num_freqs`` mode solves on
         both the source and monitor sides). ``eps`` is shared by reference (the
         operator never mutates it)."""
-        return ModeSolver(self.eps, self.dl_x_um, self.dl_y_um, wavelength_um)
+        return ModeSolver(self.eps, self.dl_x_um, self.dl_y_um, wlen_um)
+
+    def at_wavelength(self, wavelength_um: float) -> "ModeSolver":
+        """Deprecated spelling of :meth:`at_wlen`."""
+        warnings.warn(
+            "ModeSolver.at_wavelength() was renamed to at_wlen(); the old name "
+            "will be removed in a future release", DeprecationWarning, stacklevel=2)
+        return self.at_wlen(wavelength_um)
 
     # -- convenience cross-section builder ---------------------------------
 
     @classmethod
+    @legacy_keywords(wavelength_um="wlen_um")
     def from_rectangular_core(
         cls,
         *,
-        wavelength_um: float,
+        wlen_um: float,
         dl_um: float,
         core_w_um: float,
         core_h_um: float,
@@ -277,15 +286,14 @@ class ModeSolver:
     ) -> "ModeSolver":
         """Build a solver for a centered rectangular core in a uniform cladding.
 
-        Rasterizes the canonical strip-waveguide cross-section (the validated
+        Samples the canonical strip-waveguide cross-section (the validated
         SOI case) onto a *square* uniform grid of spacing ``dl_um``. This keeps
-        the plugin decoupled from the :mod:`photonhub.components` spec models —
-        feed it plain numbers (or read them off a ``Box`` + two ``Medium``
+        the plugin decoupled from the :mod:`photonhub.components` spec models, feed it plain numbers (or read them off a ``Box`` + two ``Medium``
         permittivities yourself and call the raw constructor).
 
         Parameters
         ----------
-        wavelength_um:
+        wlen_um:
             Free-space wavelength (microns).
         dl_um:
             Uniform grid spacing for both x and y (microns).
@@ -318,7 +326,7 @@ class ModeSolver:
         eps = cls._rasterize_rect(
             nx, ny, dl_um, dl_um, core_w_um, core_h_um,
             float(n_core) ** 2, float(n_clad) ** 2)
-        return cls(eps, dl_um, dl_um, wavelength_um)
+        return cls(eps, dl_um, dl_um, wlen_um)
 
     @staticmethod
     def _rasterize_rect(
@@ -327,7 +335,7 @@ class ModeSolver:
         eps_core: float, eps_clad: float,
     ) -> np.ndarray:
         """Centered rectangular core on a uniform grid. Returns ``eps[iy, ix]``.
-        (Same rasterization as ``benchmarks/waveguide/mode_solver.build_eps``.)"""
+        (Same mesh sampling as ``validation/suites/waveguide/mode_solver.build_eps``.)"""
         eps = np.full((ny, nx), eps_clad, dtype=float)
         xs = (np.arange(nx) - (nx - 1) / 2.0) * dl_x_um
         ys = (np.arange(ny) - (ny - 1) / 2.0) * dl_y_um
@@ -342,7 +350,7 @@ class ModeSolver:
     def _operator(self, k0: float, polarization: PolarizationName) -> np.ndarray:
         """Assemble the dense ``(N, N)`` transverse operator, ``N = nx*ny``.
 
-        Generalizes ``benchmarks/waveguide/mode_solver._operator`` to anisotropic
+        Generalizes ``validation/suites/waveguide/mode_solver._operator`` to anisotropic
         grid spacing (separate ``dl_x``, ``dl_y``) and a selectable flux-
         conservative direction. The ``"TE"`` (Ex-major) branch with
         ``dl_x == dl_y`` reproduces the benchmark operator exactly.
@@ -444,7 +452,7 @@ class ModeSolver:
             without an API break.
         bend_radius_um:
             Must be ``None`` (or non-finite/<=0 is rejected). **Bent waveguides
-            are out of scope** — see the module docstring's error bound. A
+            are out of scope**, see the module docstring's error bound. A
             finite positive value raises ``NotImplementedError`` rather than
             silently returning a wrong (curvature-free) result.
 

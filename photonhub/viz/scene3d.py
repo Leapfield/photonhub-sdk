@@ -1,15 +1,15 @@
-"""``plot_3d()`` — interactive 3D geometry as a plotly figure (design §3, §6).
+"""``plot_3d()``, interactive 3D geometry as a plotly figure.
 
 Structures become ``Mesh3d`` (boxes -> 8 verts / 12 tris; spheres ->
 parametric mesh), sources ``Scatter3d`` markers / translucent planes, monitors
 point markers / translucent boxes / planes, plus a wireframe box of the physical
 region. By default the PML is not drawn: the wireframe sits at the inner (non-PML)
 boundary and geometry is clipped to it; ``show_pml=True`` restores the full
-domain wireframe with translucent PML shells and unclipped geometry.
+domain wireframe with translucent PML regions and unclipped geometry.
 
 plotly is the optional ``photonhub[viz]`` extra and is imported LAZILY: when it
 is absent, :func:`plot_3d` raises ``ImportError`` with the exact
-``pip install photonhub[viz]`` hint (design §8).
+``pip install photonhub[viz]`` hint.
 """
 
 import hashlib
@@ -381,7 +381,7 @@ def _cylinder_mesh(go, g, color, name, n=48, bounds=None, lighting=None):
     lo = g.center_um[a_i] - half
     hi = g.center_um[a_i] + half
     verts = geom._arc_polygon(cu, cv, g.radius_um, g.inner_radius_um,
-                              g.angle_start, g.angle_stop, n=n)
+                              g.angle_start_rad, g.angle_stop_rad, n=n)
     return _clipped_prism(
         go, g.axis, verts, lo, hi, color, name, bounds,
         lighting=lighting,
@@ -434,7 +434,7 @@ def _tag_monitor_trace(trace, monitor, index, uid_suffix=""):
 
 
 def _interior_bounds_um(sim):
-    """Per-axis ``(lo, hi)`` of the physical interior — the realized domain
+    """Per-axis ``(lo, hi)`` of the physical interior, the realized domain
     minus the PML slabs. An axis whose PML halves meet or overlap (possible in
     tiny schematic scenes) falls back to the full axis extent."""
     from ._style import _axis_spacings_um
@@ -484,7 +484,7 @@ def plot_3d(sim, show_pml=False, **kw):
 
     By default the PML is not drawn: the wireframe marks the inner (non-PML)
     boundary and structures / planes are clipped to it. ``show_pml=True``
-    restores the full-domain wireframe, translucent PML shells, and unclipped
+    restores the full-domain wireframe, translucent PML regions, and unclipped
     geometry."""
     go = _require_plotly()
     fig = go.Figure()

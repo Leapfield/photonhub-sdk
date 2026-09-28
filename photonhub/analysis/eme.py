@@ -1,4 +1,4 @@
-"""Full-vector eigenmode-expansion (EME) propagator — CPU, frequency-domain.
+"""Full-vector eigenmode-expansion (EME) propagator, CPU, frequency-domain.
 
 A device is represented by z-invariant :class:`Section` objects.  Each section
 propagates its *raw* local eigenmodes diagonally, adjacent sections are matched by
@@ -27,7 +27,7 @@ Hermitian Poynting metric over the non-PML physical region.  Consequently
 ``|amplitude|^2`` is not assumed to be power for evanescent or PML modes.
 This continuum path is **experimental**: analytic operator checks pass, but the
 current high-contrast all-bound-port device sweep is not stable under nested
-continuum-shell refinement.  Per-interface nondegenerate reaction-orthogonality
+radiation-mode-group refinement.  Per-interface nondegenerate reaction-orthogonality
 and bidirectional guided-input residuals expose the present high-order trace
 inconsistency.  Do not use it for quantitative radiation loss without
 independent mesh/window/PML/basis and FDTD convergence.
@@ -54,6 +54,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 
 from .vector_modes import VectorMode, VectorModeSolver
+from .._compat import legacy_keywords
 
 __all__ = [
     "Section",
@@ -88,7 +89,7 @@ class Section:
         experimental radiation and evanescent modes.
     length_um:
         Physical length of the section along propagation (microns). ``0.0`` marks
-        a **port / semi-infinite lead** — it contributes its interface with its
+        a **port / semi-infinite lead**, it contributes its interface with its
         neighbour but no propagation phase.
     """
 
@@ -195,8 +196,7 @@ class EMEResult:
     def transmission(self) -> float:
         """Fundamental-to-fundamental physical power transmission.
 
-        Index-based, so it follows ``n_eff`` ordering and NOT polarization —
-        see :meth:`_fundamental_index`. Warns when the two ports disagree on
+        Index-based, so it follows ``n_eff`` ordering and NOT polarization, see :meth:`_fundamental_index`. Warns when the two ports disagree on
         the polarization at index 0. Prefer :meth:`transmission_of`
         (``result.transmission_of("TE")``) whenever the ports can reorder,
         which is the normal case for a taper.
@@ -254,6 +254,17 @@ class EMEResult:
         Metric-aware like :attr:`transmission` (physical power ratio);
         ``polarization=None`` reproduces it exactly.
         """
+        if polarization is not None and (
+                _mixed_fundamental(self.left_modes)
+                or _mixed_fundamental(self.right_modes)):
+            raise ValueError(
+                "a port's fundamental is one of a degenerate TE/TM pair (a "
+                "square or round core): the solver returns the pair as "
+                "mixtures whose TE/TM labels are arbitrary, and mixed "
+                "differently at each port, so a transmission by polarization "
+                "label is undefined. Read transmitted_power(0) for the total "
+                "transmitted power; a transmission for one polarization needs "
+                "ports that are not degenerate (a non-square core)")
         i = self._fundamental_index(self.left_modes, polarization)
         j = self._fundamental_index(self.right_modes, polarization)
         assert self.right_power_metric is not None
@@ -268,11 +279,26 @@ class EMEResult:
         """Warn when index 0 means a different polarization at each port.
 
         That is exactly the condition under which an index-based read is
-        silently wrong, and it is detectable from the port bases alone — so
+        silently wrong, and it is detectable from the port bases alone, so
         it is reported rather than left for the user to discover from an
         implausible number.
         """
         if not self.left_modes or not self.right_modes:
+            return
+        mixed = [side for side, modes in (("input", self.left_modes),
+                                          ("output", self.right_modes))
+                 if _mixed_fundamental(modes)]
+        if mixed:
+            ports = ("input and output ports' fundamentals are each"
+                     if len(mixed) == 2 else f"{mixed[0]} port's fundamental is")
+            # the labels of a degenerate pair are arbitrary, and so is the
+            # [0, 0] element: it depends on how each port's pair was mixed
+            warnings.warn(
+                f"EME {what} reads S-matrix element [0, 0], but the {ports} "
+                "one of a degenerate TE/TM pair (a square or round core), "
+                "returned as an arbitrary mixture, so the element depends on "
+                "how the pair was mixed at each port. Read transmitted_power(0) for the "
+                "total transmitted power.", RuntimeWarning, stacklevel=3)
             return
         a = str(getattr(self.left_modes[0], "polarization", "") or "").upper()
         b = str(getattr(self.right_modes[0], "polarization", "") or "").upper()
@@ -307,7 +333,9 @@ class EMEResult:
 
         Unlike the former forced-unitary interface, this is a physical flux
         diagnostic: radiation/PML attenuation or an incomplete trace basis may
-        produce a deficit.  A value above one is a passivity/convergence failure.
+        produce a deficit.  A value above one by more than about 1e-3 is a
+        passivity/convergence failure (:func:`run_eme` warns); below that it
+        is the residual of guided traces that are not exactly orthogonal.
         """
         return self.transmitted_power(input_mode) + self.reflected_power(input_mode)
 
@@ -909,7 +937,7 @@ def interface_smatrix(
     dl_y_um: float,
     *,
     rcond: float = 1e-10,
-    enforce_passivity: bool = True,
+    enforce_passivity: bool = False,
     return_diagnostics: bool = False,
 ) -> Union[SMatrix, Tuple[SMatrix, InterfaceDiagnostics]]:
     """Generalized two-sided Petrov-Galerkin match at a waveguide step.
@@ -922,6 +950,17 @@ def interface_smatrix(
     reaction-product pairs ``Ex*Hy`` and ``Ey*Hx`` are natively co-located.)
     A rank-revealing SVD exposes truncation through continuity residuals; it
     never fabricates exact unitarity.
+
+    ``enforce_passivity=True`` clips any gain of an ordinary real guided
+    interface (singular values of the power-normalized S-matrix above 1).
+    It is off by default: the guided traces are not exactly orthogonal, so
+    raw interfaces are slightly active (about 1e-3 on an adiabatic taper,
+    1e-2 at an abrupt step), and the clip does not remove only that gain.
+    It also pulls the fundamental channel down, by 0.1 % (``num_modes=2``)
+    to 0.4 % (``num_modes=4``) on an adiabatic taper at dl 0.04 um, a bias
+    that does not shrink with more modes or slabs (it does shrink with a
+    finer cross-section mesh), while the raw cascade stays lossless to 3e-4. The
+    raw violation is always reported in the diagnostics.
     """
     n_left = len(left_modes)
     n_right = len(right_modes)
@@ -1075,11 +1114,7 @@ def interface_smatrix(
     # Preserve the field equations for those generalized channels and expose
     # any apparent gain through the diagnostic instead.
     ordinary_real_guided = all(
-        m.mode_type == "guided"
-        and abs(m.k_eff) <= 100.0 * np.finfo(float).eps
-        and m.overlap_weights is None
-        and tuple(m.pml_cells_xy) == (0, 0)
-        for m in (*left_modes, *right_modes)
+        _is_ordinary_guided(m) for m in (*left_modes, *right_modes)
     )
     apply_passivity_correction = bool(
         enforce_passivity and ordinary_real_guided
@@ -1220,7 +1255,7 @@ def star_product(sa: SMatrix, sb: SMatrix) -> SMatrix:
 
 
 def cascade(segments: Sequence[SMatrix]) -> SMatrix:
-    """Fold a left-to-right sequence of S-matrices with the star product."""
+    """Cascade a left-to-right sequence of S-matrices with the star product."""
     if not segments:
         raise ValueError("cascade needs at least one S-matrix segment")
     total = segments[0]
@@ -1234,7 +1269,7 @@ def run_eme(
     n_modes: Optional[int] = None,
     *,
     interface_rcond: float = 1e-10,
-    enforce_passivity: bool = True,
+    enforce_passivity: bool = False,
 ) -> EMEResult:
     """Cascade a sequence of :class:`Section`s into one device S-matrix.
 
@@ -1247,7 +1282,15 @@ def run_eme(
     n_modes:
         Optional cap applied independently to every section.  Adjacent sections
         may retain different counts; their interface blocks are rectangular.
-        A cap may not split a degenerate validated Yee beta shell.
+        A cap may not split a degenerate set of modes (a validated Yee beta
+        group, or the TE/TM pair of a square or round core).
+    enforce_passivity:
+        Clip the gain of each ordinary real guided interface (see
+        :func:`interface_smatrix`). Off by default: the clip biases the
+        fundamental transmission low by 0.1 to 0.4 %, and more modes or
+        slabs do not remove the bias. Without it, a cascade of ordinary
+        guided ports whose ``energy_balance(0)`` exceeds 1 by more than 1e-3
+        warns: that gain is a basis that has not converged.
 
     Returns
     -------
@@ -1282,21 +1325,14 @@ def run_eme(
                 continue
             last = section.modes[cap - 1]
             following = section.modes[cap]
-            if (
-                last.yee_eme_compatible
-                and following.yee_eme_compatible
-                and abs(last.n_eff_complex - following.n_eff_complex)
-                <= 1e-6
-                * max(
-                    abs(last.n_eff_complex),
-                    abs(following.n_eff_complex),
-                    1.0,
-                )
-            ):
+            if _degenerate(last, following):
+                what = ("validated Yee beta shell"
+                        if last.yee_eme_compatible and following.yee_eme_compatible
+                        else "pair of modes (for example the TE/TM pair of a "
+                             "square or round core)")
                 raise ValueError(
-                    f"n_modes={cap} splits a degenerate validated Yee beta "
-                    f"shell in section {k}; include the complete multiplet "
-                    "or use a smaller cap"
+                    f"n_modes={cap} splits a degenerate {what} in section {k}; "
+                    "include the complete multiplet or use a smaller cap"
                 )
     bases: List[Tuple[VectorMode, ...]] = [
         tuple(sec.modes if n_modes is None else sec.modes[:int(n_modes)])
@@ -1348,7 +1384,7 @@ def run_eme(
     right_trace = _basis_trace(
         bases[-1], dl_x, dl_y, rcond=interface_rcond
     )
-    return EMEResult(
+    result = EMEResult(
         s11=s11,
         s12=s12,
         s21=s21,
@@ -1363,11 +1399,71 @@ def run_eme(
         right_power_metric=right_trace.power_metric,
         interface_diagnostics=tuple(diagnostics),
     )
+    if not enforce_passivity:
+        _warn_if_active(result, bases)
+    return result
 
 
+def _degenerate(a: VectorMode, b: VectorMode) -> bool:
+    """Whether two modes share one propagation constant (to 1e-6)."""
+    return (abs(a.n_eff_complex - b.n_eff_complex)
+            <= 1e-6 * max(abs(a.n_eff_complex), abs(b.n_eff_complex), 1.0))
+
+
+def _mixed_fundamental(modes: Sequence[VectorMode]) -> bool:
+    """Whether a port's fundamental is one of a degenerate TE/TM pair (a
+    square or round core). The solver returns such a pair as mixtures, so
+    its TE/TM label (``te_fraction >= 0.5``) is arbitrary: the pair itself is
+    degenerate, or the lone mode's TE share is within 0.02 of one half. With
+    one mode per port only a near-45-degree mixture is caught; solving the
+    port with ``num_modes >= 2`` detects the pair at any mixing angle."""
+    if not modes:
+        return False
+    beta = [getattr(m, "n_eff_complex", None) for m in modes[:2]]
+    if len(modes) > 1 and None not in beta and _degenerate(modes[0], modes[1]):
+        return True
+    tf = getattr(modes[0], "te_fraction", None)
+    return tf is not None and abs(float(tf) - 0.5) < 0.02
+
+
+# A cascade gaining more than this fraction of the fundamental input's power
+# is a basis that has not converged; below it the raw result is the more
+# accurate one (a 0.5 -> 0.8 um taper: raw interfaces 4e-4 to 3e-3 active, raw
+# cascade lossless to 3e-4). Single interfaces are not judged: an abrupt step
+# with a guided-only basis is 1e-2 active even when converged in the mesh.
+_GAIN_TOLERANCE = 1e-3
+
+
+def _is_ordinary_guided(mode: VectorMode) -> bool:
+    """The ports the passivity clip applies to: guided, lossless, no overlap
+    weights, no PML (see interface_smatrix)."""
+    return (mode.mode_type == "guided"
+            and abs(mode.k_eff) <= 100.0 * np.finfo(float).eps
+            and mode.overlap_weights is None
+            and tuple(mode.pml_cells_xy) == (0, 0))
+
+
+def _warn_if_active(result: EMEResult, bases) -> None:
+    """Warn when a raw cascade of ordinary guided ports gains power."""
+    if not all(_is_ordinary_guided(m) for b in bases for m in b):
+        return
+    balance = result.energy_balance(0)
+    if balance - 1.0 > _GAIN_TOLERANCE:
+        from .._compat import caller_stacklevel
+
+        warnings.warn(
+            f"EME cascade gains power: T + R = {balance:.6g} for input mode 0 "
+            f"(more than 1 + {_GAIN_TOLERANCE:g}). The modal basis has not "
+            "converged; check it with more modes, a finer cross-section mesh "
+            "or eme_convergence_report. enforce_passivity=True clips the gain "
+            "but biases the transmission low.", RuntimeWarning,
+            stacklevel=caller_stacklevel())
+
+
+@legacy_keywords(wavelength_um="wlen_um")
 def waveguide_section(
     *,
-    wavelength_um: float,
+    wlen_um: float,
     dl_um: float,
     core_w_um: float,
     core_h_um: float,
@@ -1388,20 +1484,20 @@ def waveguide_section(
     """Solve a centered rectangular-core cross-section and wrap it as a
     :class:`Section`.
 
-    Pass the **same** ``wavelength_um``, ``dl_um``, ``window_w_um`` and
+    Pass the **same** ``wlen_um``, ``dl_um``, ``window_w_um`` and
     ``window_h_um`` for every section of a device so they share one transverse
     grid (required by :func:`run_eme`). Only ``core_w_um`` / ``core_h_um`` should
     vary between sections.
 
     ``neff_margin`` drops modes whose ``n_eff`` is within this margin of the
-    cladding index — i.e. **near-cutoff** modes. Those are poorly resolved (large
+    cladding index, i.e. **near-cutoff** modes. Those are poorly resolved (large
     evanescent tails into the window walls) and break the within-section
     orthonormality the interface relies on, so a small margin (e.g. ``0.05``)
     keeps the modal basis clean. Default ``0.0`` keeps every guided mode the
     solver returns.
     """
     solver = VectorModeSolver.from_rectangular_core(
-        wavelength_um=wavelength_um,
+        wlen_um=wlen_um,
         dl_um=dl_um,
         core_w_um=core_w_um,
         core_h_um=core_h_um,
@@ -1429,7 +1525,7 @@ def waveguide_section(
         )
     if not modes:
         raise ValueError(
-            f"no EME modes for core_w={core_w_um} um at lambda={wavelength_um} "
+            f"no EME modes for core_w={core_w_um} um at lambda={wlen_um} "
             f"um (neff_margin={neff_margin} may be too strict)"
         )
     return Section(modes=modes, length_um=length_um)
@@ -1467,7 +1563,7 @@ def waveguide_section(
 # ``if __name__ == "__main__":``. The *thread* backend has no such constraint and
 # skips result pickling; which backend wins depends on how much of the eigensolve
 # releases the GIL and on the process-startup cost relative to the workload (see
-# ``benchmarks/eme/eme_band_speedup.py`` for measured numbers).
+# ``validation/suites/eme/eme_band_speedup.py`` for measured numbers).
 
 #: Per-section base solvers, stashed in a module global so a pool task ships only
 #: ``(section, wavelength)`` indices rather than re-pickling a solver per task.
@@ -1477,7 +1573,7 @@ _BAND_SOLVERS: Optional[Sequence[VectorModeSolver]] = None
 
 
 def _band_pool_init(base_solvers: Sequence[VectorModeSolver]) -> None:
-    """Process-pool initializer — stash the base solvers once per worker."""
+    """Process-pool initializer, stash the base solvers once per worker."""
     global _BAND_SOLVERS
     _BAND_SOLVERS = base_solvers
 
@@ -1509,7 +1605,7 @@ def _solve_section_task(
         basis_kwargs,
     ) = task
     assert _BAND_SOLVERS is not None  # set before any task runs
-    solver = _BAND_SOLVERS[si].at_wavelength(wl_um)
+    solver = _BAND_SOLVERS[si].at_wlen(wl_um)
     if basis_kwargs is None:
         modes = solver.solve(num_modes=num_modes, **(solve_kwargs or {}))
     else:
@@ -1525,6 +1621,7 @@ def _solve_section_task(
     return si, wi, modes
 
 
+@legacy_keywords(ref_wavelength_um="ref_wlen_um")
 def rectangular_base_section(
     *,
     core_w_um: float,
@@ -1535,22 +1632,22 @@ def rectangular_base_section(
     n_clad: float,
     window_w_um: float,
     window_h_um: float,
-    ref_wavelength_um: float = 1.31,
+    ref_wlen_um: float = 1.31,
     subpixel: bool = True,
     subpixel_method: str = "tensor",
 ) -> Tuple[VectorModeSolver, float]:
-    """Raster a centered rectangular-core cross-section **once** and pair it with
+    """Sample a centered rectangular-core cross-section **once** and pair it with
     its length, ready for a band/length sweep via :func:`run_eme_band`.
 
     Mirrors the geometry arguments of :func:`waveguide_section`, but returns the
-    *unsolved* base solver instead of solved modes: the permittivity raster is
-    wavelength-independent (non-dispersive prototype), so ``ref_wavelength_um`` is
-    only a placeholder — :func:`run_eme_band` rebases every solve to the swept
+    *unsolved* base solver instead of solved modes: the permittivity sampled grid is
+    wavelength-independent (non-dispersive prototype), so ``ref_wlen_um`` is
+    only a placeholder, :func:`run_eme_band` rebases every solve to the swept
     wavelength with :meth:`VectorModeSolver.at_wavelength`. Pass the **same**
     ``dl_um`` / ``window_*`` for every section of a device so they share one
     transverse grid (required by :func:`run_eme`)."""
     solver = VectorModeSolver.from_rectangular_core(
-        wavelength_um=ref_wavelength_um, dl_um=dl_um, core_w_um=core_w_um,
+        wlen_um=ref_wlen_um, dl_um=dl_um, core_w_um=core_w_um,
         core_h_um=core_h_um, n_core=n_core, n_clad=n_clad,
         window_w_um=window_w_um, window_h_um=window_h_um,
         subpixel=subpixel, subpixel_method=subpixel_method,  # type: ignore[arg-type]
@@ -1558,9 +1655,10 @@ def rectangular_base_section(
     return solver, length_um
 
 
+@legacy_keywords(wavelengths_um="wlens_um")
 def run_eme_band(
     base_sections: Sequence[Tuple[VectorModeSolver, float]],
-    wavelengths_um: Sequence[float],
+    wlens_um: Sequence[float],
     *,
     num_modes: int,
     neff_margin: float = 0.0,
@@ -1570,6 +1668,7 @@ def run_eme_band(
     basis_kwargs: Optional[dict] = None,
     workers: Optional[int] = None,
     backend: str = "auto",
+    enforce_passivity: bool = False,
 ) -> Dict[float, EMEResult]:
     """Cascade a staircased device across a band of wavelengths, solving the
     independent per-(wavelength × section) FDE eigenmodes **in parallel**.
@@ -1577,19 +1676,19 @@ def run_eme_band(
     Parameters
     ----------
     base_sections:
-        Cross-sections in propagation order as ``(base_solver, length_um)`` pairs
-        — e.g. from :func:`rectangular_base_section`. The solver is rasterized
-        once and reused across the whole band; ``length_um == 0`` marks a port
+        Cross-sections in propagation order as ``(base_solver, length_um)``
+        pairs, e.g. from :func:`rectangular_base_section`. Each cross-section is
+        sampled on the mesh once and reused across the whole band.
+        ``length_um == 0`` marks a port
         lead (as in :class:`Section`). All sections must share one transverse grid.
-    wavelengths_um:
+    wlens_um:
         The free-space wavelengths (microns) to sweep.
     num_modes:
         Guided modes solved per cross-section. Passed to
         :meth:`VectorModeSolver.solve` on the ordinary path, or used as
         ``num_guided`` when ``basis_kwargs`` selects a complete EME basis.
     neff_margin:
-        Drop modes whose ``n_eff`` is within this margin of ``n_clad`` (near-cutoff
-        — see :func:`waveguide_section`). Requires ``n_clad``.
+        Drop modes whose ``n_eff`` is within this margin of ``n_clad`` (near-cutoff, see :func:`waveguide_section`). Requires ``n_clad``.
     n_clad:
         Cladding index, needed only when ``neff_margin > 0``.
     n_modes:
@@ -1608,23 +1707,25 @@ def run_eme_band(
         Worker count for the eigensolves. ``None`` → ``min(#solves, os.cpu_count)``.
         ``1`` (or a single solve) runs serially with no pool.
     backend:
-        ``"auto"`` (default) — ``"process"`` on fork platforms (Linux/CI/cloud,
+        ``"auto"`` (default), ``"process"`` on fork platforms (Linux/CI/cloud,
         ~3.5x), ``"thread"`` on spawn platforms (macOS/Windows, ~1.7x without the
         process-startup tax or ``__main__``-guard requirement). Force ``"process"``
         for a large spawn-platform sweep, or ``"serial"`` to disable parallelism.
+    enforce_passivity:
+        Forwarded to :func:`run_eme` (off by default).
 
     Returns
     -------
     dict[float, EMEResult]
-        ``{wavelength_um: EMEResult}`` — one cascaded device S-matrix per
+        ``{wavelength_um: EMEResult}``, one cascaded device S-matrix per
         wavelength, identical to a per-wavelength :func:`run_eme` cascade.
     """
     global _BAND_SOLVERS
     if len(base_sections) < 2:
         raise ValueError("run_eme_band needs at least two sections (in/out ports)")
-    wls = [float(w) for w in wavelengths_um]
+    wls = [float(w) for w in wlens_um]
     if not wls:
-        raise ValueError("wavelengths_um must be non-empty")
+        raise ValueError("wlens_um must be non-empty")
     if num_modes < (0 if basis_kwargs is not None else 1):
         requirement = ">= 0 with basis_kwargs" if basis_kwargs is not None else ">= 1"
         raise ValueError(f"num_modes must be {requirement}")
@@ -1715,5 +1816,6 @@ def run_eme_band(
                     f"(neff_margin={neff_margin} may be too strict)"
                 )
             sections.append(Section(modes=modes, length_um=lengths[si]))
-        results[wl] = run_eme(sections, n_modes=n_modes)
+        results[wl] = run_eme(sections, n_modes=n_modes,
+                              enforce_passivity=enforce_passivity)
     return results

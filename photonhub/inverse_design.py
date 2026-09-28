@@ -1,10 +1,10 @@
 """Adjoint-method gradients for inverse design (topology optimization).
 
 A *continuous* (frequency-domain) adjoint built entirely on the existing
-forward solver — no engine change. The whole point: one gradient over the whole
+forward solver, no engine change. The whole point: one gradient over the whole
 design region costs **two** simulations (one forward, one adjoint) regardless of
 the number of design variables, where a central finite-difference check of the
-same gradient costs **2N** simulations. ``benchmarks/adjoint/gradient_check.py``
+same gradient costs **2N** simulations. ``validation/suites/adjoint/gradient_check.py``
 verifies the two agree.
 
 Physics
@@ -28,14 +28,14 @@ where
 * ``u`` is the complex forward objective amplitude (e.g. ``E_z`` at the probe),
   and ``conj(u)`` is the objective's adjoint excitation coefficient,
 * the sum runs over the Yee cells of pixel ``i`` and the three E-components, each
-  sampled at its own Yee node — matching how the engine assigns ``eps`` per
+  sampled at its own Yee node, matching how the engine assigns ``eps`` per
   component (``sample_component_eps``, ``reference_solver.cpp``), and
 * ``beta`` is one complex normalization constant.
 
 Only the *direction* of the gradient carries physics; ``beta`` is a
 units/normalization factor (it absorbs the section-12 DFT-phasor normalization
 and the Gaussian-pulse delay phase) that is **pinned once** against finite
-differences (``BETA``, confirmed in ``benchmarks/adjoint/gradient_check.py``). A
+differences (``BETA``, confirmed in ``validation/suites/adjoint/gradient_check.py``). A
 step-normalized optimizer (Adam, line search) sees only the gradient direction,
 i.e. only ``arg(beta)``; ``|beta|`` rescales every component equally and never
 changes a design.
@@ -49,7 +49,7 @@ second problem freezes ``beta`` from the first and still agrees).
 
 This is the *continuous* adjoint (it differentiates the frequency-domain Maxwell
 operator, not the discrete time-stepper), so it matches a finite-difference
-gradient of the FDTD solver up to discretization error — a few percent on a
+gradient of the FDTD solver up to discretization error, a few percent on a
 coarse grid, shrinking as ``dl`` falls.
 """
 
@@ -76,7 +76,7 @@ from .analysis.mode_overlap import mode_amplitude
 from .analysis.modes import Mode
 
 # Complex adjoint normalization constant, pinned against central finite
-# differences (benchmarks/adjoint/gradient_check.py). The structural physics
+# differences (validation/suites/adjoint/gradient_check.py). The structural physics
 # (gradient ∝ Re[beta . conj(u) . sum_c E_fwd.E_adj]) is exact; BETA fixes the
 # overall complex scale set by the §12 phasor normalization and the pulse delay
 # phase. arg(BETA) sets the gradient DIRECTION (what a step-normalized optimizer
@@ -111,7 +111,7 @@ BETA_MODE: complex = -0.1928 + 0.9812j   # exp(1.765j); see mode_power_check.py
 def _axis_box(c0: int, c1: int, dl: float, quarter: bool) -> Tuple[float, float]:
     """(center, size) microns for a box spanning integer cells ``[c0, c1)``.
 
-    ``quarter=False`` puts the faces on cell boundaries ``k*dl`` — cell centres
+    ``quarter=False`` puts the faces on cell boundaries ``k*dl``, cell centres
     ``(k+0.5)*dl`` then fall strictly inside exactly one such box, so adjacent
     pixel boxes tile the design region with no last-wins ambiguity (§9).
     ``quarter=True`` shifts the faces to ``(k+0.25)*dl`` so a *multi-component*
@@ -195,19 +195,23 @@ class DesignRegion:
 
     @property
     def n_params(self) -> int:
+        """Number of density parameters: the product of the pixel-grid dimensions."""
         return self.shape[0] * self.shape[1] * self.shape[2]
 
     @property
     def cells_per_pixel(self) -> Tuple[int, int, int]:
+        """Number of solver cells along each axis of one design pixel."""
         return tuple((a1 - a0) // n
                      for (a0, a1), n in zip(self.cells, self.shape))  # type: ignore
 
     @property
     def size_um(self) -> Tuple[float, float, float]:
+        """Realized physical extent along each axis, in microns."""
         return tuple((a1 - a0) * self.dl_um for a0, a1 in self.cells)  # type: ignore
 
     @property
     def center_um(self) -> Tuple[float, float, float]:
+        """Center of the realized design region, in microns."""
         return tuple(0.5 * (a0 + a1) * self.dl_um
                      for a0, a1 in self.cells)  # type: ignore
 
@@ -286,7 +290,7 @@ class DesignRegion:
 
 @dataclass(frozen=True)
 class PointIntensity:
-    """Maximize ``|E_comp(probe)|^2`` at a single point and frequency — the
+    """Maximize ``|E_comp(probe)|^2`` at a single point and frequency, the
     simplest adjoint objective: its adjoint source is a single point dipole at
     the probe, polarized along ``component``, with post-multiplied coefficient
     ``conj(u)`` (``u`` = the forward phasor at the probe).
@@ -304,6 +308,7 @@ class PointIntensity:
     beta: complex = BETA
 
     def monitor(self) -> ProfileMonitor:
+        """Build the single-point DFT monitor for this objective component and frequency."""
         return ProfileMonitor(
             name=self.name, center_um=self.probe_um, size_um=(0.0, 0.0, 0.0),
             fields=(self.component,), freqs_hz=(self.freq_hz,))
@@ -333,8 +338,7 @@ class PointIntensity:
 
 @dataclass(frozen=True)
 class ModePower:
-    """Maximize the power coupled into a guided ``mode`` at an output port —
-    ``J = |c|^2``, where ``c`` is the P_mode-normalized complex modal amplitude
+    """Maximize the power coupled into a guided ``mode`` at an output port, ``J = |c|^2``, where ``c`` is the P_mode-normalized complex modal amplitude
     of the recorded plane (``mode_amplitude``). This is THE objective for
     waveguide inverse design: bends, mode converters, (de)multiplexers,
     grating couplers.
@@ -344,8 +348,7 @@ class ModePower:
        ``c_in == 1`` on an input plane, but ``mode_source(power_watts=1)``
        normalizes to SI watts, so ``J`` carries a scene/grid-dependent
        positive scale (measured ``~4/dl_um`` on SOI strip scenes: J = 23.4
-       at dl = 0.05 um where T ~ 0.29). Maximizing J still maximizes T —
-       optimization and relative comparisons are unaffected — but do NOT
+       at dl = 0.05 um where T ~ 0.29). Maximizing J still maximizes T, optimization and relative comparisons are unaffected, but do NOT
        report J as transmission; use the S-matrix path
        (:func:`photonhub.analysis.smatrix`), which normalizes by the driven
        port's incident amplitude and is calibrated (|S21|^2).
@@ -353,8 +356,8 @@ class ModePower:
     By reciprocity the adjoint excitation is the SAME mode launched BACKWARD from
     the output plane (a `ModeSource` with ``direction`` reversed), with the
     post-multiplied coefficient ``conj(c)``. Build the recording monitor with
-    :meth:`monitor` (a 4-tangential `ProfileMonitor` on the output plane) — pass
-    a `Simulation` that carries the run's grid (any shell with the right
+    :meth:`monitor` (a 4-tangential `ProfileMonitor` on the output plane), pass
+    a `Simulation` that carries the run's grid (any geometry-only simulation with the right
     ``size_um``/``grid`` works; the domain is fixed across the optimization).
     """
 
@@ -398,7 +401,7 @@ class ModePower:
         return complex(c[self.freq_hz])
 
     def value(self, data: RunResult) -> float:
-        """Figure of merit ``|c|^2`` — relative modal power (not a calibrated
+        """Figure of merit ``|c|^2``, relative modal power (not a calibrated
         transmission; see the class warning)."""
         return float(abs(self.amplitude(data)) ** 2)
 
@@ -457,7 +460,7 @@ def assemble_gradient(
 
     **Direction, not magnitude.** ``BETA`` is a unit-magnitude fitted phase, so
     the result is proportional to dJ/drho with an uncalibrated (and
-    configuration-dependent) constant — see the note on ``BETA``. Fine for a
+    configuration-dependent) constant, see the note on ``BETA``. Fine for a
     line-searching optimizer; wrong for anything that reads the gradient's
     size.
     """
@@ -529,8 +532,8 @@ def value_and_gradient(
     unit adjoint source and keeping only the design-region monitor. ``beta``
     defaults to the objective's own normalization constant.
 
-    ``device`` (``"cpu"`` / ``"gpu"`` / ``"gpu:N"``) runs BOTH solves — the
-    overwhelming majority of the gradient's compute — on that backend (it is
+    ``device`` (``"cpu"`` / ``"gpu"`` / ``"gpu:N"``) runs BOTH solves, the
+    overwhelming majority of the gradient's compute, on that backend (it is
     forwarded to ``run_local``); it overrides any ``device`` in ``run_kwargs``.
     The host-side gradient assembly (``assemble_gradient``) is a negligible
     NumPy reduction over the design-region phasors and always runs on the CPU."""
@@ -584,14 +587,14 @@ def _descend(method, fg, x0, bounds, n_iters, step, maximize):
     ``maximize`` else minimizes; ``bounds`` is ``(lo, hi)`` applied to every
     variable, or None.
 
-    Default ``method="lbfgs"`` is SciPy L-BFGS-B — a quasi-Newton method that
+    Default ``method="lbfgs"`` is SciPy L-BFGS-B, a quasi-Newton method that
     builds curvature from the gradient history and line-searches each step, the
     standard choice for adjoint inverse design. Unlike Adam, L-BFGS USES the
     gradient magnitude, but the adjoint gradient's magnitude is a normalization
-    constant (only ``arg(beta)`` — the direction — is physically pinned; the raw
-    magnitude is ~1e-21). So we CALIBRATE that constant once — probe ``J`` along
+    constant (only ``arg(beta)``, the direction, is physically pinned; the raw
+    magnitude is ~1e-21). So we CALIBRATE that constant once, probe ``J`` along
     the gradient at the start to recover the scale that makes ``grad`` consistent
-    with ``J`` (the scale is constant across the design, so one probe suffices) —
+    with ``J`` (the scale is constant across the design, so one probe suffices) ,
     then hand SciPy a consistent, ``J(x0)``-normalized ``(f, grad)``.
     ``method="adam"`` keeps the scale-free normalized-gradient Adam (``step`` =
     max per-variable change per iteration); only Adam uses ``step``."""
@@ -678,12 +681,11 @@ def optimize(
 ) -> OptimizeResult:
     """Topology optimization driven by the adjoint gradient.
 
-    ``method`` is ``"adam"`` (default — normalized-gradient Adam) or ``"lbfgs"``
+    ``method`` is ``"adam"`` (default, normalized-gradient Adam) or ``"lbfgs"``
     (SciPy L-BFGS-B); see :func:`_descend`. Adam is the default HERE because for
     high-dimensional topology the continuous-adjoint gradient is slightly noisy
-    (cos ~0.98 vs finite differences), which perturbs L-BFGS's curvature estimates
-    — empirically Adam reaches a better design in fewer evaluations
-    (``benchmarks/adjoint/optimizer_compare.py``). For a FEW smooth shape
+    (cos ~0.98 vs finite differences), which perturbs L-BFGS's curvature estimates, empirically Adam reaches a better design in fewer evaluations
+    (``validation/suites/adjoint/optimizer_compare.py``). For a FEW smooth shape
     parameters, prefer :func:`optimize_parametric`, which defaults to L-BFGS-B.
     ``n_iters`` bounds the optimizer iterations. Densities are box-constrained to
     ``bounds``. Maximizes ``objective`` by default; returns the BEST design seen.
@@ -694,7 +696,7 @@ def optimize(
 
     ``param_map`` (a ``(region.shape) -> (region.shape)`` array map) constrains the
     design: the structure is built from ``param_map(rho)`` and the gradient is
-    mapped through it — a proper projected gradient. For a LINEAR, self-adjoint
+    mapped through it, a proper projected gradient. For a LINEAR, self-adjoint
     projection (e.g. a symmetry-averaging map, which is its own adjoint) this is
     exact; ``best`` and ``rho`` are reported in the mapped (constrained) space.
     Use it to enforce device symmetry or a density filter."""
@@ -766,7 +768,7 @@ def optimize_parametric(
     differentiable parameterization (e.g. a taper's control-point widths -> a
     rendered waveguide). Each evaluation runs ONE forward + ONE adjoint solve to
     get ``dJ/drho`` over the pixels, then chains it to the parameters through the
-    parameterization Jacobian ``drho/dp`` — which is a **cheap central
+    parameterization Jacobian ``drho/dp``, which is a **cheap central
     finite-difference of the analytic** ``expand`` (no extra FDTD solves):
 
         dJ/dp_j = sum_i (dJ/drho_i) (drho_i/dp_j),
@@ -775,7 +777,7 @@ def optimize_parametric(
     So the cost is the SAME two solves per evaluation as topology optimization,
     regardless of the pixel count, while optimizing only ``len(p)`` variables.
     Make ``expand`` smooth (a soft/graded boundary over ~1 cell) so ``drho/dp`` is
-    well-defined. ``method`` is ``"lbfgs"`` (default, SciPy L-BFGS-B — well suited
+    well-defined. ``method`` is ``"lbfgs"`` (default, SciPy L-BFGS-B, well suited
     to a few smooth parameters) or ``"adam"``; see :func:`_descend`. ``bounds``
     (lo, hi) box-constrains every parameter. Returns the BEST parameters seen.
     Maximizes ``objective`` by default."""

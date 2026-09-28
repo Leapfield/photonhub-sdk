@@ -2,7 +2,9 @@
 
 from typing import Annotated, Literal, Optional, Tuple, Union
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+import warnings
+
+from pydantic import AliasChoices, ConfigDict, Field, field_validator, model_validator
 
 from .base import (
     AxisName,
@@ -25,9 +27,11 @@ class PointDipole(FrozenModel):
     J0 [A/m^2] (electric) or M0 [V/m^2] (magnetic); the injected current
     MOMENT is ``J0 * dl^3`` on a uniform grid, so the Hertzian radiated power
     of an electric dipole in vacuum is ``eta0 * k^2 * (J0*dl^3)^2 / (12*pi)``.
-    Because every DFT/flux output is normalized per unit source amplitude,
-    changing ``amplitude`` rescales only the raw time-domain fields, not the
-    reported spectra. A dipole placed inside the PML/absorber layers is NOT
+    The engine normalizes every DFT/flux output per unit amplitude of the
+    FIRST wire-order source and :class:`~photonhub.RunResult` multiplies
+    that amplitude back in, so the reported spectra are those of the
+    sources as declared (fields scale with ``amplitude``, flux with its
+    square). A dipole placed inside the PML/absorber layers is NOT
     rejected by the engine and radiates almost nothing: keep sources inside
     the interior (``run_local`` warns before launching such a scene; see
     ``Simulation.point_sources_in_boundary_layers``).
@@ -81,14 +85,36 @@ class PlaneWave(FrozenModel):
     )
     amplitude: float = 1.0
     source_time: SourceTimeType
-    # Schema 1.18 — oblique injection (constant-k Bloch method): angle_theta
-    # tilts off the propagation direction; angle_phi is the tilt azimuth in
+    # Schema 1.18 — oblique injection (constant-k Bloch method): angle_theta_rad
+    # tilts off the propagation direction; angle_phi_rad is the tilt azimuth in
     # the transverse plane from the first CYCLIC transverse axis (axis+1)%3.
     # None (default) = normal incidence, omitted from the wire. Nonzero
     # angles need the transverse axes set to "bloch" with the matching
     # Simulation.bloch_k_per_um — use Simulation.with_oblique_plane_wave.
-    angle_theta: Optional[float] = None
-    angle_phi: Optional[float] = None
+    # Radians; the wire keys stay ``angle_theta``/``angle_phi`` (listed first
+    # so the generated schema keeps them).
+    angle_theta_rad: Optional[float] = Field(
+        default=None, validation_alias=AliasChoices("angle_theta", "angle_theta_rad"),
+        serialization_alias="angle_theta")
+    angle_phi_rad: Optional[float] = Field(
+        default=None, validation_alias=AliasChoices("angle_phi", "angle_phi_rad"),
+        serialization_alias="angle_phi")
+
+    @property
+    def angle_theta(self) -> Optional[float]:
+        """Deprecated spelling of :attr:`angle_theta_rad`."""
+        warnings.warn("PlaneWave.angle_theta was renamed to angle_theta_rad; the old "
+                      "name will be removed in a future release",
+                      DeprecationWarning, stacklevel=2)
+        return self.angle_theta_rad
+
+    @property
+    def angle_phi(self) -> Optional[float]:
+        """Deprecated spelling of :attr:`angle_phi_rad`."""
+        warnings.warn("PlaneWave.angle_phi was renamed to angle_phi_rad; the old "
+                      "name will be removed in a future release",
+                      DeprecationWarning, stacklevel=2)
+        return self.angle_phi_rad
 
     @field_validator("polarization")
     @classmethod
@@ -154,11 +180,10 @@ class ModeSource(FrozenModel):
     """Inject a guided mode on a TF/SF plane (NUMERICS.md §18).
 
     .. deprecated::
-        The §18 aux-line ModeSource is deprecated in favour of the equivalence-
-        current Huygens launch (per-cell ``PointDipole`` sheets via
+        The §18 aux-line ModeSource is deprecated in favour of the source current Huygens launch (per-cell ``PointDipole`` source planes via
         ``mode_launch`` over a discrete Yee mode). Both paths support uniform and
         graded transverse/propagation axes; §18 uses the graded auxiliary-line
-        construction in NUMERICS §§15.9 and 18.4. The equivalence-current path is
+        construction in NUMERICS §§15.9 and 18.4. The source-current path is
         preferred for solved Yee modes because it carries their discrete paired-H
         fields and grid provenance. §18 remains for the adjoint (gradient pinned
         to it) and scalar/FLM modes; new solved-mode code should use ``mode_launch``.
@@ -166,7 +191,7 @@ class ModeSource(FrozenModel):
     The 1-D
     auxiliary line runs at the mode phase index ``n_eff`` (which gives both the
     modal phase velocity and the scalar-limit modal impedance), and each
-    transverse plane point is scaled by ``profile`` — the FDE eigenmode
+    transverse plane point is scaled by ``profile``, the FDE eigenmode
     resampled onto the grid's transverse plane, row-major ``[v*nu + u]`` with
     ``u``/``v`` the lower/higher-indexed transverse axes. ``polarization`` is
     the major tangential E component. Build via
@@ -184,7 +209,7 @@ class ModeSource(FrozenModel):
     so a single real signed profile is exact; the engine injects each off the
     same guided-mode aux carrier with its own scalar-limit paired H. When the
     minor fields are omitted (the legacy default) the engine injects the
-    scalar-limit major component only — older engines/JSON stay valid."""
+    scalar-limit major component only, older engines/JSON stay valid."""
 
     type: Literal["mode_source"] = "mode_source"
     axis: AxisName
@@ -439,12 +464,12 @@ class ModeSource(FrozenModel):
 class TfsfBox(FrozenModel):
     """Closed total-field/scattered-field box (NUMERICS.md section 13.5,
     schema 1.18): a normal-incidence plane wave injected on all SIX faces of
-    an axis-aligned box, so the incident field exists ONLY inside — everything
+    an axis-aligned box, so the incident field exists ONLY inside, everything
     outside is pure scattered field. Single-run scattering cross-sections with
     PML on every side (no periodic transverse boundaries needed). CPU solver
     only in this release. ``phsolver validate`` enforces: uniform grid, every
-    face in the uniform background (structures strictly inside — the
-    scatterer — or strictly outside), faces clear of the PML/absorber layers,
+    face in the uniform background (structures strictly inside, the
+    scatterer, or strictly outside), faces clear of the PML/absorber layers,
     and no Bloch boundaries or symmetry planes. Accuracy note: scattering
     cross-sections of curved bodies at ~20 cells per wavelength carry a
     ~3-5 % band-mean staircase/smoothing bias (NUMERICS.md section 14.4);

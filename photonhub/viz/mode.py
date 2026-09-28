@@ -1,9 +1,9 @@
-"""``plot_mode()`` — the transverse field of an FDE eigenmode as a heatmap.
+"""``plot_mode()``, the transverse field of an FDE eigenmode as a heatmap.
 
 Renders a :class:`photonhub.analysis.modes.Mode` (the dominant transverse
 component ``Ex``/``Ey`` of a guided mode) on its real-space µm cross-section.
 The field is signed, so it uses the same diverging, zero-centered colormap the
-field views use for a real/imag slice (design §7). The title carries the
+field views use for a real/imag slice. The title carries the
 component, the modal index ``n_eff``, and the free-space wavelength.
 
 Consumes the mode's :meth:`~photonhub.analysis.modes.Mode.field_dataarray`
@@ -59,14 +59,14 @@ def plot_overlap(mode_a, mode_b, *, axes=None, center_a=(0.0, 0.0),
                  center_b=(0.0, 0.0), direction="+", cmap=None):
     """Three-panel view of a mode⇄mode overlap (:func:`photonhub.analysis.mode_overlap`):
     ``|E|`` of each mode on the shared grid and the **overlap integrand**
-    ``Re(E_A*·E_B)`` — so you can *see* where the two profiles match (the integrand
+    ``Re(E_A*·E_B)``, so you can *see* where the two profiles match (the integrand
     is positive where they reinforce, negative/zero where they mismatch). The
     suptitle carries the power coupling, the field overlap and the mismatch loss.
 
     ``mode_a``/``mode_b`` are any of scalar :class:`~photonhub.analysis.modes.Mode`,
     :class:`~photonhub.analysis.vector_modes.VectorMode`, or
     :func:`~photonhub.analysis.mode_overlap.gaussian_mode`. ``center_b`` shifts mode B
-    (lateral misalignment), ``direction="-"`` uses mode B's backward partner — both
+    (lateral misalignment), ``direction="-"`` uses mode B's backward partner, both
     forwarded to the overlap so the panels match the reported numbers. Returns the
     three matplotlib ``Axes``; never calls ``plt.show()``."""
     import matplotlib.pyplot as plt

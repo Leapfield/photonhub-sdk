@@ -1,14 +1,14 @@
-"""Full-vectorial finite-difference eigenmode (FDE) solver — CPU only.
+"""Full-vectorial finite-difference eigenmode (FDE) solver, CPU only.
 
 This is the **full-vector** companion to the frozen semi-vectorial
 :mod:`photonhub.analysis.modes`. Where that solver carries a single dominant
 transverse field component (Ex-major quasi-TE / Ey-major quasi-TM) and drops the
 operator that couples the two transverse fields, this one solves the **coupled
-transverse-magnetic-field eigenproblem** — keeping the vectorial coupling — so
+transverse-magnetic-field eigenproblem**, keeping the vectorial coupling, so
 it returns *real* hybrid/TM effective indices and **all six** field components.
 It models a straight (z-invariant) waveguide cross-section like the semi-vec, and
-additionally — via an opt-in curvature term + tangential PML (see *Bent
-waveguides* below) — **bent** waveguides with radiation (bend) loss, returning a
+additionally, via an opt-in curvature term + tangential PML (see *Bent
+waveguides* below), **bent** waveguides with radiation (bend) loss, returning a
 real ``n_eff`` plus positive attenuation index ``k_eff`` (the derived
 ``n_eff_complex = n_eff + i*k_eff`` is positive-loss metadata). Anisotropy
 (diagonal ε) is supported; dispersion and a fully anisotropic (off-diagonal) ε
@@ -51,14 +51,14 @@ the E-field formulation handles the interface discontinuities worse.
 The operator is assembled as a :class:`scipy.sparse` matrix (a compact stencil
 per row → ``O(N)`` nonzeros) and the eigenpairs nearest a target index come from
 :func:`scipy.sparse.linalg.eigs` in **shift-invert** mode
-(``sigma = (n_guess*k0)^2``, ``which='LM'``) — far cheaper than the semi-vec's
+(``sigma = (n_guess*k0)^2``, ``which='LM'``), far cheaper than the semi-vec's
 dense ``O(N^3)`` path, so the ``2N`` problem stays tractable on a generous
 window. :meth:`solve` filters the returned eigenpairs to genuinely guided modes
 (``n_clad < n_eff < n_core``, near-real positive ``b^2``) and sorts them by
 descending ``n_eff``. :meth:`solve_eme_basis` instead targets guided, box/PML
 radiation, and negative-``beta^2`` evanescent parts of one common operator.
 The continuum path is experimental: its analytic operator regressions pass, but
-device-level radiation/PML shell convergence has not yet been demonstrated.
+device-level radiation/PML boundary-region convergence has not yet been demonstrated.
 
 Field reconstruction (all six components)
 =========================================
@@ -81,8 +81,18 @@ wall). The default walls are **PEC** electric walls (tangential E = 0): for the
 transverse H this is a homogeneous-Neumann ghost on the tangential-H component
 and a homogeneous-Dirichlet ghost on the normal-H component.
 :meth:`from_rectangular_core` exposes ``x_symmetry="pmc"`` for a *magnetic*
-x-wall, which makes the lowest mode exactly x-uniform (``kx = 0``) — the 1-D slab
+x-wall, which makes the lowest mode exactly x-uniform (``kx = 0``), the 1-D slab
 limit a 2-D solver must reproduce for the analytic-slab validation.
+
+``x_min_symmetry="pec"|"pmc"`` makes the x-min wall a **mirror plane** through
+the centre of ε column 0 (NUMERICS.md §20.7). The H nodes sit on cell corners,
+half a cell from that plane, so the ghost column is the image of node 0
+(``H[-1] = ±H[0]``), not of node 1 as at the other walls. The half window then
+carries the full operator restricted to one parity. Its modes take the plane as
+the x origin: ``center_offset_um`` puts column ``j`` at ``x = j*dl_x``, the full
+solve's coordinate for the same column. ``core_fraction`` lays the half out as
+the full solve's arrays hold it, so it describes the full mode; the other
+integrals, including overlaps, cover the stored half.
 
 Bent waveguides (real phase index + loss metadata)
 ==================================================
@@ -97,13 +107,13 @@ Helmholtz equation turns the constant longitudinal ``β²`` into the radius-depe
 **generalized** problem ``A h = β₀² B h`` where ``A`` is the *ungraded* (physical-ε)
 straight FLM operator and ``B = diag((R/r)²)``, ``r = R + x`` the absolute radius at
 the radial offset ``x`` (+x outward from the bend center). This ``(R/r)²``
-"centrifugal" weight is the full non-perturbative curvature effect — it replaces the
+"centrifugal" weight is the full non-perturbative curvature effect, it replaces the
 older scalar Heiblum–Harris conformal-index map ``ε → ε·exp(2x/R)``, which only
 reproduced the bend shift to first order in ``1/R`` and was ~12× too weak at tight
 radii vs an independent full-vector bend solve (which is mathematically equivalent: a
-transformation-optics radial Jacobian on ε *and* μ — see
+transformation-optics radial Jacobian on ε *and* μ, see
 :meth:`_centrifugal_weight`). The reported ``Re(n_eff)`` is the **highest in-band**
-eigenvalue of a clean (PML-free) generalized solve — the physical, outer-shifted
+eigenvalue of a clean (PML-free) generalized solve, the physical, outer-shifted
 bend index, sorting by descending neff. A bend radiates, so the
 **loss** ``mode.k_eff`` / ``mode.loss_db_per_cm`` comes from a second generalized
 solve **with** a tangential PML (complex coordinate stretch ``s(x) = 1 + iσ/k0`` on
@@ -111,12 +121,11 @@ the in-plane edges, made by turning the FLM half-cell x-spacings complex): it ta
 the radiating **core-confined** mode's ``Im(β)``, which is monotone in ``R`` and
 guarded by a **passivity clamp** (a lossless bend cannot amplify). The straight path
 (``bend_radius_um=None``, default) makes ``B`` the identity and keeps every quantity
-real — bit-for-bit the original lossless operator.
+real, bit-for-bit the original lossless operator.
 
 .. note::
    The leaky bend ``n_eff(R)`` (real part) and loss are *window-dependent* for a
-   tight, lossy bend (the outward-radiating mode samples the finite window/PML) —
-   a caveat any bend solver carries. The match to an independent full-vector bend solve is at the
+   tight, lossy bend (the outward-radiating mode samples the finite window/PML), a caveat any bend solver carries. The match to an independent full-vector bend solve is at the
    *identical* cross-section + window (a fixed bend-mode study,
    5×3 µm). Widen the window ~linearly with ``R`` for a converged result.
 
@@ -126,22 +135,22 @@ Group index
 over two extra solves at ``lambda (1 +/- delta)`` (``delta ~ 1e-3``); the same
 mode is tracked across the three solves by maximum transverse-field overlap.
 PhotonHub's media are non-dispersive (``eps`` is λ-independent), so this is pure
-*waveguide* dispersion. Opt-in (``solve(..., group_index=True)``) — it triples
+*waveguide* dispersion. Opt-in (``solve(..., group_index=True)``), it triples
 the solve cost.
 
 Public API
 ==========
-* ``VectorModeSolver(eps, dl_x_um, dl_y_um, wavelength_um)`` — same raw-eps
+* ``VectorModeSolver(eps, dl_x_um, dl_y_um, wavelength_um)``, same raw-eps
   validation as :class:`photonhub.analysis.modes.ModeSolver`.
-* ``VectorModeSolver.from_rectangular_core(...)`` — the centered-rectangular-core
-  rasterizer (mirrors the semi-vec), plus ``x_symmetry`` for the slab limit.
+* ``VectorModeSolver.from_rectangular_core(...)``, the centered-rectangular-core
+  mesh sampler (mirrors the semi-vec), plus ``x_symmetry`` for the slab limit.
 * ``VectorModeSolver.solve(num_modes=1, n_guess=None, group_index=False,
-  bend_radius_um=None, num_pml=0, pml_strength=30.0)`` — the best-confined guided
+  bend_radius_um=None, num_pml=0, pml_strength=30.0)``, the best-confined guided
   modes, highest ``Re(n_eff)`` first. **No polarization argument**: the
   full-vector solve finds every mode; polarization is a property of the result.
   ``bend_radius_um`` switches on the bent/leaky solve.
 * ``VectorModeSolver.solve_eme_basis(num_guided=1, num_radiation=0,
-  num_evanescent=0, ...)`` — a common-operator EME basis. Continuum requests
+  num_evanescent=0, ...)``, a common-operator EME basis. Continuum requests
   use closed-box spectral seeds followed by four-sided complex-coordinate PML
   continuation; ``pml_cells_xy=(0, 0)`` selects an analytic hard-wall box.
   Radiation/evanescent requests are experimental and are not yet validated for
@@ -156,7 +165,8 @@ Public API
   ``.field_dataarray(component=...)`` (xarray, real-space µm coords) and
   ``.core_fraction(...)``. EME bases additionally set ``.mode_type``,
   ``.overlap_weights``, ``.physical_mask``, ``.pml_cells_xy``, and
-  ``.eigen_residual``.
+  ``.eigen_residual``. Half-window solves set ``.x_min_symmetry`` and
+  ``.center_offset_um``.
 
 CPU only. Requires :mod:`scipy` (sparse assembly + shift-invert eigensolve);
 :mod:`numpy` + :mod:`xarray` as for the rest of the plugins.
@@ -171,6 +181,8 @@ import numpy as np
 import xarray as xr
 
 from ._constants import EPS0, C0 as _C0
+from .._compat import legacy_keywords
+import warnings
 
 try:  # scipy is a hard dependency of the full-vector solver (sparse eigensolve)
     import scipy.sparse as _sp
@@ -190,6 +202,10 @@ ComponentName = Literal["Ex", "Ey", "Ez", "Hx", "Hy", "Hz"]
 #: wall; ``"pmc"`` is a magnetic wall that makes the lowest mode x-uniform
 #: (kx = 0) — used to recover the 1-D slab limit in the 2-D solver.
 XSymmetry = Literal["none", "pmc"]
+
+#: Parity of the x-min mirror plane of a half-window solve (NUMERICS.md §20.7).
+#: ``"pec"`` is odd / electric (Hx odd, Hy even); ``"pmc"`` is even / magnetic.
+MirrorSymmetry = Literal["pec", "pmc"]
 
 #: Cross-section rasterization for :meth:`VectorModeSolver.from_rectangular_core`.
 #: ``"staircase"`` hard-samples ε (no smoothing); ``"volume"`` area-averages each
@@ -247,7 +263,7 @@ def _axx_coeffs(q1, q2, q3, q4, n, s, e, w, k):
 
 def _axy_coeffs(q1, q2, q3, q4, n, s, e, w, k):
     """Pxy block (Hx←Hy), eqs (28)–(34) for diagonal ε. Corners (32),(33) are
-    nonzero wherever εyy≠εzz — the genuine anisotropic vectorial coupling."""
+    nonzero wherever εyy≠εzz, the genuine anisotropic vectorial coupling."""
     (_, yy1, zz1) = q1
     (_, yy2, zz2) = q2
     (_, yy3, zz3) = q3
@@ -298,7 +314,7 @@ def _yblock(xcoeff_fn, q1, q2, q3, q4, n, s, e, w, k):
 
 def _odd(n: int) -> int:
     """Smallest odd integer ``>= n`` (cell-count helper so a cell center sits on
-    the cross-section origin — mirrors :mod:`photonhub.analysis.modes`)."""
+    the cross-section origin, mirrors :mod:`photonhub.analysis.modes`)."""
     return n if n % 2 == 1 else n + 1
 
 
@@ -360,15 +376,28 @@ class VectorMode:
     center_offset_um:
         Optional ``(x, y)`` placement metadata (microns, mode frame: x = width,
         y = height): the ACTUAL center of the solver's sample window minus the
-        center the caller REQUESTED. The cross-section rasterizers deliberately
+        center the caller REQUESTED. The cross-section mesh samplers deliberately
         snap their eps window to the simulation grid (so dielectric walls land
         at the same sub-cell positions the FDTD saw), which displaces the array
         center from the requested center by up to ~a cell; consumers that
         reconstruct real-space coordinates as ``(i - (n-1)/2)*dl + center``
         (``vector_modal_fields`` and everything built on it) shift by this
-        offset so the mode lands where its raster truly was. ``None`` (default,
-        e.g. a hand-built or idealized-rectangle mode) means "centered as
-        requested" — the legacy behavior.
+        offset so the mode lands where its window truly was. A half-window
+        solve (:attr:`x_min_symmetry`) sets ``((nx-1)/2*dl_x_um, 0)``: its
+        window starts on the symmetry plane, which is the requested centre, so
+        column ``j`` lands at ``x = j*dl_x_um``. A further placement shift adds
+        to that offset rather than replacing it. ``None`` (default, e.g. a
+        hand-built or idealized-rectangle mode) means "centered as requested",
+        the legacy behavior.
+    x_min_symmetry:
+        ``"pec"`` or ``"pmc"`` for a mode solved on a half window (the parity of
+        its symmetry plane, NUMERICS.md §20.7), else ``None``. The arrays hold
+        the columns from the plane to the +x edge. :meth:`core_fraction`
+        describes the full mode. The arrays themselves, :attr:`te_fraction`,
+        :meth:`modal_power` and the overlap helpers describe the stored half
+        window: an overlap with a full-width partner, such as a full-window
+        mode, a Gaussian beam or a recorded plane, returns about half the full
+        coupling. Solve the full window for coupling to such a partner.
     """
 
     n_eff: float
@@ -438,12 +467,16 @@ class VectorMode:
     #: :func:`solve_yee_eme_basis` validates the complete basis reaction Gram.
     yee_eme_compatible: bool = False
     #: Propagation axis and absolute transverse node origin for a validated
-    #: Yee EME basis.  ``center_offset_um`` records only the sub-cell snap
+    #: Yee EME basis.  ``center_offset_um`` records only the placement
     #: relative to a requested centre, so it cannot distinguish two otherwise
     #: identical windows translated in the simulation.  These fields are set
     #: together with ``yee_eme_compatible`` and checked at every interface.
     yee_eme_axis: Optional[str] = None
     yee_eme_origin_um: Optional[Tuple[float, float]] = None
+    #: Parity of the mirror plane of a half-window solve, or ``None`` (see the
+    #: class docstring). A trailing default, like the fields above, so
+    #: hand-built modes stay source compatible.
+    x_min_symmetry: Optional[MirrorSymmetry] = None
 
     @property
     def shape(self) -> Tuple[int, int]:
@@ -479,7 +512,7 @@ class VectorMode:
 
     @property
     def te_fraction(self) -> float:
-        """Transverse-E TE fraction ``∫|Ex|² / (∫|Ex|² + ∫|Ey|²)`` — the
+        """Transverse-E TE fraction ``∫|Ex|² / (∫|Ex|² + ∫|Ey|²)``, the
         polarization purity. ``~1`` for a clean TE (Ex-major) mode, ``~0`` for a
         clean TM (Ey-major) mode, ``~0.5`` for a strongly hybrid mode."""
         px = float(np.sum(np.abs(self.ex) ** 2))
@@ -512,30 +545,40 @@ class VectorMode:
 
     def _node_coords_um(self) -> Tuple[np.ndarray, np.ndarray]:
         """Real-space ``(xs, ys)`` node coordinates in microns, RELATIVE to the
-        requested mode centre — the SAME reconstruction
+        requested mode centre: the placement
         :func:`~photonhub.analysis.mode_overlap.vector_modal_fields` uses, so this
         class reports the coordinates its own overlap consumers place it at.
 
         Prefers the carried graded node ladders (:attr:`x_coords_um` /
         :attr:`y_coords_um`, whose pitch is NOT the scalar ``dl_x_um``); else the
         uniform ladder PLUS :attr:`center_offset_um`, the window-placement shift a
-        grid-snapped cross-section solve applies (up to ~a cell). Ignoring either
-        mis-reports every coordinate by that shift."""
+        grid-snapped cross-section solve applies (up to ~a cell) and a half-window
+        solve sets to half its width. Ignoring either mis-reports every
+        coordinate by that shift."""
         ny, nx = self.ex.shape
         if self.x_coords_um is not None:
             return (np.asarray(self.x_coords_um, dtype=np.float64),
                     np.asarray(self.y_coords_um, dtype=np.float64))
         off_w, off_h = self.center_offset_um or (0.0, 0.0)
-        xs = (np.arange(nx) - (nx - 1) / 2.0) * self.dl_x_um + off_w
+        if self.x_min_symmetry is not None:
+            # §20.7 half window: take the half width back out of the offset
+            # first, so column j lands on exactly j*dl_x, the value the full
+            # solve reports for that column. The centred ladder plus the offset
+            # agrees only to rounding, which misaligns the two DataArrays.
+            xs = (np.arange(nx) * self.dl_x_um
+                  + (off_w - 0.5 * (nx - 1) * self.dl_x_um))
+        else:
+            xs = (np.arange(nx) - (nx - 1) / 2.0) * self.dl_x_um + off_w
         ys = (np.arange(ny) - (ny - 1) / 2.0) * self.dl_y_um + off_h
         return xs, ys
 
     def field_dataarray(self, component: str = "Ex") -> xr.DataArray:
         """One field ``component`` as an :class:`xarray.DataArray` with real-space
         ``x``/``y`` coordinates in microns (origin at the REQUESTED cross-section
-        centre; a grid-snapped solve's :attr:`center_offset_um` and a graded solve's
-        node ladders are honoured — see :meth:`_node_coords_um`). Dims
-        ``("y", "x")``.
+        centre; a grid-snapped or half-window solve's :attr:`center_offset_um` and a
+        graded solve's node ladders are honoured, see :meth:`_node_coords_um`). Dims
+        ``("y", "x")``. A half-window mode's ``x`` starts at 0 on its symmetry
+        plane and equals the full solve's ``x`` from the centre column on.
 
         ``component`` is one of ``"Ex"``, ``"Ey"``, ``"Ez"``, ``"Hx"``, ``"Hy"``,
         ``"Hz"`` (default ``"Ex"``). The data is complex; ``plot_mode`` and other
@@ -565,18 +608,39 @@ class VectorMode:
 
     def core_fraction(self, core_w_um: float, core_h_um: float) -> float:
         """Fraction of the transverse-E energy ``|Ex|² + |Ey|²`` inside a centered
-        ``core_w_um x core_h_um`` bounding box — a confinement metric (1.0 = fully
+        ``core_w_um x core_h_um`` bounding box, a confinement metric (1.0 = fully
         confined). The box is centered on the REQUESTED cross-section centre,
         matching :meth:`VectorModeSolver.from_rectangular_core`; the mode's own
-        node coordinates honour a grid-snapped solve's :attr:`center_offset_um` and
-        a graded solve's ladders (see :meth:`_node_coords_um`), so the box lands on
-        the real core instead of being displaced by the window snap."""
+        node coordinates honour a grid-snapped or half-window solve's
+        :attr:`center_offset_um` and a graded solve's ladders (see
+        :meth:`_node_coords_um`), so the box lands on the real core instead of
+        being displaced by the window placement.
+
+        On a half-window mode (:attr:`x_min_symmetry` set) the fraction is the
+        full mode's, laid out as the full solve's arrays hold it. Those arrays
+        report each sample half a cell before its node, so the mirror image of
+        stored column ``j`` sits at ``x = -(j+1)*dl_x_um`` from the plane, one
+        column further out than the column itself. Every stored column but the
+        last, on the far wall, therefore counts twice, and the box is tested at
+        both positions. A full solve's H arrays are exact mirror images in this
+        layout. Its E arrays are not beside a vertical core wall, where the two
+        samples of a pair divide by the permittivity of different cells, so the
+        result can differ from the full solve's own value by O(dl) there
+        (NUMERICS.md §20.7)."""
         xs_c, ys_c = self._node_coords_um()
+        p = np.abs(self.ex) ** 2 + np.abs(self.ey) ** 2
+        if self.x_min_symmetry is not None:
+            # §20.7: the full solve pairs column c0 + j with c0 - 1 - j, so the
+            # image of half column j is reported at xs_c[0] - (j + 1)*dl_x and
+            # the far-wall column has none. Rebuild that layout.
+            nx = p.shape[1]
+            p = np.concatenate([p[:, -2::-1], p], axis=1)
+            xs_c = np.concatenate(
+                [xs_c[0] - np.arange(nx - 1, 0, -1) * self.dl_x_um, xs_c])
         xs = np.abs(xs_c)
         ys = np.abs(ys_c)
         inside = (ys[:, None] <= core_h_um / 2.0 + 1e-12) & \
                  (xs[None, :] <= core_w_um / 2.0 + 1e-12)
-        p = np.abs(self.ex) ** 2 + np.abs(self.ey) ** 2
         total = float(p.sum())
         if total <= 0.0:
             return 0.0
@@ -584,7 +648,7 @@ class VectorMode:
 
     def modal_power(self) -> float:
         """Time-averaged modal power (watts) carried across the cross-section by
-        this full-vector mode — the **physical** z-Poynting flux
+        this full-vector mode, the **physical** z-Poynting flux
 
             P = (1/2) integral Re( E x H* ) . z_hat dA
               = (1/2) integral Re( Ex Hy* - Ey Hx* ) dA ,
@@ -638,11 +702,25 @@ class VectorModeSolver:
         ``"none"`` (default) for electric (PEC) walls on every edge, or ``"pmc"``
         for a magnetic wall on the x-axis edges. On a y-only (x-invariant) ε
         profile each wall gives an x-uniform (``kx = 0``) slab fundamental, but of
-        a DIFFERENT polarization — the operator is in H, so the electric wall
+        a DIFFERENT polarization, the operator is in H, so the electric wall
         (``"none"``) yields the slab **TE0** (Eₓ-major) and the magnetic wall
         (``"pmc"``) the slab **TM0** (E_y-major). Choose the wall to match the
         polarization you want (the wrong one returns a too-low n_eff; see
-        :meth:`from_rectangular_core`).
+        :meth:`from_rectangular_core`). With ``x_min_symmetry`` set it governs
+        the x-max wall only.
+    x_min_symmetry:
+        ``None`` (default) or a symmetry plane on the x-min edge: ``"pec"``
+        (odd / electric: Hₓ odd, H_y even, so Eₓ even) or ``"pmc"`` (even /
+        magnetic: the complementary parity). The plane passes through the centre
+        of ε column 0. So ``eps`` is the half of a mirror-symmetric cross-section
+        that keeps the column straddling the plane (NUMERICS.md §20.7). The plane
+        is the x origin of the returned modes: column ``j`` reports
+        ``x = j*dl_x_um`` through :attr:`VectorMode.center_offset_um`. A caller
+        whose plane sits elsewhere in its own frame centres the mode on the
+        plane when placing it, as with any solve. Overlaps of such a mode cover
+        the half window only (see :attr:`VectorMode.x_min_symmetry`). Bent
+        solves and an x PML are rejected: a bend has no mirror symmetry, and
+        the PML would cover the plane.
     """
 
     #: Speed of light in vacuum (m/s), matching :mod:`photonhub.analysis.modes`.
@@ -653,15 +731,17 @@ class VectorModeSolver:
     #: cap is generous; a single-mode strip needs only a modest window.
     MAX_UNKNOWNS: int = 40000
 
+    @legacy_keywords(wavelength_um="wlen_um")
     def __init__(
         self,
         eps: np.ndarray,
         dl_x_um: float,
         dl_y_um: float,
-        wavelength_um: float,
+        wlen_um: float,
         x_symmetry: XSymmetry = "none",
         *,
         eps_tensor: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+        x_min_symmetry: Optional[MirrorSymmetry] = None,
     ) -> None:
         eps_arr = np.asarray(eps, dtype=float)
         if eps_arr.ndim != 2:
@@ -677,17 +757,22 @@ class VectorModeSolver:
             raise ValueError("eps must be >= 1 everywhere (passive dielectric)")
         if not (dl_x_um > 0 and dl_y_um > 0):
             raise ValueError("dl_x_um and dl_y_um must be > 0")
-        if not (wavelength_um > 0):
-            raise ValueError("wavelength_um must be > 0")
+        if not (wlen_um > 0):
+            raise ValueError("wlen_um must be > 0")
         if x_symmetry not in ("none", "pmc"):
             raise ValueError(
                 f"x_symmetry must be 'none' or 'pmc', got {x_symmetry!r}")
+        if x_min_symmetry not in (None, "pec", "pmc"):
+            raise ValueError(
+                "x_min_symmetry must be None, 'pec' (odd / electric), or 'pmc' "
+                f"(even / magnetic), got {x_min_symmetry!r}")
 
         self.eps: np.ndarray = eps_arr
         self.dl_x_um: float = float(dl_x_um)
         self.dl_y_um: float = float(dl_y_um)
-        self.wavelength_um: float = float(wavelength_um)
+        self.wavelength_um: float = float(wlen_um)
         self.x_symmetry: XSymmetry = x_symmetry
+        self.x_min_symmetry: Optional[MirrorSymmetry] = x_min_symmetry
 
         # Diagonal permittivity tensor (εxx, εyy, εzz) the operator + field
         # reconstruction use. Scalar ε ⇒ all three equal ``eps`` (the isotropic
@@ -710,27 +795,36 @@ class VectorModeSolver:
             self._exx, self._eyy, self._ezz = comps
             self._is_tensor = True
 
-    def at_wavelength(self, wavelength_um: float) -> "VectorModeSolver":
+    def at_wlen(self, wlen_um: float) -> "VectorModeSolver":
         """A sibling solver on the SAME cross-section (``eps`` / tensor, ``dl``,
-        symmetry) at a new free-space wavelength — for re-solving a full-vector
+        symmetry) at a new free-space wavelength, for re-solving a full-vector
         mode across a frequency band (``wavelength_um = C0 / freq_hz * 1e6``)
-        without re-rasterizing. Mirrors :meth:`ModeSolver.at_wavelength`; the
+        without repeating mesh sampling. Mirrors :meth:`ModeSolver.at_wavelength`; the
         permittivity (and any KFJ tensor) is shared by reference."""
         eps_tensor = (
             (self._exx, self._eyy, self._ezz) if self._is_tensor else None
         )
         return VectorModeSolver(
-            self.eps, self.dl_x_um, self.dl_y_um, wavelength_um,
+            self.eps, self.dl_x_um, self.dl_y_um, wlen_um,
             self.x_symmetry, eps_tensor=eps_tensor,
+            x_min_symmetry=self.x_min_symmetry,
         )
+
+    def at_wavelength(self, wavelength_um: float) -> "VectorModeSolver":
+        """Deprecated spelling of :meth:`at_wlen`."""
+        warnings.warn(
+            "VectorModeSolver.at_wavelength() was renamed to at_wlen(); the old name "
+            "will be removed in a future release", DeprecationWarning, stacklevel=2)
+        return self.at_wlen(wavelength_um)
 
     # -- convenience cross-section builder ---------------------------------
 
     @classmethod
+    @legacy_keywords(wavelength_um="wlen_um")
     def from_rectangular_core(
         cls,
         *,
-        wavelength_um: float,
+        wlen_um: float,
         dl_um: float,
         core_w_um: float,
         core_h_um: float,
@@ -746,14 +840,14 @@ class VectorModeSolver:
     ) -> "VectorModeSolver":
         """Build a solver for a centered rectangular core in a uniform cladding.
 
-        Rasterizes the canonical strip-waveguide cross-section onto a *square*
-        uniform grid of spacing ``dl_um`` (the same rasterization as
+        Samples the canonical strip-waveguide cross-section onto a *square*
+        uniform grid of spacing ``dl_um`` (the same mesh sampling as
         :meth:`photonhub.analysis.modes.ModeSolver.from_rectangular_core`, so the
         full-vector and semi-vec solvers are drop-in comparable).
 
         Parameters
         ----------
-        wavelength_um:
+        wlen_um:
             Free-space wavelength (microns).
         dl_um:
             Uniform grid spacing for both x and y (microns).
@@ -772,33 +866,41 @@ class VectorModeSolver:
             x-wall boundary, ``"none"`` (default, electric / PEC walls) or
             ``"pmc"`` (magnetic x-wall). With ``core_w_um == window_w_um`` this
             builds a y-only slab cross-section whose fundamental is exactly
-            x-uniform (kx = 0) — the 1-D slab limit. **The wall selects the
+            x-uniform (kx = 0), the 1-D slab limit. **The wall selects the
             polarization**, because the operator is in H: an electric wall
             (``"none"``) makes the major-H component Neumann (and Hₓ=0), so its
             x-uniform fundamental is the slab **TE0** (Eₓ-major); a magnetic wall
             (``"pmc"``) flips the parity, so its x-uniform fundamental is the slab
             **TM0** (E_y-major). Picking the *wrong* wall for the polarization you
-            want does not error — it returns a mode of that polarization forced to
+            want does not error, it returns a mode of that polarization forced to
             zero at the walls (a spurious kx ≈ π/window_w), whose n_eff is too low.
             So: ``"none"`` for a TE slab, ``"pmc"`` for a TM slab (see
             ``validation/test_tier2a_vector_modesolver.py``).
         x_min_symmetry:
             ``None`` (default, full cross-section), ``"pec"``, or ``"pmc"`` to
-            exploit a mirror symmetry about the width center (NUMERICS.md §20):
-            the solver keeps only the **right half** (x ≥ centre), so the
-            eigenproblem is half the size. The right half shares its nodes with
-            the full centered grid. ``"pec"`` makes the x-min wall an odd /
-            electric plane (reconstructs the full **even** mode exactly — the
-            right choice for a TE-like width-even fundamental such as the taper's
-            TE0); ``"pmc"`` makes it an even / magnetic plane (the complementary
-            parity, selecting width-odd modes). The far wall sits in the cladding
-            where the field has decayed, so its BC is immaterial.
+            exploit a mirror symmetry about the width center (NUMERICS.md §20.7).
+            The solver keeps the ε columns from the centre column, the one
+            straddling the plane, to the +x edge. The eigenproblem is about half
+            the size, and every kept H node is a node of the full grid.
+            ``"pec"`` makes the x-min wall an odd / electric plane: it keeps the
+            modes whose Eₓ is even and E_y odd in x, such as TE0. ``"pmc"`` makes
+            it an even / magnetic plane with the complementary parity, such as
+            TM0 and the width-odd TE1. The half solve reproduces the full solve's
+            modes of that parity at the same ``dl``, to eigensolver precision:
+            equal ``n_eff``, and field arrays equal to the full ones from the
+            centre column on, up to normalization. Its modes report ``x`` from
+            the plane, the core centre, so column ``j`` sits at ``x = j*dl_um``
+            as in the full solve. Their overlaps cover the half window only, so
+            an overlap with a full-width partner (a fibre mode, say) returns
+            about half the full coupling; see :attr:`VectorMode.x_min_symmetry`.
+            ``x_symmetry`` still sets the far (x-max) wall, so the default
+            matches the full solve.
         subpixel:
             ``False`` hard-samples ε (staircase). ``True`` (default) smooths the
             high-contrast walls; the kind is set by ``subpixel_method``.
         subpixel_method:
             ``"tensor"`` (default) applies a diagonalized
-            **Kottke–Farjadpour–Johnson** subpixel tensor — the interface-normal
+            **Kottke–Farjadpour–Johnson** subpixel tensor, the interface-normal
             ε-component gets the harmonic mean and tangential components the
             arithmetic mean. This is exact on the rectangle's axis-aligned face
             cells; at a partially filled corner the diagonal-only FLM solver
@@ -828,18 +930,14 @@ class VectorModeSolver:
             raise ValueError(
                 "x_min_symmetry must be None, 'pec' (odd / electric), or 'pmc' "
                 f"(even / magnetic), got {x_min_symmetry!r}")
-        # §20: keep the RIGHT half [centre .. +x edge]; the x-min wall is the
-        # symmetry plane. nx is odd so the centre node is index (nx-1)//2 and the
-        # slice shares its nodes with the full grid. The wall fold sign comes from
-        # x_symmetry: "none" (-1) = PEC plane (reconstructs the full EVEN mode,
-        # e.g. TE0); "pmc" (+1) = magnetic plane (the complementary parity). The
-        # far (east) wall sits in the cladding (field ≈ 0), so its matching BC is
-        # immaterial — both x-walls take the plane's sign. The half has an EVEN
-        # node count, fine for the operator (>= 3 nodes).
+        # §20.7: keep the ε columns [centre .. +x edge]. nx is odd, so column
+        # (nx-1)//2 is centred on the plane x = 0; H node j of the half is node
+        # (nx-1)//2 + j of the full grid, at x = (j + 1/2)·dl, and both solves
+        # report it at its ε column centre x = j·dl. The solver folds the x-min
+        # wall about the plane itself (half a cell before node 0); x_symmetry
+        # keeps setting the far wall, as in the full solve.
         half = x_min_symmetry is not None
         c0 = (nx - 1) // 2 if half else 0
-        if half:
-            x_symmetry = "pmc" if x_min_symmetry == "pmc" else "none"
 
         if subpixel and subpixel_method == "tensor":
             eps, tensor = cls._kfj_tensor_rect(
@@ -847,13 +945,15 @@ class VectorModeSolver:
             if half:
                 eps = eps[:, c0:]
                 tensor = tuple(t[:, c0:] for t in tensor)
-            return cls(eps, dl_um, dl_um, wavelength_um,
-                       x_symmetry=x_symmetry, eps_tensor=tensor)
+            return cls(eps, dl_um, dl_um, wlen_um,
+                       x_symmetry=x_symmetry, eps_tensor=tensor,
+                       x_min_symmetry=x_min_symmetry)
         eps = cls._rasterize_rect(
             nx, ny, dl_um, dl_um, cw, ch, ec, ecl, subpixel=subpixel)
         if half:
             eps = eps[:, c0:]
-        return cls(eps, dl_um, dl_um, wavelength_um, x_symmetry=x_symmetry)
+        return cls(eps, dl_um, dl_um, wlen_um, x_symmetry=x_symmetry,
+                   x_min_symmetry=x_min_symmetry)
 
     @staticmethod
     def _rasterize_rect(
@@ -867,7 +967,7 @@ class VectorModeSolver:
         With ``subpixel=False`` this hard-samples (binary core/clad at the cell
         center, the semi-vec convention). With ``subpixel=True`` (default) each
         cell carries the **volume-fraction-averaged** permittivity of the core box
-        it overlaps — `eps = f*eps_core + (1-f)*eps_clad`, `f` the EXACT separable
+        it overlaps, `eps = f*eps_core + (1-f)*eps_clad`, `f` the EXACT separable
         axis-aligned fill fraction (box-cap KFJ §16.2). This removes the staircase
         at the high-contrast walls, so n_eff converges smoothly (the same
         accuracy-vs-resolution win the FDTD engine gets from §16 subpixel)."""
@@ -948,7 +1048,7 @@ class VectorModeSolver:
 
     def _x_centers_um(self, nx: int) -> np.ndarray:
         """In-plane x cell-center coordinates (µm), origin at the cross-section
-        center, +x outward from the bend center — the radial offset the
+        center, +x outward from the bend center, the radial offset the
         curvature map and PML profile are functions of."""
         return (np.arange(nx) - (nx - 1) / 2.0) * self.dl_x_um
 
@@ -976,7 +1076,7 @@ class VectorModeSolver:
         i.e. a **generalized eigenproblem** ``A h = β₀² B h`` with the diagonal
         mass matrix ``B = diag((R/r)²)`` and ``A`` the *ungraded* (physical-ε)
         straight transverse-H operator. The ``(R/r)²`` "centrifugal" weight is the
-        full non-perturbative curvature effect — the dominant term at tight bends,
+        full non-perturbative curvature effect, the dominant term at tight bends,
         where the reported ``n_eff(R)`` rises far faster than ``1/R``.
 
         Returns the per-column ``(R/r)²`` (length ``nx``); all-ones for the
@@ -1023,7 +1123,7 @@ class VectorModeSolver:
         positive-loss metadata for propagation. The PML sits
         *outside* the guided core (the window is cladding-padded), so it does not
         perturb the bound mode while absorbing the leaky/radiated tail. Returns
-        all-ones (real, no stretch) when ``pml_cells == 0`` — the straight,
+        all-ones (real, no stretch) when ``pml_cells == 0``, the straight,
         lossless path."""
         s = np.ones(nx, dtype=complex)
         if pml_cells <= 0:
@@ -1060,7 +1160,7 @@ class VectorModeSolver:
         between the window's min and max), a geometry-free proxy that works for
         the raw-eps solver. Returns a length-``vecs.shape[1]`` array in ``[0, 1]``;
         a well-confined guided mode is ``~0.5–0.9``, a PML-localized or radiation
-        eigenpair ``~0`` — so ranking by this cleanly rejects the spurious modes a
+        eigenpair ``~0``, so ranking by this cleanly rejects the spurious modes a
         leaky/PML spectrum is full of.
 
         The operator's H-field is flattened in (ix, iy) order (``p = ix*ny+iy``),
@@ -1116,7 +1216,7 @@ class VectorModeSolver:
         Index convention: built in **(ix, iy)** order, ``p = ix*ny + iy`` (x outer,
         y inner), on each ε component transposed to ``[ix, iy]``. The four ε
         quadrants around a node (paper Fig. 1: 1=NW, 2=SW, 3=SE, 4=NE) are read
-        from a one-ring edge-replication pad (a cladding ghost ring — exact to the
+        from a one-ring edge-replication pad (a cladding ghost ring, exact to the
         mode's accuracy since the window is cladding-padded). The diagonal
         ``Pxx``/``Pyy`` blocks are 5-point; the off-diagonal ``Pxy``/``Pyx`` carry
         the vectorial coupling, including the 4 anisotropic corner couplings (eqs
@@ -1124,11 +1224,15 @@ class VectorModeSolver:
         eigenvalue is ``b² = (n_eff k0)²``.
 
         Boundary conditions: symmetric/antisymmetric wall folding of the N/S/E/W
-        coefficients — the default (PEC-like) electric walls use ``Hx`` tangential
+        coefficients, the default (PEC-like) electric walls use ``Hx`` tangential
         → symmetric on the y-walls / antisymmetric on the x-walls and vice-versa
         for ``Hy``; ``x_symmetry == "pmc"`` swaps the x-wall parity so the lowest
-        mode is x-uniform (``kx = 0``) — the 1-D slab limit. The corner couplings
+        mode is x-uniform (``kx = 0``), the 1-D slab limit. The corner couplings
         vanish in the cladding ring at the walls, so they need no folding.
+        These edge folds mirror about the wall node (``H[-1] = ±H[+1]``). An
+        ``x_min_symmetry`` plane instead mirrors about the centre of ε column 0,
+        half a cell before node 0 (``H[-1] = ±H[0]``), and folds the corner
+        couplings as well (NUMERICS.md §20.7).
         """
         # Work in (ix, iy) ordering: transpose each ε component to [ix, iy].
         nx, ny = self.eps.T.shape
@@ -1210,15 +1314,35 @@ class VectorModeSolver:
         sgn_x = +1.0 if self.x_symmetry == "pmc" else -1.0
         sgn_y = +1.0
         # Hx (Pxx,Pyx) symmetric on the same-parity wall, Hy (Pyy,Pxy) the mirror.
-        for (wall, dirA, dirB, sgn) in (
-                (ii[:, -1], "N", "S", sgn_y),    # NORTH wall: fold N onto S
-                (ii[:, 0], "S", "N", sgn_y),     # SOUTH wall: fold S onto N
-                (ii[-1, :], "E", "W", sgn_x),    # EAST  wall: fold E onto W
-                (ii[0, :], "W", "E", sgn_x)):    # WEST  wall: fold W onto E
+        folds = [
+            (ii[:, -1], "N", "S", sgn_y),    # NORTH wall: fold N onto S
+            (ii[:, 0], "S", "N", sgn_y),     # SOUTH wall: fold S onto N
+            (ii[-1, :], "E", "W", sgn_x),    # EAST  wall: fold E onto W
+        ]
+        if self.x_min_symmetry is None:
+            folds.append((ii[0, :], "W", "E", sgn_x))   # WEST wall: W onto E
+        for (wall, dirA, dirB, sgn) in folds:
             Pxx[dirB][wall] += sgn * Pxx[dirA][wall]
             Pyx[dirB][wall] += sgn * Pyx[dirA][wall]
             Pyy[dirB][wall] -= sgn * Pyy[dirA][wall]
             Pxy[dirB][wall] -= sgn * Pxy[dirA][wall]
+        if self.x_min_symmetry is not None:
+            # §20.7 mirror plane through the centre of ε column 0. Node ix sits at
+            # the corner x = (ix + 1/2)·dl, so the plane lies half a cell before
+            # node 0 and the ghost column -1 is the image of column 0 itself:
+            # H[-1] = ±H[0], not the ±H[+1] of the edge-node folds above. The
+            # W / NW / SW couplings therefore land on P / N / S. Unlike a
+            # cladding wall, the plane crosses the core, where the Pxy/Pyx corner
+            # couplings are nonzero, so they fold too. This runs after the N/S
+            # folds, so a corner node drops the same out-of-range couplings the
+            # full grid drops. "pec" = Hx odd, Hy even; "pmc" the reverse.
+            sgn_m = +1.0 if self.x_min_symmetry == "pmc" else -1.0
+            wall = ii[0, :]
+            for blk, sgn in ((Pxx, sgn_m), (Pyx, sgn_m),
+                             (Pyy, -sgn_m), (Pxy, -sgn_m)):
+                blk["P"][wall] += sgn * blk["W"][wall]
+                blk["N"][wall] += sgn * blk["NW"][wall]
+                blk["S"][wall] += sgn * blk["SW"][wall]
 
         # ----- 9-point sparse assembly -----
         # neighbor (row-subset, col-subset) index pairs in the (ix, iy) grid.
@@ -1308,7 +1432,7 @@ class VectorModeSolver:
             ``num_pml == 0`` falls back to a sensible default thickness.
         pml_strength:
             PML conductivity scale ``σ_max/k0`` (dimensionless); the polynomial
-            profile peaks at the wall. Default ``30.0`` — strong enough to absorb
+            profile peaks at the wall. Default ``30.0``, strong enough to absorb
             the bend radiation in a handful of cells.
 
         Returns
@@ -1325,7 +1449,7 @@ class VectorModeSolver:
         **Large-radius spurious-gain trap.** For a wide bend the field is nearly
         bound and its evanescent tail barely reaches the PML; finite PML absorption
         of that tail can flip the engine-metadata loss sign (nonphysical *gain*,
-        ``k_eff < 0``) or spawn PML-localized spurious modes — the documented
+        ``k_eff < 0``) or spawn PML-localized spurious modes, the documented
         radiation caveat
         (window/PML size must grow ~linearly with R). The bend solve guards this in
         two layers: (i) the physical mode is selected by **core confinement**
@@ -1344,6 +1468,12 @@ class VectorModeSolver:
                 "bend_radius_um must be nonzero (use None for a straight guide)")
         if num_pml < 0:
             raise ValueError("num_pml must be >= 0")
+        if self.x_min_symmetry is not None and (
+                bend_radius_um is not None or num_pml > 0):
+            raise ValueError(
+                "x_min_symmetry supports only the straight PML-free solve: a "
+                "bend is not mirror symmetric about the width centre, and the "
+                "x PML would cover the mirror plane")
         ny, nx = self.eps.shape
         if nx * ny > self.MAX_UNKNOWNS:
             raise ValueError(
@@ -1392,18 +1522,9 @@ class VectorModeSolver:
             # dn_eff/dlambda via central difference (lambda step = lam*delta).
             dneff_dlam = (m_hi.n_eff - m_lo.n_eff) / (2.0 * lam * delta)
             n_g = m.n_eff - lam * dneff_dlam
-            out.append(VectorMode(
-                n_eff=m.n_eff, n_group=float(n_g),
-                ex=m.ex, ey=m.ey, ez=m.ez, hx=m.hx, hy=m.hy, hz=m.hz,
-                wavelength_um=m.wavelength_um,
-                dl_x_um=m.dl_x_um, dl_y_um=m.dl_y_um,
-                k_eff=m.k_eff, bend_radius_um=m.bend_radius_um,
-                mode_type=m.mode_type,
-                overlap_weights=m.overlap_weights,
-                physical_mask=m.physical_mask,
-                pml_cells_xy=m.pml_cells_xy,
-                eigen_residual=m.eigen_residual,
-            ))
+            # replace, not a rebuild: a rebuild dropped a half-window mode's
+            # center_offset_um and x_min_symmetry.
+            out.append(replace(m, n_group=float(n_g)))
         return tuple(out)
 
     def solve_eme_basis(
@@ -1423,7 +1544,7 @@ class VectorModeSolver:
         .. warning::
            Radiation/evanescent and PML requests are experimental. Analytic
            spectrum/Maxwell checks pass, but the current high-contrast device
-           basis does not stabilize under nested continuum-shell refinement.
+           basis does not stabilize under nested radiation-mode-group refinement.
            Require independent mesh, window, PML, basis, and FDTD convergence
            before interpreting a result as quantitative radiation loss.
 
@@ -1483,6 +1604,10 @@ class VectorModeSolver:
             pml_x, pml_y = (int(pml_cells_xy[0]), int(pml_cells_xy[1]))
         if pml_x < 0 or pml_y < 0:
             raise ValueError("PML cell counts must be >= 0")
+        if self.x_min_symmetry is not None and pml_x > 0:
+            raise ValueError(
+                "x_min_symmetry: the x PML would cover the mirror plane; use "
+                "the hard-wall box pml_cells_xy=(0, 0)")
         if 2 * pml_x >= nx - 2 or 2 * pml_y >= ny - 2:
             raise ValueError(
                 f"PML ({pml_x}, {pml_y}) leaves too little physical window "
@@ -1902,9 +2027,9 @@ class VectorModeSolver:
 
         Straight, lossless path (``bend_radius_um is None and num_pml == 0``):
         ordinary real eigenproblem (``B`` = identity), near-real ``β²`` band
-        filter, ``k_eff == 0`` — **bit-for-bit** the original solver. Bent path:
+        filter, ``k_eff == 0``, **bit-for-bit** the original solver. Bent path:
         the **generalized** eigenproblem ``A h = β₀² B h`` with the centrifugal
-        mass matrix ``B = diag((R/r)²)`` (:meth:`_mass_matrix`) — the physical
+        mass matrix ``B = diag((R/r)²)`` (:meth:`_mass_matrix`), the physical
         cylindrical treatment (see :meth:`_centrifugal_weight`). The reported
         real ``n_eff`` is the physical bend phase index; when a PML is present
         the positive-loss metadata ``k_eff`` comes from the radiating confined
@@ -2185,12 +2310,22 @@ class VectorModeSolver:
         sx = self._pml_stretch(nx, pml_x, strength_x, k0)
         sy = self._pml_stretch(ny, pml_y, strength_y, k0)
 
+        # §20.7 x-min mirror plane: the ghost column -1 is the image of column 0
+        # (f[-1] = parity * f[0]). "pec" makes Hx odd and Hy, Hz even; the ghost
+        # ε column -1 is column 1, since ε column 0 is centred on the plane.
+        mirror = self.x_min_symmetry is not None
+        parity_hx = +1.0 if self.x_min_symmetry == "pmc" else -1.0
+        parity_ht = -parity_hx                  # Hy and Hz
+
         def derivative(
             f: np.ndarray, spacing: float, stretch: np.ndarray, axis: int,
+            lo_parity: Optional[float] = None,
         ) -> np.ndarray:
             """Differentiate on the same complex coordinate contour as the
             eigen-operator.  Face distances are the arithmetic stretch average;
             a centred denominator is the sum of its two adjacent face distances.
+            ``lo_parity`` replaces the one-sided x-min difference by the centred
+            one against the mirror ghost ``lo_parity * f[:, 0]``.
             """
             face = 0.5 * (stretch[:-1] + stretch[1:]) * spacing
             g = np.zeros_like(f, dtype=complex)
@@ -2199,7 +2334,11 @@ class VectorModeSolver:
                     (f[:, 2:] - f[:, :-2])
                     / (face[:-1] + face[1:])[None, :]
                 )
-                g[:, 0] = (f[:, 1] - f[:, 0]) / face[0]
+                if lo_parity is None:
+                    g[:, 0] = (f[:, 1] - f[:, 0]) / face[0]
+                else:
+                    g[:, 0] = ((f[:, 1] - lo_parity * f[:, 0])
+                               / (stretch[0] * spacing + face[0]))
                 g[:, -1] = (f[:, -1] - f[:, -2]) / face[-1]
             else:
                 g[1:-1, :] = (
@@ -2210,18 +2349,19 @@ class VectorModeSolver:
                 g[-1, :] = (f[-1, :] - f[-2, :]) / face[-1]
             return g
 
-        def ddx(f: np.ndarray) -> np.ndarray:
-            return derivative(f, dx, sx, axis=1)
+        def ddx(f: np.ndarray, parity: float) -> np.ndarray:
+            return derivative(f, dx, sx, axis=1,
+                              lo_parity=parity if mirror else None)
 
         def ddy(f: np.ndarray) -> np.ndarray:
             return derivative(f, dy, sy, axis=0)
 
         # Hz from div(H)=0: dHx/dx + dHy/dy - i*beta*Hz = 0 -> Hz = (-i/beta)(...).
-        hz = (-1j / beta) * (ddx(hx) + ddy(hy))
+        hz = (-1j / beta) * (ddx(hx, parity_hx) + ddy(hy))
 
         curl_x = ddy(hz) + 1j * beta * hy
-        curl_y = -1j * beta * hx - ddx(hz)
-        curl_z = ddx(hy) - ddy(hx)
+        curl_y = -1j * beta * hx - ddx(hz, parity_ht)
+        curl_z = ddx(hy, parity_ht) - ddy(hx)
 
         # Same-grid compatibility bridge for the native FLM vertex/cell
         # staggering (one 3-point pass per tangential axis).  Preserve each
@@ -2235,6 +2375,8 @@ class VectorModeSolver:
         def smooth_x(e: np.ndarray) -> np.ndarray:
             g = e.astype(float).copy()
             g[:, 1:-1] = (e[:, :-2] + e[:, 1:-1] + e[:, 2:]) / 3.0
+            if mirror:
+                g[:, 0] = (e[:, 1] + e[:, 0] + e[:, 1]) / 3.0
             return g
 
         eps_x = smooth_y(self._exx)            # for Ex
@@ -2284,6 +2426,13 @@ class VectorModeSolver:
             overlap_weights = None
             physical_mask = None
 
+        # §20.7 placement: the plane is the x origin of a half window. Its array
+        # centre sits (nx-1)/2 columns past the plane, so the centred ladder
+        # plus this offset reports column j at x = j·dl_x, the coordinate the
+        # full solve reports for the same column.
+        center_offset_um = (
+            (0.5 * (nx - 1) * self.dl_x_um, 0.0) if mirror else None)
+
         return VectorMode(
             n_eff=float(neff_c.real),
             n_group=None,
@@ -2294,11 +2443,13 @@ class VectorModeSolver:
             k_eff=float(neff_c.imag),
             bend_radius_um=(None if bend_radius_um is None
                             else float(bend_radius_um)),
+            center_offset_um=center_offset_um,
             mode_type=mode_type,
             overlap_weights=overlap_weights,
             physical_mask=physical_mask,
             pml_cells_xy=(pml_x, pml_y),
             eigen_residual=eigen_residual,
+            x_min_symmetry=self.x_min_symmetry,
         )
 
     @staticmethod

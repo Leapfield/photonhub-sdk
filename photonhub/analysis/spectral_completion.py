@@ -4,7 +4,7 @@ A high-Q resonator forces a painful trade in FDTD: the spectrum of a
 :class:`~photonhub.components.TimeMonitor` signal is the integral
 :math:`F(f) = \\int_0^T u(t) e^{2\\pi i f t} dt`, and for a cavity whose energy
 decays like :math:`e^{-2\\alpha t}` the integral converges only on the ringdown
-timescale :math:`1/\\alpha = Q/(\\pi f_r)` — so the run length scales with Q,
+timescale :math:`1/\\alpha = Q/(\\pi f_r)`, so the run length scales with Q,
 and a :math:`Q = 10^5` cavity needs ~10\\ :sup:`6` steps of ringdown for a
 spectrum the physics determined long before.
 
@@ -17,7 +17,7 @@ resonator's field is a sum of decaying complex exponentials
     s_k = -\\alpha_k - 2\\pi i f_k, \\quad \\alpha_k > 0,
 
 one term per mode. If the poles :math:`s_k` and amplitudes :math:`c_k` are
-known, the *remainder* of the spectrum integral has a closed form — so a run
+known, the *remainder* of the spectrum integral has a closed form, so a run
 may stop after a few well-resolved ringdown periods and the spectrum can be
 completed analytically instead of stepped to convergence.
 
@@ -28,7 +28,7 @@ wire format):
 1. **Poles** come from :class:`~photonhub.analysis.ResonanceAnalysis` (filter
    diagonalization), fitted on the late, source-free part of the record.
 2. **Amplitudes** are re-fit by linear least squares of the *real* recorded
-   signal against those poles — a deliberately transparent step, so the model
+   signal against those poles, a deliberately transparent step, so the model
    the acceptance gate validates is bit-for-bit the model the tail uses.
 3. **The tail is a geometric series, not an integral.** The engine's §12
    running DFT is a rectangle-rule sum over samples spaced :math:`\\Delta`;
@@ -48,15 +48,14 @@ wire format):
 4. **A held-out window decides whether to believe any of it.** The model is
    fitted on the last segment of the record only, then extrapolated
    *backward* over an earlier, fully held-out window and compared against
-   what was actually recorded there. Backward is the stringent direction —
-   amplitudes grow, so an over-fitted decay rate or a missed mode is
+   what was actually recorded there. Backward is the stringent direction, amplitudes grow, so an over-fitted decay rate or a missed mode is
    amplified rather than buried. Only if the relative residual on that
    window is below ``residual_tol`` is the tail added; otherwise the
    truncated spectrum is returned unchanged (with ``accepted = 0`` and a
    warning), or an exception is raised under ``strict=True``. Completion is
    an accelerator with a correctness gate, never a guess.
 
-What this is NOT (v1 scope): it completes *point-probe* spectra — Q
+What this is NOT (v1 scope): it completes *point-probe* spectra, Q
 extraction, mode lineshapes, local spectra. Completing a plane monitor
 (flux/port transmission) needs per-cell amplitudes for every cell of the
 plane, which requires late-window plane sampling or engine support; that is
@@ -114,12 +113,12 @@ class SpectrumCompleter:
     Parameters
     ----------
     freq_window : (float, float)
-        Frequency band (Hz) searched for resonant poles — passed to
+        Frequency band (Hz) searched for resonant poles, passed to
         :class:`ResonanceAnalysis`. Should generously cover the band of
         ``freqs`` you will complete.
     fit_start : float, optional
         Absolute time (seconds, on the record's own time axis) where the
-        pure-ringdown model becomes valid — i.e. after every source has
+        pure-ringdown model becomes valid, i.e. after every source has
         switched off. Defaults to the midpoint of the record; setting it
         explicitly to just after your source's end is always better.
     holdout_fraction : float, default 0.25
@@ -138,7 +137,7 @@ class SpectrumCompleter:
         constants across the fit segment (``alpha * span >= this``). The
         tail is an extrapolation of the fitted decay RATE; a record over
         which a mode's amplitude changes by under ~10% has not measured that
-        rate, it has assumed it — the limiting case being a pure sinusoid,
+        rate, it has assumed it, the limiting case being a pure sinusoid,
         whose fitted ``alpha`` is numerical noise and whose "tail" would be
         a near-divergent spike the holdout gate cannot catch (the model fits
         the held-out window perfectly).
@@ -147,7 +146,11 @@ class SpectrumCompleter:
         of warning and returning the truncated spectrum.
     resonance_analysis : ResonanceAnalysis, optional
         Pre-configured pole finder; by default one is built from
-        ``freq_window`` with its default basis size.
+        ``freq_window`` with its default basis size and ``rcond=1e-4``. The
+        completer keeps that former default: at ``ResonanceAnalysis``'s
+        current ``1e-8``, heavily damped spurious poles clear
+        ``min_amplitude_rel`` on noisy records, and extrapolated back over
+        the holdout they reject records the former cutoff accepted.
     """
 
     def __init__(
@@ -183,7 +186,8 @@ class SpectrumCompleter:
         self.min_amplitude_rel = float(min_amplitude_rel)
         self.min_decay_resolved = float(min_decay_resolved)
         self.strict = bool(strict)
-        self._rf = resonance_analysis or ResonanceAnalysis(freq_window=freq_window)
+        self._rf = resonance_analysis or ResonanceAnalysis(
+            freq_window=freq_window, rcond=1e-4)
 
     # -- public entry points -------------------------------------------------
 
@@ -232,7 +236,7 @@ class SpectrumCompleter:
         xarray.Dataset
             ``spectrum`` (complex, completed), ``truncated`` (complex, the
             recorded-samples-only DFT), ``tail`` (complex, the analytic
-            remainder actually added — zero when rejected), each over
+            remainder actually added, zero when rejected), each over
             ``freq``; per-mode diagnostics ``mode_freq`` / ``mode_decay`` /
             ``mode_q`` over ``mode``; and attrs ``accepted`` (1/0),
             ``holdout_residual``, ``residual_tol``, ``fit_start``,
@@ -414,7 +418,7 @@ def _rectangle_dft(u: np.ndarray, t: np.ndarray, delta: float,
                    freqs: np.ndarray) -> np.ndarray:
     """§12-style rectangle-rule DFT over the recorded samples.
 
-    ``F(f) = delta * sum_n u(t_n) e^{+2 pi i f t_n}`` — the e^{+i w t} phasor
+    ``F(f) = delta * sum_n u(t_n) e^{+2 pi i f t_n}``, the e^{+i w t} phasor
     convention of the engine's running DFT, evaluated at the record's own
     sample times. Chunked over frequencies to bound the outer-product memory.
     """
@@ -430,7 +434,7 @@ def _lls_amplitudes(u: np.ndarray, t: np.ndarray, poles: np.ndarray,
     """Complex amplitudes ``c_k`` minimizing ``|u - Re sum c_k e^{s_k (t-tr)}|``.
 
     Linear in (Re c, Im c): with ``E = e^{s_k (t - t_ref)}``,
-    ``Re[c E] = Re(E) Re(c) - Im(E) Im(c)`` — a real design matrix
+    ``Re[c E] = Re(E) Re(c) - Im(E) Im(c)``, a real design matrix
     ``[Re E | -Im E]`` solved by ``lstsq``.
     """
     e = np.exp(np.outer(t - t_ref, poles))
@@ -464,8 +468,8 @@ def _discrete_tail(poles: np.ndarray, c: np.ndarray, *, t_ref: float,
 
     with ``c'_k = c_k e^{s_k (t_last - t_ref)}`` (the amplitude walked
     forward to the last recorded sample), ``r_k`` from ``s_k`` and ``q_k``
-    from ``conj(s_k)``. Matching the engine's quadrature exactly — a sum,
-    not the continuous integral — means the completed spectrum converges to
+    from ``conj(s_k)``. Matching the engine's quadrature exactly, a sum,
+    not the continuous integral, means the completed spectrum converges to
     the engine's own infinite-run value with no quadrature offset.
     """
     c_at_end = c * np.exp(poles * (t_last - t_ref))

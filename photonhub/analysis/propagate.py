@@ -1,38 +1,39 @@
-"""Angular-spectrum propagation of a recorded DFT plane — the metalens
+"""Angular-spectrum propagation of a recorded DFT plane, the metalens
 focal-spot workflow.
 
 A ``field_dft`` plane recorded on the TRANSMISSION side of a device (in a
 homogeneous region) determines the field everywhere downstream: decompose the
 tangential E into plane waves by FFT, advance each by ``e^{i k_n dz}``
 (evanescent components decay), and reconstruct. This is EXACT for a
-homogeneous half-space — no paraxial or far-field approximation — which is
+homogeneous half-space, no paraxial or far-field approximation, which is
 precisely the metalens question: where does the transmitted field focus, how
 tight is the spot, what is the peak intensity?
 
-* :func:`propagate_plane` — the complex transverse E (plus the
+* :func:`propagate_plane`, the complex transverse E (plus the
   divergence-completed ``E_n``) at one or many ``dz`` offsets;
-* :func:`focal_scan` — sweep ``dz``, return the on-axis / peak intensity
+* :func:`focal_scan`, sweep ``dz``, return the on-axis / peak intensity
   curve, the focal plane, and spot metrics (peak z, FWHM along both axes).
 
 Assumptions: uniform grid over the plane; the field has decayed at the
-window edge (the FFT is periodic — the plane is zero-padded 2x to keep
+window edge (the FFT is periodic, the plane is zero-padded 2x to keep
 wrap-around negligible; a plane clipped mid-beam will show artifacts);
-homogeneous (non-dispersive at each frequency) medium of index ``n`` filling
-the region swept by ``dz``. Yee half-cell offsets of the two tangential E
-components are removed spectrally (exact), so the returned fields are
-node-collocated.
+homogeneous medium of index ``n`` filling the region swept by ``dz`` (in a
+dispersive medium, ``n(f)`` at each recorded frequency). Yee half-cell
+offsets of the two tangential E components are removed spectrally (exact),
+so the returned fields are node-collocated.
 """
 
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
 from ._constants import _TANGENTIAL, C0
-from .diffraction import _CYCLIC, _infer_n_medium, _resolve_monitor
+from .diffraction import _CYCLIC, _resolve_monitor, _resolve_n_medium, _wire_position
 
 __all__ = ["propagate_plane", "focal_scan", "FocalScan", "focal_metrics", "FocalMetrics"]
 
@@ -41,7 +42,7 @@ _AXIS_IDX = {"x": 0, "y": 1, "z": 2}
 
 def _plane_arrays(simulation, data, monitor):
     """(e1, e2, coords1, coords2, freqs, axis, (u1, u2)) with the tangential
-    E arrays shaped (nf, n1, n2) — mirrors analysis.diffraction's extraction."""
+    E arrays shaped (nf, n1, n2), mirrors analysis.diffraction's extraction."""
     mon = _resolve_monitor(simulation, monitor)
     size = mon.size_um
     zero_axes = [i for i, s in enumerate(size) if s == 0.0]
@@ -71,7 +72,10 @@ def _plane_arrays(simulation, data, monitor):
         vals = np.asarray(arr.values)
         return np.transpose(vals[:, 0, :, :], (0, 2, 1))  # (f, n1, n2)
 
-    pos_a = float(np.asarray(da.coords[axis].values).reshape(-1)[0])
+    # the plane's position in the wire frame the medium is sampled in (read
+    # through frame.wire_array); the in-plane coordinates stay as given, as
+    # the results are
+    pos_a = _wire_position(data, mon.name, axis)
     return (plane(comps[0]), plane(comps[1]), p1, p2, freqs, axis, (u1, u2),
             mon, pos_a)
 
@@ -82,14 +86,29 @@ def propagate_plane(
     monitor,
     dz_um,
     *,
-    n_medium: Optional[float] = None,
+    n_medium: Optional[Union[float, np.ndarray]] = None,
     direction: str = "+",
 ) -> Dict[str, np.ndarray]:
     """Reconstruct the node-collocated complex E at offset(s) ``dz_um``
-    downstream (``direction`` '+' = toward +axis) of a recorded plane.
+    downstream of a recorded plane.
+
+    ``direction`` is the way the recorded field travels: ``"+"`` toward
+    +axis, ``"-"`` toward -axis (a reflected or downward beam). ``dz_um`` is
+    measured along that travel direction, so a positive offset is always
+    downstream: the plane at axis coordinate ``a + dz`` for ``"+"`` and
+    ``a - dz`` for ``"-"``, where ``a`` is the recorded plane. A negative
+    offset looks upstream (the propagating part is exact; evanescent parts
+    are only ever damped).
+
+    ``n_medium`` is the index of the region swept (a scalar, or one value per
+    recorded frequency). Default: read from the scene at the plane; in a
+    dispersive (pole) medium that is ``sqrt(Re eps(f))`` per frequency, and
+    the returned ``"n_medium"`` is then that array. ``data`` is a
+    ``RunResult`` or a plain ``name -> DataArray`` mapping (wire frame); the
+    plane's position is read through ``frame.wire_array``.
 
     Returns ``{"e1", "e2", "en", "coords1_um", "coords2_um", "dz_um",
-    "freqs_hz"}`` — each field shaped ``(n_dz, nf, n1, n2)`` with ``e1/e2``
+    "freqs_hz"}``, each field shaped ``(n_dz, nf, n1, n2)`` with ``e1/e2``
     the in-plane components along the plane's cyclic transverse axes and
     ``en`` the normal component completed from ``div E = 0``.
     """
@@ -97,9 +116,8 @@ def propagate_plane(
         raise ValueError(f"direction must be '+' or '-', got {direction!r}")
     (e1_r, e2_r, p1, p2, freqs, axis, (u1, u2), mon,
      pos_a) = _plane_arrays(simulation, data, monitor)
-    if n_medium is None:
-        n_medium = _infer_n_medium(simulation, axis, pos_a)
-    n_medium = float(n_medium)
+    n_f, n_report = _resolve_n_medium(simulation, axis, pos_a, freqs,
+                                      n_medium)
 
     d1 = float(p1[1] - p1[0])
     d2 = float(p2[1] - p2[0])
@@ -118,7 +136,7 @@ def propagate_plane(
     out2 = np.empty_like(out1)
     outn = np.empty_like(out1)
     for fi, f in enumerate(freqs):
-        k = 2.0 * math.pi * n_medium * f / C0 * 1e-6  # rad/um
+        k = 2.0 * math.pi * n_f[fi] * f / C0 * 1e-6  # rad/um
         kn2 = k * k - (K1 * K1 + K2 * K2)
         kn = np.sqrt(kn2.astype(np.complex128))
         kn = np.where(kn.real < 0, -kn, kn)
@@ -138,12 +156,14 @@ def propagate_plane(
             Sn = np.where(np.abs(kn) > 1e-12 * k,
                           -(K1 * S1 + K2 * S2) / (sgn * kn), 0.0)
         for zi, z in enumerate(dz):
-            # propagating: phase advance along the travel direction;
-            # evanescent: ALWAYS decay with |dz| (the inverse — exponential
-            # re-amplification — is ill-posed and would explode numerical
-            # noise; this is the standard band-limited angular spectrum)
-            ph = np.exp(1j * sgn * kn.real * z) * \
-                np.exp(-np.abs(kn.imag) * abs(z))
+            # propagating: phase advance along the travel direction. A wave
+            # toward sgn*axis is e^{i sgn kn x_a}; at x_a = a + sgn*dz that is
+            # e^{i kn dz} for either direction, so dz > 0 is downstream both
+            # ways. Evanescent: ALWAYS decay with |dz| (the inverse —
+            # exponential re-amplification — is ill-posed and would explode
+            # numerical noise; this is the standard band-limited angular
+            # spectrum)
+            ph = np.exp(1j * kn.real * z) * np.exp(-np.abs(kn.imag) * abs(z))
             out1[zi, fi] = np.fft.ifft2(S1 * ph)[:n1, :n2]
             out2[zi, fi] = np.fft.ifft2(S2 * ph)[:n1, :n2]
             outn[zi, fi] = np.fft.ifft2(Sn * ph)[:n1, :n2]
@@ -152,7 +172,7 @@ def propagate_plane(
         "e1": out1, "e2": out2, "en": outn,
         "coords1_um": p1.copy(), "coords2_um": p2.copy(),
         "dz_um": dz.copy(), "freqs_hz": freqs.copy(),
-        "axes": (u1, u2), "n_medium": n_medium,
+        "axes": (u1, u2), "n_medium": n_report,
     }
 
 
@@ -171,10 +191,14 @@ class FocalScan:
 
     @property
     def peak_intensity_per_z(self) -> np.ndarray:
+        """Maximum intensity across each sampled transverse plane."""
         return self.intensity.reshape(self.dz_um.size, -1).max(axis=1)
 
     @property
     def peak_dz_um(self) -> float:
+        """Propagation offset in microns with the largest sampled intensity.
+
+        If peaks tie, return the first offset in scan order."""
         return float(self.dz_um[int(np.argmax(self.peak_intensity_per_z))])
 
     def focal_plane(self) -> np.ndarray:
@@ -216,13 +240,15 @@ def focal_scan(
     *,
     dz_um,
     freq_hz: Optional[float] = None,
-    n_medium: Optional[float] = None,
+    n_medium: Optional[Union[float, np.ndarray]] = None,
     direction: str = "+",
 ) -> FocalScan:
     """Sweep ``dz_um`` downstream of a recorded plane and return the
     intensity volume + spot metrics for ONE recorded frequency (``freq_hz``
     defaults to the monitor's single frequency; required when it records
-    several)."""
+    several). ``n_medium`` and ``direction`` are as in
+    :func:`propagate_plane`; ``FocalScan.n_medium`` is the index at
+    ``freq_hz``."""
     (e1_r, _e2, _p1, _p2, freqs, _axis, _axes, mon,
      _pos) = _plane_arrays(simulation, data, monitor)
     if freq_hz is None:
@@ -238,13 +264,15 @@ def focal_scan(
 
     res = propagate_plane(simulation, data, monitor, dz_um,
                           n_medium=n_medium, direction=direction)
+    n_scan = res["n_medium"]
+    n_scan = float(n_scan[fi]) if np.ndim(n_scan) else float(n_scan)
     sub = slice(fi, fi + 1)
     inten = (np.abs(res["e1"][:, sub]) ** 2 + np.abs(res["e2"][:, sub]) ** 2
              + np.abs(res["en"][:, sub]) ** 2)[:, 0]
     return FocalScan(
         dz_um=res["dz_um"], coords1_um=res["coords1_um"],
         coords2_um=res["coords2_um"], intensity=inten,
-        freq_hz=float(freqs[fi]), n_medium=res["n_medium"])
+        freq_hz=float(freqs[fi]), n_medium=n_scan)
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +371,7 @@ def _gaussian_fwhm(sz, p1, p2, half_win_um=2.5):
 
     fx_lin, fy_lin = linear(sz[:, j0], p1), linear(sz[i0, :], p2)
     try:
-        from scipy.optimize import curve_fit
+        from scipy.optimize import OptimizeWarning, curve_fit
         mx = np.abs(p1 - x0) <= half_win_um
         my = np.abs(p2 - y0) <= half_win_um
         X, Y = np.meshgrid(p1[mx], p2[my], indexing="ij")
@@ -353,8 +381,12 @@ def _gaussian_fwhm(sz, p1, p2, half_win_um=2.5):
             xx, yy = xy
             return A * np.exp(-((xx - xc) ** 2) / (2 * sx ** 2) - ((yy - yc) ** 2) / (2 * sy ** 2))
 
-        popt, _ = curve_fit(g, (X.ravel(), Y.ravel()), Z.ravel(),
-                            p0=(float(Z.max()), x0, y0, fx_lin / 2.3548, fy_lin / 2.3548), maxfev=20000)
+        with warnings.catch_warnings():
+            # only the best parameters are read; a covariance scipy cannot
+            # estimate is discarded, so its warning is noise to the caller
+            warnings.simplefilter("ignore", OptimizeWarning)
+            popt, _ = curve_fit(g, (X.ravel(), Y.ravel()), Z.ravel(),
+                                p0=(float(Z.max()), x0, y0, fx_lin / 2.3548, fy_lin / 2.3548), maxfev=20000)
         c = 2.0 * math.sqrt(2.0 * math.log(2.0))
         return (float(popt[1]), float(popt[2]), c * abs(float(popt[3])), c * abs(float(popt[4])),
                 "gaussian", i0, j0)
@@ -370,7 +402,7 @@ def focal_metrics(
     dz_um,
     incident_power: float,
     freq_hz: float | None = None,
-    n_medium: float | None = None,
+    n_medium: float | np.ndarray | None = None,
     aperture_fwhm: float = 3.0,
     disc_radius_um: float | None = None,
     center_um: tuple[float, float] | None = None,
@@ -385,12 +417,15 @@ def focal_metrics(
     focus is the plane of peak ``S_z`` over ``dz_um`` (then refined within
     ``refine_um``), the FWHM is a 2-D Gaussian fit to ``S_z`` there, and the
     focusing efficiency is the power through a circular aperture of radius
-    ``aperture_fwhm`` x FWHM around the peak over ``incident_power`` — the
+    ``aperture_fwhm`` x FWHM around the peak over ``incident_power``, the
     definitions used by the metalens literature. ``transmission`` is the
     power through a disc of ``disc_radius_um`` about ``center_um`` at the
     recorded plane over ``incident_power`` (the lens's own transmission).
     ``incident_power`` must be read in the same units, e.g. the forward power
-    of an input plane from :func:`~photonhub.analysis.diffraction_orders`."""
+    of an input plane from :func:`~photonhub.analysis.diffraction_orders`.
+    ``n_medium`` defaults to the scene's index at the plane at ``freq_hz``
+    (``sqrt(Re eps(f))`` in a dispersive medium), as in
+    :func:`propagate_plane`."""
     (e1_r, e2_r, p1, p2, freqs, axis, (_u1, _u2), mon,
      pos_a) = _plane_arrays(simulation, data, monitor)
     if freq_hz is None:
@@ -398,9 +433,7 @@ def focal_metrics(
             raise ValueError(f"monitor {mon.name!r} records {freqs.size} frequencies — pass freq_hz")
         freq_hz = float(freqs[0])
     fi = int(np.argmin(np.abs(freqs - float(freq_hz))))
-    if n_medium is None:
-        n_medium = _infer_n_medium(simulation, axis, pos_a)
-    n = float(n_medium)
+    n = float(_resolve_n_medium(simulation, axis, pos_a, freqs, n_medium)[0][fi])
     k = 2.0 * math.pi * n * freqs[fi] / C0 * 1e-6
     spec = _Spectrum(e1_r[fi], e2_r[fi], p1, p2, k)
     if center_um is None:

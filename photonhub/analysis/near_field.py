@@ -1,4 +1,4 @@
-"""Near-to-far-field (NTFF) projection — a recorded near-field surface -> the
+"""Near-to-far-field (NTFF) projection, a recorded near-field surface -> the
 far-zone radiation pattern, via the surface-equivalence theorem.
 
 This is a pure-host post-processor (no engine / C++ change). Given the
@@ -72,7 +72,7 @@ of the dropped prefactor.
 **Area element.** ``dS`` is taken from each face's *real* transverse coordinate
 spacings (centered-difference cell widths, reusing
 :func:`~photonhub.analysis.mode_overlap._cell_widths`), so graded / non-uniform
-meshes integrate correctly — no uniform-spacing assumption.
+meshes integrate correctly, no uniform-spacing assumption.
 
 **Yee staggering.** The engine's DFT monitor records each tangential component
 at its own Yee node, so the raw plane's E and H are staggered by half a cell
@@ -86,7 +86,7 @@ fixes the TRANSVERSE part by averaging each component to the in-plane cell node
 half-cell E/H stagger is NOT corrected: the recorded plane carries a single
 normal coordinate and no grid spacing, and the SIGN of the offset depends on
 how the monitor plane was snapped (the quarter-cell placement idiom), so the
-referral is not inferrable from the DataArray alone — a trial correction made
+referral is not inferrable from the DataArray alone, a trial correction made
 a real dipole box's pattern asymmetry WORSE monotonically in the assumed
 direction. A remaining O(k dl/2) phase on
 the ``N`` vs ``L`` balance persists (cf. the longitudinal de-stagger
@@ -109,6 +109,7 @@ from typing import Dict, Literal, Mapping, Optional, Sequence, Tuple, Union
 import numpy as np
 import xarray as xr
 
+from ..components import frame as _frame
 from ._constants import _TANGENTIAL, C0, ETA0  # noqa: F401  (C0/ETA0 re-exported)
 from .mode_overlap import _TRANSVERSE, _cell_widths, _colocate_to_node
 
@@ -174,7 +175,7 @@ class FarField:
 
     def directivity(self) -> np.ndarray:
         """Directivity ``D = 4 pi U / P_rad`` (dimensionless), shape
-        ``(n_freq, n_dir)`` — the radiation pattern normalized so its
+        ``(n_freq, n_dir)``, the radiation pattern normalized so its
         solid-angle average is 1 (for an isotropic radiator D==1 everywhere)."""
         p = self.radiated_power()
         p = np.where(p > 0, p, np.nan)
@@ -307,7 +308,7 @@ def equivalent_currents(
     ``sign`` is the orientation of the outward normal relative to ``+axis``
     (``+1`` for an outward normal along ``+axis``, ``-1`` along ``-axis``).
     ``colocate`` (default on) averages each Yee-staggered component to the
-    in-plane cell node before forming ``J``/``M`` — correct for the engine's
+    in-plane cell node before forming ``J``/``M``, correct for the engine's
     staggered DFT output; pass ``False`` for synthetic already-co-located
     fields (see the module docstring's "Yee staggering").
     Returns a dict with the three Cartesian components of ``J`` and ``M`` (keys
@@ -364,7 +365,7 @@ def _cell_widths_clipped(coords: np.ndarray,
     """Per-sample quadrature widths, optionally CLIPPED to a span.
 
     The plain :func:`_cell_widths` midpoint rule extends a half-cell past each
-    end sample — right for an open aperture, wrong for one face of a CLOSED
+    end sample, right for an open aperture, wrong for one face of a CLOSED
     box: each face then over-covers its span by a full cell per axis and
     double-counts the edge strips its neighbouring faces already integrate
     (measured +5-17% radiated power on the analytic-dipole box, F11). Clamping
@@ -400,9 +401,9 @@ def _project_one_face(
     for a set of direction cosines ``(rx,ry,rz)`` (each a flat ``(n_dir,)``
     array). ``k`` is the free-space wavenumber (1/m).
 
-    Computes ``N = integral J exp(-i k r_hat.r') dS`` (and ``L`` from ``M``) —
+    Computes ``N = integral J exp(-i k r_hat.r') dS`` (and ``L`` from ``M``) ,
     the MINUS-sign kernel of the ``e^{-i omega t}`` convention, matching the
-    code below and the module docstring — by forming the kernel on the face's
+    code below and the module docstring, by forming the kernel on the face's
     grid (coords in µm -> m) and summing with the centered-difference
     cell-area quadrature."""
     t1 = currents["t1"]
@@ -566,7 +567,7 @@ def far_field(
 
     Single-plane (default) or closed-box projection of the tangential ``E``/``H``
     recorded by a ``ProfileMonitor`` (``data[monitor_name]``), via the
-    surface-equivalence currents ``J = n_hat x H``, ``M = -n_hat x E`` and the
+    surface-source currents ``J = n_hat x H``, ``M = -n_hat x E`` and the
     radiation integral (see the module docstring). Returns a :class:`FarField`
     with ``E_theta``/``E_phi`` (far-field amplitudes), from which intensity,
     radiated power and directivity follow.
@@ -602,8 +603,7 @@ def far_field(
         ``sign`` are ignored. Each named monitor must be in ``data``.
     colocate:
         Average each Yee-staggered tangential component to the in-plane cell
-        node before forming the equivalence currents (default ``True`` —
-        correct for the engine's staggered DFT output, mirroring the mode
+        node before forming the source currents (default ``True``, correct for the engine's staggered DFT output, mirroring the mode
         readout's convention). Pass ``False`` for synthetic already-co-located
         fields. See the module docstring's "Yee staggering" for what remains
         uncorrected (the normal-axis E/H half-cell stagger).
@@ -623,9 +623,9 @@ def far_field(
     """
     # Assemble the list of (DataArray, axis, sign) faces.
     if faces is not None:
-        face_specs = [(data[name], ax, float(sg)) for name, ax, sg in faces]
+        face_specs = [(_frame.wire_array(data, name), ax, float(sg)) for name, ax, sg in faces]
     else:
-        da = data[monitor_name]
+        da = _frame.wire_array(data, monitor_name)
         if axis is None:
             axis = _infer_normal_axis(da)
         face_specs = [(da, axis, float(sign))]

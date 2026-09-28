@@ -6,16 +6,20 @@ packs that directory into one ``.h5`` so Phase-0/1a golden outputs survive
 into HDF5 without an engine rebuild. The engine-native HighFive writer is
 deferred to the Linux GPU box where libhdf5 is a package install.
 
-Layout — deliberately "the output directory in one file":
+Layout, deliberately "the output directory in one file":
 
     /                       attrs: format, manifest_version, manifest_json
     /monitors/<name>        dataset: the monitor's raw float32 array (== .bin),
                             flat, little-endian; gzip-compressed when non-empty
+    /sim_json               dataset: the ``sim.json`` beside the outputs, if any
+    /client_json            dataset: the ``client.json`` beside it, if any (the
+                            client state the wire does not carry: see
+                            :mod:`photonhub.components.frame`)
 
 Everything else (run/grid/provenance metadata, monitor shapes/dims/coords,
 the section-12 complex64 reconstruction and normalization) is carried by the
 embedded ``manifest_json`` and rebuilt by :class:`photonhub.data.RunResult`
-using the exact same code path as the raw directory — so an HDF5 load is
+using the exact same code path as the raw directory, so an HDF5 load is
 bit-identical to a raw-directory load, by construction.
 
     from photonhub import convert_to_hdf5
@@ -35,6 +39,7 @@ from typing import Union
 import numpy as np
 
 from .data import (
+    RunResult,
     validate_monitor_manifest_entry,
     validate_result_manifest_contract,
 )
@@ -214,6 +219,29 @@ def convert_to_hdf5(src: Union[str, Path],
                     f.attrs["manifest_version"] = str(
                         manifest.get("manifest_version", "1"))
                     f.attrs["manifest_json"] = json.dumps(manifest)
+                    # The simulation the runners write beside the outputs
+                    # travels with the bundle (a variable-length string
+                    # DATASET: a Huygens-sheet sim.json runs to megabytes,
+                    # past the HDF5 attribute limit), so RunResult can restore
+                    # the first source's amplitude on frequency-domain
+                    # arrays and read ports exactly as from the directory.
+                    spec_path = out_dir / "sim.json"
+                    if spec_path.is_file():
+                        f.create_dataset(
+                            "sim_json",
+                            data=spec_path.read_text(encoding="utf-8"),
+                            dtype=h5py.string_dtype("utf-8"))
+                        # and its client state (a fitted domain's origin, the
+                        # symmetry-plane record, declared ports), found where
+                        # RunResult finds it (beside sim.json, or the cloud
+                        # client's record for a job's cache directory), so the
+                        # bundle reads in the frame the run returned
+                        state_path = RunResult._client_state_path(spec_path)
+                        if state_path is not None:
+                            f.create_dataset(
+                                "client_json",
+                                data=state_path.read_text(encoding="utf-8"),
+                                dtype=h5py.string_dtype("utf-8"))
                     monitor_group = f.create_group("monitors")
                     for entry, source, signature, path, expected in opened:
                         name = entry["name"]

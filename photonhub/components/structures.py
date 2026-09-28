@@ -1,15 +1,17 @@
 """Geometry/material structures (NUMERICS.md sections 9-10).
 
-``structures`` is an ordered list; materials are rasterized per E component
+``structures`` is an ordered list; materials are sampled on the mesh per E component
 at that component's own Yee point and the LAST structure containing the
-point wins (containment is closed). Geometries may extend beyond the domain
-— only the part inside the grid matters — so no domain check applies here.
+point wins (containment is closed). Geometries may extend beyond the domain, only the part inside the grid matters, so no domain check applies here.
 """
 
 import math
-from typing import Annotated, Literal, Optional, Tuple, Union
+from typing import Annotated, Any, Literal, Optional, Tuple, Union
 
-from pydantic import Field, field_validator, model_validator
+import warnings
+
+from pydantic import AliasChoices, Field, PlainValidator, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from .base import AxisName, FrozenModel, NonNegativeUm, PositiveUm, Vec3Um
 
@@ -34,9 +36,12 @@ class LorentzPole(FrozenModel):
     combined across ``lorentz``/``poles``/``drude``.
 
     Passivity (Im eps >= 0 for omega > 0) requires delta_eps >= 0 and
-    gamma >= 0; the engine validates these. ``gamma = 0`` is a lossless
-    (undamped) resonance — allowed, but the timestep must stay clear of the
-    resonance for stability (NUMERICS.md §19 omega0*dt/2 < 1)."""
+    gamma >= 0; the engine validates these. ``gamma = 0`` (a lossless,
+    undamped resonance) is allowed. Stability (NUMERICS.md §19.4) needs
+    omega0*dt < 2 per pole and, over all the medium's poles, the
+    discrete-Nyquist bound eps_inf - sum delta_eps*x/(1-x) - sum
+    (wp*dt/2)^2 >= courant^2 with x = (omega0*dt/2)^2; the engine rejects a
+    spec that fails it and names the largest stable courant."""
 
     resonance_frequency_hz: float = Field(gt=0.0)  # f0 = omega0 / 2pi
     delta_eps: float = Field(ge=0.0)               # oscillator strength
@@ -44,16 +49,19 @@ class LorentzPole(FrozenModel):
 
 
 class DrudePole(FrozenModel):
-    """One Drude (free-carrier) term of a dispersive medium (NUMERICS.md §19)
-    — the metal/plasmonics building block. Under e^{-i omega t} it contributes
+    """One Drude (free-carrier) term of a dispersive medium (NUMERICS.md §19),
+    the metal/plasmonics building block. Under e^{-i omega t} it contributes
 
         chi(omega) = -wp^2 / (omega^2 + i*gamma*omega)
 
     with wp = 2*pi*plasma_frequency_hz and gamma = 2*pi*linewidth_hz (the
     collision rate; 0 = collisionless plasma). Below the plasma frequency the
-    real permittivity goes strongly NEGATIVE — the medium reflects like a
+    real permittivity goes strongly NEGATIVE, and the medium reflects like a
     metal. The engine realizes it as the omega0 = 0 ADE pole with strength
-    wp^2 (no resonance-Nyquist bound applies)."""
+    wp^2. It lowers the medium's permittivity at the time-step Nyquist by
+    (wp*dt/2)^2, so a metal fit with eps_inf near 1 needs a fine grid or a
+    low courant (NUMERICS.md §19.4; the engine rejects a spec that fails the
+    bound and names the largest stable courant)."""
 
     plasma_frequency_hz: float = Field(gt=0.0)        # wp / 2pi
     linewidth_hz: float = Field(default=0.0, ge=0.0)  # gamma / 2pi
@@ -65,7 +73,9 @@ class PermittivityArray(FrozenModel):
     the flat C-order (x-major) array of nx*ny*nz node values, each >= 1.
     Node [0, 0, 0] sits ON the structure box's low corner and
     [nx-1, ny-1, nz-1] on the high corner; the engine trilinear-interpolates
-    at its §9 Yee sample points. Prefer :meth:`Medium.from_eps_array`."""
+    at its §9 Yee sample points. Prefer :meth:`Medium.from_eps_array`.
+    CPU solver only in this release: a GPU run carrying custom media is
+    refused before it starts."""
 
     shape: Tuple[int, int, int]
     values: Tuple[float, ...] = Field(min_length=8, repr=False)
@@ -98,7 +108,7 @@ class PermittivityArray(FrozenModel):
 class Medium(FrozenModel):
     """Isotropic nonmagnetic medium: scalar relative permittivity plus an
     electric conductivity entering the lossy Ca/Cb update (NUMERICS.md
-    section 10). ``sigma = 0`` reproduces the Phase-0 update bit-exactly.
+    section 10). ``sigma = 0`` gives the lossless update.
 
     A non-dispersive medium leaves ``lorentz``/``poles``/``drude`` unset and
     the fields are omitted from the wire entirely (back-compat: schema < 1.9
@@ -106,8 +116,7 @@ class Medium(FrozenModel):
     poles supplied, ``permittivity`` is the high-frequency limit eps_inf
     (NUMERICS.md §19) and the medium is dispersive (the ADE polarization
     update engages only in cells carrying poles). The engine consumes the
-    poles in WIRE ORDER — ``lorentz`` first, then ``poles``, then ``drude`` —
-    up to ``MAX_ADE_POLES`` combined."""
+    poles in WIRE ORDER, ``lorentz`` first, then ``poles``, then ``drude``, up to ``MAX_ADE_POLES`` combined."""
 
     permittivity: float = Field(ge=1.0)
     conductivity_s_per_m: float = Field(default=0.0, ge=0.0)
@@ -177,10 +186,12 @@ class Medium(FrozenModel):
 
     @property
     def is_anisotropic(self) -> bool:
+        """True when diagonal ``permittivity_xyz`` is supplied."""
         return self.permittivity_xyz is not None
 
     @property
     def is_custom(self) -> bool:
+        """True when a node-based ``permittivity_data`` grid is supplied."""
         return self.permittivity_data is not None
 
     @classmethod
@@ -250,7 +261,7 @@ class Medium(FrozenModel):
 
     def permittivity_at_hz(self, freq_hz: float) -> float:
         """Real relative permittivity ``Re eps(omega)`` at ``freq_hz`` under
-        the §19 pole model — for a non-dispersive medium this is just
+        the §19 pole model, for a non-dispersive medium this is just
         ``permittivity``; with poles, ``permittivity`` alone is only the
         high-frequency limit eps_inf and is the WRONG value to hand a mode
         solver or any other frequency-anchored consumer (a Si pole fit reads
@@ -302,7 +313,7 @@ class Cylinder(FrozenModel):
     ring/cylinder (no angular test). A 90-degree waveguide bend is an annulus
     with a 90-degree sweep. The curved sidewall is exact (faceting-free).
     Angles are in radians, measured by ``atan2(v, u)`` in the transverse
-    (u, v) plane. Hard-sampled in Phase 2 (curved subpixel deferred, §16.6)."""
+    (u, v) plane. Curved subpixel averaging is not supported."""
 
     type: Literal["cylinder"] = "cylinder"
     axis: AxisName
@@ -310,8 +321,31 @@ class Cylinder(FrozenModel):
     radius_um: PositiveUm
     inner_radius_um: NonNegativeUm = 0.0
     length_um: PositiveUm
-    angle_start: float = 0.0
-    angle_stop: float = 2.0 * math.pi
+    # Angles are radians; the wire key stays ``angle_start``/``angle_stop`` and
+    # is listed first so the generated schema keeps it (CONTRIBUTING.md, Names).
+    angle_start_rad: float = Field(
+        default=0.0, validation_alias=AliasChoices("angle_start", "angle_start_rad"),
+        serialization_alias="angle_start")
+    angle_stop_rad: float = Field(
+        default=2.0 * math.pi,
+        validation_alias=AliasChoices("angle_stop", "angle_stop_rad"),
+        serialization_alias="angle_stop")
+
+    @property
+    def angle_start(self) -> float:
+        """Deprecated spelling of :attr:`angle_start_rad`."""
+        warnings.warn("Cylinder.angle_start was renamed to angle_start_rad; the old "
+                      "name will be removed in a future release",
+                      DeprecationWarning, stacklevel=2)
+        return self.angle_start_rad
+
+    @property
+    def angle_stop(self) -> float:
+        """Deprecated spelling of :attr:`angle_stop_rad`."""
+        warnings.warn("Cylinder.angle_stop was renamed to angle_stop_rad; the old "
+                      "name will be removed in a future release",
+                      DeprecationWarning, stacklevel=2)
+        return self.angle_stop_rad
 
     @model_validator(mode="after")
     def _check(self) -> "Cylinder":
@@ -320,11 +354,11 @@ class Cylinder(FrozenModel):
                 f"inner_radius_um ({self.inner_radius_um}) must be < "
                 f"radius_um ({self.radius_um})"
             )
-        sweep = self.angle_stop - self.angle_start
+        sweep = self.angle_stop_rad - self.angle_start_rad
         if not (0.0 < sweep <= 2.0 * math.pi + 1e-9):
             raise ValueError(
-                "angle_stop - angle_start must be in (0, 2*pi], got "
-                f"{sweep} (start={self.angle_start}, stop={self.angle_stop})"
+                "angle_stop_rad - angle_start_rad must be in (0, 2*pi], got "
+                f"{sweep} (start={self.angle_start_rad}, stop={self.angle_stop_rad})"
             )
         return self
 
@@ -335,7 +369,7 @@ class Polygon(FrozenModel):
     in the two transverse axes (u = lower-indexed, v = higher-indexed),
     counter-clockwise. ``sidewall_angle > 0`` (radians) narrows the
     cross-section toward +axis; the given vertices live at ``reference_plane``.
-    Hard-sampled in Phase 2 (curved/polygon subpixel deferred, §16.6)."""
+    Curved and polygon subpixel averaging are not supported."""
 
     type: Literal["polyslab"] = "polyslab"
     axis: AxisName
@@ -363,36 +397,56 @@ GeometryType = Annotated[
 StructureName = Annotated[str, Field(min_length=1)]
 
 
+def is_material(value) -> bool:
+    """True for a materials-library ``Material`` (duck-typed: it has the
+    ``n(wlen_um)`` index and the ``medium(...)`` fit factory)."""
+    return (type(value).__name__ == "Material" and callable(getattr(value, "medium", None))
+            and callable(getattr(value, "n", None)))
+
+
+def _material_entry(value):
+    if is_material(value):
+        return value
+    raise ValueError("nor is it a materials-library entry (ph.materials.<name>)")
+
+
+# A materials-library entry, which the client resolves (a Structure's medium,
+# the Simulation background) and which never reaches the wire or the schema.
+# The only other member of the unions it sits in is the wire model, so a dict
+# or a number is validated as that model (and fails with its errors, beta
+# review INT-05) instead of passing through as an unchecked value.
+MaterialEntry = SkipJsonSchema[Annotated[Any, PlainValidator(_material_entry)]]
+
+
 class Structure(FrozenModel):
     """One geometry filled with one medium; list order is paint order
     (last wins, NUMERICS.md section 9). ``name`` is optional authoring/display
-    metadata and never changes rasterization or paint-order semantics."""
+    metadata and never changes mesh sampling or paint-order semantics."""
 
     geometry: GeometryType
-    medium: Medium
+    # A materials-library entry (``ph.materials.Si``) may stand here on the
+    # client: the Simulation resolves it to the constant index at its band
+    # centre (setup layer phase 5). It never reaches the wire or the schema.
+    medium: Union[Medium, MaterialEntry]
     name: Optional[StructureName] = None
 
     @field_validator("medium", mode="before")
     @classmethod
-    def _medium_not_material(cls, v):
-        # Beta papercuts (duck-typed: materials.py imports Medium from here,
-        # the reverse import would cycle). A fit object (PoleFit/LorentzFit)
-        # carries its engine Medium as a property — coerce it losslessly. A
-        # Material is a fit FACTORY whose .medium needs arguments — pydantic's
-        # generic model_type error gives no way forward, so name the
-        # conversion explicitly.
+    def _medium_or_material(cls, v):
+        # Duck-typed: materials.py imports Medium from here, the reverse import
+        # would cycle. A fit object (PoleFit/LorentzFit) carries its engine
+        # Medium as a property — coerce it losslessly. A Material is a fit
+        # FACTORY whose .medium needs arguments: it is kept as it is for the
+        # Simulation to resolve at its band centre; anything else is a Medium.
         fitted = getattr(v, "medium", None)
         if isinstance(fitted, Medium) and not isinstance(v, Medium):
             return fitted
-        if type(v).__name__ == "Material" and callable(fitted):
-            raise ValueError(
-                f"got the materials-library entry {getattr(v, 'name', v)!r} "
-                "where a Medium is required — pick the fit first: "
-                ".medium(wavelength_um=...) for a constant index at one "
-                "wavelength, or .medium(band_um=(lo, hi)) for a dispersive "
-                "fit over a band (e.g. "
-                "ph.materials.Si.medium(band_um=(1.5, 1.6)))")
-        return v
+        if is_material(v):
+            return v
+        if isinstance(v, Medium) or isinstance(v, dict):
+            return v                       # a dict validates as a Medium, and only as one
+        raise ValueError(
+            f"medium must be a Medium, a fit, or a materials-library entry; got {type(v).__name__}")
 
     @model_validator(mode="after")
     def _custom_medium_needs_box(self) -> "Structure":

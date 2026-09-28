@@ -9,9 +9,9 @@ The calculation unit is one **Tcell-step** = 1e12 cell-updates =
 $0.40/Tcell-step and is overridable.
 
 The cell count, ``dt`` and step count are computed to match the engine's
-``resolve.cpp`` exactly — the round-half-away-from-zero cell rule
+``resolve.cpp`` exactly, the round-half-away-from-zero cell rule
 (:func:`photonhub.components.grid.realized_cells`), the §2 uniform Courant
-limit and the §15.5 graded (per-axis minimum spacing) limit — so the dollar
+limit and the §15.5 graded (per-axis minimum spacing) limit, so the dollar
 figure never drifts from what ``phsolver`` actually runs. It is exact for a
 full-duration run; auto-shutoff (NUMERICS.md §7) can only make a run *cheaper*.
 
@@ -27,13 +27,14 @@ from math import ceil, sqrt
 from typing import TYPE_CHECKING, Optional, Tuple
 
 from .components.grid import graded_primary_spacings, resolved_cell_counts
+from .constants import c0
 
 if TYPE_CHECKING:  # avoid a runtime import cycle (cost <- simulation <- cost)
     from .components.simulation import Simulation
 
 # Speed of light, identical to the engine's kC0 (engine/include/phcore/types.h)
 # so the resolved dt matches bit-for-bit-comparable inputs.
-_C0 = 2.99792458e8  # m/s, exact
+_C0 = c0  # m/s, exact
 
 # Planning-cost unit. One Tcell-step = 1e12 cell-updates.
 TCELL = 1.0e12
@@ -87,6 +88,10 @@ class CostEstimate:
     wall_seconds: float
 
     def summary(self) -> str:
+        """Format the estimated price, grid, memory, output size, and wall time.
+
+        Wall time assumes the full duration and the configured throughput.
+        Auto-shutoff may finish sooner. This method makes no service request."""
         nx, ny, nz = self.cells_per_axis
         return (
             f"cost estimate: ${self.usd:,.2f} "
@@ -119,7 +124,7 @@ def _cells_and_min_spacing_um(sim: "Simulation"):
     """Per-axis (cell count, minimum primary spacing in microns), matching the
     engine: a graded axis has ``len(coords)`` cells (the §15.1 replicate-last
     closing node derives the final cell), a uniform axis has the round-half-away
-    cell count and constant spacing ``dl`` (with the boundary-aware §1 floor —
+    cell count and constant spacing ``dl`` (with the boundary-aware §1 floor ,
     a plain periodic axis may be a single cell)."""
     dl = sim.grid.dl_um
     counts = list(

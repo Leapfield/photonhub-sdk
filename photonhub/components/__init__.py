@@ -5,6 +5,8 @@ These models are the single source of truth for the schema
 them via ``python -m photonhub.schema emit``.
 """
 
+from .authoring import Domain, GaussianBeam, Mesh, Port
+from .mode_window import mode_window_um
 from .base import BoundaryKind, FieldComponentName, FrozenModel
 from .grid import (
     GradedMeshAxis,
@@ -13,6 +15,8 @@ from .grid import (
     MeshOverride,
     UniformMesh,
     auto_mesh,
+    axis_mirror_mismatch,
+    graded_primary_spacings,
 )
 from .medium import Background, Boundaries
 from .monitors import (
@@ -49,8 +53,18 @@ from .structures import (
     Structure,
 )
 
+# ``TFSFBox`` is the public name (CONTRIBUTING.md, Names: acronyms in caps). The
+# class keeps its original ``__name__`` because it keys the generated schema's
+# ``$defs``; the alias is the same object.
+TFSFBox = TfsfBox
+
 __all__ = [
+    "mode_window_um",
     "Background",
+    "Domain",
+    "GaussianBeam",
+    "Mesh",
+    "Port",
     "Boundaries",
     "BoundaryKind",
     "Apodization",
@@ -79,6 +93,7 @@ __all__ = [
     "MonitorType",
     "PlaneWave",
     "TfsfBox",
+    "TFSFBox",
     "PointDipole",
     "PortMode",
     "Polygon",
@@ -91,4 +106,6 @@ __all__ = [
     "Structure",
     "UniformMesh",
     "auto_mesh",
+    "axis_mirror_mismatch",
+    "graded_primary_spacings",
 ]

@@ -17,7 +17,7 @@ read identically::
 
 Local backend: each simulation is an independent :func:`run_local` subprocess
 (GPU-driver-crash isolation; identical local/cloud file protocol). ``max_workers``
-multiplexes the subprocesses — on the cloud this becomes a fan-out across GPUs;
+multiplexes the subprocesses, on the cloud this becomes a fan-out across GPUs;
 locally it defaults to 1 (serial) so a CPU box is not oversubscribed. A failed
 simulation is captured per-name (partial-failure semantics) and never aborts
 the rest of the batch.
@@ -52,12 +52,19 @@ class Job:
 
     def __init__(self, fn: Callable[[], RunResult],
                  name: Optional[str] = None, job_id: Optional[str] = None,
-                 cancel_event: Optional[threading.Event] = None):
+                 cancel_event: Optional[threading.Event] = None,
+                 on_cancel: Optional[Callable[[], Tuple[object, bool]]] = None):
         self.name = name
         # Remote jobs expose the service identifier for cancellation/resume;
         # local jobs leave this as None while retaining the same handle type.
         self.job_id = job_id
         self._cancel_event = cancel_event
+        # How a remote job is stopped where it runs (the cloud path asks the
+        # service); returns (the service's reply, whether it says the job is
+        # stopped). None for a local job, whose cancel_event is enough.
+        self._on_cancel = on_cancel
+        self._cancel_lock = threading.Lock()
+        self._cancel_reply: Optional[object] = None
         self._done = threading.Event()
         self._data: Optional[RunResult] = None
         self._exc: Optional[BaseException] = None
@@ -79,12 +86,39 @@ class Job:
         """True once the run has finished (successfully or not)."""
         return self._done.is_set()
 
-    def cancel(self) -> None:
+    def cancel(self):
         """Ask the solver to stop. No-op when the run has already finished or
         the job was created without a cancel event; a cancelled run raises
-        :class:`SolverRunError` from :meth:`result`."""
+        :class:`SolverRunError` from :meth:`result`.
+
+        A cloud job (``ph.cloud.submit``, ``ph.cloud.resume``) is cancelled by
+        asking the service, which is what stops its spend, and this returns
+        the service's reply. When the reply says the job is cancelled the
+        local wait ends with the same :class:`SolverRunError`; a job that
+        finished just before is still collected. It still reaches the service
+        after :meth:`result` gave up waiting (the job keeps running then),
+        asks only once however often it is called, and does nothing once the
+        result has been returned or the service reported the job finished. A
+        service that refuses raises its ``CloudError``, and the job keeps
+        running."""
         if self._cancel_event is not None:
             self._cancel_event.set()
+        with self._cancel_lock:
+            if self._cancel_reply is not None:
+                return self._cancel_reply
+            if self._on_cancel is None or self._data is not None:
+                return None
+            if self._done.is_set() and isinstance(self._exc, SolverRunError):
+                return None   # the service reported the job failed or cancelled
+            reply, stopped = self._on_cancel()
+            self._cancel_reply = reply
+            if stopped and self._done.is_set() and self._data is None \
+                    and not isinstance(self._exc, SolverRunError):
+                # the wait had given up (a timeout) with the job still
+                # running; it is cancelled now, so say that instead
+                self._exc = SolverRunError(
+                    f"job {self.job_id or self.name!r} was cancelled")
+        return reply
 
     def result(self, timeout: Optional[float] = None) -> RunResult:
         """Block until the run finishes and return its :class:`RunResult`,
@@ -117,7 +151,7 @@ def submit(
     Takes :func:`run_local`'s arguments (``log_file`` mirrors the engine event
     stream to disk, ``device`` selects cpu/gpu backends) EXCEPT ``quiet``: a
     background job never draws the live status line (it would fight foreground
-    output and other jobs) — pass ``progress`` to consume events instead.
+    output and other jobs), pass ``progress`` to consume events instead.
     ``cancel_event`` (or :meth:`Job.cancel`) terminates the solver early;
     the job then raises :class:`SolverRunError` from ``result()``."""
     ev = cancel_event if cancel_event is not None else threading.Event()
@@ -181,10 +215,12 @@ class BatchResults:
 
     @property
     def succeeded(self) -> List[str]:
+        """Names of successful runs, in result insertion order."""
         return list(self._results)
 
     @property
     def failed(self) -> List[str]:
+        """Names of failed or timed-out runs, in error insertion order."""
         return list(self._errors)
 
     def __repr__(self) -> str:

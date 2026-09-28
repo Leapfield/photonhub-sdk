@@ -3,7 +3,7 @@ figure-of-merit stops moving, and stamp the evidence into the result.
 
 The user's standing bar is *convergence demonstrated, not assumed*. Nothing in
 the stack looped build -> run -> extract -> drift -> stop; the pieces existed
-(``benchmarks/gds/framework/metrics.convergence`` had zero callers,
+(``validation/suites/gds/framework/metrics.convergence`` had zero callers,
 ``spec.resolutions`` was parsed and ignored). This wires them together.
 
 Two design points learned from this repo's own history:

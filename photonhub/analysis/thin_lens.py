@@ -1,4 +1,4 @@
-"""High-NA vectorial focused beam (Richards–Wolf) — the metalens-grade
+"""High-NA vectorial focused beam (Richards–Wolf), the metalens-grade
 excitation the paraxial :mod:`gaussian_beam` cannot provide.
 
 An aplanatic-lens focus is the angular-spectrum superposition of plane waves
@@ -11,7 +11,7 @@ polarization-elongated spot at high NA), the aplanatic apodization
 
 Evaluation is EXACT and fast: the focal field is a 2-D Fourier transform of
 the weighted pupil, so the plane fields are computed by FFT on a k-grid
-matched to the simulation's own ``dl`` — and each Yee component's half-cell
+matched to the simulation's own ``dl``, and each Yee component's half-cell
 stagger is applied as an exact spectral phase ``e^{i k delta}`` before the
 transform (no interpolation, no paraxial approximation anywhere). E and H
 are built per ray (``h = n/eta0 * k_hat x e``), so the Huygens pair is
@@ -19,16 +19,19 @@ consistent at any NA.
 
 Two layers, mirroring :mod:`gaussian_beam`:
 
-* :func:`thin_lens_beam` — the sampled plane as a ``yee_staggered``
+* :func:`thin_lens_beam`, the sampled plane as a ``yee_staggered``
   :class:`~photonhub.analysis.vector_modes.VectorMode` (transverse-E pair
   jointly L2-normalized; also a monitor/overlap reference);
-* :func:`thin_lens_source` — that plus the per-cell equivalence-current
-  sheet, returning the ``PointDipole`` list for ``Simulation.sources``.
+* :func:`thin_lens_source`, that plus the per-cell source-current
+  source plane, returning the ``PointDipole`` list for ``Simulation.sources``.
 
-Conventions: engine ``e^{-i omega t}`` phasors, forward propagation
-``e^{+i k_n a}`` toward ``+axis`` (``direction`` handled by the sheet);
+Conventions: engine ``e^{-i omega t}`` phasors (the recorded convention of
+monitor data, so :func:`thin_lens_beam` is directly an overlap reference;
+:func:`thin_lens_source` conjugates it for the source plane, which stamps
+``e^{+i omega t}``), forward propagation
+``e^{+i k_n a}`` toward ``+axis`` (``direction`` handled by the source plane);
 ``focus_distance_um >= 0`` puts the focus that far DOWNSTREAM of the
-injection plane (0 = focus on the plane). ``n_eff`` for the sheet's
+injection plane (0 = focus on the plane). ``n_eff`` for the source plane's
 half-cell straddle is the power-weighted mean ``n <cos theta>`` of the cone.
 """
 
@@ -42,21 +45,23 @@ import numpy as np
 
 from ..components.sources import PointDipole
 from ..viz import _geometry as _geom
-from .gaussian_beam import _plane_grids, _resolve_index, _resolve_wavelength
+from .gaussian_beam import (_default_center, _modeled_watts, _plane_grids,
+                            _resolve_index, _resolve_wavelength, conjugate_fields)
 from .mode_overlap import ETA0
 from .vector_modes import VectorMode
 from .yee_mode import _window_center_offset
+from .._compat import legacy_keywords
 
 __all__ = ["thin_lens_beam", "thin_lens_source"]
 
 _AXES = ("x", "y", "z")
 
 
-def _resolve_pol_angle(axis: str, polarization, pol_angle) -> float:
-    if polarization is not None and pol_angle is not None:
-        raise ValueError("give polarization OR pol_angle, not both")
-    if pol_angle is not None:
-        return float(pol_angle)
+def _resolve_pol_angle(axis: str, polarization, pol_angle_rad) -> float:
+    if polarization is not None and pol_angle_rad is not None:
+        raise ValueError("give polarization OR pol_angle_rad, not both")
+    if pol_angle_rad is not None:
+        return float(pol_angle_rad)
     h_letter, v_letter = _geom.in_plane_axes(axis)
     if polarization is None:
         return 0.0
@@ -72,18 +77,19 @@ def _resolve_pol_angle(axis: str, polarization, pol_angle) -> float:
         f"(E{h_letter} or E{v_letter}), got {polarization!r}")
 
 
+@legacy_keywords(wavelength_um="wlen_um", pol_angle="pol_angle_rad")
 def thin_lens_beam(
     sim,
     *,
     axis: str,
     na: float,
-    wavelength_um: Optional[float] = None,
+    wlen_um: Optional[float] = None,
     freq_hz: Optional[float] = None,
     source_time=None,
     n: Optional[float] = None,
     center_um: Optional[Tuple[float, float]] = None,
     polarization: Optional[str] = None,
-    pol_angle: Optional[float] = None,
+    pol_angle_rad: Optional[float] = None,
     focus_distance_um: float = 0.0,
     pupil=None,
     half_w_um: Optional[float] = None,
@@ -96,21 +102,21 @@ def thin_lens_beam(
     ----------
     sim:
         Simulation whose grid/size/§20 symmetry the beam is sampled on (a
-        placeholder shell is fine).
+        placeholder geometry-only simulation is fine).
     axis:
-        Propagation axis ('x' | 'y' | 'z') — the injection plane's normal.
+        Propagation axis ('x' | 'y' | 'z'), the injection plane's normal.
     na:
         Numerical aperture ``n sin(theta_max)`` of the focusing cone, in the
         LAUNCH medium (``0 < na < n``).
-    wavelength_um, freq_hz, source_time:
+    wlen_um, freq_hz, source_time:
         Frequency the beam is built at (at most one of the first two; else
         ``source_time.freq0_hz``).
     n:
         Launch-medium index. Default ``sqrt(sim.background.permittivity)``.
     center_um:
         Transverse focus centre ``(h, v)`` in the in-plane-axis order;
-        default the domain centre.
-    polarization, pol_angle:
+        default the domain centre (0, the symmetry plane, on an axis with one).
+    polarization, pol_angle_rad:
         Incident linear polarization before the lens (component name or
         angle from the first in-plane axis). Default: along the first
         in-plane axis.
@@ -123,16 +129,22 @@ def thin_lens_beam(
         ``sqrt(cos theta)``. Default: uniform (clipped Airy-type focus).
     half_w_um, half_v_um, window_airy_units:
         Sampled-window half-extents. Default: ``window_airy_units`` (12)
-        Airy radii ``0.61 lambda / NA`` — wide enough that the discarded
-        tail carries ~<1e-3 of the power for a uniform pupil — widened by
+        Airy radii ``0.61 lambda / NA``, wide enough that the discarded
+        tail carries ~<1e-3 of the power for a uniform pupil, widened by
         the defocus cone ``focus_distance * tan(theta_max)``, clipped to
         the domain.
 
     Returns
     -------
     VectorMode
-        ``yee_staggered``; six components sampled at their true in-plane Yee
-        locations; ``n_eff = n <cos theta>`` (power-weighted).
+        In the recorded ``e^{-i omega t}`` convention of monitor data, so it
+        is directly a mode-monitor or overlap reference (for
+        :func:`~photonhub.analysis.eq_current_source.equivalence_current_source`
+        pass ``conjugate_fields`` of it, imported as
+        ``from photonhub.analysis.gaussian_beam import conjugate_fields``;
+        :func:`thin_lens_source` does). ``yee_staggered``; six components
+        sampled at their true in-plane Yee locations;
+        ``n_eff = n <cos theta>`` (power-weighted).
     """
     if axis not in _AXES:
         raise ValueError(f"axis must be one of x/y/z, got {axis!r}")
@@ -141,7 +153,7 @@ def thin_lens_beam(
         raise ValueError("thin_lens_beam needs the grid's base dl_um")
     dl = float(dl)
 
-    lam_um = _resolve_wavelength(wavelength_um, freq_hz, source_time)
+    lam_um = _resolve_wavelength(wlen_um, freq_hz, source_time)
     n_bg = _resolve_index(sim, n)
     if not 0.0 < float(na) < n_bg:
         raise ValueError(
@@ -149,7 +161,7 @@ def thin_lens_beam(
     na = float(na)
     if focus_distance_um < 0.0:
         raise ValueError("focus_distance_um must be >= 0 (downstream focus)")
-    pol = _resolve_pol_angle(axis, polarization, pol_angle)
+    pol = _resolve_pol_angle(axis, polarization, pol_angle_rad)
 
     k = 2.0 * math.pi * n_bg / lam_um          # rad/um in the medium
     sin_max = na / n_bg
@@ -159,8 +171,7 @@ def thin_lens_beam(
     h_letter, v_letter = _geom.in_plane_axes(axis)
     size = sim.size_um
     if center_um is None:
-        h_c = float(size[_AXES.index(h_letter)]) / 2.0
-        v_c = float(size[_AXES.index(v_letter)]) / 2.0
+        h_c, v_c = _default_center(sim, h_letter), _default_center(sim, v_letter)
     else:
         h_c, v_c = float(center_um[0]), float(center_um[1])
     airy_um = 0.61 * lam_um / na
@@ -303,6 +314,7 @@ def thin_lens_beam(
     )
 
 
+@legacy_keywords(wavelength_um="wlen_um", pol_angle="pol_angle_rad")
 def thin_lens_source(
     sim,
     *,
@@ -315,21 +327,26 @@ def thin_lens_source(
     n: Optional[float] = None,
     center_um: Optional[Tuple[float, float]] = None,
     polarization: Optional[str] = None,
-    pol_angle: Optional[float] = None,
+    pol_angle_rad: Optional[float] = None,
     focus_distance_um: float = 0.0,
     pupil=None,
-    wavelength_um: Optional[float] = None,
+    wlen_um: Optional[float] = None,
     freq_hz: Optional[float] = None,
     half_w_um: Optional[float] = None,
     half_v_um: Optional[float] = None,
     window_airy_units: float = 12.0,
     amplitude_threshold: float = 1e-6,
 ) -> List[PointDipole]:
-    """Launch a high-NA focused beam — :func:`thin_lens_beam` plus the
-    per-cell equivalence-current Huygens sheet. ``power_watts`` (default 1 W)
+    """Launch a high-NA focused beam, :func:`thin_lens_beam` plus the
+    per-cell source-current Huygens source plane. ``power_watts`` (default 1 W)
     normalizes the launched power on the engine's discrete Poynting
-    quadrature like every other launch; parameters match
-    :func:`thin_lens_beam` / :func:`~photonhub.analysis.gaussian_beam.gaussian_beam_source`."""
+    quadrature like every other launch, as the whole, unfolded device's
+    power (a beam centred on k §20 symmetry planes puts ``power_watts / 2^k``
+    into the modeled part, NUMERICS §20.8); parameters match
+    :func:`thin_lens_beam` / :func:`~photonhub.analysis.gaussian_beam.gaussian_beam_source`.
+    The beam converges onto ``focus_distance_um`` past the source plane: its
+    recorded-convention mode is conjugated once for the source plane, which stamps
+    ``e^{+i omega t}`` phasors."""
     if direction not in ("+", "-"):
         raise ValueError(f"direction must be '+' or '-', got {direction!r}")
     if not power_watts > 0.0:
@@ -337,22 +354,25 @@ def thin_lens_source(
     from .eq_current_source import equivalence_current_source
 
     beam = thin_lens_beam(
-        sim, axis=axis, na=na, wavelength_um=wavelength_um, freq_hz=freq_hz,
+        sim, axis=axis, na=na, wlen_um=wlen_um, freq_hz=freq_hz,
         source_time=source_time, n=n, center_um=center_um,
-        polarization=polarization, pol_angle=pol_angle,
+        polarization=polarization, pol_angle_rad=pol_angle_rad,
         focus_distance_um=focus_distance_um, pupil=pupil,
         half_w_um=half_w_um, half_v_um=half_v_um,
         window_airy_units=window_airy_units)
+    # the beam is in the recorded e^{-i omega t} convention; the sheet stamps
+    # e^{+i omega t}, so without this conjugation the beam is launched
+    # time-reversed and diverges from a virtual focus behind the sheet
+    beam = conjugate_fields(beam)
 
     # window as resolved by the beam (mirror of its own derivation)
     h_letter, v_letter = _geom.in_plane_axes(axis)
     size = sim.size_um
     if center_um is None:
-        h_c = float(size[_AXES.index(h_letter)]) / 2.0
-        v_c = float(size[_AXES.index(v_letter)]) / 2.0
+        h_c, v_c = _default_center(sim, h_letter), _default_center(sim, v_letter)
     else:
         h_c, v_c = float(center_um[0]), float(center_um[1])
-    lam_um = _resolve_wavelength(wavelength_um, freq_hz, source_time)
+    lam_um = _resolve_wavelength(wlen_um, freq_hz, source_time)
     n_bg = _resolve_index(sim, n)
     theta_max = math.asin(min(float(na) / n_bg, 1.0))
     spread = float(window_airy_units) * (0.61 * lam_um / float(na)) + \
@@ -369,5 +389,5 @@ def thin_lens_source(
         source_time=source_time, direction=direction,
         h_center_um=h_c, v_center_um=v_c,
         half_w_um=clip(hw, h_c, h_letter), half_v_um=clip(hv, v_c, v_letter),
-        power_watts=float(power_watts),
+        power_watts=_modeled_watts(sim, axis, h_c, v_c, power_watts),
         amplitude_threshold=float(amplitude_threshold))

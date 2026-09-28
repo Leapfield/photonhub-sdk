@@ -1,11 +1,11 @@
 """Directional-power mode-overlap: a recorded field plane -> mode-resolved T.
 
-This is the Phase-2 Track-B *mode-monitor transmission* post-processor. Given a
+Compute mode-monitor transmission. Given a
 field plane recorded by an FDTD run (the tangential ``E`` and ``H`` DataArrays
 on a plane whose normal is the waveguide's propagation axis) and a frozen FDE
 :class:`~photonhub.analysis.modes.Mode`, it computes the **forward (or backward)
 power transmission** ``T(f)`` into that single mode. There is **NO S-matrix**
-here — this is a one-mode-at-a-time projection.
+here, this is a one-mode-at-a-time projection.
 
 Physics / method
 ================
@@ -25,7 +25,7 @@ NOTE ON THE DENOMINATOR (deviation from the handoff brief): the brief wrote
 *self*-overlap evaluates to ``a_pm = P_mode`` exactly (substitute
 ``E_sim=e_mode, H_sim=h_mode``: both cross terms equal ``2*P_mode * (1/4)``).
 ``|a_pm|^2 / P_mode`` would then give ``P_mode`` rather than the required
-``T=1``. The self-consistent power ratio is ``T = |a_pm|^2 / P_mode^2`` — i.e.
+``T=1``. The self-consistent power ratio is ``T = |a_pm|^2 / P_mode^2``, i.e.
 ``a_pm`` is the *unnormalized* coefficient and the normalized modal amplitude is
 ``a_pm / P_mode``. We implement that (so self-overlap == 1 exactly); see the
 test suite which pins it.
@@ -38,7 +38,7 @@ transverse ``H`` (``h_mode -> -h_mode``), equivalently picking ``a_minus``.
 
 **Scalar-limit H reconstruction (APPROXIMATION).** The frozen FDE solver returns
 only a *scalar* transverse ``E`` profile (the major component ``Ex`` for TE,
-``Ey`` for TM) and a real ``n_eff`` — it carries no ``H`` and no minor-component
+``Ey`` for TM) and a real ``n_eff``, it carries no ``H`` and no minor-component
 ``E``. We therefore reconstruct the modal transverse ``H`` from the scalar mode
 in the **quasi-TEM / weakly-guided limit**:
 
@@ -54,7 +54,7 @@ and ``P_mode = (n_eff / (2 eta0)) * integral |profile|^2 dA``.
 
 **Area element.** ``dA`` is taken from the plane's *real* transverse coordinate
 spacings (centered-difference cell widths), so graded / non-uniform meshes are
-handled correctly — no uniform-spacing assumption.
+handled correctly, no uniform-spacing assumption.
 
 **Scope.** Fundamental mode, looped over the monitor's frequencies. By default
 one scalar mode profile (+ its ``n_eff``) is used for every frequency (the frozen
@@ -68,14 +68,14 @@ Mode ⇄ mode overlap (no FDTD run)
 :func:`mode_overlap` is the **mode-to-mode** companion: it takes two *modes* (a
 scalar :class:`~photonhub.analysis.modes.Mode`, a full-vector
 :class:`~photonhub.analysis.vector_modes.VectorMode`, or an analytic
-:func:`gaussian_mode`) — not a recorded plane — resamples both onto a common
+:func:`gaussian_mode`), not a recorded plane, resamples both onto a common
 transverse grid, and returns their coupling efficiency. It answers "how much of
 mode A couples into mode B": a waveguide TE0 into a lensed-fibre / free-space
 Gaussian (fibre-to-chip coupling efficiency), the fundamental of one guide into
 that of another (a butt-joint / taper-step mismatch loss), or any two solved
 cross-sections. It reports BOTH the impedance-aware power coupling (the two-term
 ``E``×``H`` Poynting overlap, the same physics as the field-to-mode kernel above)
-and the simpler Hermitian field overlap — see :class:`ModeOverlap`.
+and the simpler Hermitian field overlap, see :class:`ModeOverlap`.
 
 Dependency-light: numpy + the xarray DataArrays the rest of PhotonHub already
 produces. No matplotlib, no engine calls.
@@ -92,6 +92,7 @@ import xarray as xr
 
 from ._constants import C0, ETA0  # noqa: F401  (ETA0 re-exported via __all__)
 from .modes import Mode
+from .._compat import caller_stacklevel, legacy_keywords
 
 __all__ = [
     "ETA0",
@@ -131,6 +132,42 @@ _QUANTITIES = ("transmission", "power", "amplitude")
 # factor analytically and move by at most ~3e-16 relative (one last-place
 # rounding of each operand).
 _UM2_TO_M2 = 1.0e-12
+
+# A plane frequency is read against the ``modes_by_freq`` entry whose key is
+# nearest. A key more than _BANK_KEY_RTOL away (relative) means the bank was not
+# solved at that frequency: the reading warns. More than _BANK_KEY_FATAL away
+# no per-frequency bank is meant: the keys are in other units (a wavelength in
+# microns, a frequency in THz) or solved for another band, and it raises.
+_BANK_KEY_RTOL = 1e-6
+_BANK_KEY_FATAL = 0.5
+
+
+def _check_bank_keys(modes_by_freq: Mapping[float, Any], freqs: Sequence[float]) -> None:
+    """Warn or raise when ``modes_by_freq`` has no key at a plane frequency
+    (see ``_BANK_KEY_RTOL``). The nearest-key lookup silently read a bank keyed
+    in microns, or solved 100 nm off the band, as if it matched."""
+    keys = np.asarray(sorted(float(k) for k in modes_by_freq))
+    worst, off = (0.0, None, None), 0
+    for f in freqs:
+        k = float(keys[np.argmin(np.abs(keys - f))])
+        rel = abs(k - f) / abs(f)
+        off += rel > _BANK_KEY_RTOL
+        if rel > worst[0]:
+            worst = (rel, f, k)
+    rel, f, k = worst
+    if rel > _BANK_KEY_FATAL:
+        raise ValueError(
+            f"modes_by_freq has no mode near the plane frequency {f:.6g} Hz: its "
+            f"nearest key is {k:.6g}, {rel:.0%} away. Key the bank by frequency in "
+            "Hz at the monitor's frequencies, as solve_modes_by_freq(solver, "
+            "freqs_hz) does.")
+    if off:
+        warnings.warn(
+            f"{off} of {len(freqs)} plane frequencies have no modes_by_freq entry "
+            f"within {_BANK_KEY_RTOL:g} (relative); the nearest key is up to "
+            f"{rel:.2%} away ({k:.6g} Hz read for {f:.6g} Hz), so those frequencies "
+            "are projected onto a mode solved at another frequency. Solve the bank "
+            "at the monitor's frequencies.", UserWarning, stacklevel=caller_stacklevel())
 
 # ETA0 (vacuum wave impedance, ohms) and C0 (free-space speed of light, m/s —
 # maps a monitor frequency to a wavelength for the longitudinal Yee de-stagger
@@ -199,7 +236,7 @@ def resample_profile(
     1-D grids ``src_x``/``src_y``) onto the destination coordinates
     ``dst_x``/``dst_y``, zero-filled outside the source window.
 
-    Generalizes ``benchmarks/waveguide/run_waveguide.py:_resample`` — numpy-only
+    Generalizes ``validation/suites/waveguide/run_waveguide.py:_resample``, numpy-only
     (two passes of :func:`numpy.interp`, x then y). Returns a ``(dst_y.size,
     dst_x.size)`` array indexed ``[iy, ix]``."""
     field = np.asarray(field, dtype=np.float64)
@@ -232,7 +269,7 @@ def _resample_cubic(
     Cubic interpolation of a smooth (well-resolved) mode profile reduces the
     cross-grid resampling error by ~10³–10⁴× vs bilinear (a guided/Gaussian mode is
     smooth at the grid scale), which is why the mode⇄mode overlap uses it when the
-    two modes live on different grids — see :func:`mode_overlap`'s ``interp``."""
+    two modes live on different grids, see :func:`mode_overlap`'s ``interp``."""
     try:
         from scipy.interpolate import RectBivariateSpline
     except Exception:  # pragma: no cover - scipy missing ⇒ caller uses bilinear
@@ -265,7 +302,7 @@ def _resample_real(
     order: int = 1,
 ) -> np.ndarray:
     """Resample a real ``field[iy, ix]`` onto ``(dst_x, dst_y)``. ``order=1`` is the
-    bilinear :func:`resample_profile` (unchanged — the field-to-mode path); higher
+    bilinear :func:`resample_profile` (unchanged, the field-to-mode path); higher
     ``order`` uses the bicubic :func:`_resample_cubic` (the mode⇄mode path), with a
     fast exact return when the destination grid coincides with the source (so a
     same-grid overlap does no interpolation at all) and a bilinear fallback when
@@ -299,7 +336,7 @@ def modal_fields(
 
     The mode's scalar profile is resampled onto the plane's transverse grid
     ``(t1_um, t2_um)`` (the two in-plane axes for ``axis``, in their natural
-    Yee order — see :func:`mode_transmission`). The major transverse ``E`` carries
+    Yee order, see :func:`mode_transmission`). The major transverse ``E`` carries
     the whole profile, the minor transverse ``E`` is zero (scalar limit), and the
     transverse ``H`` is ``(n_eff/eta0) * (z_hat x e_mode)``; ``direction="-"``
     flips ``H`` to select the backward mode.
@@ -328,7 +365,7 @@ def modal_fields(
         / ``dl_y`` direction); must be one of the two transverse axes for
         ``axis``. The mode's WIDTH (``dl_x``) is mapped to the OTHER transverse
         axis. ``None`` (default) keeps the legacy mapping ``width->t1,
-        height->t2`` — correct only when the thickness lies on the second
+        height->t2``, correct only when the thickness lies on the second
         transverse axis (e.g. x-propagation with a z-normal slab). For
         y-propagation of a z-normal slab the thickness is the FIRST transverse
         axis, so pass ``thickness_axis="z"`` to orient the mode correctly (else
@@ -428,7 +465,7 @@ def _resample_complex(
     *,
     order: int = 1,
 ) -> np.ndarray:
-    """Like :func:`resample_profile` but for a complex ``field`` — real and
+    """Like :func:`resample_profile` but for a complex ``field``, real and
     imaginary parts are resampled independently (the interpolation is linear in the
     data, so this preserves the per-point complex value exactly on the source grid
     and interpolates the relative phase between components). ``order`` selects
@@ -454,7 +491,7 @@ def vector_modal_fields(
 ) -> Dict[str, np.ndarray]:
     """Assemble the FULL-VECTOR transverse fields of a
     :class:`~photonhub.analysis.vector_modes.VectorMode` on a monitor/injection
-    plane — the full-vector analogue of :func:`modal_fields`.
+    plane, the full-vector analogue of :func:`modal_fields`.
 
     Unlike :func:`modal_fields` (which carries one scalar profile in the major-E
     component and reconstructs ``H`` in the scalar limit), this resamples the
@@ -468,7 +505,7 @@ def vector_modal_fields(
     six complex ``(ny, nx)`` component arrays ``ex, ey, ez, hx, hy, hz`` indexed
     ``[iy, ix]``). Returns a dict with ``"e1"``, ``"e2"``, ``"h1"``, ``"h2"``
     (transverse components along ``t1``/``t2``), each a ``(t2.size, t1.size)``
-    complex array — same layout as :func:`modal_fields`.
+    complex array, same layout as :func:`modal_fields`.
     """
     if axis not in _TRANSVERSE:
         raise ValueError(f"axis must be one of x/y/z, got {axis!r}")
@@ -627,22 +664,24 @@ def _overlap_terms(
     fold_low: Tuple[bool, bool] = (False, False),
 ) -> Dict[float, Tuple[complex, float]]:
     """Per-frequency directional-power overlap terms ``{f: (a_pm, P_mode)}`` for a
-    recorded plane projected onto ``mode`` — the shared kernel behind
+    recorded plane projected onto ``mode``, the shared kernel behind
     :func:`mode_amplitude` (``c = a_pm/P_mode``), :func:`mode_transmission`
     (``|c|² = |a_pm|²/P_mode²``) and the power readout (``|a_pm|²/P_mode``).
     ``a_pm`` is the unnormalized complex coefficient, ``P_mode`` the mode's own
-    power on the plane. See :func:`mode_transmission` for the argument schema.
+    power on the plane: with the longitudinal de-stagger on, the power a unit
+    mode carries through the Yee plane, ``P_mode * cos(phi)`` (NUMERICS §18.7).
+    See :func:`mode_transmission` for the argument schema.
 
     ``destagger_dl`` (the grid spacing along the propagation/normal axis, microns)
-    enables the **longitudinal Yee de-stagger** — see :func:`mode_transmission`.
+    enables the **longitudinal Yee de-stagger**, see :func:`mode_transmission`.
 
     ``fold_low`` = (t1 folded, t2 folded): the in-plane axis' MIN face is a §20
     symmetry plane (PMC/PEC fold) the plane's coordinate ladder starts ON. The
     half-domain quadrature then weights an ON-PLANE (node-registered) sample row
-    by half a cell — its cell covers only ``[0, dl/2]`` of the modeled half —
+    by half a cell, its cell covers only ``[0, dl/2]`` of the modeled half ,
     where :func:`_cell_widths`' end rule would extend it ``dl/2`` into the
     MIRROR half and over-count fold-antinode modes (an even mode's ~+dl/(2 w_eff)
-    power inflation; a fold-node mode is untouched — the parity-asymmetric bias
+    power inflation; a fold-node mode is untouched, the parity-asymmetric bias
     that under-read T on folded readings). Products whose components sit ½-cell
     off the fold axis (grid.h Yee offsets) have no on-plane row and keep full
     weights, so the halving is applied per product term. Default (False, False)
@@ -680,6 +719,8 @@ def _overlap_terms(
     # frequency, so a mixed ``modes_by_freq`` bank (Yee + FLM entries) co-locates
     # exactly the frequencies whose reference mode needs it — one bank entry must
     # not decide for all the others.
+    if modes_by_freq and freqs[0] is not None:
+        _check_bank_keys(modes_by_freq, freqs)
     out: Dict[float, Tuple[complex, float]] = {}
     for f in freqs:
         Es1, c1, c2 = _plane_component(sim_plane_fields, e1_name, f, t1, t2)
@@ -827,6 +868,21 @@ def _overlap_terms(
                     "pass destagger_dl=None to read without the correction.")
             N = 2.0 * p_mode
             a_ds = ((I_eH / N) + (I_Eh / N) * np.exp(-1j * phi)) / (2.0 * np.cos(phi))
+            # The mode's power THROUGH THIS YEE PLANE is P_mode*cos(phi), not
+            # P_mode. The Yee scheme conserves the staggered product
+            # 1/2 Re sum E_k x H*_{k+1/2} dA exactly along a lossless guide
+            # on ANY graded ladder (the discrete Poynting theorem; it is also
+            # what the §12 flux monitor reads), and with E and H expanded as
+            # above that product is (|a|^2 - |b|^2) * P_mode * cos(phi). The
+            # de-staggered |a|^2 * P_mode therefore over-reads the conserved
+            # flux by sec(phi) ~ 1 + (beta*dl)^2/8, a factor set by the LOCAL
+            # cell: two ports in cells of different widths (any graded
+            # propagation axis) read a lossless straight guide as lossy or
+            # gainy (NUMERICS §18.7). Folding cos(phi) into P_mode leaves the
+            # normalised amplitude c = a_pm/P_mode (and |c|^2, the self-overlap
+            # 1) unchanged and corrects every POWER readout: |a_pm|^2/|P_mode|
+            # here and the S-matrix's c*sqrt(|P_mode|).
+            p_mode = p_mode * np.cos(phi)
             a_pm = a_ds * p_mode  # |a_pm|^2/P_mode^2 = |a_ds|^2 (T) downstream
         elif destagger_dl and f is None:
             warnings.warn(
@@ -866,14 +922,14 @@ def mode_amplitude(
     (see the module docstring). The normalization by ``P_mode`` makes a clean
     single-mode forward self-overlap read ``c == 1`` exactly (so ``|c|^2 == T``,
     the power transmission). Crucially ``c`` retains the **phase** of the modal
-    projection — in the engine's ``e^{-i omega t}`` convention a forward wave's
+    projection, in the engine's ``e^{-i omega t}`` convention a forward wave's
     phasor advances as ``e^{+i beta z}``, so ``c`` picks up ``e^{+i beta L}``
-    along a straight guide — which is exactly what an S-matrix assembler needs
+    along a straight guide, which is exactly what an S-matrix assembler needs
     (``S_ij = b_i / a_j``).
 
     The amplitude is *directional*: ``direction="+"`` projects onto the forward
     mode, ``direction="-"`` onto the backward one. A pure forward wave reads a
-    near-unit forward ``c`` and a near-zero backward ``c``, and vice versa — this
+    near-unit forward ``c`` and a near-zero backward ``c``, and vice versa, this
     is what separates incident (forward) from scattered (backward) at a port.
 
     Parameters mirror :func:`mode_transmission`; see it for the
@@ -919,28 +975,27 @@ def mode_transmission(
         P_mode = (1/2) integral Re( e_mode x h_mode* ) . n_hat dA
 
     in the ``e^{-i omega t}`` convention, with the scalar-limit modal ``H``
-    (see the module docstring; the ``P_mode^2`` denominator — not ``P_mode`` —
-    is the squared NORMALISED amplitude ``|c|^2``, so a clean single-mode
+    (see the module docstring; the ``P_mode^2`` denominator, not ``P_mode``, is the squared NORMALISED amplitude ``|c|^2``, so a clean single-mode
     self-overlap reads ``T == 1``).
     ``direction="+"`` returns forward T, ``direction="-"`` backward T.
 
     ``power=True`` instead returns the actual modal **power**
     ``|a_pm|^2 / |P_mode| * 1e-12`` (= ``|c|^2 * |P_mode|`` in the engine's SI
-    flux units, always ``>= 0`` — the magnitude of ``P_mode`` so a backward
+    flux units, always ``>= 0``, the magnitude of ``P_mode`` so a backward
     ``direction="-"`` reading, whose signed flux through the +n_hat plane is
     negative, is still a power). The ``1e-12`` converts the µm² area element of
     the overlap quadrature to m², making the value **flux-commensurate**: it
     carries the same §12 source-spectrum normalization AND the same SI area
     element as a ``PowerMonitor``, so ``mode_power / flux`` on one plane is the
     modal power fraction (~1 for a clean guide). (Before 2026-08 the µm² element
-    was returned unconverted — a ~1e12 unit mismatch against flux.) Use
+    was returned unconverted, a ~1e12 unit mismatch against flux.) Use
     ``power=True`` when ratioing two planes whose modes may DIFFER (e.g. a
     w1→w2 taper): ``P_out / P_in`` is then the true power transmission. The bare ``|c|^2`` (power=False) drops each port's ``P_mode``,
     so its ratio is only correct when both ports carry the SAME mode (it cancels);
     for unequal-width ports it is wrong (the historical taper-parity bug).
 
     This is exactly ``|c|^2`` of the complex amplitude from
-    :func:`mode_amplitude` — use that function when you need the phase (e.g. for
+    :func:`mode_amplitude`, use that function when you need the phase (e.g. for
     an S-matrix). Behaviour here is unchanged (back-compatible).
 
     Parameters
@@ -972,28 +1027,39 @@ def mode_transmission(
     thickness_axis:
         Simulation axis along the guide's slab thickness; forwarded to
         :func:`modal_fields` to orient the mode (pass the slab normal, e.g.
-        ``"z"``, for any non-x propagation — see that function). ``None`` keeps
+        ``"z"``, for any non-x propagation, see that function). ``None`` keeps
         the legacy thickness-on-second-transverse-axis mapping.
     modes_by_freq:
         Optional ``{freq_hz: Mode}`` map. When given, each plane frequency is
         projected onto the mode whose key is nearest that frequency (using that
         mode's own profile *and* ``n_eff``), instead of the single frozen
-        ``mode`` — the per-λ mode solve. ``mode`` is still required (used as the
-        fallback for any frequencyless plane).
+        ``mode``, the per-λ mode solve. ``mode`` is still required (used as the
+        fallback for any frequencyless plane). A nearest key more than 1e-6
+        (relative) from a plane frequency warns, since that frequency is then
+        read against a mode solved elsewhere, and one more than 50 % away
+        raises (keys in other units, or a mode mapping for another band).
     destagger_dl:
         Grid spacing (microns) along the propagation / monitor-normal axis. When
         given, applies the **longitudinal Yee de-stagger**: the engine records
         ``E`` at the cell node but ``H`` half a cell along the normal, so the
         two-term overlap carries a phase ``phi = beta*dl/2`` (``beta =
         2*pi*n_eff/lambda``) that under-reads a clean mode by ``cos(phi/2)`` and
-        leaks ``sin(phi/2)`` of the COUNTER-propagating wave into the reading — a
+        leaks ``sin(phi/2)`` of the COUNTER-propagating wave into the reading, a
         ~1% standing-wave ripple at a normalization plane in front of a reflecting
         junction (the transverse :func:`_colocate_to_node` does NOT fix this).
         The correction solves the 2x2 forward/backward system for the clean
         co-propagating amplitude (a clean forward wave still reads ``T=1``; a pure
-        reflection reads ``~0`` forward). ``None`` (default) = off, so synthetic
-        already-co-located fields and the legacy readout are unchanged. Pass the
-        run's uniform grid ``dl`` (e.g. ``scene.dl_um``).
+        reflection reads ``~0`` forward). With it, the mode's power through the
+        plane is ``P_mode * cos(phi)``: the staggered flux the Yee scheme
+        conserves along a lossless guide, which the de-staggered ``|c|^2 *
+        P_mode`` over-read by ``sec(phi)``. So ``power=True`` readings of two
+        planes in cells of different widths (a graded propagation axis) or in
+        modes of different ``n_eff`` ratio to the conserved power (NUMERICS
+        §18.7); ``T`` (``|c|^2``) is unchanged. ``None`` (default) = off, so
+        synthetic already-co-located fields and the legacy readout are
+        unchanged. Pass the plane's own cell width along the normal (a
+        :class:`~photonhub.analysis.mode_devices.ModeMonitor` carries it as
+        ``dl_um``; on a uniform grid it is the grid's ``dl``).
 
     Returns
     -------
@@ -1053,7 +1119,7 @@ def mode_decomposition(
     destagger_dl: Optional[float] = None,
     fold_low: Tuple[bool, bool] = (False, False),
 ) -> Dict[int, Dict[float, Any]]:
-    """Multi-mode modal decomposition of a recorded plane — project it onto EACH
+    """Multi-mode modal decomposition of a recorded plane, project it onto EACH
     mode in ``mode_bank`` and return the per-mode result keyed ``{mode_index:
     {freq_hz: value}}``.
 
@@ -1076,28 +1142,28 @@ def mode_decomposition(
     mode_bank:
         The modes to project onto, in one of two forms (:data:`ModeBank`):
 
-        * **per-frequency** ``{freq_hz: {mode_index: Mode}}`` — each plane
+        * **per-frequency** ``{freq_hz: {mode_index: Mode}}``, each plane
           frequency is projected onto the mode of that index solved AT that
           frequency (true ``H`` + ``n_eff(λ)``), via the same nearest-frequency
           lookup as :func:`mode_transmission`'s ``modes_by_freq``. This is the
           dispersive, accurate case; build it with
-          :func:`~photonhub.analysis.mode_devices.solve_mode_bank`. The bank must be
-          **rectangular** — the SAME mode indices at every frequency; a ragged
-          bank raises (else the nearest-frequency lookup would silently fabricate
+          :func:`~photonhub.analysis.mode_devices.solve_mode_bank`. The mode mapping must be
+          **rectangular**, the SAME mode indices at every frequency; a ragged
+          mode mapping raises (else the nearest-frequency lookup would silently fabricate
           a reading at a frequency missing that index).
-        * **frozen** ``{mode_index: Mode}`` — one mode per index, projected onto
+        * **frozen** ``{mode_index: Mode}``, one mode per index, projected onto
           every plane frequency (the band-centre modes).
 
         Modes may be scalar :class:`Mode` or full-vector ``VectorMode`` (the
         overlap kernel uses the mode's true transverse ``H`` when present, else
-        the scalar-limit reconstruction — same rule as the single-mode path).
+        the scalar-limit reconstruction, same rule as the single-mode path).
     direction:
-        ``"+"`` forward (default) or ``"-"`` backward — applied to every index.
+        ``"+"`` forward (default) or ``"-"`` backward, applied to every index.
     quantity:
         ``"transmission"`` (default) → ``|c|² = |a_pm|²/P_mode²`` (real,
         self-overlap 1); ``"power"`` → ``|a_pm|²/P_mode · 1e-12`` (real modal
-        power in the engine's SI flux units — flux-commensurate, see
-        :func:`mode_transmission` ``power=True`` — the quantity to ratio
+        power in the engine's SI flux units, flux-commensurate, see
+        :func:`mode_transmission` ``power=True``, the quantity to ratio
         across unequal-mode ports); ``"amplitude"`` → the
         complex normalised amplitude ``c = a_pm/P_mode`` (carries phase, for an
         S-matrix / multimode-port assembler).
@@ -1200,19 +1266,19 @@ class ModeOverlap:
     """Result of a mode⇄mode overlap (:func:`mode_overlap`).
 
     Carries BOTH common definitions of "mode overlap" so the caller picks the one
-    their convention wants — both are in common use ("power coupling" and
+    their convention wants, both are in common use ("power coupling" and
     "overlap"):
 
     Attributes
     ----------
     power:
-        **Power-coupling efficiency** ``∈ [0, 1]`` — the headline number, the
+        **Power-coupling efficiency** ``∈ [0, 1]``, the headline number, the
         fraction of mode_a's power that couples into mode_b across a butt joint.
         The impedance-aware two-term (E *and* H) Poynting coupling, with the form
         chosen (see :attr:`method`) to be the *most accurate available* for the
         operands:
 
-        * **both full-vector** (``method="snyder_love"``) — the rigorous Snyder &
+        * **both full-vector** (``method="snyder_love"``), the rigorous Snyder &
           Love power coupling
 
               A = ∫ (E₁ × H₂*) · n̂ dA ,   B = ∫ (E₂ × H₁*) · n̂ dA ,
@@ -1224,7 +1290,7 @@ class ModeOverlap:
           the analytic power-coupling overlap to the colocation floor (~1e-4), carrying the genuine
           ``n_eff`` (impedance) mismatch through each mode's true ``H``.
 
-        * **either operand scalar / Gaussian** (``method="geomean"``) — the bounded,
+        * **either operand scalar / Gaussian** (``method="geomean"``), the bounded,
           argument-order-independent geometric mean ``|A| |B| / (4 P₁ P₂)``. A scalar
           mode's ``H`` is the ``(n_eff/η₀)·(ẑ×E)`` reconstruction, which makes the
           Snyder–Love form **over-count by the inverse-Fresnel factor**
@@ -1234,12 +1300,12 @@ class ModeOverlap:
         ``power`` is ``1`` for two identical co-propagating modes and ``0`` for
         power-orthogonal modes (e.g. TE0 vs TE1). It is bounded by 1 to within
         discretization error; two *dissimilar* full-vector modes can overshoot 1 by
-        a small margin (``≲ 1e-3`` on a shared grid — the standard overlap does the same,
+        a small margin (``≲ 1e-3`` on a shared grid, the standard overlap does the same,
         since distinct modes of *different* guides are not a single orthonormal
         basis). Take ``min(power, 1)`` for a hard efficiency, or read :attr:`field`
         for the rigorously bounded overlap.
     field:
-        **Field overlap** ``|F|² ∈ [0, 1]`` — the simpler, impedance-blind
+        **Field overlap** ``|F|² ∈ [0, 1]``, the simpler, impedance-blind
         Hermitian transverse-E correlation
 
             F = ∫ E₁* · E₂ dA / sqrt( ∫|E₁|² dA · ∫|E₂|² dA ) ,
@@ -1248,7 +1314,7 @@ class ModeOverlap:
         reports. For two full-vector modes of differing impedance this differs from
         :attr:`power`; for scalar/Gaussian modes the two coincide.
     coupling:
-        **Complex power-coupling amplitude** — ``|coupling|² == power`` and
+        **Complex power-coupling amplitude**, ``|coupling|² == power`` and
         ``arg(coupling)`` is the relative modal phase, taken from the Snyder & Love
         coefficient ``a₁₂ = ¼∫(E₁* × H₂ + E₂ × H₁*) · n̂ dA``. For two full-vector
         modes this is exactly the complex coupling coefficient ``a₁₂/√(P₁P₂)`` an
@@ -1258,7 +1324,7 @@ class ModeOverlap:
         the phase the overlap sign.) Distinct from :attr:`amplitude`, which is the
         impedance-blind FIELD overlap.
     amplitude:
-        The complex field overlap ``F`` above — ``|amplitude|² == field`` (NOT
+        The complex field overlap ``F`` above, ``|amplitude|² == field`` (NOT
         ``power``), and its phase ``arg(F)`` is the relative modal phase of the
         E-fields. For the power-coupling phase prefer :attr:`coupling`; for the
         field-shape sign use this.
@@ -1268,7 +1334,7 @@ class ModeOverlap:
         for diagnostics.
     method:
         Which power-coupling form :attr:`power` used: ``"snyder_love"`` (the exact
-        two-term coupling — both operands full-vector, or the contra-propagating
+        two-term coupling, both operands full-vector, or the contra-propagating
         ``direction="-"`` fallback for scalar/Gaussian operands, where the
         direction-blind geometric mean would wrongly read ``1`` for a mode
         against its own backward partner) or ``"geomean"`` (the bounded
@@ -1310,7 +1376,7 @@ def _mode_plane_fields(
     interp_order: int = 3,
     direction: Direction = "+",
 ) -> Dict[str, np.ndarray]:
-    """Transverse ``(e1, e2, h1, h2)`` of one mode on the plane grid ``(c1, c2)`` —
+    """Transverse ``(e1, e2, h1, h2)`` of one mode on the plane grid ``(c1, c2)`` ,
     the full-vector path for a ``VectorMode`` (its true H), the scalar-limit
     reconstruction for a scalar :class:`Mode` / :func:`gaussian_mode`. Mirrors the
     dispatch in :func:`_overlap_terms`. ``direction="-"`` builds the backward
@@ -1382,12 +1448,12 @@ def mode_overlap(
     direction: Direction = "+",
 ) -> ModeOverlap:
     """Overlap / coupling efficiency between two **modes** ``mode_a`` and
-    ``mode_b`` — the mode⇄mode companion to the field-plane :func:`mode_transmission`.
+    ``mode_b``, the mode⇄mode companion to the field-plane :func:`mode_transmission`.
 
     Each operand is a frozen FDE mode (scalar :class:`~photonhub.analysis.modes.Mode`
     or full-vector :class:`~photonhub.analysis.vector_modes.VectorMode`) or an analytic
     :func:`gaussian_mode`. Both are resampled onto a **common transverse grid**, so
-    they need not share resolution, window, or even a polarization branch — the
+    they need not share resolution, window, or even a polarization branch, the
     overlap measures how much of one mode's power couples into the other. Typical
     uses: a waveguide TE0 onto a lensed-fibre / free-space **Gaussian** (the
     fibre-to-chip coupling efficiency), the fundamental of a width-``w1`` guide onto
@@ -1400,7 +1466,7 @@ def mode_overlap(
     Parameters
     ----------
     mode_a, mode_b:
-        The two modes. Either may be scalar, full-vector, or a Gaussian — mixed is
+        The two modes. Either may be scalar, full-vector, or a Gaussian, mixed is
         fine (the kernel uses each mode's true ``H`` when it has one, else the
         scalar-limit ``H = (n_eff/η₀)(ẑ × e)``; see the module docstring).
     axis:
@@ -1411,11 +1477,10 @@ def mode_overlap(
     grid:
         Optional ``(x_um, y_um)`` 1-D coordinate arrays (microns) of the evaluation
         plane. ``None`` (default) auto-builds the union of both modes' windows at
-        the finer spacing (:func:`_union_grid`) so neither is clipped — for two
+        the finer spacing (:func:`_union_grid`) so neither is clipped, for two
         modes already on the same grid this is their native grid (exact self-overlap).
     center_a, center_b:
-        ``(t1, t2)`` offset (microns) of each mode's axis in the plane frame —
-        use ``center_b`` to model a **lateral misalignment** (e.g. a fibre offset
+        ``(t1, t2)`` offset (microns) of each mode's axis in the plane frame, use ``center_b`` to model a **lateral misalignment** (e.g. a fibre offset
         from the waveguide), which lowers the coupling.
     thickness_axis:
         Slab-normal axis, forwarded to the per-mode field assembly to orient the
@@ -1423,14 +1488,14 @@ def mode_overlap(
         mapping.
     interp:
         Cross-grid resample order when the two modes live on **different** grids:
-        ``"cubic"`` (default, bicubic — ~10³–10⁴× lower resampling error for a
+        ``"cubic"`` (default, bicubic, ~10³–10⁴× lower resampling error for a
         smooth, well-resolved mode) or ``"linear"`` (bilinear). Modes already on a
         common grid are not resampled at all, so this has no effect there. Cubic
         needs scipy; without it the kernel transparently falls back to bilinear.
     direction:
         Propagation direction of ``mode_b`` relative to the forward ``mode_a``:
-        ``"+"`` (default) co-propagating — the transmission / butt-joint coupling;
-        ``"-"`` contra-propagating — ``mode_b``'s transverse ``H`` is flipped to the
+        ``"+"`` (default) co-propagating, the transmission / butt-joint coupling;
+        ``"-"`` contra-propagating, ``mode_b``'s transverse ``H`` is flipped to the
         backward mode (for contra-directional couplers, Bragg back-coupling, or a
         forward-vs-backward orthogonality check). **Note:** a forward mode and the
         *same* mode's backward partner are power-orthogonal, so their overlap is
@@ -1438,9 +1503,8 @@ def mode_overlap(
         the boundary conditions (the :mod:`~photonhub.analysis.eme` interface S-matrix),
         not from this single-plane overlap. With a scalar / Gaussian operand the
         bounded geometric-mean power form is direction-blind, so ``"-"`` falls
-        back to the two-term ``|a12|^2`` (``snyder_love``) form — which does
-        carry the forward/backward cancellation and reads the physical ``~0`` —
-        and emits a ``UserWarning`` (see :attr:`ModeOverlap.method`).
+        back to the two-term ``|a12|^2`` (``snyder_love``) form, which does
+        carry the forward/backward cancellation and reads the physical ``~0``, and emits a ``UserWarning`` (see :attr:`ModeOverlap.method`).
 
     Returns
     -------
@@ -1573,7 +1637,7 @@ def mode_overlap_matrix(
     quantity: str = "coupling",
     **kwargs: Any,
 ) -> np.ndarray:
-    """Pairwise mode⇄mode overlap **matrix** between two sequences of modes — the
+    """Pairwise mode⇄mode overlap **matrix** between two sequences of modes, the
     multimode-port companion to :func:`mode_overlap`.
 
     Entry ``M[i, j]`` is :func:`mode_overlap` of ``modes_a[i]`` with ``modes_b[j]``.
@@ -1598,20 +1662,19 @@ def mode_overlap_matrix(
     **kwargs:
         Forwarded verbatim to :func:`mode_overlap` for every pair (``axis``,
         ``grid``, ``center_a``, ``center_b``, ``thickness_axis``, ``interp``,
-        ``direction``) — e.g. ``direction="-"`` for a contra-directional block.
+        ``direction``), e.g. ``direction="-"`` for a contra-directional block.
 
     Returns
     -------
     numpy.ndarray
-        ``(len(modes_a), len(modes_b))`` — complex for ``"coupling"``/``"amplitude"``,
+        ``(len(modes_a), len(modes_b))``, complex for ``"coupling"``/``"amplitude"``,
         real for ``"power"``/``"field"``.
 
     .. warning::
         A MIXED list (some full-vector ``VectorMode``, some scalar/Gaussian
         operands) silently mixes normalization conventions across the entries:
         vector⇄vector pairs use the exact two-term ``snyder_love`` power form
-        while any pair with a scalar operand uses the bounded ``geomean`` —
-        the two differ by up to the inverse-Fresnel factor across an index
+        while any pair with a scalar operand uses the bounded ``geomean``, the two differ by up to the inverse-Fresnel factor across an index
         step, so entries of one matrix are not mutually comparable. A
         ``UserWarning`` is emitted for a mixed list; prefer a homogeneous
         basis (solve everything full-vector).
@@ -1637,9 +1700,10 @@ def mode_overlap_matrix(
     return out
 
 
+@legacy_keywords(wavelength_um="wlen_um")
 def gaussian_mode(
     *,
-    wavelength_um: float,
+    wlen_um: float,
     dl_um: float,
     mfd_um: Optional[Union[float, Tuple[float, float]]] = None,
     waist_um: Optional[Union[float, Tuple[float, float]]] = None,
@@ -1659,24 +1723,24 @@ def gaussian_mode(
     (flat phase at the waist), linearly polarized along ``x`` (``"TE"``, an
     ``Ex``-major mode) or ``y`` (``"TM"``). Its modal index is the background index
     ``n`` (so the scalar-limit ``H = (n/η₀)(ẑ × E)`` carries the right impedance for
-    the medium the beam lives in — air ``n=1``, or an index-matched cladding).
+    the medium the beam lives in, air ``n=1``, or an index-matched cladding).
 
     Parameters
     ----------
-    wavelength_um:
-        Free-space wavelength (microns) — stored on the mode for bookkeeping; the
+    wlen_um:
+        Free-space wavelength (microns), stored on the mode for bookkeeping; the
         waist sizing is wavelength-independent (you specify the spot size directly).
     dl_um:
         Grid spacing of the returned profile (microns). Make it ``<=`` the partner
         mode's spacing so the overlap grid resolves both.
     mfd_um:
-        **Mode-field diameter** (microns) — the 1/e² *intensity* diameter, the
+        **Mode-field diameter** (microns), the 1/e² *intensity* diameter, the
         spec fibre vendors quote (e.g. SMF-28 ≈ 10.4 µm at 1550 nm). Scalar (round
         beam) or ``(MFDx, MFDy)`` (elliptical, e.g. a lensed fibre). Relates to the
         field 1/e radius as ``w₀ = MFD/2``. Provide exactly one of ``mfd_um`` /
         ``waist_um``.
     waist_um:
-        **Field 1/e radius** ``w₀`` (microns), scalar or ``(w₀ₓ, w₀ᵧ)`` — the other
+        **Field 1/e radius** ``w₀`` (microns), scalar or ``(w₀ₓ, w₀ᵧ)``, the other
         way to size the beam (``w₀ = MFD/2``).
     n:
         Background refractive index the beam propagates in (default ``1.0``, air),
@@ -1699,8 +1763,8 @@ def gaussian_mode(
         raise ValueError("provide exactly one of mfd_um or waist_um")
     if not (dl_um > 0.0):
         raise ValueError("dl_um must be > 0")
-    if not (wavelength_um > 0.0):
-        raise ValueError("wavelength_um must be > 0")
+    if not (wlen_um > 0.0):
+        raise ValueError("wlen_um must be > 0")
     if polarization not in ("TE", "TM"):
         raise ValueError(f"polarization must be 'TE' or 'TM', got {polarization!r}")
 
@@ -1737,7 +1801,7 @@ def gaussian_mode(
     return Mode(
         n_eff=float(n),
         field=field,
-        wavelength_um=float(wavelength_um),
+        wavelength_um=float(wlen_um),
         polarization=polarization,
         dl_x_um=float(dl_um),
         dl_y_um=float(dl_um),
@@ -1746,6 +1810,6 @@ def gaussian_mode(
 
 def _gauss_odd(v: int) -> int:
     """Smallest odd integer ``>= v`` so a Gaussian's peak sits on a cell center
-    (a centered profile, matching the FDE mode rasterizers)."""
+    (a centered profile, matching the FDE mode mesh samplers)."""
     v = int(v)
     return v if v % 2 == 1 else v + 1

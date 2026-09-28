@@ -1,8 +1,8 @@
-"""Parametric PIC component library — the "~one line per component" sugar
+"""Parametric PIC component library, the "~one line per component" sugar
 layer on top of the geometry primitives in :mod:`photonhub.components.structures`.
 
 Each builder returns a small :class:`Component` bundling the emitted
-:class:`~photonhub.Structure` geometry with its :class:`Port` s — the planes
+:class:`~photonhub.Structure` geometry with its :class:`Port` s, the planes
 where a mode source / mode monitor will later attach. Builders are
 *position-agnostic*: they take a ``center_um`` and place geometry relative to
 it, so the caller positions the device inside their (corner-origin) domain.
@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 from .components.base import AxisName, Vec3Um
+from .components.authoring import Port
 from .components.structures import Box, Cylinder, Medium, Polygon, Structure
 
 __all__ = [
@@ -48,7 +49,7 @@ __all__ = [
 # Default material/geometry for the SOI strip platform (NUMERICS.md / Phase-2
 # MVP). n ~= 3.5 silicon core, 220 nm slab, 450 nm strip width.
 # NOTE: n = 3.5 is a generic library default; the GDS benchmark suite
-# (benchmarks/gds/) uses the convention n = 3.478 (permittivity 3.478**2,
+# (validation/suites/gds/) uses the convention n = 3.478 (permittivity 3.478**2,
 # Si at 1.55 um) — pass an explicit medium when matching those results.
 SILICON = Medium(permittivity=12.25)
 DEFAULT_WIDTH_UM = 0.45
@@ -56,20 +57,6 @@ DEFAULT_THICKNESS_UM = 0.22
 
 _AXES: Tuple[AxisName, AxisName, AxisName] = ("x", "y", "z")
 _INDEX = {"x": 0, "y": 1, "z": 2}
-
-
-@dataclass(frozen=True)
-class Port:
-    """A plane where a mode source / mode monitor attaches.
-
-    ``axis`` is the local propagation axis at the port; ``width_um`` is the
-    waveguide width there (sizes the transverse mode window).
-    """
-
-    name: str
-    center_um: Tuple[float, float, float]
-    axis: str
-    width_um: float
 
 
 @dataclass(frozen=True)
@@ -83,6 +70,24 @@ class Component:
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+def _arm_length(arm_length_um: Optional[float], lead_um: Optional[float],
+                body_um: float, default: Optional[float] = None) -> float:
+    """The centre-to-port distance from either spelling: ``arm_length_um``
+    (the whole arm) or ``lead_um`` (the straight guide beyond the device body,
+    ``body_um`` from the centre). Exactly one, or the builder's default."""
+    if arm_length_um is not None and lead_um is not None:
+        raise ValueError("pass arm_length_um or lead_um, not both")
+    if lead_um is not None:
+        if not float(lead_um) >= 0.0:
+            raise ValueError("lead_um must be >= 0")
+        return body_um + float(lead_um)
+    if arm_length_um is not None:
+        return float(arm_length_um)
+    if default is not None:
+        return default
+    raise ValueError("pass arm_length_um (centre to port) or lead_um (device body to port)")
 
 
 def _third_axis(a: AxisName, b: AxisName) -> AxisName:
@@ -167,8 +172,10 @@ def straight(
     )
     half = length_um / 2.0
     ports = (
-        Port("in", _vec(center_um, **{axis: -half}), axis, width_um),
-        Port("out", _vec(center_um, **{axis: +half}), axis, width_um),
+        Port("in", _vec(center_um, **{axis: -half}), axis, width_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
+        Port("out", _vec(center_um, **{axis: +half}), axis, width_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
     )
     return Component(structures=(structure,), ports=ports)
 
@@ -204,8 +211,8 @@ def bend(
         radius_um=radius_um + width_um / 2.0,
         inner_radius_um=radius_um - width_um / 2.0,
         length_um=thickness_um,
-        angle_start=0.0,
-        angle_stop=math.pi / 2.0,
+        angle_start_rad=0.0,
+        angle_stop_rad=math.pi / 2.0,
     )
     structure = Structure(geometry=geometry, medium=medium)
     # Arc endpoints on the centerline radius. Start end faces +u, propagating
@@ -213,8 +220,10 @@ def bend(
     p_start = _vec(center_um, **{u_axis: radius_um})
     p_stop = _vec(center_um, **{v_axis: radius_um})
     ports = (
-        Port("in", p_start, u_axis, width_um),
-        Port("out", p_stop, v_axis, width_um),
+        Port("in", p_start, u_axis, width_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
+        Port("out", p_stop, v_axis, width_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
     )
     return Component(structures=(structure,), ports=ports)
 
@@ -280,8 +289,10 @@ def taper(
     )
     structure = Structure(geometry=geometry, medium=medium)
     ports = (
-        Port("in", _vec(center_um, **{axis: -half_len}), axis, width1_um),
-        Port("out", _vec(center_um, **{axis: +half_len}), axis, width2_um),
+        Port("in", _vec(center_um, **{axis: -half_len}), axis, width1_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
+        Port("out", _vec(center_um, **{axis: +half_len}), axis, width2_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
     )
     return Component(structures=(structure,), ports=ports)
 
@@ -297,7 +308,7 @@ def _cosine_lens_half(s: float, length: float, w1: float, w2: float, w_m: float)
 
     The FULL width follows ``W(x) = W_m*cos(pi*x/(2*L0))`` (Chandran et al., Opt.
     Lett. 45, 6230 (2020), Eq. 1), with the peak ``W_m`` reached *inside* the
-    taper — a convex lens that focuses the mode — and ``w1``/``w2`` at the two
+    taper, a convex lens that focuses the mode, and ``w1``/``w2`` at the two
     ends. ``L0`` is set from the taper length via Eq. 2,
     ``L_t = (2*L0/pi)*(arccos(w1/W_m) + arccos(w2/W_m))``. With ``W_m`` equal to
     the wider end the peak slides to that end and the shape reduces to a
@@ -331,8 +342,7 @@ def cosine_taper(
     """A cosine ("beam shaping") width taper: a curved-sidewall ``Polygon``
     whose full width follows ``W(x) = W_m*cos(pi*x/(2*L0))`` from ``width1_um`` to
     ``width2_um`` along ``axis`` (Chandran et al., Opt. Lett. 45, 6230 (2020)).
-    ``peak_width_um`` (``W_m``) is the maximum width reached inside the taper —
-    the convex lens that focuses the beam; it must be >= both end widths and
+    ``peak_width_um`` (``W_m``) is the maximum width reached inside the taper, the convex lens that focuses the beam; it must be >= both end widths and
     defaults to the wider end (a monotonic cosine taper). The sidewall is
     discretized into ``n_points`` samples per edge; ports carry the end widths."""
     width_axis, thickness_axis = _planar_axes(axis, thickness_axis)
@@ -372,8 +382,10 @@ def cosine_taper(
     )
     structure = Structure(geometry=geometry, medium=medium)
     ports = (
-        Port("in", _vec(center_um, **{axis: -half_len}), axis, width1_um),
-        Port("out", _vec(center_um, **{axis: +half_len}), axis, width2_um),
+        Port("in", _vec(center_um, **{axis: -half_len}), axis, width1_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
+        Port("out", _vec(center_um, **{axis: +half_len}), axis, width2_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
     )
     return Component(structures=(structure,), ports=ports)
 
@@ -386,14 +398,21 @@ def cosine_taper(
 def crossing(
     *,
     width_um: float = DEFAULT_WIDTH_UM,
-    arm_length_um: float = 3.0,
+    arm_length_um: Optional[float] = None,
+    lead_um: Optional[float] = None,
     thickness_um: float = DEFAULT_THICKNESS_UM,
     medium: Medium = SILICON,
     center_um: Vec3Um = (0.0, 0.0, 0.0),
     thickness_axis: AxisName = "z",
 ) -> Component:
     """A waveguide crossing: two ``Box`` waveguides crossed at 90 degrees in
-    the slab plane. Four ports, one per arm end."""
+    the slab plane. Four ports, one per arm end. The arm is given either as
+    ``arm_length_um``, port to port (default 3.0), or as ``lead_um``, the
+    straight guide from the crossing square's edge to each port."""
+    # ``arm_length_um`` is the whole arm (port to port); ``lead_um`` counts
+    # from the crossing square's edge, ``width_um / 2`` from the centre.
+    arm_length_um = 2.0 * _arm_length(None if arm_length_um is None else arm_length_um / 2.0,
+                                      lead_um, width_um / 2.0, default=1.5)
     a_axis, b_axis = _bend_plane_axes(thickness_axis)  # the two in-plane axes
     arm_a = _slab_box(
         center=center_um,
@@ -417,10 +436,14 @@ def crossing(
     )
     half = arm_length_um / 2.0
     ports = (
-        Port(f"{a_axis}-", _vec(center_um, **{a_axis: -half}), a_axis, width_um),
-        Port(f"{a_axis}+", _vec(center_um, **{a_axis: +half}), a_axis, width_um),
-        Port(f"{b_axis}-", _vec(center_um, **{b_axis: -half}), b_axis, width_um),
-        Port(f"{b_axis}+", _vec(center_um, **{b_axis: +half}), b_axis, width_um),
+        Port(f"{a_axis}-", _vec(center_um, **{a_axis: -half}), a_axis, width_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
+        Port(f"{a_axis}+", _vec(center_um, **{a_axis: +half}), a_axis, width_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
+        Port(f"{b_axis}-", _vec(center_um, **{b_axis: -half}), b_axis, width_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
+        Port(f"{b_axis}+", _vec(center_um, **{b_axis: +half}), b_axis, width_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
     )
     return Component(structures=(arm_a, arm_b), ports=ports)
 
@@ -436,7 +459,8 @@ def cosine_taper_crossing(
     junction_width_um: float,
     peak_width_um: float,
     taper_length_um: float,
-    arm_length_um: float,
+    arm_length_um: Optional[float] = None,
+    lead_um: Optional[float] = None,
     n_points: int = 48,
     thickness_um: float = DEFAULT_THICKNESS_UM,
     medium: Medium = SILICON,
@@ -447,7 +471,7 @@ def cosine_taper_crossing(
     Lett. 45, 6230 (2020)). Four convex cosine tapers connect the single-mode
     routing guide (``wg_width_um`` = W_in) to a solid central junction of side
     ``junction_width_um`` (= W_out); each taper bulges to a peak width
-    ``peak_width_um`` (= W_m) in its middle — the lens that focuses the beam
+    ``peak_width_um`` (= W_m) in its middle, the lens that focuses the beam
     across the intersection so it couples to the through arm instead of
     scattering into the cross arms.
 
@@ -456,10 +480,12 @@ def cosine_taper_crossing(
     from ``junction_width_um`` at the junction to ``wg_width_um`` at the routing
     end (peaking at ``peak_width_um`` inside), then a straight routing stub out to
     the port at ``arm_length_um`` from center. Four ports, each ``wg_width_um``
-    wide. ``arm_length_um`` must be >= ``junction_width_um/2 + taper_length_um``.
-    The paper's footprint is ``junction_width_um + 2*taper_length_um``.
+    wide. ``arm_length_um`` must be >= ``junction_width_um/2 + taper_length_um``;
+    ``lead_um`` gives the stub's length instead, from the taper's end to the
+    port. The paper's footprint is ``junction_width_um + 2*taper_length_um``.
     """
     inner = junction_width_um / 2.0 + taper_length_um  # end of the shaped region
+    arm_length_um = _arm_length(arm_length_um, lead_um, inner)
     if arm_length_um < inner - 1e-9:
         raise ValueError(
             f"arm_length_um ({arm_length_um}) must be >= junction_width_um/2 + "
@@ -524,7 +550,8 @@ def cosine_taper_crossing(
                 )
             port_name = f"{prop_axis}{'+' if sign > 0 else '-'}"
             port_center = _vec(center_um, **{prop_axis: sign * arm_length_um})
-            ports.append(Port(port_name, port_center, prop_axis, wg_width_um))
+            ports.append(Port(port_name, port_center, prop_axis, wg_width_um,
+                thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis))
     return Component(structures=tuple(structures), ports=tuple(ports))
 
 
@@ -549,10 +576,10 @@ def spline_width_profile(
     ``widths_um`` are ``N >= 2`` knot widths equally spaced along the taper,
     listed from the routing-waveguide end (``s = 0``) to the far end
     (``s = length_um``). ``interpolation`` is the curve drawn through them:
-    ``"natural"`` (cubic spline, zero end curvature — the default and the
+    ``"natural"`` (cubic spline, zero end curvature, the default and the
     classic "spline interpolation" of the Ma et al. crossing), ``"not-a-knot"``
     (SciPy's default cubic end condition), ``"pchip"`` (shape-preserving,
-    never overshoots a knot) or ``"linear"`` (straight segments — the
+    never overshoots a knot) or ``"linear"`` (straight segments, the
     13-segment convention of the classic Y-junction example). Returns a callable
     ``w(s)`` accepting a scalar or an array of positions in ``[0, length_um]``."""
     import numpy as np
@@ -585,7 +612,8 @@ def spline_taper_crossing(
     wg_width_um: float,
     taper_length_um: float,
     widths_um,
-    arm_length_um: float,
+    arm_length_um: Optional[float] = None,
+    lead_um: Optional[float] = None,
     interpolation: str = "natural",
     n_points: int = 121,
     thickness_um: float = DEFAULT_THICKNESS_UM,
@@ -601,9 +629,10 @@ def spline_taper_crossing(
     Each arm runs centre -> port along one in-plane axis: a taper of
     ``taper_length_um`` (= L) whose full width is the ``interpolation`` curve
     (see :func:`spline_width_profile`) through the equally spaced knots
-    ``widths_um`` — listed the paper's way, ``w1`` at the routing-waveguide end
-    and ``wN`` at the crossing centre — followed by a straight routing stub of
-    ``wg_width_um`` out to the port at ``arm_length_um`` from centre. The four
+    ``widths_um``, listed the paper's way, ``w1`` at the routing-waveguide end
+    and ``wN`` at the crossing centre, followed by a straight routing stub of
+    ``wg_width_um`` out to the port at ``arm_length_um`` from centre (or
+    ``lead_um`` beyond the taper's end). The four
     tapers overlap at the centre; their union is the device (the wide knots next
     to the centre "merge into the cross-sectional region", as the paper puts
     it), so the near-centre width profile is buried inside the junction and
@@ -614,6 +643,7 @@ def spline_taper_crossing(
     import numpy as np
 
     knots = [float(w) for w in widths_um]
+    arm_length_um = _arm_length(arm_length_um, lead_um, taper_length_um)
     if arm_length_um < taper_length_um - 1e-9:
         raise ValueError(
             f"arm_length_um ({arm_length_um}) must be >= taper_length_um "
@@ -688,7 +718,8 @@ def spline_taper_crossing(
                 )
             port_name = f"{prop_axis}{'+' if sign > 0 else '-'}"
             port_center = _vec(center_um, **{prop_axis: sign * arm_length_um})
-            ports.append(Port(port_name, port_center, prop_axis, wg_width_um))
+            ports.append(Port(port_name, port_center, prop_axis, wg_width_um,
+                thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis))
     return Component(structures=tuple(structures), ports=tuple(ports))
 
 
@@ -709,8 +740,7 @@ def coupler(
     thickness_axis: AxisName = "z",
 ) -> Component:
     """A directional coupler: two parallel straight waveguides separated
-    edge-to-edge by ``gap_um`` (along the in-plane width axis). Four ports —
-    two per guide at the ends."""
+    edge-to-edge by ``gap_um`` (along the in-plane width axis). Four ports, two per guide at the ends."""
     width_axis, thickness_axis = _planar_axes(axis, thickness_axis)
     # center-to-center spacing = one width + the edge-to-edge gap
     offset = (width_um + gap_um) / 2.0
@@ -738,10 +768,14 @@ def coupler(
     )
     half = length_um / 2.0
     ports = (
-        Port("top_in", _vec(top_center, **{axis: -half}), axis, width_um),
-        Port("top_out", _vec(top_center, **{axis: +half}), axis, width_um),
-        Port("bot_in", _vec(bot_center, **{axis: -half}), axis, width_um),
-        Port("bot_out", _vec(bot_center, **{axis: +half}), axis, width_um),
+        Port("top_in", _vec(top_center, **{axis: -half}), axis, width_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
+        Port("top_out", _vec(top_center, **{axis: +half}), axis, width_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
+        Port("bot_in", _vec(bot_center, **{axis: -half}), axis, width_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
+        Port("bot_out", _vec(bot_center, **{axis: +half}), axis, width_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
     )
     return Component(structures=(top, bot), ports=ports)
 
@@ -781,8 +815,8 @@ def ring(
         radius_um=outer_r,
         inner_radius_um=radius_um - width_um / 2.0,
         length_um=thickness_um,
-        angle_start=0.0,
-        angle_stop=2.0 * math.pi,
+        angle_start_rad=0.0,
+        angle_stop_rad=2.0 * math.pi,
     )
     ring_structure = Structure(geometry=ring_geom, medium=medium)
 
@@ -805,12 +839,13 @@ def ring(
     )
     half = bus_length_um / 2.0
     ports = (
-        Port("in", _vec(bus_center, **{bus_axis: -half}), bus_axis, bus_width_um),
+        Port("in", _vec(bus_center, **{bus_axis: -half}), bus_axis, bus_width_um,
+            thickness_um=thickness_um, medium=medium),
         Port(
             "through",
             _vec(bus_center, **{bus_axis: +half}),
             bus_axis,
-            bus_width_um,
+            bus_width_um, thickness_um=thickness_um, medium=medium,
         ),
     )
     return Component(structures=(ring_structure, bus_structure), ports=ports)
@@ -827,7 +862,8 @@ def bragg_grating(
     corrugation_um: float,
     period_um: float,
     n_periods: int,
-    arm_length_um: float,
+    arm_length_um: Optional[float] = None,
+    lead_um: Optional[float] = None,
     duty: float = 0.5,
     thickness_um: float = DEFAULT_THICKNESS_UM,
     medium: Medium = SILICON,
@@ -838,14 +874,15 @@ def bragg_grating(
     """A sidewall-corrugated waveguide Bragg grating (Wang et al., Opt. Express
     20, 15547 (2012), strip variant). A straight strip of width ``wg_width_um``
     whose two sidewalls corrugate SYMMETRICALLY (equal ± on each side, so the
-    average width — hence the average effective index — is constant): over a
+    average width, hence the average effective index, is constant): over a
     ``period_um`` the full width alternates between ``wg_width + 2*corrugation``
     (wide, a ``duty`` fraction of the period) and ``wg_width - 2*corrugation``
     (narrow). ``n_periods`` teeth open a photonic stopband at the Bragg
     wavelength ``λ_B ≈ 2*n_eff*period``; ``corrugation_um`` (the per-side tooth
     amplitude) sets the coupling coefficient κ, hence the stopband width. Plain
     routing stubs of the nominal ``wg_width`` run out to the two ports at
-    ``±arm_length_um`` (``in`` at −axis, ``through`` at +axis)."""
+    ``±arm_length_um`` (``in`` at −axis, ``through`` at +axis), or ``lead_um``
+    beyond the grating's ends."""
     width_axis, thickness_axis = _planar_axes(axis, thickness_axis)
     if n_periods < 1:
         raise ValueError("n_periods must be >= 1")
@@ -855,6 +892,7 @@ def bragg_grating(
             f"{wg_width_um - 2*corrugation_um} would be non-positive")
     grating_len = n_periods * period_um
     half_g = grating_len / 2.0
+    arm_length_um = _arm_length(arm_length_um, lead_um, half_g)
     wide_w = wg_width_um + 2.0 * corrugation_um
     narrow_w = wg_width_um - 2.0 * corrugation_um
     wide_len = duty * period_um
@@ -886,8 +924,10 @@ def bragg_grating(
                 thickness_axis=thickness_axis, length_um=stub_len,
                 width_um=wg_width_um, thickness_um=thickness_um, medium=medium))
     ports = (
-        Port("in", _vec(center_um, **{axis: -arm_length_um}), axis, wg_width_um),
-        Port("through", _vec(center_um, **{axis: +arm_length_um}), axis, wg_width_um),
+        Port("in", _vec(center_um, **{axis: -arm_length_um}), axis, wg_width_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
+        Port("through", _vec(center_um, **{axis: +arm_length_um}), axis, wg_width_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
     )
     return Component(structures=tuple(structures), ports=ports)
 
@@ -945,7 +985,7 @@ def _sbend_centerline(rho1, rho2, straight_um, y_target, n):
 
 def _cos_sbend(dy: float, length: float, n: int):
     """Raised-cosine S-bend centerline from (0, 0) to (``length``, ``dy``),
-    horizontal (zero-slope) at both ends — the standard low-loss access-waveguide
+    horizontal (zero-slope) at both ends, the standard low-loss access-waveguide
     bend used to fan the two outputs apart until they decouple."""
     n = max(2, n)
     return [(length * i / (n - 1), dy * 0.5 * (1.0 - math.cos(math.pi * i / (n - 1))))
@@ -980,7 +1020,8 @@ def y_branch(
     wg_width_um: float,
     splitting_length_um: float,
     gap_um: float,
-    arm_length_um: float,
+    arm_length_um: Optional[float] = None,
+    lead_um: Optional[float] = None,
     top_radii: Tuple[float, float],
     bot_radii: Tuple[float, float],
     top_straight_um: float = 0.0,
@@ -1015,16 +1056,18 @@ def y_branch(
 
     Because the paper's two outputs sit only ``gap_um`` apart they would remain
     evanescently coupled (a directional coupler) and the per-arm power would slosh
-    between them — so for a clean split-ratio readout the arms are fanned apart
+    between them, so for a clean split-ratio readout the arms are fanned apart
     with a raised-cosine access bend over ``fanout_length_um`` to a decoupled
     ``output_offset_final_um`` (default = the junction offset, i.e. no fanout).
     Three ports: ``in`` (−axis), ``o_top`` / ``o_bot`` (+axis, offset in the width
-    axis)."""
+    axis), at ``arm_length_um`` from the centre or ``lead_um`` beyond the
+    splitting region and the access bend."""
     width_axis, thickness_axis = _planar_axes(axis, thickness_axis)
     poly_axes = [ax for ax in _AXES if ax != thickness_axis]  # (u, v)
     offset = (wg_width_um + gap_um) / 2.0
     y_final = output_offset_final_um if output_offset_final_um is not None else offset
     half_L = splitting_length_um / 2.0
+    arm_length_um = _arm_length(arm_length_um, lead_um, splitting_length_um / 2.0 + fanout_length_um)
     t_center = center_um[_INDEX[thickness_axis]]
     slab_bounds = (t_center - thickness_um / 2.0, t_center + thickness_um / 2.0)
 
@@ -1174,10 +1217,13 @@ def y_branch(
         thickness_um=thickness_um, medium=medium))
 
     ports = (
-        Port("in", _vec(center_um, **{axis: -arm_length_um}), axis, wg_width_um),
+        Port("in", _vec(center_um, **{axis: -arm_length_um}), axis, wg_width_um,
+            thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
         Port("o_top", _vec(center_um, **{axis: arm_length_um, width_axis: +y_final}),
-             axis, wg_width_um),
+             axis, wg_width_um,
+                 thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
         Port("o_bot", _vec(center_um, **{axis: arm_length_um, width_axis: -y_final}),
-             axis, wg_width_um),
+             axis, wg_width_um,
+                 thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
     )
     return Component(structures=tuple(structures), ports=ports)

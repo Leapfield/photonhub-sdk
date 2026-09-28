@@ -14,8 +14,10 @@ from __future__ import annotations
 import math
 from typing import Dict, Tuple
 
+from ..constants import c0, eps0, mu0
+
 #: Free-space speed of light (m/s) — exact SI (engine ``kC0``).
-C0: float = 2.99792458e8
+C0: float = c0
 
 
 def engine_dt_s(dl_um: float, courant: float = 0.99,
@@ -36,10 +38,10 @@ def engine_dt_s(dl_um: float, courant: float = 0.99,
 
 #: Vacuum permeability (H/m) — CODATA 2018 (engine ``kMu0``). NOT the pre-2019
 #: exact ``4e-7*pi`` (which differs by ~5e-10 relative).
-MU0: float = 1.25663706212e-6
+MU0: float = mu0
 
 #: Vacuum permittivity (F/m) = ``1/(MU0 * C0^2)`` (engine ``kEps0``).
-EPS0: float = 1.0 / (MU0 * C0 * C0)
+EPS0: float = eps0
 
 #: Vacuum wave impedance (ohms), ``eta0 = sqrt(MU0/EPS0) = MU0 * C0`` — the
 #: literal equals that product to the displayed digits.

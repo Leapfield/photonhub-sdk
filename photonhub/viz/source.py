@@ -1,4 +1,4 @@
-"""``plot_source_time()`` — 1D preview of a source's drive: the injected
+"""``plot_source_time()``, 1D preview of a source's drive: the injected
 current ``J(t)`` (Gaussian envelope × carrier) and its spectral envelope.
 
 Faithful to the engine: the time waveform and the spectral envelope are the

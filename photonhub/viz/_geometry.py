@@ -33,9 +33,25 @@ either. The recognized patch-spec kinds are:
 """
 
 import math
+from contextlib import contextmanager
 from typing import Optional, Tuple
 
 _AXES = "xyz"
+
+
+def frame_origin(sim) -> Tuple[float, float, float]:
+    """The user-frame position of the wire's corner (``Simulation.origin_um``),
+    ``(0, 0, 0)`` for a hand-built or ingested scene. The plotters sample and
+    check in the corner frame and draw in the user's frame (design spec §4.4)."""
+    from ..components.frame import frame_origin as _origin
+    return _origin(sim)
+
+
+def plane_offsets(origin: Tuple[float, float, float], axis: str) -> Tuple[float, float]:
+    """The in-plane (horizontal, vertical) components of a 3-vector for a cut
+    normal to ``axis``."""
+    h, v = in_plane_axes(axis)
+    return origin[axis_index(h)], origin[axis_index(v)]
 
 
 def axis_index(axis: str) -> int:
@@ -46,13 +62,42 @@ def axis_index(axis: str) -> int:
         raise ValueError(f"axis must be one of 'x', 'y', 'z', got {axis!r}")
 
 
+_DISPLAY_SWAP = False
+
+
 def in_plane_axes(axis: str) -> Tuple[str, str]:
     """The two axis letters that remain in the cut plane, in (horizontal,
     vertical) order: the natural pair for a constant-``axis`` slice. For a
-    z-cut this is ('x', 'y'); for x it is ('y', 'z'); for y it is ('x', 'z')."""
+    z-cut this is ('x', 'y'); for x it is ('y', 'z'); for y it is ('x', 'z').
+
+    Inside :func:`displayed_transposed` the pair comes back swapped, so a view
+    that opts in draws the same plane with its other axis horizontal. That is
+    a presentation choice only: the ascending pair above is the convention
+    every caller outside such a block sees, the wire and the Workbench
+    included."""
     a = axis_index(axis)
     rest = [i for i in range(3) if i != a]
-    return _AXES[rest[0]], _AXES[rest[1]]
+    h, v = _AXES[rest[0]], _AXES[rest[1]]
+    return (v, h) if _DISPLAY_SWAP else (h, v)
+
+
+@contextmanager
+def displayed_transposed(swap: bool = True):
+    """Swap the (horizontal, vertical) order every view derives from
+    :func:`in_plane_axes`, for the duration of the block.
+
+    A 2D view is assembled by many helpers (the ε sample, the outlines, the
+    overlays and their glyphs, the symmetry planes, the limits and the axis
+    labels), and each asks :func:`in_plane_axes` which way round the plane
+    goes. Flipping the answer once, here, turns the whole picture together
+    rather than transposing a dozen artists after the fact."""
+    global _DISPLAY_SWAP
+    previous = _DISPLAY_SWAP
+    _DISPLAY_SWAP = bool(swap)
+    try:
+        yield
+    finally:
+        _DISPLAY_SWAP = previous
 
 
 def select_plane(x, y, z) -> Tuple[str, float]:
@@ -76,14 +121,20 @@ def box_rectangle(
     size_um: Tuple[float, float, float],
     axis: str,
     value: float,
+    tol: float = 0.0,
 ) -> Optional[Tuple[float, float, float, float]]:
     """Cross-section of a box on the plane, as ``(x0, y0, width, height)`` in
     the in-plane axes' order, or ``None`` if the plane does not intersect.
 
-    Intersects iff ``|value - center[axis]| <= size[axis]/2`` (closed, matching
-    the §9 closed-containment rasterization rule)."""
+    Intersects iff ``|value - center[axis]| <= size[axis]/2 + tol`` (closed,
+    matching the §9 closed-containment mesh sampling rule). ``tol`` defaults to
+    0 — exact containment, what structure mesh sampling means. Overlay glyphs
+    pass half a cell for a box that is FLAT on the cut axis: a monitor plane
+    carries no thickness to intersect, and the quarter-cell auto-snap moves it
+    off any round cut coordinate, so exact containment hides it from the very
+    view that is meant to show where it sits."""
     a = axis_index(axis)
-    if abs(value - center_um[a]) > size_um[a] / 2.0:
+    if abs(value - center_um[a]) > size_um[a] / 2.0 + tol:
         return None
     h_ax, v_ax = (_AXES.index(c) for c in in_plane_axes(axis))
     x0 = center_um[h_ax] - size_um[h_ax] / 2.0
@@ -215,8 +266,8 @@ def cylinder_section(
     radius_um: float,
     inner_radius_um: float,
     length_um: float,
-    angle_start: float,
-    angle_stop: float,
+    angle_start_rad: float,
+    angle_stop_rad: float,
     cut_axis: str,
     value: float,
     full_sweep_tol: float = 1e-9,
@@ -230,7 +281,7 @@ def cylinder_section(
       ``inner_radius>0`` -> ``("annulus", (cx, cy, r_outer, r_inner))``; a
       partial sweep -> ``("polygon", arc-vertices)`` (a wedge, annular when
       ``inner_radius>0``). Angles use ``atan2(v, u)`` in the (u, v) transverse
-      plane, matching the rasterizer.
+      plane, matching the mesh sampler.
     - Cut PARALLEL to the axis: a rectangle spanning ``[axial_lo, axial_hi]``
       and the EXACT outer-circle chord on the surviving transverse axis at the
       cut offset. The annular hole and a partial sweep are still ignored here
@@ -249,7 +300,7 @@ def cylinder_section(
     if cut_axis == geom_axis:
         if not (axial_lo <= value <= axial_hi):
             return None
-        sweep = angle_stop - angle_start
+        sweep = angle_stop_rad - angle_start_rad
         is_full = sweep >= 2.0 * math.pi - full_sweep_tol
         if is_full and inner_radius_um <= 0.0:
             return ("circle", (cu, cv, radius_um))
@@ -257,7 +308,7 @@ def cylinder_section(
             return ("annulus", (cu, cv, radius_um, inner_radius_um))
         return ("polygon",
                 _arc_polygon(cu, cv, radius_um, inner_radius_um,
-                             angle_start, angle_stop))
+                             angle_start_rad, angle_stop_rad))
 
     # Parallel cut: exact chord of the outer circle at the cut offset (the
     # annular hole / partial sweep are still ignored — see the docstring).
@@ -275,6 +326,42 @@ def cylinder_section(
     h_lo, h_hi = spans[h_ax]
     v_lo, v_hi = spans[v_ax2]
     return ("rect", (h_lo, v_lo, h_hi - h_lo, v_hi - v_lo))
+
+
+def reflect_spec(kind, params, sign_h: int, sign_v: int):
+    """The same cut-plane patch spec reflected about ``h = 0`` and/or ``v = 0``
+    (``sign_* = -1`` reflects that in-plane axis, ``+1`` leaves it).
+
+    A NUMERICS §20 symmetry plane sits on an axis MINIMUM face, i.e. at
+    coordinate 0, so unfolding the half domain is exactly this negation. The
+    spec kinds are the tagged union this module returns, so a new geometry
+    kind gets its mirror here and nowhere else."""
+    if sign_h == 1 and sign_v == 1:
+        return (kind, params)
+    if kind == "rect":
+        return (kind, _reflect_rect(params, sign_h, sign_v))
+    if kind == "rects":
+        return (kind, tuple(_reflect_rect(r, sign_h, sign_v) for r in params))
+    if kind == "circle":
+        cx, cy, r = params
+        return (kind, (sign_h * cx, sign_v * cy, r))
+    if kind == "annulus":
+        cx, cy, r_outer, r_inner = params
+        return (kind, (sign_h * cx, sign_v * cy, r_outer, r_inner))
+    if kind == "polygon":
+        return (kind, tuple((sign_h * h, sign_v * v) for h, v in params))
+    return (kind, params)   # forward-compatible: an unknown kind is passed on
+
+
+def _reflect_rect(rect, sign_h: int, sign_v: int):
+    """Reflect ``(x0, y0, w, h)``. A reflected rectangle keeps its extent and
+    moves its ORIGIN to the far edge: x0 -> -(x0 + w)."""
+    x0, y0, w, h = rect
+    if sign_h == -1:
+        x0 = -(x0 + w)
+    if sign_v == -1:
+        y0 = -(y0 + h)
+    return (x0, y0, w, h)
 
 
 def structure_patch_spec(geometry, axis: str, value: float):
@@ -297,7 +384,7 @@ def structure_patch_spec(geometry, axis: str, value: float):
         return cylinder_section(
             geometry.axis, geometry.center_um, geometry.radius_um,
             geometry.inner_radius_um, geometry.length_um,
-            geometry.angle_start, geometry.angle_stop, axis, value)
+            geometry.angle_start_rad, geometry.angle_stop_rad, axis, value)
     return None
 
 

@@ -1,4 +1,4 @@
-"""PhotonHub Python client — build simulation specs, run the solver, load results.
+"""PhotonHub Python client. Build simulation specs, run the solver, and load results.
 
 >>> import photonhub as ph
 >>> sim = ph.Simulation(...)
@@ -7,7 +7,12 @@
 """
 
 from .components import (
+    Domain,
+    GaussianBeam,
+    Mesh,
+    Port,
     SCHEMA_VERSION,
+    mode_window_um,
     Apodization,
     Background,
     Boundaries,
@@ -27,7 +32,7 @@ from .components import (
     ModeSolveProvenance,
     ModeSource,
     PlaneWave,
-    TfsfBox,
+    TFSFBox,
     PointDipole,
     PortMode,
     Polygon,
@@ -40,12 +45,15 @@ from .components import (
     MeshOverride,
     UniformMesh,
     auto_mesh,
+    axis_mirror_mismatch,
+    graded_primary_spacings,
 )
 from . import library
 from . import materials
+from .constants import c0, eps0
 from .cost import CostEstimate, quote
 from .data import RunResult
-from .gds import GdsLayer, export_gds, import_gds, read_gds_cell_names
+from .gds import GDSLayer, export_gds, import_gds, read_gds_cell_names
 from .hdf5 import convert_to_hdf5
 from .runners import (
     Batch,
@@ -72,10 +80,17 @@ from .inverse_design import (
     value_and_gradient,
 )
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 __all__ = [
+    "c0",
+    "eps0",
+    "mode_window_um",
     "Apodization",
+    "Domain",
+    "GaussianBeam",
+    "Mesh",
+    "Port",
     "Background",
     "Batch",
     "BatchResults",
@@ -89,7 +104,7 @@ __all__ = [
     "PowerMonitor",
     "CW",
     "GaussianPulse",
-    "GdsLayer",
+    "GDSLayer",
     "import_gds",
     "export_gds",
     "Job",
@@ -103,7 +118,7 @@ __all__ = [
     "library",
     "materials",
     "PlaneWave",
-    "TfsfBox",
+    "TFSFBox",
     "PointDipole",
     "PortMode",
     "Polygon",
@@ -121,6 +136,8 @@ __all__ = [
     "MeshOverride",
     "UniformMesh",
     "auto_mesh",
+    "axis_mirror_mismatch",
+    "graded_primary_spacings",
     "convert_to_hdf5",
     "quote",
     "find_solver",
@@ -160,6 +177,9 @@ _RENAMED = {
     "auto_grid": "auto_mesh",
     "run_async": "submit",
     "estimate_cost": "quote",
+    # 2026-09 naming convention (CONTRIBUTING.md, Names): acronyms in caps
+    "GdsLayer": "GDSLayer",
+    "TfsfBox": "TFSFBox",
 }
 
 

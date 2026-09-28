@@ -17,10 +17,11 @@ python -m pip install photonhub
 
 That installs the full scripting client: build simulations, estimate cost,
 run on the **cloud GPU** (`ph.cloud.run_quoted(sim, max_usd=...)` with your beta
-API key), and read results — no compiler, no engine build. **Local** runs
+API key), and read results, with no compiler and no engine build. **Local** runs
 (`ph.run_local`) also need the `phsolver` engine binary, which pip does not
 ship: invited beta participants receive the standalone headless solver
-archive (point `$PHOTONHUB_SOLVER` at it or put it on `PATH`; the copy inside
+archive (install it with `photonhub install-solver --archive <file> --sha256
+<digest>`, or point `$PHOTONHUB_SOLVER` at it or put it on `PATH`; the copy inside
 the desktop app is locked to that app and is not a standalone command), and
 developers with the monorepo build it with
 `cmake -S engine -B build && cmake --build build`.
@@ -69,45 +70,52 @@ desktop app's file-format integrations.
 
 ## See your simulation before you run it
 
-Every `Simulation` plots itself — geometry, sources, monitors, PML, and the
-**permittivity the solver actually meshes** — with matplotlib (built in; plotly
-for 3D). `grid=True` overlays the Yee cell edges so you can check resolution:
+Every `Simulation` plots itself: geometry, sources, monitors, PML, and the
+**permittivity the solver actually meshes**, with matplotlib (built in; plotly
+for 3D). `grid=True` overlays the mesh cell edges so you can check resolution:
 
 ```python
 sim.plot(z=2.0)                   # scene cross-section through the source
-sim.plot_index(z=2.0, grid=True)    # rasterized ε + the Yee mesh overlay
+sim.plot_index(z=2.0, grid=True)    # the permittivity the run sees + the mesh overlay
 sim.plot_3d()                     # interactive 3D  (pip install photonhub[viz])
 ```
 
 ## What you can do today
 
-Shipped surface as of schema **v1.20.0-alpha.1** (a dispersive solver core
-cross-checked against analytic references — multi-pole Lorentz + Drude ADE
+Shipped surface as of schema **v1.21.0-alpha.1** (a dispersive solver core
+cross-checked against analytic references: multi-pole Lorentz + Drude ADE
 with a fitted metals library (Au/Ag/Cu/Al) and PEC structures, with recorded
 CPU↔GPU equivalence (full inventory 475/475 on 2026-08-27, a dated
-pre-merge record) under the numerical contract's tolerances — plus full-vector mode
-injection, GDS import (`ph.import_gds`), adjoint gradients, and the silicon-PIC
-MVP):
+pre-merge record) under the numerical contract's tolerances; plus full-vector mode
+injection, GDS import (`ph.import_gds`), adjoint gradients, and silicon
+photonic-circuit tools):
 
+- **Ports and declarative setup:** `ph.Port` names a plane, a guide and a
+  mode. `ph.Simulation(ports=..., source="in", wlens_um=...,
+  domain=ph.Domain(...), mesh=ph.Mesh(...))` fits the box around your
+  structures, builds the mesh, launches the driven port and records every
+  port; `data.transmission("out")` and `data.reflection()` read them back as
+  spectra. `symmetry=` reduces a symmetric device to the half the solver
+  steps, and every view and readout shows the whole device.
 - **Run a simulation:** `ph.run_local(sim)` (subprocess + file protocol;
   `device="cpu"|"gpu"|"gpu:N"`), `ph.submit(sim)` and `ph.Batch(...)` for many
   sims in flight.
 - **Know the cost first:** `sim.cost_estimate()` (or `ph.quote(sim)`)
   returns a dollar estimate
-  from an overridable Tcell-step planning rate *before* you press run; the
+  from an overridable planning rate per cell and time step *before* you press run; the
   default is an estimator input, not a production billing commitment.
 - **Geometry:** `Box`, `Sphere`, `Cylinder` (full, or an annular sector / ring
-  via `inner_radius_um` + `angle_start` / `angle_stop`), and `Polygon` (an
-  extruded polygon — e.g. a taper).
+  via `inner_radius_um` + `angle_start_rad` / `angle_stop_rad`), and `Polygon` (an
+  extruded polygon, e.g. a taper).
 - **Sources:** `PointDipole`, `PlaneWave` (normal-incidence TF/SF; oblique
   via `Simulation.with_oblique_plane_wave` + Bloch boundaries, schema 1.18),
-  the closed `TfsfBox` scattering box (single-run cross-sections with PML on
-  all sides), and the recommended `mode_launch` waveguide-mode builder — all
-  driven by a `GaussianPulse` or a steady-state `CW` carrier. The
+  the closed `TFSFBox` scattering box (single-run cross-sections with PML on
+  all sides), and the `mode_launch` waveguide-mode builder that declared ports
+  use, all driven by a `GaussianPulse` or a steady-state `CW` carrier. The
   `ModeSource` wire type remains for legacy scalar and continuous-adjoint
   compatibility.
 - **Monitors:** `TimeMonitor`, `SnapshotMonitor`, `ProfileMonitor`,
-  and `PowerMonitor` — fp64 DFT field and flux power. A DFT plane may carry the
+  and `PowerMonitor`: fp64 DFT field and flux power. A DFT plane may carry the
   optional `ModePort` authoring recipe; the engine strictly validates and then
   ignores that metadata while recording the same raw fields, and result
   post-processing performs the requested modal projection. Workbench keeps one
@@ -116,34 +124,35 @@ MVP):
   to the first wire-order normalization source with no other active excitation,
   so an unevaluable S-column is rejected before the time-domain run.
 - **Component library:** `ph.library.straight / bend / taper / crossing /
-  coupler / ring` — each returns a `Component` (structures + ports) in ~one line.
-- **Material library:** `ph.materials` — 20 literature materials (Si, SiO2,
+  coupler / ring`: each returns a `Component` (structures + ports) in ~one line.
+- **Material library:** `ph.materials`: 20 literature materials (Si, SiO2,
   Si3N4, GaAs, InP, Ge, LiNbO3, sapphire, AlN, TiO2, MgF2, CaF2, PMMA, ...)
   with cited dispersion data and validity ranges. `Si.medium(1.55)` freezes
   the index at one wavelength; `Si.medium(band_um=(1.5, 1.6))` least-squares
   fits the engine's single Lorentz pole over the band (Courant-safe pole
-  placement, ≤1e-4 index error over 100 nm). Bring measured ellipsometry data
+  placement; it warns when the fitted index is off by more than 1e-3).
+  Bring measured ellipsometry data
   via `materials.Material.from_nk_data(...)`.
-- **Mode-resolved transmission:** the recommended `photonhub.analysis` pipeline —
-  `solve_yee_mode` → `mode_launch` → `mode_monitor` →
-  `transmission(out, in, data)` — returns `{freq_hz: T}`. Use
+- **Mode-resolved transmission by hand:** the `photonhub.analysis` pipeline
+  that declared ports build for you, `solve_yee_mode` → `mode_launch` →
+  `mode_monitor` → `transmission(out, in, data)`, returns `{freq_hz: T}`. Use
   `solve_yee_mode_bank` / `solve_modes_by_freq` for a broadband launch and readout;
   the legacy `ModeSolver` / `mode_source` path remains for scalar and adjoint
   compatibility. Full complex multiport S-matrices:
-  `analysis.smatrix` (`SPort` + `assemble_smatrix`, one run per driven port —
+  `analysis.smatrix` (`SPort` + `assemble_smatrix`, one run per driven port,
   a multi-port S-parameter driver).
 - **Meshing:** `UniformMesh`, or `GradedMesh` + `auto_mesh` for a
   cells-per-λ graded mesh; `MeshOverride` (a per-structure mesh override) forces
-  a target spacing inside a geometry regardless of material —
+  a target spacing inside a geometry regardless of material:
   `sim.with_mesh_overrides(MeshOverride(geometry=Box(...), dl_um=(0.02,0.02,None)))`.
   Graded meshes run on CPU, single GPU, and multi-GPU with PML/absorber,
-  dispersive media, DFT/flux monitors, and plane-wave/mode sources. The one
-  unsupported combination is graded + `subpixel_method="tensor_full"`.
+  dispersive media, DFT/flux monitors, and plane-wave/mode sources. They
+  reject the full-tensor subpixel methods (`tensor_full`, `contour_full`).
 - **Mode solving:** the FDE plugins provide the lightweight semi-vectorial
   `ModeSolver` and the full-vector `VectorModeSolver`, including bent/leaky
   modes with complex `n_eff` and bend-loss readout.
 - **Visualization:** `Simulation.plot` / `plot_index` (draws Box / Sphere /
-  Cylinder / Polygon; `grid=True` overlays the Yee mesh) / `plot_3d`,
+  Cylinder / Polygon; `grid=True` overlays the mesh) / `plot_3d`,
   `RunResult.plot_field`, and the module-level `photonhub.viz.plot_mode`
   (FDE mode heatmap) and `photonhub.viz.plot_spectrum` (`T` vs λ).
 - **Export:** HDF5 converter for the parsed results.
@@ -157,31 +166,35 @@ MVP):
 ### Limits (today)
 
 This is a **dispersive** solver core cross-checked against analytic references,
-plus the silicon-PIC MVP:
+plus silicon photonic-circuit tools:
 
-- Dispersion is **multi-pole ADE** — up to 6 Lorentz + Drude poles per medium
+- Dispersion is **multi-pole ADE**: Lorentz + Drude poles per medium
   (metals/plasmonics; numerical definition in the numerics reference, §19; the
   single- and multi-pole/Drude scenes are in the recorded GPU equivalence
   inventory under §8 tolerances, dated 2026-08-27) on
   top of relative permittivity + Ohmic conductivity; a passivity-enforced
-  CCPR fitter and anisotropic poles are still open. Explicit
+  pole fitter and anisotropic poles are still open. Explicit
   subpixel + Lorentz runs are supported and equivalence-tested, but the client
   keeps their construction default off and warns callers to use the stabilized
   PML profile.
 - S-matrix assembly (`analysis.smatrix`) costs **one simulation per driven
-  port** — there is no single-run multiport solve.
+  port**; there is no single-run multiport solve.
+- Open issues and their workarounds are listed on the documentation site's
+  [known limitations](https://leapfield.ai/docs/guides/known-limitations/)
+  page.
 
-Net: shapes go in and **mode-resolved transmission** comes out — solve the
-eigenmode, inject it with `mode_launch`, ratio two `mode_monitor` planes, and plot
-`T(λ)`; or assemble the full S-matrix with `analysis.smatrix`.
+Net: shapes go in and **mode-resolved transmission** comes out: declare ports
+and read `data.transmission("out")`, or solve the eigenmode, inject it with
+`mode_launch`, ratio two `mode_monitor` planes, and plot `T(λ)`; or assemble
+the full S-matrix with `analysis.smatrix`.
 
 ## Learn more
 
-- **[API documentation and guides](https://leapfield.app/docs/)** — the full reference for
-  every public symbol in this package, plus install and quickstart guides.
-- [PhotonHub product overview](https://leapfield.app/#product)
-- [Request beta access or support](https://leapfield.app/#request)
+- **[API documentation and guides](https://leapfield.ai/docs/)**: the reference for
+  the supported simulation, analysis, cloud and visualization namespaces, plus
+  install and quickstart guides.
+- [PhotonHub product overview](https://leapfield.ai/#product)
+- [Request beta access or support](https://leapfield.ai/#request)
 
-The worked-example gallery (thirty-one executed notebooks) lives in the
-project source tree and is summarized on the documentation site's examples
-page.
+The worked-example gallery of executed notebooks lives in the project source
+tree and is shown on the documentation site's examples page.

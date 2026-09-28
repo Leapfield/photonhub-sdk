@@ -7,12 +7,14 @@ from typing import Annotated, Literal, Optional, Sequence, Tuple, Union
 from pydantic import Field, model_validator
 
 from .base import FreqHz, FrozenModel
+from .._compat import caller_stacklevel, legacy_keywords
+from ..constants import c0
 
 # Free-space speed of light (m/s), identical to the engine's kC0
 # (engine/include/phcore/types.h) and to grid.py / cost.py, so the wavelength
 # <-> frequency conversion used by :meth:`GaussianPulse.for_band` round-trips
 # bit-comparably with the rest of the client.
-_C0_M_PER_S = 2.99792458e8
+_C0_M_PER_S = c0
 
 
 class GaussianPulse(FrozenModel):
@@ -89,12 +91,12 @@ class GaussianPulse(FrozenModel):
         """Instant the source is considered done injecting, ``(offset+8)*tau``
         (engine ``source_end_time``). Auto-shutoff (NUMERICS.md §7) may not
         terminate the run before this time, so it is the settling floor on the
-        step count — inversely proportional to ``fwidth_hz``."""
+        step count, inversely proportional to ``fwidth_hz``."""
         return (self.offset + 8.0) * self.tau_s
 
     def spectral_amplitude(self, freq_hz: float) -> float:
         """Relative spectral envelope at ``freq_hz`` (peak 1.0 at ``freq0_hz``):
-        ``exp(-(freq-freq0)^2/(2 fwidth^2))`` — the dominant sideband of the
+        ``exp(-(freq-freq0)^2/(2 fwidth^2))``, the dominant sideband of the
         analytic pulse spectrum (engine ``gaussian_pulse_spectrum``)."""
         d = (freq_hz - self.freq0_hz) / self.fwidth_hz
         return math.exp(-0.5 * d * d)
@@ -109,8 +111,7 @@ class GaussianPulse(FrozenModel):
             |S(0)|/|S(freq0)| = 2*|cos(phase)| * exp(-(freq0/fwidth)^2 / 2)
 
         (:meth:`spectral_amplitude` alone is the dominant +freq0 sideband,
-        which under-reports the DC weight by the ``2*|cos(phase)|`` factor —
-        2x at the default ``phase=0``). A large value is the over-broadband
+        which under-reports the DC weight by the ``2*|cos(phase)|`` factor, 2x at the default ``phase=0``). A large value is the over-broadband
         instability tell (even a few percent is risky); :meth:`for_band`
         keeps this far below 1."""
         return 2.0 * abs(math.cos(self.phase)) * self.spectral_amplitude(0.0)
@@ -118,12 +119,14 @@ class GaussianPulse(FrozenModel):
     # --- band -> pulse tuning (settling-aware) ---
 
     @classmethod
+    @legacy_keywords(wavelengths_um="wlens_um")
     def for_band(
         cls,
         *,
         freqs_hz: Optional[Sequence[float]] = None,
-        wavelengths_um: Optional[Sequence[float]] = None,
+        wlens_um: Optional[Sequence[float]] = None,
         freq0_hz: Optional[float] = None,
+        wlen0_um: Optional[float] = None,
         band_sigmas: float = 1.0,
         offset: float = 5.0,
         phase: float = 0.0,
@@ -132,12 +135,11 @@ class GaussianPulse(FrozenModel):
         """Pick ``freq0_hz``/``fwidth_hz`` to cover a measurement band with the
         SHORTEST settling that band justifies (NUMERICS.md §5/§7).
 
-        Exactly one of ``freqs_hz`` or ``wavelengths_um`` defines the band (only
-        its extremes matter). ``freq0_hz`` defaults to the band centre
-        ``(fmin+fmax)/2``. ``fwidth_hz`` is set so the further band edge sits at
+        Exactly one of ``freqs_hz`` or ``wlens_um`` defines the band (only
+        its extremes matter). ``freq0_hz`` (or its wavelength form ``wlen0_um``,
+        microns) defaults to the band centre ``(fmin+fmax)/2``. ``fwidth_hz`` is set so the further band edge sits at
         ``band_sigmas`` standard deviations from ``freq0``: ``band_sigmas=1``
-        (default) puts the edges at ~61% spectral amplitude, the broadest pulse
-        — hence the shortest :attr:`source_end_time_s` — that covers the band
+        (default) puts the edges at ~61% spectral amplitude, the broadest pulse, hence the shortest :attr:`source_end_time_s`, that covers the band
         near-flat without spilling much energy outside it. Lower ``band_sigmas``
         broadens the pulse further (settling shrinks, the band flattens toward
         the peak) at the cost of spectral density spread outside the band (lower
@@ -147,28 +149,34 @@ class GaussianPulse(FrozenModel):
 
         ``fwidth`` is capped at ``freq0 / min_dc_sigmas`` so DC stays at least
         ``min_dc_sigmas`` (default 4 → DC weight ``2*exp(-8)`` ~ 6.7e-4 at
-        phase 0, both sidebands counted — see :attr:`dc_amplitude`) standard
+        phase 0, both sidebands counted, see :attr:`dc_amplitude`) standard
         deviations from ``freq0``; past this the broadband drive dumps DC into
         its lowest carrier and the run goes unstable. A band too wide for that
         cap is
         clamped (narrower fwidth, longer settling, under-driven edges) with a
-        warning — such a band wants a broadband mode source (``num_freqs``),
+        warning, such a band wants a broadband mode source (``num_freqs``),
         not a single Gaussian.
 
         Returns a :class:`GaussianPulse`; read :attr:`source_end_time_s` on it
         to see the resulting settling floor.
         """
-        if (freqs_hz is None) == (wavelengths_um is None):
-            raise ValueError("for_band: pass exactly one of freqs_hz or wavelengths_um")
+        if (freqs_hz is None) == (wlens_um is None):
+            raise ValueError("for_band: pass exactly one of freqs_hz or wlens_um")
+        if wlen0_um is not None:
+            if freq0_hz is not None:
+                raise ValueError("for_band: pass freq0_hz or wlen0_um, not both")
+            if not float(wlen0_um) > 0.0:
+                raise ValueError("for_band: wlen0_um must be positive")
+            freq0_hz = _C0_M_PER_S / (float(wlen0_um) * 1e-6)
         if band_sigmas <= 0.0:
             raise ValueError("for_band: band_sigmas must be > 0")
         if min_dc_sigmas <= 0.0:
             raise ValueError("for_band: min_dc_sigmas must be > 0")
 
-        if wavelengths_um is not None:
-            lams = [float(w) for w in wavelengths_um]
+        if wlens_um is not None:
+            lams = [float(w) for w in wlens_um]
             if not lams or any(w <= 0.0 for w in lams):
-                raise ValueError("for_band: wavelengths_um must be positive")
+                raise ValueError("for_band: wlens_um must be positive")
             freqs = [_C0_M_PER_S / (w * 1e-6) for w in lams]
         else:
             freqs = [float(f) for f in freqs_hz]
@@ -200,15 +208,14 @@ class GaussianPulse(FrozenModel):
                 f"(min_dc_sigmas={min_dc_sigmas:g}) to stay stable; band edges "
                 "will be under-driven. Use a broadband mode source (num_freqs) "
                 "for a band this wide.",
-                stacklevel=2,
+                stacklevel=caller_stacklevel(),
             )
             fwidth = fwidth_dc_cap
         return cls(freq0_hz=f0, fwidth_hz=fwidth, offset=offset, phase=phase)
 
     def plot(self, *, ax=None):
         """Preview the injected current ``J(t)`` (envelope × carrier) and, when
-        building its own figure, the spectral envelope ``|J(f)|`` alongside —
-        the quick check that the pulse covers your band and settles. Returns the
+        building its own figure, the spectral envelope ``|J(f)|`` alongside, the quick check that the pulse covers your band and settles. Returns the
         time-domain matplotlib ``Axes``. See :func:`photonhub.viz.plot_source_time`."""
         from ..viz.source import plot_source_time
         return plot_source_time(self, ax=ax)
@@ -220,7 +227,7 @@ class CW(FrozenModel):
     ``J(t) = amplitude * ramp(t) * cos(2 pi freq0 t + phase)`` with a C¹
     smooth sin² turn-on over ``ramp_cycles`` carrier periods, then constant
     forever. For steady-state analysis: the source never ends, so §7
-    auto-shutoff never fires — set ``run_time_s`` long enough to ring up.
+    auto-shutoff never fires, set ``run_time_s`` long enough to ring up.
 
     §12 normalization is defined AT THE CARRIER only: when a CW is the
     normalization source (first in wire order), every DFT/flux monitor
@@ -238,6 +245,7 @@ class CW(FrozenModel):
     def band_freqs_hz(self):
         # Broadband windowed carriers are a Gaussian-pulse feature; sources
         # probe this attribute generically.
+        """Return ``None``. A continuous wave has no broadband carrier window."""
         return None
 
 

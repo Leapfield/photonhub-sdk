@@ -12,8 +12,8 @@ Two pure entry points, both returning ``{"findings": [...], "counts": ...}``:
   frequency list longer than the run length can resolve, a multi-GB
   output budget).
 - :func:`result_checks` — post-run data health over an open result bundle
-  (non-finite values, all-zero recordings, a source-normalized flux far
-  above unity).
+  (non-finite values, all-zero recordings, a flux per unit first-source
+  amplitude far above unity).
 
 Advisory only: nothing here raises for a merely-suspicious setup, and no
 finding blocks a run.  Findings are ``{id, severity, monitor, message,
@@ -34,8 +34,8 @@ _C = 299_792_458.0
 # normalization reference), a normalized DFT/flux value divides by a
 # vanishing amplitude and amplifies numerical noise by >= 1/floor.
 _ENVELOPE_FLOOR = 1.0e-2
-# A source-normalized flux mildly above 1 can be legitimate (resonant
-# recycling, finite-band normalization); 1.5 is far outside that.
+# A flux per unit first-source amplitude mildly above 1 can be legitimate
+# (resonant recycling, finite-band normalization); 1.5 is far outside that.
 _FLUX_UNITY_TOLERANCE = 1.5
 # Per-monitor on-disk output warning threshold, and the whole-run info line.
 _MONITOR_OUTPUT_WARN_BYTES = 1 << 30      # 1 GiB
@@ -349,12 +349,18 @@ def result_checks(data) -> dict:
                 "nothing (probe in dead space, gated out, or before the "
                 "source ramp).", monitor=name))
 
-        if (entry.get("type") == "flux" and abs_max is not None
-                and abs_max > _FLUX_UNITY_TOLERANCE):
+        # The bound is on the flux PER UNIT first-source amplitude (the
+        # engine's own normalization): RunResult restores A0^2 when it knows
+        # the simulation, so divide it back out before comparing.
+        a0 = getattr(data, "norm_amplitude", None)
+        unit_max = (abs_max / (a0 * a0)
+                    if abs_max is not None and a0 not in (None, 0.0) else abs_max)
+        if (entry.get("type") == "flux" and unit_max is not None
+                and unit_max > _FLUX_UNITY_TOLERANCE):
             status = "error" if status == "error" else "warning"
             findings.append(_finding(
                 "flux-above-unity", "warning",
-                f"Source-normalized flux reaches {abs_max:.3g} (> "
+                f"Flux per unit first-source amplitude reaches {unit_max:.3g} (> "
                 f"{_FLUX_UNITY_TOLERANCE:g}): non-physical for a passive "
                 "scene — usually an under-resolved run or frequencies "
                 "outside the normalizing source's band.",

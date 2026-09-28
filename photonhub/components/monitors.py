@@ -1,14 +1,15 @@
 """Field monitors (NUMERICS.md sections 6 and 12).
 
-Monitor names must be filename-safe (the engine writes ``<name>.bin``) and —
-a constraint JSON Schema cannot express across array items — unique within a
+Monitor names must be filename-safe (the engine writes ``<name>.bin``) and, a constraint JSON Schema cannot express across array items, unique within a
 simulation (enforced by ``Simulation``).
 """
 
-from typing import Annotated, Literal, Optional, Tuple, Union
+from typing import Annotated, List, Literal, Optional, Sequence, Tuple, Union
 
 from pydantic import Field, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
+from ..constants import c0
 from .base import (
     MAX_INT32,
     AxisName,
@@ -61,10 +62,10 @@ class Apodization(FrozenModel):
     """Time window applied to a monitor's running DFT (the standard
     ``ApodizationSpec`` analogue, NUMERICS.md section 12). A Gaussian roll-ON of
     standard deviation ``width_s`` for t < ``start_s``, flat (== 1) on
-    ``[start_s, end_s]``, and a Gaussian roll-OFF for t > ``end_s`` — used to
+    ``[start_s, end_s]``, and a Gaussian roll-OFF for t > ``end_s``, used to
     isolate the late-time steady state of a resonant structure (suppressing the
     source-injection transient). ``start_s``/``end_s`` (seconds) are each
-    optional — omit a side to leave it ungated; ``width_s`` (seconds) is the
+    optional, omit a side to leave it ungated; ``width_s`` (seconds) is the
     Gaussian standard deviation of each roll and must be positive."""
 
     start_s: Optional[float] = Field(default=None, ge=0.0)
@@ -92,6 +93,10 @@ class PortMode(FrozenModel):
 
 
 MODE_PORT_MAX_TRIAL_MODES = 32
+
+# Free-space speed of light (m/s), identical to the engine's kC0 and to
+# source_time.py, so ``wlens_um`` converts bit-comparably with ``for_band``.
+_C0_M_PER_S = c0
 
 
 def mode_port_solver_polarization(
@@ -237,14 +242,17 @@ class ModePort(FrozenModel):
 
 class ProfileMonitor(FrozenModel):
     """Running-DFT field monitor over a box region (NUMERICS.md section 12):
-    fp64 accumulation every step over the full run, raw Yee-located phasors,
-    normalized by the first wire-order source's ``A0 * S(f)``. ``size_um``
+    fp64 accumulation every step over the full run, raw Yee-located phasors.
+    The engine normalizes them by the first wire-order source's ``A0 * S(f)``
+    and :class:`~photonhub.RunResult` multiplies ``A0`` back in, so the
+    arrays are the continuous-wave phasors of the sources as declared, in
+    V/m and A/m (:class:`PowerMonitor` states the convention). ``size_um``
     components may be 0 (plane/line/point regions); the region is snapped per
     component to that component's Yee sublattice, and the engine validator
     REJECTS boxes whose per-component snaps disagree (the output carries one
     shape/origin per monitor). When ``fields`` mixes Yee offsets along an
     axis, a face belongs strictly between an integer cell boundary and the
-    next half-cell plane — canonically ``(k + 0.25) * dl``, which every
+    next half-cell plane, canonically ``(k + 0.25) * dl``, which every
     component snaps to cell ``k`` with quarter-cell fp margin.
 
     You do not have to place faces there yourself: building a
@@ -255,7 +263,7 @@ class ProfileMonitor(FrozenModel):
     The policy is deterministic and minimal: faces already strictly inside a
     first half-cell, axes whose listed components share one Yee offset, and
     faces at/beyond the domain edges (where the engine's index clamp makes
-    every component agree — full-domain boxes stay full-domain) are left
+    every component agree, full-domain boxes stay full-domain) are left
     byte-identical, and a face and its quarter point snap to the SAME cell,
     so any scene the engine already accepted keeps its exact recorded
     region. A sub-half-cell box straddling a cell boundary cannot be snapped
@@ -286,6 +294,104 @@ class ProfileMonitor(FrozenModel):
     # ordinary DFT monitor; Workbench/result APIs compile the saved recipe into
     # ModeMonitor/SPort post-processing after a run.
     mode_port: Optional[ModePort] = None
+    # Client-side authoring marker (never on the wire, never in the schema):
+    # ``"interior:<axis>"`` asks the Simulation to fill the in-plane centre and
+    # extent of a :meth:`plane` monitor normal to ``<axis>`` with the PML-free
+    # interior of the domain at construction
+    # (``Simulation._resolve_plane_spans``). None once resolved.
+    span: SkipJsonSchema[Optional[Literal["interior:x", "interior:y", "interior:z"]]] = None
+    # Client-side authoring marker, like ``span``: ``(i, n)`` asks the
+    # Simulation to place this plane at the i-th of ``n`` stations spread
+    # evenly along its normal across the interior (:meth:`sections`). None
+    # once resolved, and never on the wire.
+    station: SkipJsonSchema[Optional[Tuple[int, int]]] = None
+
+    @classmethod
+    def plane(
+        cls,
+        name: str,
+        axis: str,
+        position_um: float,
+        *,
+        wlens_um: Optional[Union[float, Sequence[float]]] = None,
+        freqs_hz: Optional[Sequence[float]] = None,
+        fields: Tuple[str, ...] = ("Ex", "Ey", "Ez"),
+        size_um: Optional[Tuple[float, float, float]] = None,
+        center_um: Optional[Tuple[float, float, float]] = None,
+        **kw,
+    ) -> "ProfileMonitor":
+        """A zero-thickness field monitor on the plane ``axis = position_um``.
+
+        With no ``size_um`` the plane spans the PML-free interior of the
+        domain: the in-plane centre and extent are filled in when the monitor
+        joins a :class:`~photonhub.Simulation` (a periodic or PEC axis spans
+        fully, a symmetry axis from the mirror to the far PML face). An
+        explicit ``size_um`` is a 3-tuple whose component along ``axis`` is
+        ignored and needs ``center_um`` alongside. Frequencies come from
+        ``wlens_um`` (microns, one value or several) or ``freqs_hz``, exactly
+        one of them. Other keywords (``apodization``, ``interval_space``,
+        ``mode_port``) pass through."""
+        if axis not in ("x", "y", "z"):
+            raise ValueError(f"axis must be one of x/y/z, got {axis!r}")
+        if (wlens_um is None) == (freqs_hz is None):
+            raise ValueError("ProfileMonitor.plane: pass exactly one of wlens_um or freqs_hz")
+        if wlens_um is not None:
+            wl = (float(wlens_um),) if isinstance(wlens_um, (int, float)) else tuple(float(w) for w in wlens_um)
+            if any(w <= 0.0 for w in wl):
+                raise ValueError("ProfileMonitor.plane: wlens_um must be positive")
+            freqs = tuple(_C0_M_PER_S / (w * 1e-6) for w in wl)
+        else:
+            freqs = tuple(float(f) for f in freqs_hz)
+        a = "xyz".index(axis)
+        if size_um is None:
+            if center_um is not None:
+                raise ValueError(
+                    "ProfileMonitor.plane: center_um needs size_um alongside; omit both "
+                    "for a plane spanning the domain interior")
+            center = [0.0, 0.0, 0.0]
+            size = [0.0, 0.0, 0.0]
+            span = f"interior:{axis}"
+        else:
+            if center_um is None:
+                raise ValueError("ProfileMonitor.plane: size_um needs center_um alongside")
+            center = [float(c) for c in center_um]
+            size = [float(s) for s in size_um]
+            span = None
+        center[a] = float(position_um)
+        size[a] = 0.0
+        return cls(name=name, center_um=tuple(center), size_um=tuple(size),
+                   fields=tuple(fields), freqs_hz=freqs, span=span, **kw)
+
+    @classmethod
+    def sections(
+        cls,
+        name: str,
+        axis: str,
+        n: int = 6,
+        *,
+        wlens_um: Optional[Union[float, Sequence[float]]] = None,
+        freqs_hz: Optional[Sequence[float]] = None,
+        fields: Tuple[str, ...] = ("Ex", "Ey", "Ez"),
+        **kw,
+    ) -> List["ProfileMonitor"]:
+        """``n`` cross-section planes normal to ``axis``, spread evenly along
+        the domain interior: the planes a long device's featured figure stands
+        along it (:func:`photonhub.viz.export_scene` with ``plane=name`` draws
+        them together).
+
+        Each is a :meth:`plane` spanning the interior, named ``{name}_0`` to
+        ``{name}_{n-1}``. Their positions are filled in when they join a
+        :class:`~photonhub.Simulation`: plane ``i`` sits at
+        ``lo + (i + 1/2) (hi - lo) / n`` of the PML-free interior along
+        ``axis``, so a simulation rebuilt around a longer device moves them
+        with it. Frequencies and other keywords are as for :meth:`plane`.
+        Returns a list: add it to ``monitors`` with ``*``."""
+        if int(n) != n or n < 1:
+            raise ValueError(f"ProfileMonitor.sections: n must be a positive integer, got {n!r}")
+        n = int(n)
+        return [cls.plane(f"{name}_{i}", axis, 0.0, wlens_um=wlens_um, freqs_hz=freqs_hz,
+                          fields=fields, **kw).model_copy(update={"station": (i, n)})
+                for i in range(n)]
 
     @field_validator("fields")
     @classmethod
@@ -314,24 +420,37 @@ class ProfileMonitor(FrozenModel):
 class PowerMonitor(FrozenModel):
     """Poynting-flux monitor perpendicular to ``axis`` at ``position_um``,
     snapped to a plane index ``1 <= kp <= n_axis - 1`` (NUMERICS.md
-    section 12). Positive values mean power toward +axis. The reported power
-    is the response to a UNIT-amplitude time-harmonic drive: the shared
-    phasors are normalized by ``1/|A0*S(f)|^2``, so for a plane wave of
-    amplitude ``E0`` the empty-domain value equals ``A/(2*eta0)`` (watts for
-    ``E0 = 1 V/m``) and the physical power is ``|A0|^2`` times the reported
-    value; ratios such as R and T (divide by an empty reference run) cancel
-    the factor. The plane average of the staggered H components biases the
-    absolute value by ``cos(k*dl/2)`` (about -1.2 % at 20 cells per
-    wavelength), which also cancels in ratios. Time convention is
-    ``e^{-i omega t}``.
+    section 12). Positive values mean power toward +axis. The value
+    :class:`~photonhub.RunResult` returns is the time-averaged power in
+    WATTS of a continuous-wave excitation at each frequency by the sources
+    as declared: the engine accumulates the flux from phasors normalized by
+    the first wire-order source's ``A0*S(f)`` (the response to a
+    unit-amplitude drive), and the reader multiplies ``A0^2`` back in (the
+    array's ``norm_amplitude`` attr; its ``normalization`` attr says so). A
+    unit dipole therefore reads its Hertzian power, and a beam or mode
+    launched with ``power_watts=1`` reads 1 W on a full plane below it.
+    Only a result whose simulation is unknown (an output directory or HDF5
+    bundle without its ``sim.json``) keeps the engine's unit-amplitude
+    values. Ratios such as R and T (divide by an empty reference run) are
+    amplitude-free either way. The plane average of the staggered H
+    components makes this exactly the flux the solver conserves from plane to
+    plane on any mesh: the power a port's modal readout reports, and the one
+    a port or beam launch built cell by cell (the default) normalizes
+    ``power_watts`` to (NUMERICS §18.7); a paraxial beam and an auxiliary-line
+    mode source keep the continuum normalization and read ``cos(k*dl/2)`` of
+    it. A
+    plane wave of field amplitude ``E0`` in an empty domain carries
+    ``cos(k*dl/2)`` of the continuum value ``E0^2*A/(2*eta0)`` (-0.5 % at 31
+    cells per wavelength, -2 % at 15), which cancels in ratios. Time
+    convention is ``e^{-i omega t}``.
 
     **Resolving a resonance peak** (Q from a spectrum): the FWHM of a
     quality-factor-``Q`` peak at ``f0`` is ``f0/Q``, so ``freqs_hz`` must be
-    spaced much finer than that — ``df << f0/Q`` — or the fitted width (and
+    spaced much finer than that, ``df << f0/Q``, or the fitted width (and
     hence Q) is dominated by sampling. E.g. a Q ~ 400 cavity peak needs a
     dedicated narrow band around ``f0``, not the source's full bandwidth
     (measured: a full-band 300-point sweep under-read Q by ~13%; a
-    peak-centred band recovered it — the ring-down ``ResonanceAnalysis`` route
+    peak-centred band recovered it, the ring-down ``ResonanceAnalysis`` route
     avoids the issue entirely).
 
     By default the monitor integrates the FULL transverse plane. Schema 1.17
@@ -342,7 +461,20 @@ class PowerMonitor(FrozenModel):
     cell-centre membership and must cover at least one cell (the engine
     validates). None/None (default) keeps the legacy full plane and is
     omitted from the wire. Not yet supported by the multi-GPU decomposition
-    (single GPU / CPU only)."""
+    (single GPU / CPU only).
+
+    **With symmetry planes** (``symmetry=``, NUMERICS §20) the value is the
+    power of the whole device through the plane, what the simulation without
+    the planes reads, the convention of ports and of every launch's
+    ``power_watts`` (NUMERICS §20.8): the engine integrates the part of the
+    plane the simulation models, and the reader multiplies it by 2 for every
+    symmetry plane that cuts the monitor plane (one whose normal lies in it,
+    reached by the window; the array's ``symmetry_factor`` attr, absent when
+    no plane cuts the monitor). A window that stops short of the symmetry
+    plane reads its own region and gets no factor, and so does a plane
+    parallel to a symmetry plane: a closed box of monitors around a source
+    therefore balances only with the image of each such face added.
+    ``RunResult.wire(name)`` keeps the modeled part."""
 
     type: Literal["flux"] = "flux"
     name: MonitorName

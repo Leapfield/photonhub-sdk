@@ -1,9 +1,9 @@
-"""Import source — launch a user-supplied field profile as a Huygens sheet.
+"""Import source, launch a user-supplied field profile as a Huygens source plane.
 
-Any transverse field map — from another solver, an analytic model, a
-measurement, or a previous run — becomes an excitation by
+Any transverse field map, from another solver, an analytic model, a
+measurement, or a previous run, becomes an excitation by
 resampling it onto the simulation's Yee injection plane and stamping the
-per-cell equivalence-current sheet
+per-cell source plane
 (:func:`~photonhub.analysis.eq_current_source.equivalence_current_source`,
 ``J = n̂ × H``, ``M = -n̂ × E``), the same machinery behind
 :func:`~photonhub.analysis.mode_devices.mode_launch` and
@@ -11,11 +11,11 @@ per-cell equivalence-current sheet
 
 Two layers, mirroring the Gaussian-beam plugin:
 
-* :func:`import_field` — resample the user arrays onto the plane's true Yee
+* :func:`import_field`, resample the user arrays onto the plane's true Yee
   sample locations and package them as a ``yee_staggered``
   :class:`~photonhub.analysis.vector_modes.VectorMode` (also usable as a
   monitor/overlap reference);
-* :func:`import_source` — that plus the sheet, returning the ``PointDipole``
+* :func:`import_source`, that plus the source plane, returning the ``PointDipole``
   list for ``Simulation.sources``.
 
 Field conventions
@@ -25,14 +25,19 @@ Arrays are indexed ``[iv, ih]`` over the plane's natural in-plane axes
 caller's own rectilinear grid ``coords_h_um`` x ``coords_v_um`` measured
 RELATIVE to ``center_um`` (so a profile exported centred on 0 drops in
 unchanged). Values are complex phasors in the engine's ``e^{-i w t}``
-convention; points outside the supplied grid are taken as 0.
+convention, the one monitor data is recorded in (a field tilted toward +h
+carries ``e^{+i k_h h}``); points outside the supplied grid are taken as 0.
+:func:`import_field` returns the mode in that same convention, so it is
+directly an overlap or mode-monitor reference; :func:`import_source`
+conjugates it for the source plane, which stamps ``e^{+i w t}``
+phasors.
 
 ``H`` is optional: when only ``e_h``/``e_v`` are given, the paired magnetic
 field is filled in the forward quasi-plane-wave limit
-``(h_h, h_v) = (n / eta0) (-e_v, +e_h)`` — exact for a normal-incidence plane
+``(h_h, h_v) = (n / eta0) (-e_v, +e_h)``, exact for a normal-incidence plane
 wave, the scalar limit otherwise (same approximation the scalar mode stack
 uses). Supply all four components for tilted/structured fields where the
-true E/H relation matters; ``direction`` is applied by the sheet either way.
+true E/H relation matters; ``direction`` is applied by the source plane either way.
 
 The transverse-E pair is jointly L2-normalized (all components scaled
 together, keeping E/H a consistent Huygens pair); absolute launch strength is
@@ -41,10 +46,11 @@ units).
 
 What's not handled
 ==================
-* **Broadband profile banks** — one profile, phased at the pulse centre. For
-  a per-frequency profile bank call ``equivalence_current_source`` directly
-  with ``modes_by_freq={freq: import_field(...)}``.
-* **Recorded-monitor import** — a ``field_dft`` plane stores its four
+* **Broadband profile mode mappings**, one profile, phased at the pulse centre. For
+  a per-frequency profile mode mapping call ``equivalence_current_source`` directly
+  with ``modes_by_freq={freq: conjugate_fields(import_field(...))}``
+  (``from photonhub.analysis.gaussian_beam import conjugate_fields``: the source plane stamps ``e^{+i w t}`` phasors).
+* **Recorded-monitor import**, a ``field_dft`` plane stores its four
   tangential components on ONE base-index coordinate set while each
   component physically sits half a cell off it; feeding those arrays here
   treats them as co-located (a <= half-cell registration blur). A
@@ -62,10 +68,12 @@ from scipy.interpolate import RegularGridInterpolator
 
 from ..components.sources import PointDipole
 from ..viz import _geometry as _geom
-from .gaussian_beam import _plane_grids, _resolve_index, _resolve_wavelength
+from .gaussian_beam import (_default_center, _modeled_watts, _plane_grids,
+                            _resolve_index, _resolve_wavelength, conjugate_fields)
 from .mode_overlap import ETA0
 from .vector_modes import VectorMode
 from .yee_mode import _window_center_offset
+from .._compat import legacy_keywords
 
 __all__ = ["import_field", "import_source"]
 
@@ -122,6 +130,7 @@ def _clip_window(sim, axis, h_c, v_c, half_w, half_v):
     return half_w, half_v
 
 
+@legacy_keywords(wavelength_um="wlen_um")
 def import_field(
     sim,
     *,
@@ -132,7 +141,7 @@ def import_field(
     coords_v_um,
     h_h=None,
     h_v=None,
-    wavelength_um: Optional[float] = None,
+    wlen_um: Optional[float] = None,
     freq_hz: Optional[float] = None,
     source_time=None,
     n: Optional[float] = None,
@@ -147,7 +156,7 @@ def import_field(
     ----------
     sim:
         The simulation whose grid/size/§20 symmetry the profile is sampled on
-        (a placeholder shell with the same grid is fine).
+        (a placeholder geometry-only simulation with the same grid is fine).
     axis:
         The injection plane's normal, ``"x"``/``"y"``/``"z"``.
     e_h, e_v:
@@ -159,14 +168,14 @@ def import_field(
     h_h, h_v:
         Optional transverse H (same shape/grid). Give both or neither;
         omitted -> forward quasi-plane-wave fill (module docstring).
-    wavelength_um, freq_hz, source_time:
+    wlen_um, freq_hz, source_time:
         The frequency the profile is phased at (at most one of the first
         two; else ``source_time.freq0_hz``).
     n:
         Index of the launch medium. Default
         ``sqrt(sim.background.permittivity)``.
     n_eff:
-        Effective longitudinal phase index used by the sheet's half-cell
+        Effective longitudinal phase index used by the source plane's half-cell
         straddle (a beam tilted by theta has ``n cos(theta)``). Default: ``n``.
     center_um:
         Transverse placement of the profile origin as ``(h, v)``; default the
@@ -178,10 +187,14 @@ def import_field(
     Returns
     -------
     VectorMode
+        In the recorded ``e^{-i w t}`` convention of the input arrays.
         ``yee_staggered``, six components on the window (``e_a = h_a = 0``),
         transverse-E jointly L2-normalized, ready for
-        :func:`~photonhub.analysis.eq_current_source.equivalence_current_source`,
-        :func:`~photonhub.analysis.mode_devices.mode_monitor`, or overlaps.
+        :func:`~photonhub.analysis.mode_devices.mode_monitor` or overlaps.
+        To hand it to
+        :func:`~photonhub.analysis.eq_current_source.equivalence_current_source`
+        directly, pass ``conjugate_fields`` of it
+        (``from photonhub.analysis.gaussian_beam import conjugate_fields``; :func:`import_source` does).
     """
     if axis not in _AXES:
         raise ValueError(f"axis must be one of x/y/z, got {axis!r}")
@@ -202,17 +215,15 @@ def import_field(
         H1 = _as_field("h_h", h_h, nv, nh)
         H2 = _as_field("h_v", h_v, nv, nh)
 
-    lam_um = _resolve_wavelength(wavelength_um, freq_hz, source_time)
+    lam_um = _resolve_wavelength(wlen_um, freq_hz, source_time)
     n_bg = _resolve_index(sim, n)
     n_eff = float(n_eff) if n_eff is not None else n_bg
     if not n_eff > 0.0:
         raise ValueError(f"n_eff must be > 0, got {n_eff}")
 
     h_letter, v_letter = _geom.in_plane_axes(axis)
-    size = sim.size_um
     if center_um is None:
-        h_c = float(size[_AXES.index(h_letter)]) / 2.0
-        v_c = float(size[_AXES.index(v_letter)]) / 2.0
+        h_c, v_c = _default_center(sim, h_letter), _default_center(sim, v_letter)
     else:
         h_c, v_c = float(center_um[0]), float(center_um[1])
 
@@ -277,6 +288,7 @@ def import_field(
     )
 
 
+@legacy_keywords(wavelength_um="wlen_um")
 def import_source(
     sim,
     *,
@@ -293,20 +305,21 @@ def import_source(
     power_watts: Optional[float] = 1.0,
     n: Optional[float] = None,
     n_eff: Optional[float] = None,
-    wavelength_um: Optional[float] = None,
+    wlen_um: Optional[float] = None,
     freq_hz: Optional[float] = None,
     center_um: Optional[Tuple[float, float]] = None,
     half_w_um: Optional[float] = None,
     half_v_um: Optional[float] = None,
     amplitude_threshold: float = 1e-6,
 ) -> List[PointDipole]:
-    """Launch an imported field map — the one-call custom excitation.
+    """Launch an imported field map, the one-call custom excitation.
 
     :func:`import_field` (whose parameters this shares) plus the Huygens
-    sheet. ``power_watts`` (default 1 W) normalizes the launched power on the
+    source plane. ``power_watts`` (default 1 W) normalizes the launched power on the
     engine's discrete Poynting quadrature exactly like the mode and beam
-    launches (into the modelled half domain under §20 symmetry); ``None``
-    keeps the imported amplitude scale. Returns the ``PointDipole`` list for
+    launches: the whole, unfolded device's power, so a profile centred on k
+    §20 symmetry planes puts ``power_watts / 2^k`` into the modeled part
+    (NUMERICS §20.8); ``None`` keeps the imported amplitude scale. Returns the ``PointDipole`` list for
     ``Simulation.sources``.
     """
     if direction not in ("+", "-"):
@@ -318,17 +331,19 @@ def import_source(
     field = import_field(
         sim, axis=axis, e_h=e_h, e_v=e_v, coords_h_um=coords_h_um,
         coords_v_um=coords_v_um, h_h=h_h, h_v=h_v,
-        wavelength_um=wavelength_um, freq_hz=freq_hz,
+        wlen_um=wlen_um, freq_hz=freq_hz,
         source_time=source_time, n=n, n_eff=n_eff, center_um=center_um,
         half_w_um=half_w_um, half_v_um=half_v_um)
+    # the field is in the recorded e^{-i w t} convention; the sheet stamps
+    # e^{+i w t}, so without this conjugation a tilt steers the mirror way and
+    # a converging field diverges
+    field = conjugate_fields(field)
 
     # Re-derive the window exactly as import_field resolved it, so the sheet
     # registers on the same ladder (same pattern as gaussian_beam_source).
     h_letter, v_letter = _geom.in_plane_axes(axis)
-    size = sim.size_um
     if center_um is None:
-        h_c = float(size[_AXES.index(h_letter)]) / 2.0
-        v_c = float(size[_AXES.index(v_letter)]) / 2.0
+        h_c, v_c = _default_center(sim, h_letter), _default_center(sim, v_letter)
     else:
         h_c, v_c = float(center_um[0]), float(center_um[1])
     ch = _as_coords("coords_h_um", coords_h_um)
@@ -343,5 +358,5 @@ def import_source(
         sim, field, axis=axis, position_um=position_um,
         source_time=source_time, direction=direction,
         h_center_um=h_c, v_center_um=v_c, half_w_um=hw, half_v_um=hv,
-        power_watts=(None if power_watts is None else float(power_watts)),
+        power_watts=_modeled_watts(sim, axis, h_c, v_c, power_watts),
         amplitude_threshold=float(amplitude_threshold))

@@ -1,7 +1,7 @@
 """Cloud client for the PhotonHub metered compute API.
 
-Reads identically to the local path — same ``Job`` / ``RunResult`` /
-``SolverRunError`` — only the namespace differs:
+Uses the same ``Job``, ``RunResult``, and ``SolverRunError`` interfaces as local
+execution. Import the cloud actions through ``ph.cloud``:
 
 >>> import photonhub as ph
 >>> ph.cloud.configure(api_key="ph_live_...", url="https://<api-host>")

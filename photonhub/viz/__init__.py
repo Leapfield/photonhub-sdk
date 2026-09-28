@@ -1,4 +1,4 @@
-"""PhotonHub visualization layer (design doc: docs/viz-layer-design.md).
+"""Plot PhotonHub simulation geometry, fields, modes, and spectra.
 
 The rendering engine behind ``Simulation.plot``/``plot_index``/``plot_3d`` and
 ``RunResult.plot_field``. All 2D methods return a matplotlib ``Axes``,
@@ -8,13 +8,13 @@ accept ``ax=``, and never call ``plt.show()``; ``plot_3d`` returns a plotly
 ``plot_mode`` (an FDE mode's transverse field), ``plot_spectrum``
 (transmission ``T(λ)`` from the mode-monitor pipeline) and ``plot_comparison``
 (an observable against a paper's extracted series) are module-level helpers
-only — a ``Mode`` is not a ``Simulation`` and a spectrum comes from
+only, a ``Mode`` is not a ``Simulation`` and a spectrum comes from
 post-processing, so neither maps cleanly onto a model method.
 
-No UI/event-loop assumptions live here, so the future standalone viewer and the
-Phase-4 GUI can call these headless (design §12).
+These helpers can render without a graphical application or event loop.
 """
 
+from ._style import sharp_inline_figures
 from .eps import (
                           plot_eps,  # deprecated alias
                           plot_index,
@@ -33,6 +33,8 @@ from .scene3d import plot_3d
 from .source import plot_source_time
 from .spectrum import plot_comparison, plot_spectrum
 
+sharp_inline_figures()
+
 __all__ = [
                           "Scene",
                           "export_scene",
@@ -49,4 +51,5 @@ __all__ = [
                           "plot_spectrum",
                           "render_field_slice",
                           "render_slice",
+    "sharp_inline_figures",
 ]

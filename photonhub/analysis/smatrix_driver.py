@@ -1,4 +1,4 @@
-"""One-call multiport S-matrix extraction — plan, run, assemble, export.
+"""One-call multiport S-matrix extraction, plan, run, assemble, export.
 
 This is the automation layer over :mod:`photonhub.analysis.smatrix` (the
 per-column assembler): a modal multi-port
@@ -7,13 +7,13 @@ the device once (a :class:`~photonhub.components.simulation.Simulation` whose
 sources are placeholders) and the N ports once (plane + outgoing direction +
 mode channel); the driver then
 
-1. solves each port's per-frequency Yee mode bank on the ACTUAL simulation
-   cross-section (:func:`~photonhub.analysis.yee_mode.solve_yee_mode_bank` — the
+1. solves each port's per-frequency Yee mode mode mapping on the ACTUAL simulation
+   cross-section (:func:`~photonhub.analysis.yee_mode.solve_yee_mode_bank`, the
    same discrete operator the launch and readout use),
 2. builds one :class:`~photonhub.analysis.mode_devices.ModeMonitor` per port and
    one driven simulation per port (the port's mode launched INTO the device
    from just outside the port plane, all port monitors recording),
-3. runs them — locally in a :class:`~photonhub.runners.batch.Batch`, on the
+3. runs them, locally in a :class:`~photonhub.runners.batch.Batch`, on the
    cloud via ``ph.cloud.Batch``, or through any callable you inject,
 4. assembles the columns into the full S-matrix
    (:func:`~photonhub.analysis.smatrix.assemble_smatrix`) with reciprocity /
@@ -21,30 +21,30 @@ mode channel); the driver then
 5. exports Touchstone (:func:`write_touchstone`) for circuit tools.
 
 The manual loop this replaces is spelled out in
-``examples/notebooks/11_smatrix.ipynb``; every step above remains available
-individually — the driver only orchestrates public building blocks, so a
-partially-manual workflow (custom banks, extra monitors, special launches) can
+``examples/course/11_smatrix.ipynb``; every step above remains available
+individually, the driver only orchestrates public building blocks, so a
+partially-manual workflow (custom mode mappings, extra monitors, special launches) can
 drop down a layer at any point.
 
 Port geometry convention
 ========================
-``SMatrixPort.position_um`` is the PORT PLANE (where S is referenced — the
+``SMatrixPort.position_um`` is the PORT PLANE (where S is referenced, the
 :class:`~photonhub.analysis.smatrix.SPort` monitor plane). The mode source for
 that port's drive is placed ``source_offset_um`` OUTSIDE the port plane (toward
 the domain wall, in the port's ``out_direction``) and launched INWARD, so the
 port monitor sits on the total-field side of its own source and records
-incident + reflected when driven — exactly the arrangement
+incident + reflected when driven, exactly the arrangement
 :func:`~photonhub.analysis.smatrix.smatrix` expects for ``S_jj``.
 
 What's not handled (deferred, matching :mod:`.smatrix`)
 =======================================================
-* **Multimode ports** — one mode channel per port. Decompose a physical plane
+* **Multimode ports**, one mode channel per port. Decompose a physical plane
   into several channels by declaring one port per (polarization, mode_index)
   at the same plane; each carries its own DFT monitor (duplicated plane
-  recording — acceptable for a handful of channels, a shared-monitor
+  recording, acceptable for a handful of channels, a shared-monitor
   optimization is a follow-up).
-* **De-embedding** — S is referenced to the port planes as placed.
-* **Reciprocity shortcuts** — every requested port is driven; use ``drive=`` to
+* **De-embedding**, S is referenced to the port planes as placed.
+* **Reciprocity shortcuts**, every requested port is driven; use ``drive=`` to
   run a subset and mirror externally if the device is known reciprocal.
 """
 
@@ -62,9 +62,11 @@ import numpy as np
 from ..viz import _geometry as _geom
 from ..components.source_time import GaussianPulse, SourceTimeType
 from .mode_devices import ModeMonitor, mode_launch, mode_monitor
+from .mode_overlap import _TRANSVERSE
 from .smatrix import (SPort, assemble_smatrix, is_passive, is_reciprocal,
                       passivity_violation, reciprocity_error, smatrix)
 from .yee_mode import solve_yee_mode_bank
+from ._constants import C0 as _C0
 
 __all__ = [
     "SMatrixPort",
@@ -88,12 +90,12 @@ class SMatrixPort:
     Parameters
     ----------
     name:
-        Port label — the S-matrix index, the monitor name, and the batch entry
+        Port label, the S-matrix index, the monitor name, and the batch entry
         key (so it must be filesystem-safe: letters, digits, ``-_.``).
     axis:
         Propagation axis of the port waveguide ('x' | 'y' | 'z').
     position_um:
-        The port plane along ``axis`` — where the port monitor sits and where
+        The port plane along ``axis``, where the port monitor sits and where
         S is referenced.
     out_direction:
         '+' or '-': the direction along ``axis`` that points OUT of the device
@@ -101,20 +103,23 @@ class SMatrixPort:
         the opposite way.
     half_w_um / half_v_um:
         Half-extents of the mode-solve window in the plane's natural
-        (horizontal, vertical) in-plane axes — same meaning as
+        (horizontal, vertical) in-plane axes, same meaning as
         :func:`~photonhub.analysis.yee_mode.solve_yee_mode`. Choose them wide
         enough that the guided mode's evanescent tail dies inside the window.
     polarization / mode_index:
         The mode channel, counted WITHIN the TE/TM family ('TE', 0 = TE0).
     center_um:
         Transverse waveguide location as (horizontal, vertical) in-plane
-        coordinates; ``None`` = the domain centre (matching
-        :func:`~photonhub.analysis.mode_devices.mode_launch`).
+        coordinates ((y, z) for an x-normal port, (x, z) for y-normal, (x, y)
+        for z-normal); ``None`` = the domain centre. The port's mode is solved,
+        read and launched at this centre.
     dl_um:
         Mode-solve transverse step; ``None`` = the simulation grid's ``dl_um``.
     source_offset_um:
         Distance from the port plane to the drive's launch plane, measured
-        toward the wall (``out_direction``). ``None`` = ``10 * dl``.
+        toward the wall (``out_direction``). ``None`` = a third of a
+        wavelength in the background, the standoff the declarative ports take
+        (NUMERICS §18.6).
     supersample / num_modes:
         Forwarded to the Yee mode solve (eigensolver frame controls).
     """
@@ -163,7 +168,7 @@ class SMatrixPort:
 
     @property
     def in_direction(self) -> str:
-        """The launch direction for this port's drive — into the device."""
+        """The launch direction for this port's drive, into the device."""
         return _OPPOSITE[self.out_direction]
 
 
@@ -186,7 +191,7 @@ def _warn_if_in_absorbing_layers(sim, axis: str, position_um: float,
                                  what: str) -> None:
     """Soft check: a launch/monitor plane inside the PML/absorber slab is a
     physics bug the engine cannot always reject. Thickness is estimated with
-    the base ``dl_um`` (approximate on graded axes — hence a warning, not an
+    the base ``dl_um`` (approximate on graded axes, hence a warning, not an
     error)."""
     kind = getattr(sim.boundaries, axis, None)
     layers = 0
@@ -214,7 +219,7 @@ class SMatrixResult:
     """The assembled S-matrix plus everything needed to audit it.
 
     ``S`` is the complex :class:`xarray.DataArray` from
-    :func:`~photonhub.analysis.smatrix.assemble_smatrix` — dims
+    :func:`~photonhub.analysis.smatrix.assemble_smatrix`, dims
     ``(port_out, port_in, f)``, ``|S_ij|^2`` a power ratio. ``data`` maps each
     DRIVEN port name to its run's ``RunResult``; ``errors`` carries
     per-drive failures when ``allow_partial=True`` let the assembly proceed
@@ -232,19 +237,28 @@ class SMatrixResult:
 
     # -- checks (delegates to analysis.smatrix) -------------------------------
     def reciprocity_error(self) -> float:
+        """Maximum finite ``abs(S_ij - S_ji)`` across ports and frequencies.
+
+        Ignore non-finite differences. Return zero when none remain."""
         return reciprocity_error(self.S)
 
     def passivity_violation(self) -> float:
+        """Largest eigenvalue of ``S.conj().T @ S`` minus one, across frequencies.
+
+        Skip matrices with non-finite entries. Return zero when no finite
+        frequency matrix is available. A non-positive value passes passivity."""
         return passivity_violation(self.S)
 
     def is_reciprocal(self, *, atol: float = 1e-6) -> bool:
+        """True when :meth:`reciprocity_error` is at most ``atol``."""
         return is_reciprocal(self.S, atol=atol)
 
     def is_passive(self, *, atol: float = 1e-6) -> bool:
+        """True when :meth:`passivity_violation` is at most ``atol``."""
         return is_passive(self.S, atol=atol)
 
     def to_touchstone(self, path, **kwargs) -> Path:
-        """Write the matrix as a Touchstone v1 ``.sNp`` file — see
+        """Write the matrix as a Touchstone v1 ``.sNp`` file, see
         :func:`write_touchstone`."""
         return write_touchstone(self.S, path, **kwargs)
 
@@ -312,10 +326,10 @@ class SMatrixPlan:
             ``path_dir`` is not a web concept and must be None). Any other
             callable is invoked as ``runner(simulations_dict)`` and must
             return a mapping ``driven-port name -> RunResult`` (or any
-            ``name -> DataArray`` mapping per run) — the injection point for
+            ``name -> DataArray`` mapping per run), the injection point for
             custom backends and tests.
         colocate:
-            Forwarded to :func:`~photonhub.analysis.smatrix.smatrix` — keep True
+            Forwarded to :func:`~photonhub.analysis.smatrix.smatrix`, keep True
             for real (Yee-staggered) engine output.
         allow_partial:
             When some drives fail: False (default) raises with the per-drive
@@ -365,9 +379,37 @@ class SMatrixPlan:
                              errors=errors, simulations=sims)
 
 
+def _as_smatrix_port(port, simulation, freqs_hz, source_time) -> SMatrixPort:
+    """Accept a :class:`photonhub.Port` beside an :class:`SMatrixPort`: the
+    outward side and the mode window resolve as the Simulation's own port
+    layer resolves them, with the band centre taken from ``source_time`` or
+    the middle of ``freqs_hz``."""
+    from ..components.authoring import Port as _Port
+    from ..components import declarative as _decl
+
+    if not isinstance(port, _Port):
+        return port
+    freqs = [float(f) for f in freqs_hz]
+    f_c = (float(source_time.freq0_hz) if source_time is not None
+           else 0.5 * (min(freqs) + max(freqs)))
+    wlen0_um = _C0 / f_c * 1e6
+    out_dir = _decl.infer_out_direction(simulation, port)
+    n_bg = math.sqrt(float(simulation.background.permittivity))
+    # the port-window rule at the longest wavelength read (NUMERICS §18.8),
+    # from the effective-index estimate: no mode solve here
+    half_w, half_v = _decl.default_window(port, wlen0_um, n_bg, shell=simulation,
+                                          wlen_max_um=_C0 / min(freqs) * 1e6)
+    family, index = port.family_index()
+    return SMatrixPort(
+        port.monitor_name, port.axis, port.plane_um, out_dir, half_w, half_v,
+        polarization=family, mode_index=index, center_um=port.hv_center_um(),
+        dl_um=port.dl_um, source_offset_um=port.source_offset_um,
+        supersample=port.supersample, num_modes=port.num_modes)
+
+
 def plan_smatrix(
     simulation,
-    ports: Sequence[SMatrixPort],
+    ports: Sequence[Union[SMatrixPort, Any]],
     *,
     freqs_hz: Sequence[float],
     source_time: Optional[SourceTimeType] = None,
@@ -384,12 +426,14 @@ def plan_smatrix(
     simulation:
         The device: a complete :class:`~photonhub.components.simulation.Simulation`
         (structures, grid, boundaries, run controls). Its ``sources`` are
-        placeholders — each driven copy replaces them with that port's mode
-        launch — and its ``monitors`` are dropped unless ``keep_monitors``.
+        placeholders, each driven copy replaces them with that port's mode
+        launch, and its ``monitors`` are dropped unless ``keep_monitors``.
     ports:
-        The port declarations (unique names).
+        The port declarations (unique names): :class:`SMatrixPort` values, or
+        :class:`photonhub.Port` values, whose outward side and mode window
+        resolve as they do on a :class:`~photonhub.Simulation`.
     freqs_hz:
-        Monitor frequencies for every port — the S-matrix's frequency axis.
+        Monitor frequencies for every port, the S-matrix's frequency axis.
     source_time:
         Drive pulse; ``None`` auto-tunes a
         :meth:`~photonhub.components.source_time.GaussianPulse.for_band` over
@@ -408,7 +452,7 @@ def plan_smatrix(
         With one prepared simulation per driven port and one
         :class:`~photonhub.analysis.smatrix.SPort` reader per port.
     """
-    port_list = list(ports)
+    port_list = [_as_smatrix_port(p, simulation, freqs_hz, source_time) for p in ports]
     if not port_list:
         raise ValueError("ports must be non-empty")
     names = [p.name for p in port_list]
@@ -439,12 +483,14 @@ def plan_smatrix(
     # --- per-port mode banks, monitors, readers -----------------------------
     banks: Dict[str, Mapping[float, Any]] = {}
     centrals: Dict[str, Any] = {}
+    centers: Dict[str, Tuple[float, float]] = {}
     monitors: Dict[str, ModeMonitor] = {}
     sports: List[SPort] = []
     for p in port_list:
         dl = float(p.dl_um) if p.dl_um is not None else _grid_dl(simulation)
         h_c, v_c = (p.center_um if p.center_um is not None
                     else _domain_center_hv(simulation, p.axis))
+        centers[p.name] = (float(h_c), float(v_c))
         _warn_if_in_absorbing_layers(simulation, p.axis, p.position_um,
                                      f"port {p.name!r} plane")
         bank = solve_yee_mode_bank(
@@ -454,10 +500,18 @@ def plan_smatrix(
             dl_um=dl, supersample=p.supersample, num_modes=p.num_modes)
         banks[p.name] = bank
         centrals[p.name] = bank[f_central]
+        # The readout frame (t1, t2) swaps the solve's (h, v) on a y-normal
+        # port. Without a centre the monitor reads at the recorded plane's
+        # mean coordinate, the domain centre (the bank's modes carry no solve
+        # provenance for mode_monitor to take it from).
+        h_name, v_name = _geom.in_plane_axes(p.axis)
+        by_axis = {h_name: float(h_c), v_name: float(v_c)}
         mm = mode_monitor(
             simulation, bank[f_central], axis=p.axis,
             position_um=p.position_um, freqs_hz=freqs, name=p.name,
-            direction=p.out_direction, modes_by_freq=bank)
+            direction=p.out_direction,
+            center_um=tuple(by_axis[t] for t in _TRANSVERSE[p.axis]),
+            modes_by_freq=bank)
         monitors[p.name] = mm
         sports.append(SPort(p.name, mm, out_direction=p.out_direction))
 
@@ -465,13 +519,18 @@ def plan_smatrix(
     extra = tuple(simulation.monitors) if keep_monitors else ()
 
     # --- one driven simulation per port -------------------------------------
+    # The launch standoff is a LENGTH, never a cell count (NUMERICS 18.6): the
+    # same wavelength-derived default the declarative ports take.
+    from ..components import declarative as _decl
+
+    wlen0_um = _C0 / float(source_time.freq0_hz) * 1e6
+    n_bg = math.sqrt(float(simulation.background.permittivity))
     sims: Dict[str, Any] = {}
     for p in port_list:
         if p.name not in driven_names:
             continue
-        dl = float(p.dl_um) if p.dl_um is not None else _grid_dl(simulation)
-        offset = (float(p.source_offset_um)
-                  if p.source_offset_um is not None else 10.0 * dl)
+        offset = (float(p.source_offset_um) if p.source_offset_um is not None
+                  else _decl.default_source_offset_um(wlen0_um, n_bg))
         src_pos = p.position_um + _SIGN[p.out_direction] * offset
         length = simulation.size_um[_AXIS_IDX[p.axis]]
         if not (0.0 < src_pos < length):
@@ -481,11 +540,15 @@ def plan_smatrix(
                 "source_offset_um or move the port plane inward")
         _warn_if_in_absorbing_layers(simulation, p.axis, src_pos,
                                      f"port {p.name!r} launch plane")
+        # Launch at the port's own centre, where its bank was solved and its
+        # monitor reads. The bank's modes carry no solve provenance, so without
+        # it mode_launch falls back to the domain centre and an off-centre port
+        # (any arm of a 1 x 2 or 2 x 2 device) was driven beside its guide.
         sources = mode_launch(
             simulation, centrals[p.name], axis=p.axis, position_um=src_pos,
             source_time=source_time, direction=p.in_direction,
-            power_watts=power_watts, modes_by_freq=banks[p.name],
-            launch=launch)
+            power_watts=power_watts, center_um=centers[p.name],
+            modes_by_freq=banks[p.name], launch=launch)
         sims[p.name] = simulation.model_copy(update={
             "sources": tuple(sources),
             "monitors": port_field_monitors + extra,
@@ -541,11 +604,11 @@ def write_touchstone(
 
     ``S`` is the :class:`xarray.DataArray` from
     :func:`~photonhub.analysis.smatrix.assemble_smatrix` /
-    :attr:`SMatrixResult.S` — dims ``(port_out, port_in, f)`` with matching
+    :attr:`SMatrixResult.S`, dims ``(port_out, port_in, f)`` with matching
     port labels on both axes. Frequencies are written ascending in Hz,
     real/imaginary (``RI``) format, one reference resistance ``z0`` (the
     Touchstone header requires one; it is dimensional bookkeeping only for
-    these modal wave amplitudes — power waves are already normalized so
+    these modal wave amplitudes, power waves are already normalized so
     ``|S_ij|^2`` is a power ratio).
 
     Layout follows the v1 spec: 1-port and 3+-port matrices in row-major

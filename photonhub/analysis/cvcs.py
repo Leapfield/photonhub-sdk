@@ -1,7 +1,7 @@
-"""CVCS — continuously-varying-cross-section EME via mode interpolation.
+"""CVCS, continuously-varying-cross-section EME via mode interpolation.
 
 A naive EME staircases a z-varying device into ``N`` constant-cross-section
-sections and solves the FDE modes of *every* one — ``N`` eigensolves, the
+sections and solves the FDE modes of *every* one, ``N`` eigensolves, the
 dominant cost. CVCS exploits the fact that, in a **smoothly varying** (adiabatic)
 region, the modes evolve smoothly with z: solve the modes at only a few **key
 planes** and **interpolate** them onto a fine sub-slicing, so the dense cascade
@@ -10,7 +10,7 @@ costs ``K`` eigensolves (``K << N``) plus cheap array interpolation.
 This is the efficiency capstone on top of :mod:`photonhub.analysis.eme` and
 :mod:`photonhub.analysis.mode_tracking`. Tracking is the prerequisite: to
 interpolate "the same" mode between two key planes, the modes must first be put
-in correspondence (and sign/phase aligned) — :func:`interpolate_mode` aligns the
+in correspondence (and sign/phase aligned), :func:`interpolate_mode` aligns the
 pair it is given, and :func:`cvcs_sections` tracks + reorders the key planes into
 a consistent basis before interpolating each track.
 
@@ -30,13 +30,13 @@ co-phased (from their transverse-E overlap) and
 Conversion (the fixed multimode basis)
 ======================================
 CVCS **does** capture inter-mode conversion, *provided the whole modal basis is
-carried through* — :func:`cvcs_sections` matches the key planes with a full
+carried through*, :func:`cvcs_sections` matches the key planes with a full
 permutation and never drops a mode, so a mode the fundamental converts into stays
 in the basis even if it is near-cutoff at the narrow planes and only well-confined
 at the wide ones. With that fixed basis, interpolating between key planes and
 cascading reproduces a full multimode staircase (e.g. a symmetric taper's
 TE0->TE2 conversion) at ``K << N`` solves. (The conversion was never an
-interpolation problem — an earlier version *dropped* the conversion target by
+interpolation problem, an earlier version *dropped* the conversion target by
 keeping only globally-present "tracks", which made it return the adiabatic limit.)
 
 Validity / scope
@@ -46,10 +46,10 @@ set by the **key-plane density relative to how fast the modes evolve**: a smooth
 varying cross-section needs few key planes; a region where the modes change quickly
 needs more. The hard case is a **sharp avoided crossing** (near-degenerate modes
 swapping over a tiny z-window): interpolation cannot resolve the rapid mode
-variation there, so it needs near-staircase key-plane density — at which point the
+variation there, so it needs near-staircase key-plane density, at which point the
 plain :mod:`~photonhub.analysis.eme` staircase is the simpler tool. CVCS's ``N/K``
 eigensolve saving is realized wherever the modes are smooth (the common case);
-see ``benchmarks/eme/cvcs_taper.py``.
+see ``validation/suites/eme/cvcs_taper.py``.
 
 CVCS currently interpolates only ordinary ``"guided"`` modes on a real,
 non-PML transverse contour. Radiation, evanescent, PML, and complex-contour
@@ -217,7 +217,7 @@ def cvcs_sections(
     keeping a **fixed multimode basis** so inter-mode conversion is represented.
 
     The key planes are put in correspondence with a *full permutation* match (every
-    mode is matched to one on the previous plane — nothing is dropped), so a mode
+    mode is matched to one on the previous plane, nothing is dropped), so a mode
     that the fundamental converts into (even one that is near-cutoff / "born" only
     at the wider planes) stays in the basis and the conversion is captured. This is
     what lets CVCS reproduce a multimode staircase (e.g. a symmetric taper's
@@ -237,7 +237,7 @@ def cvcs_sections(
         device. Choose ``n_subslices >> K`` (the point of CVCS).
     min_confidence:
         Optional guard (default ``0.0`` = off): if ``> 0``, reject when any
-        adjacent key-plane match is weaker than this overlap — a coarse check that
+        adjacent key-plane match is weaker than this overlap, a coarse check that
         the key planes are dense enough to correspond. It is conservative (a
         near-cutoff *higher* mode can have a weak link without spoiling the
         result), so the real validation is convergence in the number of key

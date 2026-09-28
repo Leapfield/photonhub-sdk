@@ -4,7 +4,7 @@
 ``$PHOTONHUB_API_KEY`` / ``$PHOTONHUB_URL``, mirroring ``find_solver``'s
 explicit→environment precedence. A missing required value is an error, not a
 silent default. ``CloudError`` is raised for config/transport/auth/result-transfer
-problems — distinct from ``SolverRunError``, which is reserved for a simulation
+problems, distinct from ``SolverRunError``, which is reserved for a simulation
 actually failing, so the two are never confused.
 """
 
@@ -32,7 +32,7 @@ DEFAULT_URL = "http://localhost:8000"
 
 
 class CloudError(RuntimeError):
-    """A cloud client/transport/auth/result-transfer error — NOT a simulation
+    """A cloud client/transport/auth/result-transfer error, NOT a simulation
     failure (that is ``SolverRunError``). Accepted jobs expose ``job_id`` for
     safe resume without a duplicate paid submission."""
 

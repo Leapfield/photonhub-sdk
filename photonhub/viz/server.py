@@ -1206,8 +1206,8 @@ def create_app(result_dir: Optional[str | Path] = None,
                 regions.append((axis, lo, hi, dl))
 
             meshed = sim.with_auto_mesh(
-                wavelength_um=wavelength_nm / 1000.0,
-                steps_per_wvl=steps_per_wvl,
+                wlen_um=wavelength_nm / 1000.0,
+                cells_per_wlen=steps_per_wvl,
                 max_grading=max_grading,
                 axes=axes,
                 refine_pad_um=positive_optional("refine_pad_um"),
@@ -1651,14 +1651,22 @@ def create_app(result_dir: Optional[str | Path] = None,
                     raise HTTPException(400, f"output parent is not a directory: {output_parent}")
 
             job_id = uuid.uuid4().hex
-            canonical_spec = sim.to_wire_json() + "\n"
+            from ..runners.local import _execution_wire_json
+            solver_snapshot = _solver_snapshot()
+            try:
+                execution_json, _ = _execution_wire_json(
+                    sim, device, solver_snapshot.get("capabilities"))
+            except Exception as exc:
+                raise HTTPException(400, str(exc))
+            canonical_spec = execution_json + "\n"
+            workspace_spec = sim.to_wire_json() + "\n"
             with workspace_lock:
                 preview = state["preview"] or {}
                 preview_sim = preview.get("sim")
                 workspace_path = (
                     preview.get("path")
                     if (preview_sim is not None
-                        and preview_sim.to_wire_json() + "\n" == canonical_spec)
+                        and preview_sim.to_wire_json() + "\n" == workspace_spec)
                     else None
                 )
             try:
@@ -1667,7 +1675,7 @@ def create_app(result_dir: Optional[str | Path] = None,
                     canonical_spec=canonical_spec,
                     device=device,
                     timeout_s=timeout_s,
-                    solver=_solver_snapshot(),
+                    solver=solver_snapshot,
                     estimate=service.sim_payload(sim)["estimate"],
                     workspace_path=workspace_path,
                     output_parent=output_parent,

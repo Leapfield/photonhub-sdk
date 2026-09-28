@@ -38,6 +38,7 @@ from ..components.grid import (UniformMesh, auto_mesh, graded_primary_spacings,
                                realized_cells, resolved_cell_counts)
 from ..components.monitors import PowerMonitor, ProfileMonitor
 from .. import materials as _materials
+from ..constants import c0
 from ..analysis.mode_devices import ModeMonitor, mode_launch, mode_monitor, transmission
 from ..analysis.yee_mode import solve_yee_mode
 from .geometry import build_geometry
@@ -45,7 +46,7 @@ from .spec import PaperSpec
 
 __all__ = ["BuiltSim", "build_simulation"]
 
-_C0 = 2.99792458e8  # m/s, the shared speed-of-light constant
+_C0 = c0  # m/s, the shared speed-of-light constant
 
 # Faithful-setup clearances (microns), referenced to the PML inner edge.
 _SRC_CLEARANCE_UM = 0.4   # source plane -> PML inner edge
@@ -94,7 +95,7 @@ def _resolve_medium(
     mat = _materials.get(material)
     if band_um is not None:
         return mat.medium(band_um=band_um)
-    return mat.medium(wavelength_um=wavelength_um)
+    return mat.medium(wlen_um=wavelength_um)
 
 
 def _band_freqs_hz(band_um: Tuple[float, float], n_points: int) -> Tuple[float, ...]:
@@ -375,7 +376,7 @@ def build_simulation(
     the graded cell ladder. ``core_dl_um`` states the core cell directly
     (e.g. ``0.025`` for 25 nm in silicon) and overrides ``cells_per_wavelength``.
 
-    ``subpixel=False`` rasterizes the geometry as a plain staircase instead of
+    ``subpixel=False`` samples the geometry on the mesh as a plain staircase instead of
     smoothing the cell that a sidewall cuts. That is a deliberate degradation,
     useful for reproducing what a coarse un-smoothed mesh does to a curved
     sidewall (extra scattering loss and back-reflection).
@@ -502,9 +503,9 @@ def build_simulation(
         # Per-medium target at the band centre: dl in the core, dl*n_core/n_clad
         # in the cladding, graded between (interfaces snapped, feature-ceiled).
         grid = auto_mesh(
-            size_um=(size_x, size_y, size_z), wavelength_um=lam_c,
+            size_um=(size_x, size_y, size_z), wlen_um=lam_c,
             structures=tuple(structures), background_index=n_clad,
-            steps_per_wvl=cells_per_wavelength, max_grading=max_grading,
+            cells_per_wlen=cells_per_wavelength, max_grading=max_grading,
         )
     else:
         grid = UniformMesh(dl_um=dl)

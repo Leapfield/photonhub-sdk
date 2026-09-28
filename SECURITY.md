@@ -7,7 +7,7 @@ service, please report it privately.
 
 ## Reporting
 
-- Email **beta@leapfield.app** with the subject line `SECURITY`.
+- Email **beta@leapfield.ai** with the subject line `SECURITY`.
 - Include the affected component and version (**Help → About** in the desktop
   app, `photonhub.__version__` for the SDK, or the solver archive's
   `manifest.json`), reproduction steps, and the impact you observed.

@@ -78,9 +78,11 @@ def field_figure(data, monitor: str, *, field: str = "Ex", val: str = "real",
         "x": _json_safe_numbers(arr.coords[col].values),
         "y": _json_safe_numbers(arr.coords[row].values),
         "colorscale": colorscale,
-        # DFT phasors are source-normalized (A0·S(f)); raw time snapshots keep
-        # solver field units with the source's arbitrary drive amplitude.
-        "colorbar": {"title": f"{_field_label(field, val)}<br>{'source-normalized' if 'freq_hz' in resolved else 'arb. units'}"},
+        # DFT phasors are the CW response of the declared sources (the engine's
+        # A0·S(f) normalization, A0 restored by RunResult when the simulation
+        # is known); raw time snapshots keep solver field units with the
+        # source's arbitrary drive amplitude.
+        "colorbar": {"title": f"{_field_label(field, val)}<br>{'CW phasor' if 'freq_hz' in resolved else 'arb. units'}"},
     }
     if diverging:
         finite = np.abs(z[np.isfinite(z)])
@@ -140,13 +142,13 @@ def _overlay_traces(outlines: Optional[dict], col: str, row: str) -> list:
 
 
 def spectrum_figure(data, monitor: str) -> dict:
-    """A flux monitor's signed, source-normalized value vs wavelength."""
+    """A flux monitor's signed value (watts for the declared sources) vs wavelength."""
     s = service.spectrum_values(data, monitor)
     return {
         "data": [{"type": "scatter", "mode": "lines+markers",
                   "x": _json_safe_numbers(s["wavelength_nm"]),
                   "y": _json_safe_numbers(s["value"]), "name": monitor}],
-        "layout": {"title": f"{monitor} · signed source-normalized flux",
+        "layout": {"title": f"{monitor} · signed flux (W)",
                    "xaxis": {"title": "wavelength (nm)"},
                    "yaxis": {"title": "signed normalized flux"}, "margin": _MARGIN},
     }
@@ -182,7 +184,7 @@ def field_spectrum_figure(data, monitor: str, *, field: str = "Ex",
                   "y": _json_safe_numbers(s["value"]), "name": field}],
         "layout": {"title": f"{monitor} · {_field_label(field, val)} spectrum",
                    "xaxis": {"title": "wavelength (nm)"},
-                   "yaxis": {"title": f"{_field_label(field, val)} · source-normalized"}, "margin": _MARGIN},
+                   "yaxis": {"title": f"{_field_label(field, val)} · CW phasor"}, "margin": _MARGIN},
     }
 
 

@@ -1,4 +1,4 @@
-"""Optical material library — literature dispersion models that emit
+"""Optical material library, literature dispersion models that emit
 :class:`~photonhub.Medium` objects (NUMERICS.md §19; the "material library"
 deferred there).
 
@@ -7,14 +7,14 @@ the published literature (Sellmeier / polynomial coefficients or tabulated
 measurement data, with the source citation and its stated validity range) and
 converts it to what the engine can run:
 
-- ``mat.medium(wavelength_um=1.55)`` — a NON-dispersive ``Medium`` frozen at
+- ``mat.medium(wlen_um=1.55)``, a NON-dispersive ``Medium`` frozen at
   one wavelength: ``permittivity = n^2 - k^2`` and any absorption mapped to
   the Ohmic conductivity (exact at that frequency).
-- ``mat.medium(band_um=(1.5, 1.6))`` — a dispersive ``Medium`` carrying the
+- ``mat.medium(band_um=(1.5, 1.6))``, a dispersive ``Medium`` carrying the
   engine's SINGLE scalar Lorentz pole (§19), least-squares fitted to the
   literature curve over the band. The fit follows the Courant-safe recipe
-  proven for c-Si in ``benchmarks/gds`` (PR #55/#57): the pole is placed near
-  the band — NOT at the material's physical UV resonance — so ``eps_inf``
+  proven for c-Si in ``validation/suites/gds`` (PR #55/#57): the pole is placed near
+  the band, NOT at the material's physical UV resonance, so ``eps_inf``
   stays well above 1 (a near-UV pole drives ``eps_inf -> 1``, which sits on
   the Courant edge and diverges). Use :meth:`Material.lorentz_fit` for the
   fit diagnostics (band error, pole placement, ADE-stability margin).
@@ -24,10 +24,10 @@ converts it to what the engine can run:
 >>> core = ph.Structure(geometry=box, medium=Si.medium(band_um=(1.5, 1.6)))
 >>> n_clad = SiO2.n(1.55)                      # 1.4440
 
-Bring your own measured (ellipsometer) data — the right path for
+Bring your own measured (ellipsometer) data, the right path for
 deposition-dependent films (PECVD SiN, a-Si:H, ...):
 
->>> mySiN = Material.from_nk_data("my_SiN", wavelength_um=wl, n=n, k=k,
+>>> mySiN = Material.from_nk_data("my_SiN", wlen_um=wl, n=n, k=k,
 ...                               reference="in-house ellipsometry 2026-05")
 
 Built-in materials (see ``MATERIALS``): the isotropic scalar engine cannot
@@ -35,12 +35,12 @@ carry birefringence, so uniaxial crystals are split into ``_o`` / ``_e``
 entries (use the ray your polarization sees). METALS (Au/Ag/Cu Johnson &
 Christy, Al Rakic) are included as tabulated n/k and are DISPERSIVE-ONLY:
 their optical/IR Re eps is negative, which no frozen permittivity >= 1
-medium can carry — build their media through the multi-pole fitter,
+medium can carry, build their media through the multi-pole fitter,
 
 >>> gold = ph.materials.Au.pole_fit(band_um=(1.0, 1.6), n_lorentz=1,
 ...                                 drude=True).medium
 
-(medium(wavelength_um=...)/medium(band_um=...) raise on a metallic
+(medium(wlen_um=...)/medium(band_um=...) raise on a metallic
 band and point here).
 
 All data files were taken from the refractiveindex.info database (public
@@ -48,7 +48,7 @@ domain, CC0 1.0), which transcribes the cited papers; coefficients are
 reproduced verbatim and the original papers are cited on each entry.
 
 Accuracy note (dispersive media): a dispersive structure makes ``Simulation``
-default subpixel smoothing OFF, and correctly so — subpixel smoothing x the
+default subpixel smoothing OFF, and correctly so, subpixel smoothing x the
 Lorentz-ADE update is a LIVE late-time instability at fine grids
 (engine/docs/subpixel-dispersion-instability.md; reconfirmed 2026-07-02 on a
 current build: a 25 c/lambda dispersive-Si scene diverges with Volume
@@ -70,6 +70,8 @@ import numpy as np
 
 from .components.structures import (MAX_ADE_POLES, DrudePole,
                                     LorentzPole, Medium)
+from ._compat import caller_stacklevel, legacy_keywords
+from .constants import c0, eps0
 
 __all__ = [
     "Material",
@@ -104,13 +106,64 @@ __all__ = [
     "Al",
 ]
 
-_C0_M_PER_S = 299792458.0
-_EPS0_F_PER_M = 8.8541878128e-12
+_C0_M_PER_S = c0
+_EPS0_F_PER_M = eps0
 
 
 def _freq_hz(wavelength_um: np.ndarray) -> np.ndarray:
     """Vacuum frequency (Hz) of a vacuum wavelength (µm)."""
     return _C0_M_PER_S / (np.asarray(wavelength_um, dtype=float) * 1e-6)
+
+
+def _ade_nyquist_eps(eps_inf: float, lorentz: Sequence[Tuple[float, float]],
+                     drude_hz: Sequence[float], dt: float) -> float:
+    """The lossless discrete permittivity at the time-step Nyquist
+    (NUMERICS.md §19.4): ``eps_inf - sum_L delta_eps*x/(1-x) -
+    sum_D (wp*dt/2)^2`` with ``x = (omega0*dt/2)^2``. ``lorentz`` holds
+    ``(resonance_frequency_hz, delta_eps)`` pairs, ``drude_hz`` plasma
+    frequencies. ``-inf`` once a pole reaches ``omega0*dt >= 2``."""
+    e = float(eps_inf)
+    for f0, de in lorentz:
+        x = (math.pi * f0 * dt) ** 2  # (omega0*dt/2)^2
+        if x >= 1.0:
+            return -math.inf
+        e -= de * x / (1.0 - x)
+    for fp in drude_hz:
+        e -= (math.pi * fp * dt) ** 2  # (wp*dt/2)^2
+    return e
+
+
+def _ade_max_dl_um(eps_inf: float, lorentz: Sequence[Tuple[float, float]],
+                   drude_hz: Sequence[float], courant: float,
+                   active_axes: int = 3) -> float:
+    """The coarsest uniform spacing (µm) meeting the §19.4 discrete-Nyquist
+    bound ``eps_nyq(dt) >= courant^2`` at the engine timestep ``dt =
+    courant*dl / (c0*sqrt(active_axes))`` (``active_axes`` 2 for a quasi-2-D
+    run with one 1-cell periodic axis). ``eps_nyq`` falls monotonically with
+    ``dt``, so the bound holds for every finer grid. ``inf`` for a medium
+    without poles."""
+    if not lorentz and not drude_hz:
+        return math.inf
+    from .analysis._constants import engine_dt_s
+
+    c2 = float(courant) ** 2
+
+    def ok(dl_um: float) -> bool:
+        return _ade_nyquist_eps(eps_inf, lorentz, drude_hz,
+                                engine_dt_s(dl_um, courant,
+                                            active_axes)) >= c2
+
+    hi = 1.0
+    while ok(hi):  # grow until the bound fails (always does: dt -> inf)
+        hi *= 2.0
+    lo = 0.0
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        if ok(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 
 # ---------------------------------------------------------------------------
@@ -121,11 +174,11 @@ def _freq_hz(wavelength_um: np.ndarray) -> np.ndarray:
 class _IndexModel:
     """A refractive-index dispersion relation n(lambda), k(lambda)."""
 
-    def n2(self, wavelength_um: np.ndarray) -> np.ndarray:  # pragma: no cover
+    def n2(self, wlen_um: np.ndarray) -> np.ndarray:  # pragma: no cover
         raise NotImplementedError
 
-    def k(self, wavelength_um: np.ndarray) -> np.ndarray:
-        return np.zeros_like(np.asarray(wavelength_um, dtype=float))
+    def k(self, wlen_um: np.ndarray) -> np.ndarray:
+        return np.zeros_like(np.asarray(wlen_um, dtype=float))
 
 
 @dataclass(frozen=True)
@@ -137,8 +190,9 @@ class Sellmeier(_IndexModel):
     a0: float
     terms: Tuple[Tuple[float, float], ...]
 
-    def n2(self, wavelength_um):
-        lam2 = np.asarray(wavelength_um, dtype=float) ** 2
+    def n2(self, wlen_um):
+        """Evaluate the Sellmeier squared index at wavelengths in microns."""
+        lam2 = np.asarray(wlen_um, dtype=float) ** 2
         out = np.full_like(lam2, self.a0)
         for b, c in self.terms:
             out = out + b * lam2 / (lam2 - c)
@@ -151,8 +205,9 @@ class Polynomial(_IndexModel):
 
     terms: Tuple[Tuple[float, float], ...]  # (coefficient, power)
 
-    def n2(self, wavelength_um):
-        lam = np.asarray(wavelength_um, dtype=float)
+    def n2(self, wlen_um):
+        """Evaluate the squared-index polynomial at wavelengths in microns."""
+        lam = np.asarray(wlen_um, dtype=float)
         out = np.zeros_like(lam)
         for c, p in self.terms:
             out = out + c * lam**p
@@ -166,12 +221,14 @@ class ConstantIndex(_IndexModel):
     n_const: float
     k_const: float = 0.0
 
-    def n2(self, wavelength_um):
-        lam = np.asarray(wavelength_um, dtype=float)
+    def n2(self, wlen_um):
+        """Constant squared refractive index, broadcast to the supplied wavelength shape."""
+        lam = np.asarray(wlen_um, dtype=float)
         return np.full_like(lam, self.n_const**2)
 
-    def k(self, wavelength_um):
-        lam = np.asarray(wavelength_um, dtype=float)
+    def k(self, wlen_um):
+        """Constant extinction coefficient, broadcast to the supplied wavelength shape."""
+        lam = np.asarray(wlen_um, dtype=float)
         return np.full_like(lam, self.k_const)
 
 
@@ -196,12 +253,20 @@ class TabulatedNK(_IndexModel):
         if self.k_table is not None and len(self.k_table) != wl.size:
             raise ValueError("TabulatedNK k must match wavelength_um length")
 
-    def n2(self, wavelength_um):
-        lam = np.asarray(wavelength_um, dtype=float)
+    def n2(self, wlen_um):
+        """Square the linearly interpolated index at wavelengths in microns.
+
+        Direct calls use endpoint values outside the table. ``Material`` checks
+        its valid range."""
+        lam = np.asarray(wlen_um, dtype=float)
         return np.interp(lam, self.wavelength_um, self.n) ** 2
 
-    def k(self, wavelength_um):
-        lam = np.asarray(wavelength_um, dtype=float)
+    def k(self, wlen_um):
+        """Linearly interpolate the extinction coefficient at wavelengths in microns.
+
+        Return zeros when no extinction table was supplied. Direct calls use
+        endpoint values outside the table; ``Material`` checks its valid range."""
+        lam = np.asarray(wlen_um, dtype=float)
         if self.k_table is None:
             return np.zeros_like(lam)
         return np.interp(lam, self.wavelength_um, self.k_table)
@@ -227,7 +292,7 @@ class LorentzFit:
     The fit is an IN-BAND surrogate: the pole placement is numerical, not the
     material's physical resonance, so the model has no meaning outside
     ``band_um`` (weakly-dispersive materials often get a far-IR pole whose
-    static ``eps(0) = eps_inf + delta_eps`` is wildly unphysical — irrelevant
+    static ``eps(0) = eps_inf + delta_eps`` is wildly unphysical, irrelevant
     for a source whose spectrum lives in the band).
     """
 
@@ -241,12 +306,14 @@ class LorentzFit:
 
     @property
     def pole_wavelength_um(self) -> Optional[float]:
+        """Pole wavelength in microns, or ``None`` when no resonance is fitted."""
         if self.resonance_frequency_hz is None:
             return None
         return _C0_M_PER_S / self.resonance_frequency_hz * 1e6
 
     @property
     def pole(self) -> Optional[LorentzPole]:
+        """Construct the fitted undamped Lorentz pole, or ``None`` for a degenerate fit."""
         if self.resonance_frequency_hz is None or self.delta_eps == 0.0:
             return None
         return LorentzPole(
@@ -257,6 +324,7 @@ class LorentzFit:
 
     @property
     def medium(self) -> Medium:
+        """Construct a ``Medium`` from the fitted permittivity, conductivity, and pole."""
         return Medium(
             permittivity=self.eps_inf,
             conductivity_s_per_m=self.conductivity_s_per_m,
@@ -278,13 +346,15 @@ class LorentzFit:
         return np.sqrt(self.eps_model(wavelength_um))
 
     def omega0_dt(self, dl_um: float, courant: float = 0.99) -> float:
-        """The ADE stability product ``omega0 * dt`` at grid spacing ``dl_um``
-        (µm) with the engine's 3-D Courant timestep
-        ``dt = courant * dl / (c0 * sqrt(3))``. The engine's ``validate()``
-        rejects a pole with ``omega0 * dt >= 2`` (NUMERICS.md §19.4); keep a
-        healthy margin below that. NB: a quasi-2D run (one 1-cell plain
-        periodic axis, NUMERICS §1/§2) steps sqrt(3/2) LARGER than this 3-D
-        estimate — ``validate()`` remains authoritative there."""
+        """The pole's resonance product ``omega0 * dt`` at grid spacing
+        ``dl_um`` (µm) with the engine's 3-D Courant timestep
+        ``dt = courant * dl / (c0 * sqrt(3))``. ``omega0 * dt < 2`` is only
+        the pole's own bound; the binding ADE rule is the discrete-Nyquist
+        inequality of NUMERICS.md §19.4 (``eps_inf - delta_eps*x/(1-x) >=
+        courant^2``, ``x = (omega0*dt/2)^2``), which :meth:`max_dl_um`
+        applies. NB: a quasi-2D run (one 1-cell plain periodic axis,
+        NUMERICS §1/§2) steps sqrt(3/2) LARGER than this 3-D estimate:
+        ``validate()`` remains authoritative there."""
         if self.resonance_frequency_hz is None:
             return 0.0
         # lazy import: analysis.__init__ is heavy and materials must stay
@@ -294,19 +364,25 @@ class LorentzFit:
         return 2.0 * math.pi * self.resonance_frequency_hz \
             * engine_dt_s(dl_um, courant)
 
-    def max_dl_um(self, courant: float = 0.99) -> float:
-        """The coarsest grid spacing (µm) that keeps ``omega0 * dt < 2``
-        (§19.4). Finer grids only shrink ``omega0 * dt``, so any ``dl`` below
-        this is ADE-safe."""
-        if self.resonance_frequency_hz is None:
+    def max_dl_um(self, courant: float = 0.99, active_axes: int = 3) -> float:
+        """The coarsest uniform grid spacing (µm) that meets the §19.4
+        discrete-Nyquist ADE bound ``eps_inf - delta_eps*x/(1-x) >=
+        courant^2`` (``x = (omega0*dt/2)^2``), which implies
+        ``omega0 * dt < 2``. ``active_axes`` is the number of axes with more
+        than one cell (2 for quasi-2-D, whose timestep is sqrt(3/2) larger).
+        Finer grids only lower ``dt``, so any ``dl`` below this is ADE-safe;
+        ``validate()`` is authoritative on a graded grid."""
+        if self.pole is None:
             return math.inf
-        w0 = 2.0 * math.pi * self.resonance_frequency_hz
-        return (2.0 / w0) * _C0_M_PER_S * math.sqrt(3.0) / courant * 1e6
+        return _ade_max_dl_um(
+            self.eps_inf,
+            [(self.resonance_frequency_hz, self.delta_eps)], (), courant,
+            active_axes)
 
 
 @dataclass(frozen=True)
 class PoleFit:
-    """A multi-pole (Lorentz + optional Drude) fit of a material band —
+    """A multi-pole (Lorentz + optional Drude) fit of a material band ,
     the schema-1.17 companion of :class:`LorentzFit`, fitting the COMPLEX
     permittivity (real dispersion AND absorption ride the poles' damping,
     no band-centre Ohmic sigma needed).
@@ -345,14 +421,31 @@ class PoleFit:
 
     def omega0_dt(self, dl_um: float, courant: float = 0.99) -> float:
         """The largest ``omega0 * dt`` over the fitted Lorentz poles at grid
-        spacing ``dl_um`` — must stay < 2 for ADE stability (§19.4; Drude
-        poles impose no resonance bound). Uses the 3-D Courant dt; a quasi-2D
-        run steps sqrt(3/2) larger (``validate()`` is authoritative)."""
+        spacing ``dl_um``. ``omega0 * dt < 2`` is only each pole's own bound;
+        the binding ADE rule is the §19.4 discrete-Nyquist inequality over
+        ALL poles, Drude included, which :meth:`max_dl_um` applies. Uses the
+        3-D Courant dt; a quasi-2D run steps sqrt(3/2) larger
+        (``validate()`` is authoritative)."""
         if not self.lorentz:
             return 0.0
         dt = courant * (dl_um * 1e-6) / (_C0_M_PER_S * math.sqrt(3.0))
         f_max = max(p.resonance_frequency_hz for p in self.lorentz)
         return 2.0 * math.pi * f_max * dt
+
+    def max_dl_um(self, courant: float = 0.99, active_axes: int = 3) -> float:
+        """The coarsest uniform grid spacing (µm) that meets the §19.4
+        discrete-Nyquist ADE bound ``eps_inf - sum_L delta_eps*x/(1-x) -
+        sum_D (wp*dt/2)^2 >= courant^2`` (``x = (omega0*dt/2)^2``).
+        ``active_axes`` is the number of axes with more than one cell (2 for
+        quasi-2-D, whose timestep is sqrt(3/2) larger). A fit with
+        ``eps_inf`` near 1 (metals, and a ``pole_fit`` of a dielectric that
+        lands there) needs a fine grid or a lower ``courant``: the engine
+        rejects a coarser spec. ``validate()`` is authoritative on a graded
+        grid."""
+        return _ade_max_dl_um(
+            self.eps_inf,
+            [(p.resonance_frequency_hz, p.delta_eps) for p in self.lorentz],
+            [d.plasma_frequency_hz for d in self.drude], courant, active_axes)
 
 
 def _lstsq_pole(
@@ -399,54 +492,58 @@ class Material:
             )
         return lam
 
-    def n(self, wavelength_um) -> Union[float, np.ndarray]:
-        """Real refractive index at ``wavelength_um`` (µm; scalar or array)."""
-        lam = self._check_range(wavelength_um)
+    @legacy_keywords(wavelength_um="wlen_um")
+    def n(self, wlen_um) -> Union[float, np.ndarray]:
+        """Real refractive index at ``wlen_um`` (µm; scalar or array)."""
+        lam = self._check_range(wlen_um)
         out = np.sqrt(self.model.n2(lam))
         return float(out) if out.ndim == 0 else out
 
-    def k(self, wavelength_um) -> Union[float, np.ndarray]:
-        """Extinction coefficient at ``wavelength_um`` (µm)."""
-        lam = self._check_range(wavelength_um)
+    @legacy_keywords(wavelength_um="wlen_um")
+    def k(self, wlen_um) -> Union[float, np.ndarray]:
+        """Extinction coefficient at ``wlen_um`` (µm)."""
+        lam = self._check_range(wlen_um)
         out = self.model.k(lam)
         return float(out) if out.ndim == 0 else out
 
-    def eps(self, wavelength_um) -> Union[complex, np.ndarray]:
+    @legacy_keywords(wavelength_um="wlen_um")
+    def eps(self, wlen_um) -> Union[complex, np.ndarray]:
         """Complex relative permittivity ``(n + ik)^2`` under the engine's
         ``e^{-i omega t}`` convention (``Im eps >= 0`` is absorbing)."""
-        lam = self._check_range(wavelength_um)
+        lam = self._check_range(wlen_um)
         nk = np.sqrt(self.model.n2(lam)) + 1j * self.model.k(lam)
         out = nk**2
         return complex(out) if out.ndim == 0 else out
 
     # -- Medium builders ----------------------------------------------------
 
+    @legacy_keywords(wavelength_um="wlen_um")
     def medium(
         self,
-        wavelength_um: Optional[float] = None,
+        wlen_um: Optional[float] = None,
         *,
         band_um: Optional[Tuple[float, float]] = None,
         **fit_kwargs,
     ) -> Medium:
         """An engine ``Medium`` for this material.
 
-        Exactly one of ``wavelength_um`` (non-dispersive, frozen at that
-        wavelength — permittivity ``n^2 - k^2``, absorption mapped to Ohmic
+        Exactly one of ``wlen_um`` (non-dispersive, frozen at that
+        wavelength, permittivity ``n^2 - k^2``, absorption mapped to Ohmic
         conductivity) or ``band_um`` (dispersive single-pole Lorentz fit over
         the band, see :meth:`lorentz_fit`; extra keyword arguments are
         forwarded to it) must be given.
         """
-        if (wavelength_um is None) == (band_um is None):
+        if (wlen_um is None) == (band_um is None):
             raise ValueError(
-                "give exactly one of wavelength_um= (constant medium) or "
+                "give exactly one of wlen_um= (constant medium) or "
                 "band_um= (dispersive single-pole fit)"
             )
-        if wavelength_um is not None:
+        if wlen_um is not None:
             if fit_kwargs:
                 raise ValueError(
                     "fit options are only meaningful with band_um="
                 )
-            lam = float(wavelength_um)
+            lam = float(wlen_um)
             self._check_range(lam)
             n_v = float(np.sqrt(self.model.n2(np.asarray(lam))))
             k_v = float(self.model.k(np.asarray(lam)))
@@ -468,15 +565,16 @@ class Material:
                 f"{self.name}: single-pole Lorentz fit over {band_um} um has "
                 f"max index error {fit.max_abs_n_error:.2e} (> 1e-3); "
                 "consider a narrower band",
-                stacklevel=2,
+                stacklevel=caller_stacklevel(),
             )
         return fit.medium
 
+    @legacy_keywords(pole_wavelength_um="pole_wlen_um")
     def lorentz_fit(
         self,
         band_um: Tuple[float, float],
         *,
-        pole_wavelength_um: Optional[float] = None,
+        pole_wlen_um: Optional[float] = None,
         num_samples: int = 128,
         min_n_inf_ratio: float = 0.7,
     ) -> LorentzFit:
@@ -487,14 +585,14 @@ class Material:
         ``(eps_inf, delta_eps)`` and solved by least squares; the placement
         is scanned on both sides of the band (a pole INSIDE the band is a
         singularity) and the best feasible fit wins, with near-ties broken
-        toward the longest pole wavelength (lowest ``omega0`` — the largest
+        toward the longest pole wavelength (lowest ``omega0``, the largest
         ADE stability margin, §19.4). Feasibility enforces the wire bound
         ``eps_inf >= 1``, passivity ``delta_eps >= 0``, and
-        ``n_inf >= min_n_inf_ratio * min(n_band)`` — the Courant-edge guard
+        ``n_inf >= min_n_inf_ratio * min(n_band)``, the Courant-edge guard
         learned from the c-Si benchmark work (an unconstrained near-UV pole
         drives ``eps_inf`` toward 1 and the run diverges).
 
-        ``pole_wavelength_um`` pins the pole instead of scanning (the c-Si
+        ``pole_wlen_um`` pins the pole instead of scanning (the c-Si
         benchmark's hand placement at 0.6 µm is reproduced this way).
 
         Absorption is NOT fitted by the pole: any tabulated ``k`` becomes the
@@ -558,11 +656,11 @@ class Material:
             eps_inf, delta_eps, err = _lstsq_pole(w, eps_target, w0)
             return eps_inf, delta_eps, err, w0
 
-        if pole_wavelength_um is not None:
-            lam0 = float(pole_wavelength_um)
+        if pole_wlen_um is not None:
+            lam0 = float(pole_wlen_um)
             if lo <= lam0 <= hi:
                 raise ValueError(
-                    f"pole_wavelength_um={lam0} lies inside the band {band_um}"
+                    f"pole_wlen_um={lam0} lies inside the band {band_um}"
                 )
             eps_inf, delta_eps, err, w0 = fit_at(lam0)
             if not feasible(eps_inf, delta_eps) or not math.isfinite(err):
@@ -633,7 +731,7 @@ class Material:
             f"{self.name}: no feasible passive single-pole Lorentz fit over "
             f"{band_um} um (anomalous band slope?); returning a constant-index "
             f"medium (max index error {const_err:.2e})",
-            stacklevel=3,
+            stacklevel=caller_stacklevel(),
         )
         return degenerate
 
@@ -648,7 +746,7 @@ class Material:
         num_samples: int = 128,
     ) -> PoleFit:
         """Fit the material's COMPLEX permittivity over ``band_um`` with
-        ``n_lorentz`` Lorentz poles plus (optionally) one Drude term — the
+        ``n_lorentz`` Lorentz poles plus (optionally) one Drude term, the
         schema-1.17 multi-pole fit for metals and wideband dielectrics.
 
         Where :meth:`lorentz_fit` fits ``Re eps`` with ONE lossless pole and
@@ -660,7 +758,8 @@ class Material:
         engine's pole budget or scipy is unavailable.
 
         Returns a :class:`PoleFit`; use ``fit.medium`` in structures, check
-        ``fit.max_rel_eps_error`` and ``fit.omega0_dt(dl_um)`` before running.
+        ``fit.max_rel_eps_error`` and ``fit.max_dl_um(courant)`` before
+        running.
         """
         from scipy.optimize import least_squares
 
@@ -785,11 +884,12 @@ class Material:
         return fit
 
     @classmethod
+    @legacy_keywords(wavelength_um="wlen_um")
     def from_nk_data(
         cls,
         name: str,
         *,
-        wavelength_um: Sequence[float],
+        wlen_um: Sequence[float],
         n: Sequence[float],
         k: Optional[Sequence[float]] = None,
         reference: str = "user-supplied measurement data",
@@ -798,7 +898,7 @@ class Material:
         """Wrap measured ``(lambda, n[, k])`` samples (e.g. ellipsometry) as
         a :class:`Material`; validity range = the table's span."""
         model = TabulatedNK(
-            wavelength_um=tuple(float(x) for x in wavelength_um),
+            wavelength_um=tuple(float(x) for x in wlen_um),
             n=tuple(float(x) for x in n),
             k_table=None if k is None else tuple(float(x) for x in k),
         )
@@ -1115,10 +1215,11 @@ PMMA = Material(
 )
 
 
+@legacy_keywords(wavelength_um="wlen_um")
 def uniaxial_medium(
     ordinary: "Material",
     extraordinary: "Material",
-    wavelength_um: float,
+    wlen_um: float,
     *,
     optic_axis: str = "z",
 ) -> Medium:
@@ -1136,8 +1237,8 @@ def uniaxial_medium(
     """
     if optic_axis not in ("x", "y", "z"):
         raise ValueError(f"optic_axis must be x/y/z, got {optic_axis!r}")
-    n_o = float(ordinary.n(wavelength_um))
-    n_e = float(extraordinary.n(wavelength_um))
+    n_o = float(ordinary.n(wlen_um))
+    n_e = float(extraordinary.n(wlen_um))
     eps = {"x": n_o * n_o, "y": n_o * n_o, "z": n_o * n_o}
     eps[optic_axis] = n_e * n_e
     return Medium(permittivity=n_o * n_o,

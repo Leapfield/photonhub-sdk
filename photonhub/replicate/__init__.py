@@ -4,7 +4,7 @@ parameters, assemble a converged FDTD simulation, read the figures-of-merit, and
 compare them against the paper.
 
 This is the paper-agnostic front end of the agentic designer: the legacy
-``benchmarks/gds`` framework was specialized to one paper (hardcoded stack,
+``validation/suites/gds`` framework was specialized to one paper (hardcoded stack,
 monkey-patched global scene builder); this package rebuilds the pieces as
 installable, spec-driven modules so any paper is expressible.
 

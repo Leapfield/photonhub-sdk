@@ -1,34 +1,34 @@
-"""GDS layout import — turn a GDSII layout into PhotonHub structures.
+"""GDS layout import, turn a GDSII layout into PhotonHub structures.
 
 A GDS file is a 2-D layout: ordered polygons each tagged by an integer
 ``(layer, datatype)`` pair, optionally organized into a hierarchy of cell
 references (instances with translation/rotation/magnification). A photonic
 device is built from that 2-D drawing by **extruding** each layer to a slab of a
-fixed z-thickness filled with one material — the "layer stack".
+fixed z-thickness filled with one material, the "layer stack".
 
 :func:`import_gds` reads the file (via the optional ``gdstk`` dependency),
 flattens any cell hierarchy into a flat polygon list, and emits one
 :class:`~photonhub.Polygon` :class:`~photonhub.Structure` per polygon on each
 requested layer, using that layer's z-extent and medium. Polygon winding is
 normalized to counter-clockwise (the orientation :class:`Polygon` and the
-rasterizer expect).
+mesh sampler expect).
 
 It pairs a GDS layout with a layer stack: each layer becomes an extruded
-medium. It is what the GDS benchmark suite (``benchmarks/gds/``) uses to
+medium. It is what the GDS benchmark suite (``validation/suites/gds/``) uses to
 build devices from the JPPhotonics ``fdtd-pipeline`` layouts (arXiv:2506.16665).
 
 >>> import photonhub as ph
->>> from photonhub.gds import import_gds, GdsLayer
+>>> from photonhub.gds import import_gds, GDSLayer
 >>> si = ph.Medium(permittivity=3.478**2)
 >>> structures = import_gds(
 ...     "crossing.gds",
-...     [GdsLayer(layer=(1, 0), medium=si, zmin_um=0.0, thickness_um=0.22),
-...      GdsLayer(layer=(2, 0), medium=si, zmin_um=0.0, thickness_um=0.15)],
+...     [GDSLayer(layer=(1, 0), medium=si, zmin_um=0.0, thickness_um=0.22),
+...      GDSLayer(layer=(2, 0), medium=si, zmin_um=0.0, thickness_um=0.15)],
 ... )
 >>> sim = ph.Simulation(..., structures=structures)
 
 Limitations (v1). Each polygon is extruded independently; polygons with holes
-(even-odd fill) are not specially handled — for the strip/rib SOI layouts this
+(even-odd fill) are not specially handled, for the strip/rib SOI layouts this
 targets, every drawn shape is a simple filled region. Curved sidewalls are a
 single global ``sidewall_angle`` per layer (matching ``Polygon``); arbitrary
 per-edge tapering is out of scope.
@@ -36,6 +36,7 @@ per-edge tapering is out of scope.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple, Union
@@ -43,13 +44,13 @@ from typing import List, Optional, Sequence, Tuple, Union
 from .components.base import AxisName
 from .components.structures import Box, Cylinder, Medium, Polygon, Sphere, Structure
 
-__all__ = ["GdsLayer", "import_gds", "export_gds", "read_gds_cell_names"]
+__all__ = ["GDSLayer", "import_gds", "export_gds", "read_gds_cell_names"]
 
 _AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
 
 
 @dataclass(frozen=True)
-class GdsLayer:
+class GDSLayer:
     """One GDS ``(layer, datatype)`` mapped to an extruded slab of one medium.
 
     ``zmin_um`` / ``thickness_um`` give the slab extent along the extrusion axis
@@ -68,11 +69,12 @@ class GdsLayer:
     def __post_init__(self) -> None:
         if self.thickness_um <= 0.0:
             raise ValueError(
-                f"GdsLayer thickness_um must be > 0, got {self.thickness_um}"
+                f"GDSLayer thickness_um must be > 0, got {self.thickness_um}"
             )
 
     @property
     def slab_bounds_um(self) -> Tuple[float, float]:
+        """Lower and upper extrusion heights, in microns."""
         return (self.zmin_um, self.zmin_um + self.thickness_um)
 
 
@@ -144,7 +146,7 @@ def _select_cell(gdstk, lib, cell_name: Optional[str], gds_path: str):
 
 def import_gds(
     gds_path: Union[str, Path],
-    layers: Sequence[GdsLayer],
+    layers: Sequence[GDSLayer],
     *,
     cell_name: Optional[str] = None,
     axis: AxisName = "z",
@@ -160,13 +162,13 @@ def import_gds(
         read regardless of the file's user unit (a GDS authored in nm or mm
         imports at its true physical size).
     layers:
-        The layers to import, as :class:`GdsLayer` specs (each maps a GDS
+        The layers to import, as :class:`GDSLayer` specs (each maps a GDS
         ``(layer, datatype)`` to a z-slab + medium). A GDS layer present in the
         file but absent from this list is ignored; a spec whose layer is absent
         from the file simply yields no structures.
     cell_name:
         Which cell to import. ``None`` (default) uses the file's single
-        top-level cell (raising if there are several — pass a name to choose).
+        top-level cell (raising if there are several, pass a name to choose).
     axis:
         Extrusion axis = slab normal (default ``"z"``: the GDS drawing plane is
         ``(x, y)``). The two GDS coordinate columns map to the two transverse
@@ -177,8 +179,7 @@ def import_gds(
         Required for hierarchical layouts; with ``False`` only the chosen cell's
         own polygons are read.
     min_area_um2:
-        Drop polygons whose absolute area is below this (default 0 = keep all) —
-        a guard against zero-area slivers from boolean ops.
+        Drop polygons whose absolute area is below this (default 0 = keep all), a guard against zero-area slivers from boolean ops.
 
     Returns
     -------
@@ -191,7 +192,7 @@ def import_gds(
     if axis not in ("x", "y", "z"):
         raise ValueError(f"axis must be one of x/y/z, got {axis!r}")
     if not layers:
-        raise ValueError("import_gds: pass at least one GdsLayer")
+        raise ValueError("import_gds: pass at least one GDSLayer")
 
     gdstk = _import_gdstk()
     gds_path = str(gds_path)
@@ -294,13 +295,13 @@ def _to_gds_polygons(gdstk, geometry, u: int, v: int, tol_um: float):
     if isinstance(geometry, Cylinder):
         cu, cv = geometry.center_um[u], geometry.center_um[v]
         inner = None if geometry.inner_radius_um == 0.0 else float(geometry.inner_radius_um)
-        sweep = geometry.angle_stop - geometry.angle_start
+        sweep = geometry.angle_stop_rad - geometry.angle_start_rad
         full = sweep >= 2.0 * 3.141592653589793 - 1e-9
         return [gdstk.ellipse(
             (cu, cv), float(geometry.radius_um),
             inner_radius=inner,
-            initial_angle=0.0 if full else float(geometry.angle_start),
-            final_angle=0.0 if full else float(geometry.angle_stop),
+            initial_angle=0.0 if full else float(geometry.angle_start_rad),
+            final_angle=0.0 if full else float(geometry.angle_stop_rad),
             tolerance=tol_um,
         )]
     raise ValueError(
@@ -312,7 +313,7 @@ def export_gds(
     structures,
     gds_path: Union[str, Path],
     *,
-    layers: Optional[Sequence[GdsLayer]] = None,
+    layers: Optional[Sequence[GDSLayer]] = None,
     axis: AxisName = "z",
     cell_name: str = "TOP",
     unit: float = 1e-6,
@@ -320,9 +321,9 @@ def export_gds(
     cylinder_tolerance_um: float = 1e-3,
     max_points: int = 0,
     z_tol_um: float = 1e-6,
-) -> Tuple[GdsLayer, ...]:
-    """Write PhotonHub structures OUT to a ``.gds`` layout — the reciprocal of
-    :func:`import_gds`. Returns the :class:`GdsLayer` stack that maps the file
+) -> Tuple[GDSLayer, ...]:
+    """Write PhotonHub structures OUT to a ``.gds`` layout, the reciprocal of
+    :func:`import_gds`. Returns the :class:`GDSLayer` stack that maps the file
     back to structures (hand it straight to :func:`import_gds` to round-trip).
 
     ``structures`` is a sequence of :class:`Structure` or a
@@ -361,20 +362,20 @@ def export_gds(
         polys = _to_gds_polygons(gdstk, s.geometry, u, v, cylinder_tolerance_um)
         entries.append((lo, hi, s.medium, polys))
 
-    def _matches(lo, hi, gl: GdsLayer) -> bool:
+    def _matches(lo, hi, gl: GDSLayer) -> bool:
         glo, ghi = gl.slab_bounds_um
         return abs(lo - glo) <= z_tol_um and abs(hi - ghi) <= z_tol_um
 
     if layers is None:
         # auto-infer one layer per distinct (rounded slab, medium)
         assigned: dict = {}
-        out_layers: List[GdsLayer] = []
+        out_layers: List[GDSLayer] = []
         for lo, hi, med, _ in entries:
             key = (round(lo, 6), round(hi, 6), _medium_key(med))
             if key not in assigned:
                 n = len(out_layers) + 1
                 assigned[key] = (n, 0)
-                out_layers.append(GdsLayer(layer=(n, 0), medium=med, zmin_um=lo, thickness_um=hi - lo))
+                out_layers.append(GDSLayer(layer=(n, 0), medium=med, zmin_um=lo, thickness_um=hi - lo))
         layer_of = {i: assigned[(round(lo, 6), round(hi, 6), _medium_key(med))]
                     for i, (lo, hi, med, _) in enumerate(entries)}
     else:
@@ -403,7 +404,7 @@ def export_gds(
 
 
 def read_gds_cell_names(gds_path: Union[str, Path]) -> Tuple[str, ...]:
-    """List every cell name in a GDS file (top-level first) — a discovery
+    """List every cell name in a GDS file (top-level first), a discovery
     helper for picking ``cell_name`` / layers before :func:`import_gds`."""
     gdstk = _import_gdstk()
     gds_path = str(gds_path)
@@ -414,3 +415,11 @@ def read_gds_cell_names(gds_path: Union[str, Path]) -> Tuple[str, ...]:
     ordered = [c.name for c in lib.cells if c.name in tops]
     ordered += [c.name for c in lib.cells if c.name not in tops]
     return tuple(ordered)
+
+
+def __getattr__(name):
+    if name == "GdsLayer":
+        warnings.warn("photonhub.gds.GdsLayer was renamed to GDSLayer; the old name will be "
+                      "removed in a future release", DeprecationWarning, stacklevel=2)
+        return GDSLayer
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -1,4 +1,4 @@
-"""Mode tracking — a consistent labeling of FDE modes across a sequence of planes.
+"""Mode tracking, a consistent labeling of FDE modes across a sequence of planes.
 
 A finite-difference mode solver returns the modes of each cross-section sorted by
 descending ``n_eff``. That order is **not** a stable identity: as a geometry (or
@@ -12,14 +12,14 @@ Mode tracking establishes that correspondence by **field overlap**: between
 adjacent planes, each mode is matched to the most-similar mode on the previous
 plane (a global assignment, not greedy), giving a set of continuous "tracks". It
 also fixes the arbitrary per-solve eigenvector sign/phase so that consecutive
-modes along a track are phase-aligned — required for any interpolation between
+modes along a track are phase-aligned, required for any interpolation between
 planes.
 
 This is the prerequisite for CVCS (continuously-varying-cross-section) modelling
 and for the per-mode interpretation of an EME (:mod:`photonhub.analysis.eme`)
 cascade. It is deliberately general: the planes can be the z-sections of an EME
 device, or the same cross-section re-solved across a wavelength band or a bend
-radius — anything that yields a sequence of mode sets **on a common transverse
+radius, anything that yields a sequence of mode sets **on a common transverse
 grid**.
 
 Similarity metric
@@ -36,7 +36,7 @@ align modes along a track. The assignment maximizing the total ``|O|`` between t
 planes is found with the Hungarian algorithm
 (:func:`scipy.optimize.linear_sum_assignment`).
 
-Limitation: an *exact* crossing (degenerate modes) is genuinely ambiguous — the
+Limitation: an *exact* crossing (degenerate modes) is genuinely ambiguous, the
 two modes are an arbitrary delocalized mix there. Sample finely enough that
 adjacent planes stay clearly distinguishable and avoid landing a plane on the
 degeneracy.
@@ -44,12 +44,14 @@ degeneracy.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+import warnings
+from dataclasses import dataclass, replace
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
+from .._compat import caller_stacklevel
 from .vector_modes import VectorMode
 
 __all__ = [
@@ -110,7 +112,7 @@ def match_modes(
 
     Returns ``(assign, sim, phase)`` each of length ``len(modes_b)``:
     ``assign[j]`` is the index in ``modes_a`` matched to ``modes_b[j]`` (``-1`` if
-    unmatched — extra mode, or below ``min_similarity``); ``sim[j] = |O|`` the
+    unmatched, extra mode, or below ``min_similarity``); ``sim[j] = |O|`` the
     match quality; ``phase[j] = O / |O|`` the unit relative phase.
     """
     overlap = transverse_overlap(modes_a, modes_b)
@@ -141,7 +143,7 @@ class TrackingResult:
         (``-1`` if absent). This is the relabeling: read row ``t`` to follow one
         physical mode through the sweep.
     neff:
-        ``n_eff`` of track ``t`` at plane ``k`` (``nan`` if absent) — the smooth,
+        ``n_eff`` of track ``t`` at plane ``k`` (``nan`` if absent), the smooth,
         crossing-aware dispersion curve.
     confidence:
         ``|overlap|`` of the match that linked this track to the previous plane
@@ -163,7 +165,7 @@ class TrackingResult:
     @property
     def has_reordering(self) -> bool:
         """True if at any plane the tracks are not in solver (descending-n_eff)
-        order — i.e. a crossing/swap occurred and naive ordering would mislabel."""
+        order, i.e. a crossing/swap occurred and naive ordering would mislabel."""
         for k in range(self.n_planes):
             present = self.mode_of[:, k]
             present = present[present >= 0]
@@ -178,7 +180,7 @@ class TrackingResult:
 
     def min_confidence(self, track: int) -> float:
         """Weakest adjacent-plane link along ``track`` (ignores its start
-        ``nan``) — a single-number reliability score for the track."""
+        ``nan``), a single-number reliability score for the track."""
         c = self.confidence[track]
         c = c[~np.isnan(c)]
         return float(c.min()) if c.size else float("nan")
@@ -258,7 +260,7 @@ def reorder_to_tracks(
     tracks present at every plane (:attr:`TrackingResult.full_tracks`).
 
     The result has the same number of modes at every plane, in the same physical
-    order — a consistent basis for an EME cascade (so ``S21[0, 0]`` is always the
+    order, a consistent basis for an EME cascade (so ``S21[0, 0]`` is always the
     same tracked mode) or for plane-to-plane interpolation.
     """
     full = tracking.full_tracks
@@ -266,3 +268,116 @@ def reorder_to_tracks(
         [mode_sets[k][tracking.mode_of[t, k]] for t in full]
         for k in range(tracking.n_planes)
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Per-frequency banks: mode labels followed across a band
+# --------------------------------------------------------------------------- #
+
+#: Adjacent-frequency shape overlap below which a bank label is not followed
+#: with confidence: a crossing sampled too coarsely, a hybridizing
+#: anti-crossing, a degenerate pair, or a mode near cut-off.
+BANK_MIN_OVERLAP = 0.9
+
+#: Change of a followed full-vector mode's TE fraction across a band above
+#: which the mode is taken to have changed character (mixed with another).
+BANK_MAX_TE_SWING = 0.5
+
+
+def _shape(mode) -> np.ndarray:
+    """A mode's transverse-E shape, flattened and L2-normalized: ``[Ex | Ey]``
+    of a :class:`VectorMode`, the ``field`` of a scalar
+    :class:`~photonhub.analysis.modes.Mode`."""
+    if hasattr(mode, "ex"):
+        v = np.concatenate([np.ravel(mode.ex), np.ravel(mode.ey)]).astype(complex)
+    else:
+        v = np.ravel(np.asarray(mode.field)).astype(complex)
+    n = float(np.linalg.norm(v))
+    return v / n if n > 0.0 else v
+
+
+def _rephased(mode, overlap: complex):
+    """``mode`` times the unit phase that makes ``overlap`` (its shape overlap
+    with the previous mode of its track) real and positive. A scalar mode's
+    real profile takes only the sign."""
+    if abs(overlap) == 0.0:
+        return mode
+    factor = np.conj(overlap) / abs(overlap)
+    if hasattr(mode, "ex"):
+        return replace(mode, ex=mode.ex * factor, ey=mode.ey * factor, ez=mode.ez * factor,
+                       hx=mode.hx * factor, hy=mode.hy * factor, hz=mode.hz * factor)
+    return mode if factor.real >= 0.0 else replace(mode, field=-np.asarray(mode.field))
+
+
+def _follow_bank(frames: Sequence[Sequence], labels: Sequence[int], freqs_hz: Sequence[float], *,
+                 anchor: Optional[int] = None, min_overlap: Optional[float] = BANK_MIN_OVERLAP,
+                 what: str = "mode", names: Optional[Dict[int, str]] = None) -> List[Dict[int, object]]:
+    """Follow the modes ``labels`` through a frequency band.
+
+    ``frames`` holds one mode list per frequency of the ascending ``freqs_hz``
+    (each in the solver's descending-``n_eff`` order); ``labels`` index the
+    modes of ``frames[anchor]`` (default: the middle frequency), where the
+    labels are defined. Every other frequency takes, for each label, the mode
+    whose transverse-E shape best matches the label's mode at the neighbouring
+    frequency (a global assignment), phase-aligned to it: a label survives a
+    crossing between modes that do not mix, and the complex amplitude read
+    against the bank does not jump by pi where a two-lobe mode's sign
+    convention flips. The anchor's modes keep their own phase.
+
+    Where two modes mix near a crossing (an anti-crossing), the modes change
+    character continuously and a label follows the mode it started as through
+    the mixing, which depends on how finely the band is sampled. Two checks
+    make that visible with a ``UserWarning``: a link whose overlap falls below
+    ``min_overlap`` (``None`` = no checks), and a full-vector label whose TE
+    fraction changes by more than ``BANK_MAX_TE_SWING`` across the band.
+    ``names`` gives the warnings a user's name for a label (``"TE1"``).
+    Returns one ``{label: mode}`` per frequency."""
+    names = names or {}
+    n = len(frames)
+    if len(freqs_hz) != n:
+        raise ValueError("frames and freqs_hz differ in length")
+    labels = list(labels)
+    anchor = n // 2 if anchor is None else int(anchor)
+    out: List[Dict[int, object]] = [{} for _ in range(n)]
+    out[anchor] = {i: frames[anchor][i] for i in labels}
+    weak = []
+    for k in list(range(anchor + 1, n)) + list(range(anchor - 1, -1, -1)):
+        prev = out[k - 1] if k > anchor else out[k + 1]
+        cand = list(frames[k])
+        if len(cand) < len(labels):
+            raise ValueError(
+                f"found only {len(cand)} {what}(s) at {freqs_hz[k]:.6g} Hz to follow the "
+                f"{len(labels)} requested: the guide may not support them across the whole band")
+        P = np.array([_shape(prev[i]) for i in labels])
+        C = np.array([_shape(m) for m in cand])
+        if P.shape[1] != C.shape[1]:
+            raise ValueError("the modes of a per-frequency bank must share one transverse grid")
+        O = P.conj() @ C.T
+        rows, cols = linear_sum_assignment(-np.abs(O))
+        for r, c in zip(rows, cols):
+            o = complex(O[r, c])
+            if min_overlap is not None and abs(o) < min_overlap:
+                weak.append((labels[r], freqs_hz[k], abs(o)))
+            out[k][labels[r]] = _rephased(cand[c], o)
+    if weak:
+        label, f, o = min(weak, key=lambda w: w[2])
+        warnings.warn(
+            f"{len(weak)} adjacent-frequency link(s) of this {what} set have a field "
+            f"overlap below {min_overlap}; the weakest, {names.get(label, f'mode {label}')} at "
+            f"{f:.6g} Hz, is "
+            f"{o:.3f}. The mode may have mixed with another near a crossing, be one of "
+            "a degenerate pair, or be near cut-off, so its index may not name one "
+            "physical mode across the band: check the modes, or split the band at the "
+            "crossing.", UserWarning, stacklevel=caller_stacklevel())
+    if min_overlap is not None:
+        for label in labels:
+            te = [out[k][label].te_fraction for k in range(n) if hasattr(out[k][label], "te_fraction")]
+            if len(te) == n and max(te) - min(te) > BANK_MAX_TE_SWING:
+                warnings.warn(
+                    f"{names.get(label, f'mode {label}')} of this {what} set changes "
+                    "polarization across the "
+                    f"band (TE fraction {min(te):.2f} to {max(te):.2f}): it mixes with "
+                    "another mode near a crossing, so its index does not name one "
+                    "physical mode across the band. Check the modes, or split the band "
+                    "at the crossing.", UserWarning, stacklevel=caller_stacklevel())
+    return out

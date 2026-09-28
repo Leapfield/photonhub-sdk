@@ -1,7 +1,7 @@
 # Workbench starter resources
 
 `mode_converter.sim.json` is generated from the repository's canonical GDS test
-case at `benchmarks/gds/test_cases/mode_converter` and its `matched_res10`
+case at `validation/suites/gds/test_cases/mode_converter` and its `matched_res10`
 profile. The source layout is the gdsfactory generic-PDK
 `mode_converter_gap0p15_length20` cell from
 `JPPhotonics/fdtd-pipeline@622e0a9`; the committed GDS SHA-256 is
@@ -33,7 +33,7 @@ from photonhub import (
 from photonhub.viz.service import mode_source_input_sha256
 
 _engine.USE_EQ_SOURCE = False
-spec = load_spec(Path("benchmarks/gds/test_cases/mode_converter"))
+spec = load_spec(Path("validation/suites/gds/test_cases/mode_converter"))
 scene = build_ph_scene(spec, load_profile("matched_res10"))
 sim = scene.sim._validated_copy({"schema_version": SCHEMA_VERSION})
 recipe_data = {

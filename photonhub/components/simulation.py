@@ -1,17 +1,22 @@
-"""Top-level simulation model — the root of the wire format."""
+"""Top-level simulation model, the root of the wire format."""
 
+import contextlib
+import contextvars
 import logging
 import math
 import os
 import stat
 import tempfile
 import warnings
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, PrivateAttr, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from ..cost import CostEstimate, quote
+from ..constants import c0, eps0, mu0
 from .base import (
     MAX_INT32,
     DftPrecisionName,
@@ -22,26 +27,46 @@ from .base import (
     _monitor_name_key,
 )
 from .grid import (
-    MeshType,
+    _structure_index,
+    auto_mesh,
     axis_min_cells,
     graded_primary_spacings,
+    GradedMesh,
+    GradedMeshAxis,
+    MeshType,
     quarter_snap_dft_face,
     realized_cells,
     resolved_cell_counts,
     snap_mixed_plane,
     snapped_plane_index,
+    UniformMesh,
     yee_axis_offsets,
 )
 from .medium import Background, Boundaries
 from .monitors import (
     ProfileMonitor,
     PowerMonitor,
+    TimeMonitor,
     MonitorType,
     mode_port_physical_polarization,
 )
 from .run import RunSpec
-from .sources import ModeSource, PlaneWave, SourceType
-from .structures import Medium, Structure
+from .sources import ModeSource, PlaneWave, PointDipole, SourceType, TfsfBox
+from . import declarative as _decl
+from . import frame as _frame
+from ._bounds import geometry_bounds_um
+from .authoring import Domain, GaussianBeam, Mesh, Port
+from .source_time import _C0_M_PER_S, CW
+from .structures import Box, MaterialEntry, Medium, Structure, is_material
+from .._compat import legacy_keywords
+
+# The run-length cap of a simulation that gives no ``run``: transits of the
+# longest domain extent at the highest index. The auto-shutoff ends a run
+# well before it (a straight strip decays in 4.7 transits at shutoff 1e-7,
+# the Y-junction of notebook 37 in 3.3, phase-5 study); the cap is the
+# ceiling the cost estimate quotes and the length a device that never decays
+# runs to, with a warning.
+DEFAULT_TRANSITS = 40.0
 
 
 def _medium_poles(medium):
@@ -49,7 +74,7 @@ def _medium_poles(medium):
 
     ``lorentz`` is the legacy OPTIONAL SINGLE pole (NUMERICS.md section 19.5)
     and ``poles`` is the list form. Wrapping the single one in ``list(...)``
-    iterates a pydantic model into (name, value) tuples instead — which is how
+    iterates a pydantic model into (name, value) tuples instead, which is how
     two validators here quietly grew an AttributeError on any scene that used
     the legacy spelling.
     """
@@ -57,6 +82,62 @@ def _medium_poles(medium):
     out = [single] if single is not None else []
     out.extend(getattr(medium, "poles", None) or [])
     return out
+
+
+def _loaded_document(info) -> bool:
+    """True when a validator runs on a document being loaded from the wire
+    (context ``wire_ingest``), where the engine is the authority and a
+    document that breaks a rule must still load so it can be fixed; False on
+    construction and on the validated copy an edit makes (``edit_copy``),
+    which must refuse what direct construction refuses."""
+    ctx = info.context or {}
+    return bool(ctx.get("wire_ingest")) and not ctx.get("edit_copy")
+
+
+def _ade_nyquist_eps(eps_inf, lorentz, drude, dt) -> float:
+    """A dispersive medium's discrete permittivity at the temporal Nyquist of
+    step ``dt`` (NUMERICS.md §19.4, the engine's ade_nyquist_eps):
+    eps_inf - sum delta_eps*x/(1-x) - sum (wp*dt/2)^2, x = (omega0*dt/2)^2, over
+    ``lorentz`` [(omega0, delta_eps)] and ``drude`` [wp] in rad/s; -inf once a
+    Lorentz pole reaches its own Nyquist (x >= 1)."""
+    e = float(eps_inf)
+    for w0, deps in lorentz:
+        x = 0.25 * w0 * w0 * dt * dt
+        if not x < 1.0:
+            return -math.inf
+        e -= deps * x / (1.0 - x)
+    for wp in drude:
+        h = 0.5 * wp * dt
+        e -= h * h
+    return e
+
+
+def _ade_max_courant(eps_inf, lorentz, drude, dt, courant) -> float:
+    """The largest courant C' <= ``courant`` meeting the §19.4 bound, dt
+    scaling with it (the engine's ade_max_courant: 80 bisection steps)."""
+    unit = dt / courant
+    lo, hi = 0.0, courant
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        if _ade_nyquist_eps(eps_inf, lorentz, drude, mid * unit) >= mid * mid:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def _ade_max_dt(eps_inf, lorentz, drude, dt, courant) -> float:
+    """The largest dt' <= ``dt`` meeting the §19.4 bound at the same courant
+    (the engine's ade_max_dt)."""
+    c2 = courant * courant
+    lo, hi = 0.0, dt
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        if _ade_nyquist_eps(eps_inf, lorentz, drude, mid) >= c2:
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 
 def _structure_axis_span(geometry, axis_index: int):
@@ -84,10 +165,66 @@ def _structure_axis_span(geometry, axis_index: int):
         return float(lo), float(hi)
     return None
 
-SCHEMA_VERSION = "1.20.0-alpha.1"
+SCHEMA_VERSION = "1.21.0-alpha.1"
 SUPPORTED_SCHEMA_MAJOR = 1
 
 _AXES = "xyz"
+# The constructor's declaration aliases (Simulation.size_um / .grid), mapped to
+# their field names so with_changes() takes the spelling a simulation is written in.
+_FIELD_ALIASES = {"domain": "size_um", "mesh": "grid"}
+# The fields Simulation.model_copy may still replace as a field copy on a
+# resolved simulation: wire content no fit or port solve reads back.
+_RAW_COPY_FIELDS = frozenset({"sources", "monitors", "subpixel", "subpixel_method",
+                              "field_precision", "dft_precision"})
+# The fields the domain/mesh/run fit and the declarative resolution move
+# without marking them set: a validated copy passes them explicitly.
+_RESOLVED_FIELDS = ("size_um", "grid", "run", "structures", "sources", "monitors",
+                    "background", "origin_um")
+# The fields whose values are coordinates in the stored (fitted) frame. A
+# domain= fit moves that frame off the user's, so an edit of one of them on
+# such a simulation cannot be read as the user wrote it.
+_FRAME_FIELDS = frozenset({"size_um", "grid", "structures", "sources", "monitors", "origin_um"})
+
+
+# The fields the declarative resolution reads from the scene it solves the
+# ports on (the port windows, cells and modes): sources and monitors a
+# model_copy swapped in over the resolved ports stay valid only while none of
+# these moves.
+_PORT_SOLVE_FIELDS = frozenset({"size_um", "grid", "origin_um", "structures", "background", "boundaries",
+                                "symmetry", "bloch_k_per_um", "pml_num_layers", "absorber_num_layers"})
+
+
+def _tupled(update: dict) -> dict:
+    """``update`` with its list or iterator sequence fields as tuples, as
+    validation makes them: a list is kept as given by a field copy, and a
+    generator would be used up by the first look at it. Anything else (a
+    tuple, None, a single model) is left for validation to accept or refuse."""
+    return {k: (tuple(v) if k in ("structures", "sources", "monitors") and isinstance(v, (list, Iterator)) else v)
+            for k, v in update.items()}
+
+
+# The simulation an edit (with_changes, model_copy, the with_* helpers) is
+# copying, while it constructs the copy: the advice about the caller's own
+# inputs, a monitor frequency the pulse barely drives or a wavelength typed as
+# a frequency, is not repeated when the original drew the same advice (beta
+# review API-06); advice the edit brings in is given, and every refusal runs.
+_EDITING: contextvars.ContextVar = contextvars.ContextVar("photonhub_simulation_editing", default=None)
+
+
+@contextlib.contextmanager
+def _editing(original):
+    token = _EDITING.set(original)
+    try:
+        yield
+    finally:
+        _EDITING.reset(token)
+
+
+def _advised_before(advice: str, found) -> bool:
+    """True inside an edit whose original drew ``advice`` (the name of the
+    Simulation method that finds it) for every one of the ``found`` findings."""
+    original = _EDITING.get()
+    return original is not None and set(found) <= set(getattr(original, advice)())
 
 _LOG = logging.getLogger(__name__)
 
@@ -96,11 +233,11 @@ _LOG = logging.getLogger(__name__)
 # S/m: since eps0*c0 = 1/eta0, the peak-conductivity unit 2*eps0/dt reduces to a
 # form needing only eta0, the cell spacing, and the Courant number (see
 # Simulation._two_eps0_over_dt).
-_ETA0 = 1.25663706212e-6 * 2.99792458e8
-_EPS0 = 8.8541878128e-12
-# Conservative ADE-resonance margin: below the measured stable point (0.75) and
-# well below NUMERICS.md section 19's non-tight bound of 2 (FINDINGS.md F18).
-_ADE_MARGIN = 0.8
+_ETA0 = mu0 * c0
+_EPS0 = eps0
+# API-06: a monitor frequency where the normalizing pulse's spectral amplitude
+# is below this fraction of its peak reads noise over almost no drive.
+_WEAK_SPECTRAL_AMPLITUDE = 1e-3
 
 # Stabilized-CPML profile: kappa_max = 5.0 and a CFS alpha_max = 0.9, both
 # quoted in 2*eps0/dt units (that profile also uses 40 layers and
@@ -113,39 +250,156 @@ _ADE_MARGIN = 0.8
 _STABLE_PML_LAYERS = 40
 _STABLE_PML_KAPPA_MAX = 5.0
 _STABLE_PML_ALPHA_SCALE = 0.9
-# The AUTO-stabilizer dose (_auto_stabilize_dispersive_pml) is 9x GENTLER than
-# with_stabilized_pml's 0.9. The stabilized profile is an OPT-IN
-# profile paired with 40 layers; auto-applying its alpha to the default 12-layer
-# slab de-tunes the PML for PROPAGATING waves: at optical grids omega*eps0 is
-# only ~0.02*(2*eps0/dt), so alpha = 0.9*(2*eps0/dt) throttles the CFS
-# absorptive term sigma*omega*eps0/(alpha^2 + (omega*eps0)^2) ~40x and the slab
-# REFLECTS instead of absorbing (dispersive crossing @25 c/lambda: R_input 0.35
-# with const-n IDENTICAL to dispersive — the alpha, not the Lorentz ADE — and
-# 5.5x the ring-down; 1-D normal incidence R 0.49). Curing the trapped-resonance
-# divergence only needs the CFS crossover alpha/(2*pi*eps0) up at the mode's
-# optical frequency — the 2026-07-03 cure measured ~2% of sigma_max, ~30x below
-# that reference value — so 0.1 keeps ~3x that margin (rod probe: stable through
-# 294k steps at alpha 3e4-1e5 S/m; CFS-inert diverges @197k) while restoring
-# low reflection (crossing R: 3e4 -> 1e-4, 1e5 -> 0.024, vs 0.35 at the 0.9
-# dose). Measured 2026-07-17 on the cloud GPU:
-# engine/docs/subpixel-dispersion-instability.md, final section.
-_AUTO_PML_ALPHA_SCALE = 0.1
-# CFS-inert threshold: an alpha below this fraction of the sigma peak leaves the
-# PML's DC pole effectively undamped (the divergence lever). 0.5%.
-_CFS_INERT_FRAC = 0.005
+# The AUTO-stabilizer dose (_auto_stabilize_dispersive_pml) is anchored to the
+# BAND, not to the timestep: alpha_max = _AUTO_PML_ALPHA_SCALE * eps0 * omega0,
+# omega0 = 2*pi times the highest carrier frequency among the sources. Both
+# sides of the trade-off are set by the optical frequency, not by dt:
+# - the CFS absorptive term sigma*omega*eps0/(alpha^2 + (omega*eps0)^2) loses
+#   in-band absorption once alpha passes omega*eps0, so the 12-layer slab
+#   REFLECTS (1-D normal incidence, vacuum, kappa 5: alpha 1.0e4 S/m -86 to
+#   -89 dB, 1.6e4 -67 to -74 dB, 2.3e4 -53 to -60 dB at dl 0.04 and 0.02 um);
+# - the trapped-resonance divergence the dose cures (a dispersive pole-boosted
+#   mode fed by the evanescent reflection of a CFS-inert PML) stops once the
+#   CFS pole sits at a fraction of the mode's optical frequency (rod probe,
+#   engine/docs/subpixel-dispersion-instability.md, 25 c/lambda in Si, mode
+#   2.93e14 Hz, source 1.93e14 Hz, 588k steps: alpha 0.24 diverges at ~110k,
+#   2e3 grows from ~300k, 3e3 grows faintly from ~440k, 5e3 and above flat).
+# 1.0 * eps0*omega0 (1.08e4 S/m at 1550 nm) sits 2x above 5e3 S/m, which is
+# flat through 588k steps and rises faintly after ~880k; the dose itself stays
+# flat through 1.18M steps (40 ps)
+# and reflects -85 to -96 dB at 153-233 THz (a 40 THz pulse at 193.4 THz),
+# level with the default profile, at every resolution; below the carrier the
+# CFS term bites: -58 dB at half the carrier frequency. The old dose,
+# 0.1 * 2*eps0/dt, grew as 1/dl: 2.3e4 S/m at dl 0.04 um (-53 dB), 4.6e4 at
+# 0.02 (-36 dB), 9.3e4 at 0.01 (-24 dB) (beta review CORE-03). The probe mode
+# sat at 1.52x the carrier and was flat at 0.30 eps0*omega_mode; if the
+# threshold scales with the mode frequency, this dose covers trapped modes up
+# to about 3x the carrier.
+_AUTO_PML_ALPHA_SCALE = 1.0
+# The band a scene without a source anchors to: its wlen0_um, else its
+# shortest wlens_um, else 1550 nm. Such a scene cannot run, but it can gain a
+# source through a copy that does not re-resolve the profile (with_changes,
+# with_oblique_plane_wave), so it is stabilized for a nominal band.
+_NOMINAL_BAND_WLEN_UM = 1.55
+# CFS-inert threshold for an explicitly set profile, in the same eps0*omega0
+# units: the rod probe still grows at 0.19 and 0.28 (2e3 and 3e3 S/m) and is
+# flat from 0.46 (5e3 S/m) up.
+_CFS_INERT_SCALE = 0.4
+
+# with_absorber / with_auto_boundaries size the section 21 absorber
+# physically: at least this many wavelengths in the background medium at the
+# lowest source frequency (freq0 - fwidth of a pulse, freq0 of a cw), and
+# never fewer than the engine's 40 layers. With the ramp strength fixed per
+# physical thickness beyond 40 layers (NUMERICS.md section 21), the
+# reflection depends on the thickness in wavelengths, not on the mesh (normal
+# incidence, vacuum, m 3, a 40 THz pulse at 193.4 THz read at 153-233 THz,
+# worst frequency 153 THz): -16 dB at one wavelength of 193.4 THz, -40 dB at
+# two (dl 0.08 to 0.01 um), and -52 dB at the two wavelengths of 153.4 THz
+# chosen here (-60 dB in SiO2). In a background of index n it cannot go below
+# about -139/n dB.
+_ABSORBER_WAVELENGTHS = 2.0
+_ABSORBER_MIN_LAYERS = 40
 
 
-def _quarter_snapped_dft_monitors(monitors, *, size_um, grid):
+# Two media whose indices at the band centre differ by less than this are the
+# same material to the port-medium check below. It is the largest index error
+# `Material.medium(band_um=...)` accepts before warning that its dispersive fit
+# no longer stands for the material, so a library material given as a band fit
+# on the structure and by name on the port (2.6e-5 apart for silicon over
+# 1.5-1.6 um) never warns, while an index typed by hand against the library's
+# (3.48 against silicon's 3.4757, 4.3e-3 apart) does. The printed indices carry
+# four decimals, so two indices that fail the check never print alike.
+_PORT_MEDIUM_INDEX_TOL = 1e-3
+
+_SDK_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + os.sep
+
+
+def _construction_caller_stacklevel() -> int:
+    """``stacklevel`` that attributes a warning raised while a ``Simulation`` is
+    built to the caller's own line (the ``ph.Simulation(...)`` or
+    ``with_changes(...)`` call): the first frame outside this package AND
+    outside pydantic, whose ``BaseModel.__init__`` runs ``model_post_init``.
+    ``_compat.caller_stacklevel`` stops at that pydantic frame. Level 1 is
+    the function that calls ``warnings.warn``, i.e. this function's caller."""
+    import inspect
+
+    import pydantic
+
+    skip = (_SDK_ROOT, os.path.dirname(os.path.abspath(pydantic.__file__)) + os.sep)
+    here = inspect.currentframe()          # None only on an interpreter without frame support
+    frame, level = (here.f_back if here is not None else None), 1
+    while frame is not None:
+        if not os.path.abspath(frame.f_code.co_filename).startswith(skip):
+            return level
+        frame, level = frame.f_back, level + 1
+    return 2
+
+
+def _warn_port_medium_mismatch(port, containing, wlen0) -> None:
+    """Warn when a port's declared ``medium`` is not the material of the
+    structure the port sits on.
+
+    ``containing`` lists every structure whose bounds contain the port centre,
+    in list order (after a symmetry fold has dropped the mirrored half, so a
+    structure is named by its ``name`` or its shape and index, never by a list
+    position the caller might not recognise); the host is the LAST
+    (NUMERICS.md §9 paint order, last wins), what the scene draws at the port.
+    ``Port.medium`` never reaches the mode solve, which reads the scene; it
+    sizes the port's cell and is the medium of the guide extension the fit
+    paints from one cell inside the port plane out through the wall, when the
+    guide stops short of it. A disagreement therefore puts one material at the
+    port plane and another in the device behind it.
+
+    Structure order is named only when an EARLIER structure containing the port
+    centre has the port's material: a cladding drawn after the guide buries it,
+    and reordering is the fix. Otherwise it is a material mismatch. A warning
+    rather than an error, because an overlapping cladding, a mode-matching stub
+    or a deliberately off-guide probe are all legitimate."""
+    dummy = Box(center_um=(0.0, 0.0, 0.0), size_um=(1.0, 1.0, 1.0))
+    wlen = float(wlen0) if wlen0 is not None else 1.55
+    n_port = _structure_index(Structure(geometry=dummy, medium=port.medium), wlen)
+
+    def label(st, n=None):
+        name = getattr(st, "name", None)
+        if name:
+            return f"structure {name!r}" + (f" (index {n:.4f})" if n is not None else "")
+        return f"a {type(st.geometry).__name__}" + (f" of index {n:.4f}" if n is not None else "")
+
+    host = containing[-1]
+    n_host = _structure_index(host, wlen)
+    if abs(n_port - n_host) < _PORT_MEDIUM_INDEX_TOL:
+        return
+    matching = [st for st in containing[:-1] if abs(_structure_index(st, wlen) - n_port) < _PORT_MEDIUM_INDEX_TOL]
+    head = f"port {port.name!r}: medium= has index {n_port:.4f} at {wlen:g} um"
+    if matching:
+        message = (
+            f"{head}, the index of {label(matching[-1])}, but {label(host, n_host)} is listed after it and "
+            "also contains the port centre. List order is paint order (last wins, NUMERICS.md section 9), "
+            "so the later structure buries the earlier one at the port, while a guide extension through the "
+            "wall, when the fit builds one, is painted in medium=. If the later structure is a cladding, "
+            "list it first; otherwise drop medium= to continue the scene's.")
+    else:
+        message = (
+            f"{head}, but {label(host, n_host)}, which the port centre falls in, differs from it by "
+            f"{abs(n_port - n_host):.2g}: a material mismatch (two media within {_PORT_MEDIUM_INDEX_TOL:g} "
+            "count as one material). A guide extension through the wall, when the fit builds one, is "
+            "painted in medium=, so the port plane and the guide behind it would be different materials. "
+            "Give the port the structure's medium, or drop medium= to take it.")
+    warnings.warn(message, UserWarning, stacklevel=_construction_caller_stacklevel())
+
+
+def _quarter_snapped_dft_monitors(monitors, *, size_um, grid, axis_min_cells=(4, 4, 4)):
     """NUMERICS.md §12 quarter-cell auto-snap over a monitor list.
 
-    Pure function of ``(monitors, size_um, grid)``: returns ``(new_monitors,
-    notes)`` where ``notes`` carries one line per ADJUSTED monitor (empty =
+    Pure function of ``(monitors, size_um, grid, axis_min_cells)``: returns
+    ``(new_monitors, notes)`` where ``notes`` carries one line per ADJUSTED
+    monitor (empty =
     nothing moved and ``new_monitors`` is the input, element-identical). For
     each :class:`ProfileMonitor` and each axis whose listed components mix
     Yee offsets, both box faces are put through
     :func:`~photonhub.components.grid.quarter_snap_dft_face`: a face whose
-    per-component engine snap already agrees — including domain-edge faces
-    rescued by the engine's index clamp — is left byte-identical, anything
+    per-component engine snap already agrees, including domain-edge faces
+    rescued by the engine's index clamp, is left byte-identical, anything
     else moves to the nearest local ``(k + 1/4)`` quarter-cell plane. A box
     face and its quarter point snap to the SAME cell, so a scene the engine
     already accepted keeps its exact recorded region; only rejected or
@@ -154,13 +408,20 @@ def _quarter_snapped_dft_monitors(monitors, *, size_um, grid):
     Raises ``ValueError`` for a sub-half-cell box straddling a cell boundary
     (its two faces would collapse onto one quarter point or invert), and when
     a ``mode_port`` window can no longer fit on its snapped plane.
+
+    ``axis_min_cells`` is the simulation's §1 per-axis cell floor
+    (:meth:`Simulation._axis_min_cells`: 1 on a plain periodic axis, 4
+    elsewhere). Counting a one-cell quasi-2D axis with the default floor of
+    4 snapped a full-extent plane's high face to the quarter point of cell 1,
+    beyond the one cell that exists, and the engine rejected every port plane
+    on such an axis.
     """
     coords = getattr(grid, "coords", None)
     dl = grid.dl_um
     axis_q = []
     for a, axis in enumerate(_AXES):
         q = getattr(coords, axis) if coords is not None else None
-        n = len(q) if q is not None else realized_cells(size_um[a], dl)
+        n = len(q) if q is not None else realized_cells(size_um[a], dl, axis_min_cells[a])
         axis_q.append((q, n))
 
     out, notes = [], []
@@ -280,10 +541,30 @@ class Simulation(FrozenModel):
     ``from_wire_json``/``from_file`` never adjusts a document."""
 
     schema_version: str = SCHEMA_VERSION
-    size_um: Tuple[PositiveUm, PositiveUm, PositiveUm]
-    grid: MeshType
-    run: RunSpec
-    background: Background = Background()
+    # ``size_um`` and ``grid`` are the wire fields. Each also accepts, under the
+    # aliases ``domain=`` and ``mesh=``, a client-only declaration (design spec
+    # §4.1, §5.1, §5.2) that _fit_domain_mesh_run resolves into the wire value
+    # before any other validator runs; the declarations are skipped in the
+    # schema and the wire key stays the first alias, so the document and the
+    # generated schema are unchanged.
+    size_um: Union[Tuple[PositiveUm, PositiveUm, PositiveUm], SkipJsonSchema[Domain]] = Field(
+        validation_alias=AliasChoices("size_um", "domain"))
+    grid: Union[MeshType, SkipJsonSchema[Mesh]] = Field(
+        validation_alias=AliasChoices("grid", "mesh"))
+    # Optional in Python: a simulation without ``run`` takes the transit cap
+    # (phase-5 plan, refinement 3) and ends at the auto-shutoff in practice.
+    # Required on the wire: the schema module keeps ``run`` in the required
+    # list and an ingested document without it is rejected below.
+    run: RunSpec = Field(default_factory=lambda: RunSpec(transits=DEFAULT_TRANSITS))
+    # The user-frame position of the wire's low corner when the domain was
+    # fitted around the device (design spec §4.4): the fit translates every
+    # positional field by -origin_um into the corner frame the wire and every
+    # validator use; results and plots add it back. Client-only; (0, 0, 0) for
+    # a domain given by hand or a document loaded from the wire.
+    origin_um: SkipJsonSchema[Tuple[float, float, float]] = (0.0, 0.0, 0.0)
+    # A materials-library entry may stand here too (resolved at construction);
+    # anything else is validated as a Background.
+    background: Union[Background, MaterialEntry] = Background()
     # NUMERICS.md section 11: layer count for every "pml" boundary axis. The
     # engine default is 12; an UNSET value is omitted from the wire format
     # (see to_wire_dict) so Phase-0 documents round-trip byte-identically and
@@ -311,7 +592,7 @@ class Simulation(FrozenModel):
     # alpha absolute S/m) is why the default alpha reads as inert. Raising kappa_max
     # + alpha_max is the "stabilized" recipe for a grazing/long-run/dispersive
     # scene that diverges: a DISPERSIVE (Lorentz) scene gets kappa 5.0 +
-    # alpha 0.9*(2*eps0/dt) applied AUTOMATICALLY at construction
+    # alpha eps0*omega0 of the highest source carrier applied AUTOMATICALLY at construction
     # (_auto_stabilize_dispersive_pml), and ``with_stabilized_pml`` builds the
     # full stabilized-CPML copy (also adding the layer bump).
     #   pml_sigma_max peak conductivity in 2*eps0/dt units. The DEFAULT
@@ -372,9 +653,9 @@ class Simulation(FrozenModel):
     # aligned interfaces (they reduce to arithmetic/harmonic) and differ only on
     # tilted/curved cells; contour is the standard match, contour_diag the
     # rigorous CP-EP alternative.
-    # Omitted from the wire when unset (see _wire_exclude), so an ingested pre-1.7.0
-    # subpixel-on document (no method key) is still run by the engine as ITS default
-    # (volume) — the field default is cosmetic on that ingest path.
+    # Omitted from the wire when unset AND smoothing is off (see _wire_exclude);
+    # with smoothing on it is always written, so the operator the engine runs is
+    # the one on the model, whatever the engine's own absent default.
     subpixel_method: SubpixelMethodName = "contour"
     # Schema 1.19 — NUMERICS.md §23 field STORAGE precision. "fp16" stores the
     # six field arrays as binary16 behind exact power-of-two per-run scales
@@ -429,6 +710,820 @@ class Simulation(FrozenModel):
     # an empty array with "sources: at least one source is required".
     sources: Tuple[SourceType, ...] = ()
     monitors: Tuple[MonitorType, ...] = ()
+    # --- declarative setup fields (client-only; never on the wire, never in the
+    # schema; design spec 2026-09-10 §4.1). Resolved at construction by
+    # _resolve_declarative into ordinary sources and monitors, and kept in the
+    # private ``_declarative`` so a result can read a port back and a with_*
+    # copy can resolve again on its new grid.
+    #   wlens_um  readout wavelengths (microns): every port's frequencies and the
+    #             pulse; wlen0_um the pulse centre (default the mean of extremes)
+    #   ports     Port values: one readout plane each, solved on this grid
+    #   source    the driven port (name or Port) or a GaussianBeam
+    wlens_um: SkipJsonSchema[Optional[Union[float, Tuple[float, ...]]]] = None
+    wlen0_um: SkipJsonSchema[Optional[float]] = None
+    ports: SkipJsonSchema[Tuple[Any, ...]] = ()
+    source: SkipJsonSchema[Optional[Any]] = None
+    _declarative: Optional[_decl.Resolved] = PrivateAttr(default=None)
+    # The symmetry fold a fitted simulation applied (design spec §4.5): which
+    # axes were folded, the ports read through their images, the monitors
+    # returned unfolded. Client state like origin_um; None on a hand-built or
+    # ingested scene.
+    _fold: Optional[_decl.Fold] = PrivateAttr(default=None)
+    # The transit cap a run length was resolved from (None when run_time_s or
+    # n_steps was given): run_local warns when the run hits it undecayed.
+    _run_transits: Optional[float] = PrivateAttr(default=None)
+    # The fields as the user gave them (the Domain, the Mesh, the user-frame
+    # structures and ports, the run as written) for a fitted or declarative
+    # simulation: with_changes rebuilds from them. None on a hand-built scene.
+    _inputs: Optional[dict] = PrivateAttr(default=None)
+    # The fields a construction-time resolver filled in and marked set so they
+    # ride the wire (the §16 subpixel default, the dispersive-PML CFS profile).
+    # They are not the user's: an edit drops them so the resolver decides again
+    # for the edited scene, while a value the user gave is kept verbatim.
+    _auto_fields: frozenset = PrivateAttr(default=frozenset())
+    # True for a document parsed from the wire (from_wire_json, from_file): its
+    # edits keep the ingestion contract (no construction-time resolution).
+    _wire_ingested: bool = PrivateAttr(default=False)
+    # The caller's own monitors as written (after the domain fit's translation,
+    # before plane spans resolve and faces quarter-snap): an edit resolves them
+    # again for the edited scene, as construction would.
+    _user_monitors: Optional[tuple] = PrivateAttr(default=None)
+    # Stored-frame fields a with_* helper replaced on a domain= fit: the
+    # inputs no longer describe the simulation, so with_changes refuses.
+    _frame_edits: tuple = PrivateAttr(default=())
+
+    def _resolve_materials(self) -> None:
+        """Replace every materials-library entry among the structures and the
+        background by the constant-index medium at the band centre
+        (``Material.medium(wlen_um=wlen0)``: absorption to conductivity, as
+        that method does), warning when the index moves by more than 0.5 %
+        across the band. The dispersive fit stays explicit
+        (``.medium(band_um=...)``). Phase-5 plan, refinement 4."""
+        entries = [st.medium for st in self.structures if is_material(st.medium)]
+        if is_material(self.background):
+            entries.append(self.background)
+        # the ports name their guide's medium too (the library passes its own through)
+        port_values = [pp for pp in self.ports if isinstance(pp, Port)]
+        if isinstance(self.source, Port):
+            port_values.append(self.source)
+        entries.extend(pp.medium for pp in port_values if is_material(pp.medium))
+        if not entries:
+            return
+        names = sorted({str(getattr(m, "name", m)) for m in entries})
+        if self.wlens_um is None and self.wlen0_um is None:
+            raise ValueError(
+                f"the materials-library entries {names} need a wavelength to resolve at: pass wlens_um "
+                "(or wlen0_um), or pick the fit yourself with .medium(wlen_um=...) or .medium(band_um=(lo, hi))")
+        if self.wlens_um is not None:
+            wlens = (float(self.wlens_um),) if isinstance(self.wlens_um, (int, float)) else tuple(float(w) for w in self.wlens_um)
+            wlen0 = float(self.wlen0_um) if self.wlen0_um is not None else 0.5 * (min(wlens) + max(wlens))
+        else:
+            wlen0 = float(self.wlen0_um)
+            wlens = (wlen0,)
+        lo, hi = min(wlens), max(wlens)
+        resolved = {}
+        for mat in entries:
+            key = id(mat)
+            if key in resolved:
+                continue
+            n0 = float(mat.n(wlen0))
+            if hi > lo:
+                drift = max(abs(float(mat.n(lo)) - n0), abs(float(mat.n(hi)) - n0)) / n0
+                if drift > 0.005:
+                    warnings.warn(
+                        f"{mat.name}: the index moves {drift:.1%} across {lo:.4g} to {hi:.4g} um; the constant "
+                        f"index at {wlen0:.4g} um is used. For dispersion pass "
+                        f"ph.materials.{mat.name}.medium(band_um=({lo:.4g}, {hi:.4g})) explicitly.",
+                        stacklevel=4)
+            resolved[key] = mat
+        structures = tuple(
+            st.model_copy(update={"medium": st.medium.medium(wlen_um=wlen0)}) if is_material(st.medium) else st
+            for st in self.structures)
+        object.__setattr__(self, "structures", structures)
+        if is_material(self.background):
+            mat = self.background
+            if float(mat.k(wlen0)) > 0.0:
+                raise ValueError(f"{mat.name} absorbs at {wlen0:.4g} um; a Background carries no conductivity, "
+                                 "give ph.Background(permittivity=...)")
+            object.__setattr__(self, "background", Background(permittivity=float(mat.n(wlen0)) ** 2))
+        import dataclasses as _dc
+        ports = tuple(_dc.replace(pp, medium=pp.medium.medium(wlen_um=wlen0))
+                      if isinstance(pp, Port) and is_material(pp.medium) else pp for pp in self.ports)
+        object.__setattr__(self, "ports", ports)
+        if isinstance(self.source, Port) and is_material(self.source.medium):
+            object.__setattr__(self, "source", _dc.replace(self.source, medium=self.source.medium.medium(wlen_um=wlen0)))
+
+    def with_changes(self, **fields) -> "Simulation":
+        """A copy with ``fields`` replaced and everything re-validated: the
+        supported edit of a simulation. A fitted or
+        declarative simulation is rebuilt from the fields as the user gave
+        them, in the user's frame, so new structures are fitted, folded and
+        their ports re-solved like the originals; a hand-built one is the
+        validated copy the ``with_*`` helpers use, built as the constructor
+        builds it, so the construction-time resolution (the subpixel default,
+        plane spans, the §12 quarter-snap, the dispersive-PML profile and their
+        warnings) is decided again for the edited scene from the fields as
+        written. Either way the result is the simulation the constructor gives
+        for the same fields. A simulation loaded with :meth:`from_wire_json`
+        is edited as the document it is: nothing is resolved again, except
+        that the monitors the edit adds (all of them when it changes the grid
+        or the size) are placed on the cells as construction places them, and
+        the declarations only the constructor resolves (a ``Domain``, a
+        ``Mesh``, a run in transits, ports) are refused. ``domain=`` and ``mesh=`` are
+        accepted as the constructor accepts them, for ``size_um`` and
+        ``grid``."""
+        fields = {_FIELD_ALIASES.get(name, name): value for name, value in fields.items()}
+        if self._inputs is not None:
+            if self._frame_edits:
+                hint = " (for a mesh, mesh= rather than with_auto_mesh)" if "grid" in self._frame_edits else ""
+                raise ValueError(
+                    f"with_changes cannot rebuild this simulation from the fields as you wrote them: "
+                    f"{list(self._frame_edits)} were replaced as stored (by model_copy or a with_* helper), in "
+                    "coordinates or content its domain= fit or its ports resolved. Build it again with "
+                    f"ph.Simulation(...), declaring that change there{hint}.")
+            with _editing(self):
+                return type(self)(**{**self._inputs, **fields})
+        return self._validated_copy(dict(fields))
+
+    def model_copy(self, *, update=None, deep: bool = False) -> "Simulation":
+        """A copy with ``update`` applied. Prefer :meth:`with_changes`, the
+        validated edit; this keeps pydantic's signature and what it means for
+        each kind of simulation:
+
+        - built by hand with a ``run``, or loaded from the wire: pydantic's
+          field copy, which re-validates nothing;
+        - one the constructor resolved (``domain=``, ``mesh=``, ports, or a run
+          given in transits or not at all): :meth:`with_changes`, so the copy
+          is the simulation the constructor builds from the same fields;
+        - except on a ``domain=`` fit, where the stored structures, sources,
+          monitors, size and grid are coordinates of the fitted box, whose
+          origin is its low corner and not the user's: an update of one of
+          them is ambiguous and raises ``ValueError`` naming
+          :meth:`with_changes`, which takes them as you wrote them. An update
+          that mixes one of them with other fields raises too. Renaming the
+          structures (the same geometry and media) is allowed, and a later
+          rebuild keeps the names. After a
+          ``with_*`` helper replaced stored coordinates of such a fit (say
+          ``with_auto_mesh``), the other fields are copied as that helper
+          copied them, in the stored coordinates.
+
+        On a resolved simulation the ``sources`` and ``monitors`` (as stored)
+        and the ``subpixel``, ``subpixel_method``, ``field_precision`` and
+        ``dft_precision`` switches are still a field copy: the path the SDK's
+        own drivers (the S-matrix plan, the adjoint gradient) take to swap a
+        resolved scene's launch and readout. Where the stored coordinates are
+        yours (no ``domain=`` fit, no ports) a later :meth:`with_changes` or
+        ``with_*`` helper keeps such a swap; on a ``domain=`` fit or a scene
+        with ports, whose stored sources and monitors are not the ones you
+        wrote, a later :meth:`with_changes` refuses instead of dropping it,
+        while a ``with_*`` helper or a ``model_copy`` of other fields keeps the
+        swap as stored. On a scene with ports or ``source=`` that edit refuses
+        when it changes what the port solves read (the size, grid, structures,
+        background, boundaries, symmetry, Bloch vector or layer counts): the
+        swapped launch and readout were made for the old ones."""
+        if update:
+            update = _tupled(dict(update))
+            inputs = self._inputs
+            keys = set(update)
+            if inputs is not None and not keys <= _RAW_COPY_FIELDS and not self._renames(update):
+                tied = sorted(keys & _FRAME_FIELDS)
+                if tied and isinstance(inputs.get("size_um"), Domain):
+                    raise ValueError(
+                        f"model_copy(update=...) cannot change {tied} on a simulation fitted with domain=: its "
+                        "stored coordinates start at the fitted box's corner, not at your origin, and the copy "
+                        "would skip the fit and the port solves. Use "
+                        f"sim.with_changes({tied[0]}=...), which rebuilds the simulation from the fields as "
+                        "you wrote them, in your coordinates.")
+                new = self._validated_copy(update) if self._frame_edits else self.with_changes(**update)
+                return super(Simulation, new).model_copy(deep=True) if deep else new
+        new = super().model_copy(update=update, deep=deep)
+        if update:
+            new._auto_fields = self._auto_fields - set(update)    # a value given here is the caller's
+            if "monitors" in update:
+                new._user_monitors = update["monitors"]
+            if self._inputs is not None:
+                # a later rebuild (with_changes, a with_* helper) starts from the
+                # inputs: the switches are frame-free; swapped sources and
+                # monitors are the user's own where the stored frame is theirs,
+                # and otherwise make the inputs stale (a rename changes nothing
+                # a rebuild reads)
+                stored = {k: v for k, v in update.items() if k in _FRAME_FIELDS}
+                merged = {**self._inputs, **{k: v for k, v in update.items() if k not in _FRAME_FIELDS}}
+                renamed = self._renamed_inputs(update) if self._renames(update) else None
+                if stored and not self._generated() and not isinstance(self._inputs.get("size_um"), Domain):
+                    merged.update(stored)
+                elif renamed is not None:
+                    merged["structures"] = renamed
+                elif stored:
+                    new._frame_edits = tuple(sorted(set(self._frame_edits) | set(stored)))
+                new._inputs = merged
+        return new
+
+    def _generated(self) -> bool:
+        """True when the stored sources and monitors hold what the declarative
+        resolution made (the port readout planes, a port or beam launch), so
+        they are not the ones the caller wrote. A ``wlens_um=`` alone, with no
+        ports and no ``source=``, generates nothing."""
+        rec = self._declarative
+        return rec is not None and (bool(rec.ports) or self.source is not None)
+
+    def _renamed_inputs(self, update: dict):
+        """The recorded input structures with the names a renaming ``update``
+        gives the stored ones, or None when they cannot be paired. The stored
+        structures are the inputs in order, moved into the corner frame, less
+        those a fold dropped (the mirrored half), then the port guide
+        extensions: each input pairs with the next stored structure when its
+        geometry, moved, is that one's. A library material is resolved in the
+        stored one, so the geometry, not the medium, pairs them."""
+        given = self._inputs.get("structures")
+        if given is None:
+            return None
+        delta = tuple(-float(o) for o in self.origin_um)
+        stored = list(zip(self.structures, update["structures"]))
+        out, j = [], 0
+        for a in given:
+            if not isinstance(a, Structure):
+                return None
+            if j < len(stored) and _frame.translate(a.geometry, delta) == stored[j][0].geometry:
+                out.append(a.model_copy(update={"name": stored[j][1].name}))
+                j += 1
+            elif self._fold is not None:
+                out.append(a)                  # the fold dropped it: a rebuild drops it again
+            else:
+                return None
+        return tuple(out)
+
+    def _renames(self, update: dict) -> bool:
+        """True when ``update`` only renames the structures: the same geometry
+        and media in the same order, which no fit or port solve reads."""
+        new = update.get("structures")
+        if set(update) != {"structures"} or not isinstance(new, tuple) or len(new) != len(self.structures):
+            return False
+        return all(isinstance(a, Structure) and a.geometry == b.geometry and a.medium == b.medium
+                   for a, b in zip(new, self.structures))
+
+    def _fit_domain_mesh_run(self) -> None:
+        """Resolve ``domain=`` into ``size_um`` and ``origin_um`` (translating
+        every positional field into the corner frame), ``mesh=`` into ``grid``
+        and ``run.transits`` into ``run_time_s`` (design spec §4.2 steps 3 to 6,
+        §4.3). Called from ``model_post_init``, which pydantic runs after the
+        field validation and BEFORE the after-validators, so every one of them
+        sees an ordinary corner-frame simulation. Nothing to do on a hand-built
+        scene."""
+        domain = self.size_um if isinstance(self.size_um, Domain) else None
+        mesh = self.grid if isinstance(self.grid, Mesh) else None
+        transits = self.run.transits
+        if transits is None and self.run.run_time_s is None and self.run.n_steps is None:
+            transits = DEFAULT_TRANSITS            # a run given for its shutoff alone: the cap
+        if domain is None and mesh is None and transits is None:
+            return
+        fold = None
+        bbox = None
+        if domain is not None and any(self.symmetry):
+            whole = list(self.structures)
+            if whole:
+                bounds = [geometry_bounds_um(st.geometry) for st in whole]
+                bbox = tuple((min(b[a][0] for b in bounds), max(b[a][1] for b in bounds)) for a in range(3))
+            fold = self._fold_symmetry(whole)
+        wlen0 = None
+        if self.wlens_um is not None:
+            wlen0 = _decl.band(self.wlens_um, self.wlen0_um)[1]
+        elif self.wlen0_um is not None:
+            wlen0 = float(self.wlen0_um)
+        n_bg = math.sqrt(float(self.background.permittivity))
+        structures = list(self.structures)
+        continuations = ()      # (port guide extension, its port's axis), set by the domain fit
+        n_max = max([_structure_index(st, wlen0 or 1.55) for st in structures] + [n_bg])
+        # the boundary-layer cell, in closed form before the mesh exists: the
+        # background cell of a graded mesh, the one cell of a uniform mesh
+        if mesh is not None:
+            if mesh.dl_um is not None and not isinstance(mesh.dl_um, tuple):
+                dl_bg = float(mesh.dl_um)
+            elif mesh.cells_per_wlen is not None:
+                if wlen0 is None:
+                    raise ValueError("mesh=Mesh(cells_per_wlen=...) needs wlens_um (or wlen0_um)")
+                dl_bg = wlen0 / ((n_max if mesh.uniform else n_bg) * float(mesh.cells_per_wlen))
+            else:                                     # every axis has its own spacing
+                dl_bg = min(float(v) for v in mesh.dl_um if v is not None)
+        else:
+            dl_bg = float(self.grid.dl_um)
+        # per axis: an axis with its own spacing (a lattice-commensurate mesh) counts in it
+        dl_ax = tuple(mesh.spacing(a) if mesh is not None and mesh.spacing(a) is not None else dl_bg for a in range(3))
+        if domain is not None:
+            # the port's own cell, before the mesh exists: the mesh's cell in the
+            # port's medium (the highest index when it names none) for a mesh by
+            # cells per wavelength, else the one spacing given
+            if mesh is not None and mesh.dl_um is not None and not isinstance(mesh.dl_um, tuple):
+                cpw = None
+            else:
+                cpw = float(mesh.cells_per_wlen) if mesh is not None and mesh.cells_per_wlen is not None else None
+
+            def port_cell(pp) -> float:
+                if cpw is None:
+                    return min(dl_ax)
+                if mesh.uniform:
+                    return dl_bg
+                n_port = n_max if pp.medium is None else max(_structure_index(
+                    Structure(geometry=Box(center_um=(0.0, 0.0, 0.0), size_um=(1.0, 1.0, 1.0)), medium=pp.medium),
+                    wlen0 or 1.55), n_bg)
+                return wlen0 / (n_port * cpw)
+
+            # the longest wavelength a port reads sizes its window
+            wlen_max = (c0 / min(_decl.band(self.wlens_um, self.wlen0_um)[0]) * 1e6
+                        if self.wlens_um is not None else wlen0)
+            size, origin, extensions = self._fit_box(domain, dl_ax, wlen0, n_bg, fold=fold, port_cell=port_cell,
+                                                     bbox=bbox, wlen_max=wlen_max)
+            delta = tuple(-o for o in origin)
+            object.__setattr__(self, "size_um", size)
+            object.__setattr__(self, "origin_um", tuple(float(o) for o in origin))
+            object.__setattr__(self, "structures",
+                               tuple(_frame.translate(structures, delta)) + tuple(e for e, _ in extensions))
+            continuations = tuple((e, along) for e, along in extensions if along is not None)
+            object.__setattr__(self, "sources", tuple(_frame.translate(list(self.sources), delta)))
+            object.__setattr__(self, "monitors", tuple(_frame.translate(list(self.monitors), delta)))
+            object.__setattr__(self, "ports", tuple(_frame.translate(list(self.ports), delta)))
+            if isinstance(self.source, (Port, GaussianBeam)):
+                object.__setattr__(self, "source", _frame.translate(self.source, delta))
+        if mesh is not None:
+            periodic = "".join(a for a in _AXES if getattr(self.boundaries, a) in ("periodic", "bloch"))
+            # the refine regions are drawn in the user's frame; the mesh is built in the wire's
+            shift = tuple(-float(o) for o in self.origin_um)
+            refine = tuple(o.model_copy(update={"geometry": _frame.translate(o.geometry, shift)}) for o in mesh.refine)
+            # the port guide extensions refine the mesh but are no interface along
+            # their port's axis (auto_mesh ``continuations``, NUMERICS §18.7)
+            drawn = {id(e) for e, _ in continuations}
+            meshed = tuple(st for st in self.structures if id(st) not in drawn)
+            if isinstance(mesh.dl_um, tuple):
+                # a lattice-commensurate mesh: each axis with a spacing is a uniform
+                # ladder at it, the others are graded by cells_per_wlen
+                graded_axes = "".join(_AXES[a] for a in range(3) if mesh.spacing(a) is None)
+                coords = {}
+                if graded_axes:
+                    auto = auto_mesh(size_um=self.size_um, wlen_um=wlen0, structures=meshed,
+                                     background_index=n_bg, cells_per_wlen=float(mesh.cells_per_wlen),
+                                     max_grading=mesh.max_grading, dl_min_um=mesh.dl_min_um,
+                                     mesh_overrides=refine, periodic_axes=periodic, axes=graded_axes,
+                                     continuations=continuations)
+                    for letter in graded_axes:
+                        coords[letter] = getattr(auto.coords, letter)
+                given = [mesh.spacing(a) for a in range(3) if mesh.spacing(a) is not None]
+                base = given[0]
+                for a in range(3):
+                    d = mesh.spacing(a)
+                    if d is not None and d != base:
+                        n = realized_cells(self.size_um[a], d, self._axis_min_cells()[a])
+                        coords[_AXES[a]] = tuple(round(i * d, 9) for i in range(n))
+                if coords:
+                    grid = GradedMesh(dl_um=base, coords=GradedMeshAxis(**coords))
+                else:
+                    grid = UniformMesh(dl_um=base)
+            elif mesh.dl_um is not None or mesh.uniform:
+                dl = float(mesh.dl_um) if mesh.dl_um is not None else wlen0 / (n_max * float(mesh.cells_per_wlen))
+                grid = UniformMesh(dl_um=dl)
+            else:
+                grid = auto_mesh(size_um=self.size_um, wlen_um=wlen0, structures=meshed,
+                                 background_index=n_bg, cells_per_wlen=float(mesh.cells_per_wlen),
+                                 max_grading=mesh.max_grading, dl_min_um=mesh.dl_min_um,
+                                 mesh_overrides=refine, periodic_axes=periodic,
+                                 continuations=continuations)
+            object.__setattr__(self, "grid", grid)
+        if transits is not None:
+            transit_s = max(self.size_um) * 1e-6 * n_max / _C0_M_PER_S
+            kept = {k: getattr(self.run, k) for k in self.run.model_fields_set
+                    if k not in ("run_time_s", "n_steps", "transits")}
+            object.__setattr__(self, "run", RunSpec(run_time_s=transits * transit_s, **kept))
+            self._run_transits = float(transits)
+        self._fold = fold
+        if fold is not None:
+            self._refuse_flux_windows_in_the_mirror_cell(fold)
+
+    def _refuse_flux_windows_in_the_mirror_cell(self, fold) -> None:
+        """Refuse a PowerMonitor window, on the kept side of an even (PMC)
+        symmetry plane, whose low edge lies within the centre of the first cell
+        from the plane (NUMERICS §20.8). The engine then holds the node row on
+        the plane (``flux_window_range``) and counts it at half weight (§12),
+        where the unfolded run counts it whole, so the window has no
+        whole-device reading (it read 10 % low at 100 nm cells). On an odd
+        (PEC) plane that row carries a pinned tangential E and nothing is
+        lost. Runs once the mesh exists; the plane is the wire's coordinate 0."""
+        for m in self.monitors:
+            if not isinstance(m, PowerMonitor) or m.center_um is None:
+                continue
+            for i, a in enumerate(_frame._cyclic(m.axis)):
+                if a not in fold.planes or self.symmetry[a] != 1:
+                    continue
+                lo = float(m.center_um[i]) - 0.5 * float(m.size_um[i])
+                q = self._axis_coords_um(a)
+                dq = float(q[1]) - float(q[0]) if q is not None and len(q) > 1 else float(self.grid.dl_um)
+                if 1e-6 < lo <= 0.5 * dq + 1e-9 * dq:
+                    raise ValueError(
+                        f"monitor {m.name!r}: its window starts {lo:.6g} um from the even (PMC) symmetry "
+                        f"plane {_AXES[a]} = {fold.planes[a]:.6g} um, inside the first cell, whose centre is "
+                        f"{0.5 * dq:.6g} um from the plane. The window then holds the row on the plane, which "
+                        "the simulation counts at half weight and the run without the plane counts whole, so "
+                        "it has no whole-device reading. Move the edge more than "
+                        f"{0.5 * dq:.6g} um from the plane, or make the window symmetric about it")
+
+    def _fold_symmetry(self, structures) -> "_decl.Fold":
+        """Fold a device described whole onto the half domain the wire and the
+        engine know (design spec §4.5, phase-4 plan). For every axis with a
+        nonzero ``symmetry`` entry the mirror plane is the structures'
+        bounding-box centre; the structure set must be mirror-symmetric about
+        it. Ports in the mirrored half are dropped and read through their
+        images, monitors crossing the plane are clipped to the kept half, and
+        anything placed entirely in the mirrored half is an error: the kept
+        half is the far side of the plane. Sets ``ports`` and ``monitors``;
+        returns the record the results read."""
+        tol = 1e-9
+        lo = [math.inf] * 3
+        hi = [-math.inf] * 3
+        for st in structures:
+            b = geometry_bounds_um(st.geometry)
+            for a in range(3):
+                lo[a], hi[a] = min(lo[a], b[a][0]), max(hi[a], b[a][1])
+        planes = {a: 0.5 * (lo[a] + hi[a]) for a in range(3) if self.symmetry[a] != 0}
+        for a, plane in planes.items():
+            odd = _frame.mirror_image_missing(structures, _AXES[a], plane)
+            if odd is not None:
+                label = f"structure {structures.index(odd)}" + (f" ({odd.name!r})" if odd.name else "")
+                raise ValueError(
+                    f"symmetry[{a}] ('{_AXES[a]}'): {label} has no mirror image about {_AXES[a]} = "
+                    f"{plane:.6g} um, the device's centre; a symmetry plane needs a mirror-symmetric "
+                    "device, or build the half domain by hand with size_um")
+
+        def near(value, a) -> bool:
+            return float(value) < planes[a] - tol
+
+        hand = "; build the half domain by hand with size_um to place it there"
+        ports = [pp if isinstance(pp, Port) else Port(**pp) for pp in self.ports]
+        driven = self.source.name if isinstance(self.source, Port) else (
+            self.source if isinstance(self.source, str) else None)
+        kept, dropped = [], []
+        for pp in ports:
+            pa = _AXES.index(pp.axis)
+            if pa in planes and abs(float(pp.center_um[pa]) - planes[pa]) <= tol:
+                raise ValueError(f"port {pp.name!r}: its plane lies on the symmetry plane {pp.axis} = "
+                                 f"{planes[pa]:.6g} um; a port cannot be read on the mirror itself")
+            near_axes = [a for a in planes if near(pp.center_um[a], a)]
+            (dropped if near_axes else kept).append((pp, near_axes))
+        mirrored = {}
+        for pp, near_axes in dropped:
+            image = pp
+            for a in near_axes:
+                image = _frame.mirror(image, _AXES[a], planes[a])
+            match = next((k for k, _ in kept
+                          if k.axis == pp.axis and abs(float(k.width_um) - float(pp.width_um)) <= tol
+                          and all(abs(float(x) - float(y)) <= tol for x, y in zip(k.center_um, image.center_um))),
+                         None)
+            if match is None:
+                raise ValueError(f"port {pp.name!r} lies in the mirrored half of the fold and no port sits at "
+                                 f"its image {tuple(round(c, 6) for c in image.center_um)}{hand}")
+            if pp.name == driven:
+                raise ValueError(f"source={pp.name!r} lies in the mirrored half of the fold; drive its image "
+                                 f"{match.name!r} or drop the symmetry plane")
+            mirrored[pp.name] = match.name
+        if isinstance(self.source, GaussianBeam):
+            beam = self.source
+            ba = _AXES.index(beam.axis)
+            if (ba in planes and near(beam.position_um, ba)) or (
+                    beam.center_um is not None and any(near(beam.center_um[a], a) for a in planes)):
+                raise ValueError(f"the beam source lies in the mirrored half of the fold{hand}")
+
+        monitors, unfolded = [], []
+        for m in self.monitors:
+            if isinstance(m, ProfileMonitor):
+                c, s = list(map(float, m.center_um)), list(map(float, m.size_um))
+                normal = _AXES.index(m.span.split(":", 1)[1]) if m.span is not None else None
+                for a, plane in planes.items():
+                    if normal is not None and a != normal:
+                        unfolded.append(m.name)        # the interior span begins on the plane
+                        continue
+                    mlo, mhi = c[a] - s[a] / 2.0, c[a] + s[a] / 2.0
+                    if s[a] == 0.0:
+                        if near(c[a], a):
+                            raise ValueError(f"monitor {m.name!r} lies in the mirrored half of the fold{hand}")
+                        continue
+                    if mhi <= plane + tol:
+                        raise ValueError(f"monitor {m.name!r} lies in the mirrored half of the fold{hand}")
+                    if mlo < plane - tol:
+                        c[a], s[a] = 0.5 * (plane + mhi), mhi - plane
+                        unfolded.append(m.name)
+                m = m.model_copy(update={"center_um": tuple(c), "size_um": tuple(s)})
+            elif isinstance(m, PowerMonitor):
+                ma = _AXES.index(m.axis)
+                for a, plane in planes.items():
+                    if a == ma:
+                        if near(m.position_um, a):
+                            raise ValueError(f"monitor {m.name!r} lies in the mirrored half of the fold{hand}")
+                    elif m.center_um is not None:
+                        i = _frame._cyclic(m.axis).index(a)
+                        c, s = list(map(float, m.center_um)), list(map(float, m.size_um))
+                        mlo, mhi = c[i] - s[i] / 2.0, c[i] + s[i] / 2.0
+                        # The result reports a window the fold clips as the whole
+                        # device's power through it, twice the kept half (NUMERICS
+                        # §20.8). That is the unfolded reading only for a window
+                        # symmetric about the plane; one wholly on the kept side
+                        # reads its own region. A window with an edge on the plane,
+                        # or crossing it asymmetrically, has no such reading.
+                        edge = 1e-6
+                        if abs(mlo - plane) <= edge or abs(mhi - plane) <= edge:
+                            raise ValueError(
+                                f"monitor {m.name!r}: its window has an edge on the symmetry plane "
+                                f"{_AXES[a]} = {plane:.6g} um, so it covers one side of a mirror-symmetric "
+                                "field and the result, which reports the whole device's power, has no "
+                                "reading for it; make the window symmetric about the plane (it then reads "
+                                f"both sides), move it off the plane, or drop the symmetry plane{hand}")
+                        if mhi < plane:
+                            raise ValueError(f"monitor {m.name!r} lies in the mirrored half of the fold{hand}")
+                        if mlo < plane:
+                            if abs((plane - mlo) - (mhi - plane)) > edge:
+                                raise ValueError(
+                                    f"monitor {m.name!r}: its window crosses the symmetry plane "
+                                    f"{_AXES[a]} = {plane:.6g} um asymmetrically ({mlo:.6g} to {mhi:.6g} um), "
+                                    "and the result, which reports the whole device's power, can only read a "
+                                    "window symmetric about the plane; center it on the plane, keep it on one "
+                                    f"side, or drop the symmetry plane{hand}")
+                            c[i], s[i] = 0.5 * (plane + mhi), mhi - plane
+                            m = m.model_copy(update={"center_um": tuple(c), "size_um": tuple(s)})
+            elif isinstance(m, TimeMonitor):
+                if any(near(m.center_um[a], a) for a in planes):
+                    raise ValueError(f"monitor {m.name!r} lies in the mirrored half of the fold{hand}")
+            monitors.append(m)
+        for src in self.sources:
+            if isinstance(src, PointDipole) and any(near(src.center_um[a], a) for a in planes):
+                raise ValueError(f"a point dipole at {src.center_um} lies in the mirrored half of the fold{hand}")
+            if isinstance(src, TfsfBox) and any(near(src.center_um[a] - src.size_um[a] / 2.0, a) for a in planes):
+                raise ValueError(f"the TFSF box crosses the symmetry plane{hand}")
+            if isinstance(src, ModeSource) and _AXES.index(src.axis) in planes and near(src.position_um, _AXES.index(src.axis)):
+                raise ValueError(f"the mode source at {src.axis} = {src.position_um} lies in the mirrored half of the fold{hand}")
+        # a structure entirely in the mirrored half is its kept image's mirror:
+        # the engine never sees that half, and the wire stays the half domain's
+        kept_structures = []
+        for st in structures:
+            b = geometry_bounds_um(st.geometry)
+            if all(b[a][1] > planes[a] - tol for a in planes):
+                kept_structures.append(st)
+        object.__setattr__(self, "structures", tuple(kept_structures))
+        object.__setattr__(self, "ports", tuple(k for k, _ in kept))
+        object.__setattr__(self, "monitors", tuple(monitors))
+        return _decl.Fold(planes=planes, mirrored_ports=mirrored, unfolded_monitors=tuple(dict.fromkeys(unfolded)))
+
+    def _fit_box(self, domain: Domain, dl_ax, wlen0, n_bg: float, fold=None, port_cell=None, bbox=None,
+                 wlen_max=None):
+        """The fitted box in the user's frame: ``(size_um, origin_um,
+        extensions)`` per design spec §4.3, where ``extensions`` pairs each port
+        guide extension (§4.2 step 6, already in the corner frame) with the
+        port's axis, the axis along which it continues its guide, or ``None``
+        when it is not its host's medium (no continuation)."""
+        structures = list(self.structures)
+        if not structures:
+            raise ValueError("domain= needs structures (or a device) to fit the box around")
+        lo = [math.inf] * 3
+        hi = [-math.inf] * 3
+        for st in structures:
+            b = geometry_bounds_um(st.geometry)
+            for a in range(3):
+                lo[a], hi[a] = min(lo[a], b[a][0]), max(hi[a], b[a][1])
+        if bbox is not None:                          # the whole device's bounds, before the fold dropped its mirrored half
+            lo, hi = [b[0] for b in bbox], [b[1] for b in bbox]
+        ports = [pp if isinstance(pp, Port) else Port(**pp) for pp in self.ports]
+        driven = self.source.name if isinstance(self.source, Port) else (
+            self.source if isinstance(self.source, str) else None)
+        if isinstance(self.source, Port) and self.source.name not in {pp.name for pp in ports}:
+            ports.append(self.source)
+        if isinstance(dl_ax, (int, float)):
+            dl_ax = (float(dl_ax),) * 3
+        if port_cell is None:
+            port_cell = lambda pp: min(dl_ax)  # noqa: E731
+
+        def margin_of(pp) -> float:
+            return float(domain.port_margin_um) if domain.port_margin_um is not None else 10.0 * port_cell(pp)
+        # Room for each port's default mode window across its guide (NUMERICS
+        # §18.8): the rule's window with 20 % more pad, which covers the
+        # refinement from the port's own solve, and two cells to the layers
+        # (one the window keeps from them, one the box's rounding to whole
+        # cells may take). A clearance is a minimum distance to the
+        # structures, so the room is added to it; an extent or walls the
+        # caller gives are the caller's box, and a window they cut is clipped
+        # with a warning.
+        need_lo, need_hi = {}, {}
+        painter = _decl._Painter(self)
+        if wlen0 is not None:
+            for pp in ports:
+                if pp.window_um is not None or pp.thickness_um is None:
+                    continue
+                plan = _decl.plan_default_window(self, pp, wlen0, wlen_max or wlen0, n_bg, painter=painter)
+                w, t = _decl._port_axes(pp)
+                for i, half, core in ((w, plan.half_w_um, 0.5 * float(pp.width_um)),
+                                      (t, plan.half_v_um, 0.5 * float(pp.thickness_um))):
+                    reach = core + 1.2 * (half - core) + 2.0 * dl_ax[i]
+                    c = float(pp.center_um[i])
+                    need_lo[i] = min(need_lo.get(i, math.inf), c - reach)
+                    need_hi[i] = max(need_hi.get(i, -math.inf), c + reach)
+        # user-frame side of each port: relative to the device's own centre
+        sides = {}
+        for pp in ports:
+            a = _AXES.index(pp.axis)
+            if pp.out_direction is not None:
+                sides[pp.name] = pp.out_direction
+            else:
+                mid = 0.5 * (lo[a] + hi[a])
+                if abs(pp.plane_um - mid) <= 1e-9:
+                    raise ValueError(f"port {pp.name!r}: its plane sits on the device centre along "
+                                     f"{pp.axis}; pass out_direction='+' or '-'")
+                sides[pp.name] = "+" if pp.plane_um > mid else "-"
+        size, origin, outer = [0.0] * 3, [0.0] * 3, []
+        for a, axis in enumerate(_AXES):
+            dl_bg = dl_ax[a]
+            kind = getattr(self.boundaries, axis)
+            if kind in ("periodic", "bloch"):
+                period = domain.period_um[a] if domain.period_um is not None else None
+                extent = float(period) if period is not None else hi[a] - lo[a]
+                n = max(1, int(round(extent / dl_bg)))
+                size[a], origin[a] = n * dl_bg, 0.5 * (lo[a] + hi[a]) - 0.5 * n * dl_bg   # centred on the device
+                outer.append((None, None))
+                continue
+            layers = self.pml_num_layers if kind == "pml" else (self.absorber_num_layers if kind == "absorber" else 0)
+            pml = layers * dl_bg
+            walls = {}
+            for pp in ports:
+                if pp.axis != axis:
+                    continue
+                side = sides[pp.name]
+                plane = pp.plane_um
+                if pp.name == driven:
+                    off = (float(pp.source_offset_um) if pp.source_offset_um is not None
+                           else _decl.default_source_offset_um(wlen0, n_bg))
+                    plane = plane + (off if side == "+" else -off)
+                plane = plane + (margin_of(pp) if side == "+" else -margin_of(pp))
+                cur = walls.get(side)
+                walls[side] = plane if cur is None else (max(cur, plane) if side == "+" else min(cur, plane))
+            given_extent = domain.extent(a)
+            if domain.walls(a) is not None:
+                # the two walls are the design's, at the coordinates given
+                walls = dict(zip("-+", domain.walls(a)))
+            elif given_extent is not None:
+                # the extent is the design's: centred on the structures, in place
+                # of the bounding box, the clearance and the port margins
+                mid = 0.5 * (lo[a] + hi[a])
+                walls = {"-": mid - 0.5 * given_extent, "+": mid + 0.5 * given_extent}
+            if wlen0 is None and (domain.clearance(a) is None) and ("+" not in walls or "-" not in walls):
+                raise ValueError("domain= needs wlens_um (or wlen0_um) for the default clearance, or clearance_um")
+            clearance = (domain.clearance(a) if domain.clearance(a) is not None
+                         else (_decl.default_margin_um(wlen0, n_bg) if wlen0 is not None else 0.0))
+            wall_hi = walls["+"] if "+" in walls else hi[a] + clearance
+            own = domain.walls(a) is None and given_extent is None
+            if own and a in need_hi:
+                wall_hi = max(wall_hi, need_hi[a])
+            if fold is not None and a in fold.planes:
+                # the mirror is the low face: no margin, no boundary layers there,
+                # and the rounding excess goes to the far side (§20)
+                wall_lo = fold.planes[a]
+                extent = (wall_hi + pml) - wall_lo
+                n = int(round(extent / dl_bg))
+                if n < 4 or not (wall_hi > wall_lo):
+                    raise ValueError(f"axis {axis!r}: the folded domain has no interior ({extent:.4g} um for "
+                                     f"{layers} boundary layers on the far face)")
+                size[a], origin[a] = n * dl_bg, wall_lo
+                outer.append((wall_lo, wall_hi + pml))
+                continue
+            wall_lo = walls["-"] if "-" in walls else lo[a] - clearance
+            if own and a in need_lo:
+                wall_lo = min(wall_lo, need_lo[a])
+            extent = (wall_hi + pml) - (wall_lo - pml)
+            n = int(round(extent / dl_bg))
+            if n < 4 or not (wall_hi > wall_lo):
+                raise ValueError(f"axis {axis!r}: the fitted domain has no interior ({extent:.4g} um for {layers} "
+                                 "boundary layers each face)")
+            size[a] = n * dl_bg
+            origin[a] = (wall_lo - pml) - 0.5 * (size[a] - extent)
+            outer.append((wall_lo - pml, wall_hi + pml))
+        # port guide extensions, to one cell past the REALIZED outer face (the
+        # rounding may have widened the box by up to half a cell each side)
+        extensions = []
+        for pp in ports:
+            a = _AXES.index(pp.axis)
+            dl_bg = dl_ax[a]
+            side = sides[pp.name]
+            if outer[a][0] is None:
+                continue
+            face = origin[a] + size[a] if side == "+" else origin[a]
+            # the structure the port sits on (design spec §5.3): its medium, and how
+            # far it already reaches toward the wall. Paint order decides which one
+            # that is: the LAST structure in list order containing the port centre
+            # wins (NUMERICS.md §9), so the guide under a cladding authored before it
+            # is the host, and a guide buried under a cladding authored after it is
+            # not (the raster has no guide there to continue).
+            containing = []
+            for st in structures:
+                b = geometry_bounds_um(st.geometry)
+                if all(b[i][0] - 1e-9 <= float(pp.center_um[i]) <= b[i][1] + 1e-9 for i in range(3)):
+                    containing.append(st)
+            host = containing[-1] if containing else None
+            if host is not None and pp.medium is not None:
+                _warn_port_medium_mismatch(pp, containing, wlen0)
+            if host is not None:
+                hb = geometry_bounds_um(host.geometry)[a]
+                reach = hb[1] if side == "+" else hb[0]
+            else:
+                reach = pp.plane_um
+            if (face - reach if side == "+" else reach - face) <= dl_bg:
+                continue                       # the guide already runs through the PML
+            medium = pp.medium if pp.medium is not None else (host.medium if host is not None else None)
+            if pp.thickness_um is None or medium is None:
+                raise ValueError(f"port {pp.name!r}: extending its guide through the wall needs thickness_um "
+                                 "on the Port and a medium (the Port's, or a structure the port sits on)")
+            end = face + dl_bg if side == "+" else face - dl_bg
+            # from one cell inside the guide (a plane on a polygon's end face would
+            # otherwise read a bare cross-section) to one cell past the outer face
+            start = pp.plane_um - dl_bg if side == "+" else pp.plane_um + dl_bg
+            t = _AXES.index(pp.thickness_axis)
+            w = [i for i in range(3) if i not in (a, t)][0]
+            center = list(pp.center_um)
+            center[a] = 0.5 * (start + end)
+            ext = [0.0, 0.0, 0.0]
+            ext[a], ext[w], ext[t] = abs(end - start), float(pp.width_um), float(pp.thickness_um)
+            box = Box(center_um=tuple(float(c) - origin[i] for i, c in enumerate(center)), size_um=tuple(ext))
+            # a continuation of its host only when it is the host's medium: otherwise
+            # (no host, or a Port medium that differs) its inner face is a real
+            # interface and stays a snap target
+            along = pp.axis if host is not None and medium == host.medium else None
+            extensions.append((Structure(geometry=box, medium=medium), along))
+        return tuple(size), tuple(origin), extensions
+
+    def model_post_init(self, __context) -> None:
+        """Fit the domain, mesh and run length, then resolve ``ports`` /
+        ``source`` / ``wlens_um``, once the fields have validated (pydantic
+        runs this before the after-validators, which then check the resolved
+        scene): the model at this point is the geometry-only simulation the mode solves need
+        (final grid, structures, symmetry, the caller's sources and monitors).
+        The launch and the readout planes are then set beside the caller's, and
+        the merged wire-level content is validated once more so a plane that
+        lands in the PML or a name clash fails here, at construction. Wire
+        ingestion carries the ``wire_ingest`` context (as do the throwaway
+        validations here and in ``_validated_copy``) and is left alone; a
+        fitted simulation refuses ``model_copy`` edits that would need this
+        resolution again (see :meth:`model_copy`)."""
+        ctx = __context if isinstance(__context, dict) else {}
+        if ctx.get("wire_ingest"):
+            self._wire_ingested = True
+            return
+        fitted = (isinstance(self.size_um, Domain) or isinstance(self.grid, Mesh)
+                  or self.run.transits is not None or self.run.run_time_s is None and self.run.n_steps is None)
+        declared = bool(self.ports) or self.source is not None or self.wlens_um is not None
+        if fitted or declared:
+            self._inputs = {name: getattr(self, name) for name in self.model_fields_set}
+        self._resolve_materials()
+        self._fit_domain_mesh_run()
+        self._user_monitors = tuple(self.monitors)
+        if declared:
+            self._apply_declarative(user_sources=tuple(self.sources),
+                                    user_monitors=tuple(self.monitors))
+        if fitted or declared:
+            type(self).model_validate(
+                self.model_dump(mode="python", exclude=set(_decl.DECLARATIVE_FIELDS) | {"origin_um"}),
+                context={"wire_ingest": True})
+
+    def _apply_declarative(self, *, user_sources, user_monitors) -> None:
+        """Solve the ports on ``self`` and set the resolved sources and monitors
+        (the readout planes quarter-snapped like any hand-built plane)."""
+        sources, monitors, resolved = _decl.resolve(
+            self, ports=tuple(self.ports), source=self.source, wlens_um=self.wlens_um,
+            wlen0_um=self.wlen0_um, sources=user_sources, monitors=user_monitors)
+        snapped, _notes = _quarter_snapped_dft_monitors(
+            monitors, size_um=self.size_um, grid=self.grid, axis_min_cells=self._axis_min_cells())
+        object.__setattr__(self, "sources", tuple(sources))
+        object.__setattr__(self, "monitors", tuple(snapped))
+        object.__setattr__(self, "ports", tuple(resolved.ports))
+        self._declarative = resolved
+
+    def __eq__(self, other) -> bool:
+        """Two simulations are equal when their fields are: the private
+        resolution record (solved modes) does not take part."""
+        if not isinstance(other, Simulation):
+            return NotImplemented
+        return self.__dict__ == other.__dict__
+
+    @property
+    def port_monitors(self):
+        """``{port name: ModeMonitor}`` for a declarative simulation, else ``{}``."""
+        return dict(self._declarative.port_monitors) if self._declarative else {}
+
+    @property
+    def port_windows_um(self):
+        """``{port name: (half_w_um, half_v_um)}``: the mode window each port's
+        mode was solved on (a port's ``window_um``, or the default, clipped to
+        the domain). Empty for a simulation without ports, and for one loaded
+        from a file, whose modes are solved again on first use. A port the
+        symmetry fold dropped reads through its mirror image and has no
+        entry."""
+        rec = self._declarative
+        return dict(getattr(rec, "port_windows_um", None) or {}) if rec else {}
+
+    @property
+    def driven_port(self) -> Optional[str]:
+        """The name of the port ``source=`` drives, if any."""
+        return self._declarative.driven if self._declarative else None
 
     @model_validator(mode="after")
     def _bloch_pairing(self) -> "Simulation":
@@ -441,13 +1536,13 @@ class Simulation(FrozenModel):
                     f"is {kinds[a]!r} — set it to 'bloch' (the value would be "
                     "silently ignored otherwise)")
         for s in self.sources:
-            theta = getattr(s, "angle_theta", None)
+            theta = getattr(s, "angle_theta_rad", None)
             if theta:
                 ax = "xyz".index(s.axis)
                 for a, name in enumerate("xyz"):
                     if a != ax and kinds[a] != "bloch":
                         raise ValueError(
-                            f"plane wave with angle_theta != 0 requires "
+                            f"plane wave with angle_theta_rad != 0 requires "
                             f"transverse boundaries.{name} = 'bloch' with the "
                             "matching bloch_k_per_um — use "
                             "Simulation.with_oblique_plane_wave(...)")
@@ -464,12 +1559,8 @@ class Simulation(FrozenModel):
         fitted = getattr(v, "medium", None)
         if isinstance(fitted, Medium) and not isinstance(v, Medium):
             v = fitted   # PoleFit/LorentzFit: fall through to the Medium rules
-        if type(v).__name__ == "Material" and callable(fitted):
-            raise ValueError(
-                f"got the materials-library entry {getattr(v, 'name', v)!r} "
-                "where a Background is required — pick the fit first, e.g. "
-                "background=ph.Background(permittivity="
-                "ph.materials.SiO2.medium(wavelength_um=1.55).permittivity)")
+        if is_material(v):
+            return v   # resolved by the Simulation at its band centre (setup layer phase 5)
         if isinstance(v, Medium):
             if (v.conductivity_s_per_m == 0.0 and not v.lorentz
                     and not v.poles and not v.drude
@@ -582,7 +1673,7 @@ class Simulation(FrozenModel):
         centred half a cell off the primary node, so a structure sized to the
         single cell fills only HALF of it and its in-plane eps is averaged with
         the background. TM/Ez physics is unaffected (that voxel is aligned);
-        in-plane-E (TE) physics is corrupted — a photonic-crystal cavity mode
+        in-plane-E (TE) physics is corrupted, a photonic-crystal cavity mode
         can vanish entirely. Until the engine treats a degenerate axis as
         invariant, structures must extend PAST the domain along it.
         """
@@ -630,6 +1721,91 @@ class Simulation(FrozenModel):
         return self
 
     @model_validator(mode="after")
+    def _run_required_on_the_wire(self, info) -> "Simulation":
+        """``run`` is optional in Python (the transit cap fills it) and required
+        on the wire: a document ingested without it is rejected, as the schema
+        says."""
+        if (info.context or {}).get("wire_ingest") and (
+                "run" not in self.model_fields_set
+                or (self.run.run_time_s is None and self.run.n_steps is None)):
+            raise ValueError("run is required on the wire (run_time_s or n_steps)")
+        return self
+
+    @model_validator(mode="after")
+    def _resolve_plane_spans(self, info) -> "Simulation":
+        """Fill the in-plane centre and extent of every
+        :meth:`ProfileMonitor.plane` monitor marked ``span="interior:<axis>"`` with the
+        PML-free interior of this domain. Client-side only: the marker never
+        reaches the wire (it is None once resolved and excluded when None), and
+        an ingested document carries no marker; a monitor added to one by an
+        edit (context ``wire_edit``) is still resolved. Runs BEFORE the
+        quarter-cell snap so the resolved faces are snapped like any hand-built
+        plane."""
+        ctx = info.context or {}
+        if ctx.get("wire_ingest") and not ctx.get("wire_edit"):
+            return self
+        if not any(isinstance(m, ProfileMonitor) and (m.span is not None or m.station is not None)
+                   for m in self.monitors):
+            return self
+        lo_hi = [self._open_interval_um(a) for a in range(3)]
+        resolved = []
+        for m in self.monitors:
+            if not (isinstance(m, ProfileMonitor) and (m.span is not None or m.station is not None)):
+                resolved.append(m)
+                continue
+            if m.station is not None:
+                # a ProfileMonitor.sections plane: station i of n, spread evenly
+                # along its normal across the interior
+                i, n = m.station
+                along = "xyz".index(m.span.split(":", 1)[1]) if m.span else \
+                    min(range(3), key=lambda a: m.size_um[a])
+                lo, hi = lo_hi[along]
+                center = list(m.center_um)
+                center[along] = lo + (i + 0.5) * (hi - lo) / n
+                m = m.model_copy(update={"center_um": tuple(center), "station": None})
+                if m.span is None:
+                    resolved.append(m)
+                    continue
+            normal = "xyz".index(m.span.split(":", 1)[1])
+            center = list(m.center_um)
+            size = list(m.size_um)
+            for a in range(3):
+                if a == normal:
+                    continue
+                lo, hi = lo_hi[a]
+                center[a] = 0.5 * (lo + hi)
+                size[a] = hi - lo
+            resolved.append(m.model_copy(update={
+                "center_um": tuple(center), "size_um": tuple(size), "span": None}))
+        object.__setattr__(self, "monitors", tuple(resolved))
+        return self
+
+    def _open_interval_um(self, axis_index: int) -> Tuple[float, float]:
+        """``(lo, hi)`` of the absorbing-layer-free interior along an axis:
+        the PML or absorber slab thickness (its layer count times the local
+        cell spacings) is removed from each face that carries one; a periodic,
+        Bloch or PEC face contributes nothing; a symmetry plane sits on the
+        low face and is kept."""
+        kind = getattr(self.boundaries, _AXES[axis_index])
+        layers = {"pml": self.pml_num_layers,
+                  "absorber": self.absorber_num_layers}.get(kind, 0)
+        length = float(self.size_um[axis_index])
+        q = self._axis_coords_um(axis_index)
+        if q is None:
+            thick_lo = thick_hi = layers * float(self.grid.dl_um)
+        else:
+            dq = graded_primary_spacings(q)
+            thick_lo = float(sum(dq[:layers]))
+            thick_hi = float(sum(dq[-layers:])) if layers else 0.0
+        lo = 0.0 if self.symmetry[axis_index] != 0 else thick_lo
+        hi = length - thick_hi
+        if not hi > lo:
+            raise ValueError(
+                f"axis {_AXES[axis_index]!r}: the absorbing layers leave no interior "
+                f"(size {length} um, {layers} layers each face)")
+        return lo, hi
+
+    @model_validator(mode="after")
     def _dft_regions_quarter_snap(self, info) -> "Simulation":
         # NUMERICS.md §12 ergonomics: auto-snap DFT field-monitor box faces
         # to quarter-cell planes wherever the engine's per-component region
@@ -642,13 +1818,19 @@ class Simulation(FrozenModel):
         # remains authoritative for them. Runs BEFORE _modal_port_rules so
         # the port checks see the final geometry. Adjustments are reported
         # per monitor on this module's DEBUG log.
-        if (info.context or {}).get("wire_ingest"):
+        # An edit of an ingested document (context ``wire_edit``, the names of
+        # the monitors it adds) snaps only those: they were written in Python.
+        ctx = info.context or {}
+        added = ctx.get("wire_edit") if ctx.get("wire_ingest") else None
+        if ctx.get("wire_ingest") and not added:
             return self
         if not any(isinstance(m, ProfileMonitor) for m in self.monitors):
             return self
         snapped, notes = _quarter_snapped_dft_monitors(
-            self.monitors, size_um=self.size_um, grid=self.grid)
+            self.monitors, size_um=self.size_um, grid=self.grid, axis_min_cells=self._axis_min_cells())
         if notes:
+            if added is not None:
+                snapped = tuple(s if m.name in added else m for m, s in zip(self.monitors, snapped))
             object.__setattr__(self, "monitors", snapped)
             for note in notes:
                 _LOG.debug("%s", note)
@@ -928,17 +2110,17 @@ class Simulation(FrozenModel):
 
     def _two_eps0_over_dt(self) -> float:
         """The CPML peak-conductivity unit ``2*eps0/dt`` [S/m] at this scene's
-        timestep — the scale ``sigma_max`` / ``alpha_max`` are quoted in, and
+        timestep, the scale ``sigma_max`` / ``alpha_max`` are quoted in, and
         the bridge between its dimensionless convention and the engine's S/m
         ``pml_alpha_max``.
 
         Built from the engine's CFL timestep (NUMERICS.md §2; resolve.cpp and
         grid.h ``graded_courant_dt``): ``dt = courant / (c0*sqrt(sum_a 1/dl_a^2))``
         over the per-axis MINIMUM primary spacing of the ACTIVE axes (a 1-cell
-        plain-periodic axis contributes no curl term and leaves the sum — the
+        plain-periodic axis contributes no curl term and leaves the sum, the
         section 2 quasi-2D reduction), which on a uniform 3-D grid is
         ``courant*dl / (c0*sqrt(3))``. Since ``eps0*c0 = 1/eta0`` this reduces to
-        ``(2/eta0)*sqrt(sum_a 1/dl_a^2)/courant`` — needing only ``eta0``, the
+        ``(2/eta0)*sqrt(sum_a 1/dl_a^2)/courant``, needing only ``eta0``, the
         cell spacings, and the Courant number, and matching the engine's dt so a
         converted alpha lands exactly on that scale."""
         mins = self._axis_min_cells()
@@ -959,21 +2141,10 @@ class Simulation(FrozenModel):
             inv_sq = 1.0 / (dl_m * dl_m)
         return (2.0 / _ETA0) * math.sqrt(inv_sq) / self.run.courant
 
-    def _pml_sigma_peak_Sm(self) -> float:
-        """The peak CPML conductivity [S/m] the engine will actually use:
-        ``pml_sigma_max`` interpreted in the ``2*eps0/dt`` convention when
-        it is > 0 (the default 1.5), else the legacy dl-heuristic
-        ``0.8*(m+1)/(eta0*dl)`` (see spec.pml_sigma_max, reference_solver.cpp
-        ``cpml_coef``). The reference for the CFS-inert test — an alpha far below
-        this leaves the DC pole undamped."""
-        if self.pml_sigma_max > 0.0:
-            return self.pml_sigma_max * self._two_eps0_over_dt()
-        return 0.8 * (self.pml_m + 1.0) / (_ETA0 * self.grid.dl_um * 1e-6)
-
     def _dispersive_boundary_crossings(self) -> Tuple[bool, bool, bool]:
         """Per axis: does a dispersive (Lorentz) structure's bounding box reach
         into that axis' OUTER absorbing band (the PML/absorber layers)? These
-        are the structures for which a stretched-coordinate PML can diverge —
+        are the structures for which a stretched-coordinate PML can diverge ,
         the absorber's reason to exist (NUMERICS.md §21). Conservative: the
         bounding box contains slanted/curved geometry, so a crossing is never
         missed (it can be over-reported).
@@ -1005,46 +2176,160 @@ class Simulation(FrozenModel):
         return tuple(out)
 
     def _validated_copy(self, update: dict) -> "Simulation":
-        """``model_copy(update=)`` with the cross-field model validators
-        RE-RUN — the shared backend of every ``with_*`` helper.
+        """A copy with ``update`` applied, built and validated as the
+        constructor builds a simulation: the shared backend of
+        :meth:`with_changes` on a hand-built scene and of every ``with_*``
+        helper. Values are the stored ones (the corner frame of a fitted scene).
 
         pydantic's ``model_copy`` skips validation entirely, so a helper using
         it alone could hand back a Simulation that direct construction rejects
         (e.g. ``with_absorber`` replacing the periodic transverse boundaries
-        required by a §13 plane-wave source), deferring the failure to engine
-        submission and defeating the model's cross-field validation contract.
+        required by a §13 plane-wave source), and it would keep every
+        construction-time decision of the original: the §16 subpixel default
+        chosen for the old structures, a ``ProfileMonitor.plane`` span marker
+        unresolved (a key the engine refuses), the §12 quarter-snap and the
+        dispersive-PML CFS profile of the old grid.
 
-        The returned object is the plain ``model_copy`` result: its
-        ``model_fields_set`` (originals plus exactly the updated keys) is what
-        ``_wire_exclude`` keys the unset-field omission on, so the wire bytes
-        of a valid scene are identical to the pre-validation behavior. The
-        validation happens on a THROWAWAY rebuilt from the FULL
-        ``model_dump`` — full, not ``exclude_unset=True``, because the unset
-        ``type`` discriminators of nested source/monitor/geometry unions would
-        be dropped and the throwaway could not re-validate; values, not
-        fields_set, are what the raising validators inspect. It is validated
-        under the ``wire_ingest`` context so the construction-time
-        conveniences (§16 subpixel default resolution, the dispersive-PML
-        advisory warning — both non-raising, both already applied/emitted when
-        ``self`` was built) do not re-fire on a copy; every RAISING validator
-        runs in that context too, so an invalid combination raises here with
-        the same error direct construction gives."""
-        new = self.model_copy(update=update)
-        type(self).model_validate(new.model_dump(mode="python"),
-                                  context={"wire_ingest": True})
+        So the copy is constructed from the fields the user set (those a
+        resolver filled in are left out, see ``_auto_fields``, so the resolver
+        decides again while an explicit choice wins), the resolved scene (size,
+        grid, run, structures, sources, background, origin), the monitors as
+        the user wrote them (``_user_monitors``: plane spans and faces are
+        resolved again for the edited domain and grid, not carried over) and
+        the update. Its ``model_fields_set`` is set to what direct construction
+        with the same fields gives, which is what ``_wire_exclude`` keys the
+        unset-field omission on, so the two wires are byte-identical. A
+        declarative scene is constructed from the caller's own sources and
+        monitors, its ports are solved again on the copy's grid, and the merged
+        content is validated once more, as at construction. The copy is built
+        inside :func:`_editing`: the advice on the caller's own inputs (a
+        weakly driven monitor frequency, a wavelength typed as a frequency) is
+        not repeated when the original drew the same; every refusal runs.
+
+        A scene the constructor resolved (``_inputs``) is rebuilt from its
+        inputs with the update, so a helper's result is what construction with
+        the helper's fields gives and a later :meth:`with_changes` keeps it.
+        The one exception is an update of stored coordinates on a ``domain=``
+        fit (``with_auto_mesh``): that is a copy in those coordinates, and the
+        inputs are marked stale (``_frame_edits``) so ``with_changes`` refuses
+        instead of dropping it. Sources or monitors a ``model_copy`` swapped in
+        over a scene's resolved ports are kept as stored, the ports with them,
+        and an update of what the port solves read is refused (see
+        :meth:`model_copy`).
+
+        A document parsed from the wire keeps the ingestion contract: the copy
+        is validated under ``wire_ingest`` (nothing resolved, nothing adjusted)
+        except that the monitors the edit adds (all of them when it changes the
+        grid or the size) have their plane spans resolved and their faces
+        quarter-snapped (context ``wire_edit``), as the engine requires of
+        them, and the construction rules a load skips hold (``edit_copy``). A
+        declaration only the constructor resolves (a ``Domain``, a ``Mesh``, a
+        run in transits, ports) is refused there."""
+        with _editing(self):
+            return self._edited_copy(_tupled(dict(update)))
+
+    def _edited_copy(self, update: dict) -> "Simulation":
+        """:meth:`_validated_copy`'s body, run inside :func:`_editing`."""
+        given = dict(update)
+        if self._wire_ingested:
+            declared = sorted(
+                [k for k in update if k in _decl.DECLARATIVE_FIELDS]
+                + [k for k in ("size_um", "grid") if isinstance(update.get(k), (Domain, Mesh))]
+                + (["run"] if getattr(update.get("run"), "transits", None) is not None else []))
+            if declared:
+                raise ValueError(
+                    f"cannot apply {declared} to a simulation loaded from the wire: domain=, mesh=, a run in "
+                    "transits and ports=/source=/wlens_um= are declarations only the constructor resolves, and a "
+                    "loaded document is edited as the document it is. Give size_um, grid (a UniformMesh or "
+                    "GradedMesh) and run_time_s or n_steps, or build the simulation with ph.Simulation(...).")
+            kept = {name: getattr(self, name) for name in self.model_fields_set}
+            # (what is no tuple here, validation refuses)
+            monitors = update.get("monitors", self.monitors)
+            monitors = monitors if isinstance(monitors, tuple) else ()
+            if "grid" in update or "size_um" in update:
+                added = tuple(getattr(m, "name", None) for m in monitors)      # every face on the new cells
+            else:
+                added = tuple(getattr(m, "name", None) for m in monitors if m not in self.monitors)
+            # edit_copy: the construction rules a load skips hold for the edit
+            return type(self).model_validate(
+                {**kept, **update}, context={"wire_ingest": True, "wire_edit": added, "edit_copy": True})
+        if self._inputs is not None and not self._frame_edits and not (
+                set(given) & _FRAME_FIELDS and isinstance(self._inputs.get("size_um"), Domain)):
+            return type(self)(**{**self._inputs, **given})
+        kwargs = {name: getattr(self, name) for name in self.model_fields_set
+                  if name not in self._auto_fields}
+        kwargs.update({name: getattr(self, name) for name in _RESOLVED_FIELDS})
+        for name in _decl.DECLARATIVE_FIELDS:
+            kwargs.pop(name, None)
+        # the monitors as written, so their spans and faces resolve for the copy
+        kwargs["monitors"] = self._user_monitors if self._user_monitors is not None else self.monitors
+        rec = self._declarative
+        swapped = sorted(set(self._frame_edits) & {"sources", "monitors"})
+        kept_rec = None
+        if rec is not None and swapped and self._generated():
+            # model_copy swapped the stored launch or readout (the S-matrix
+            # plan, the adjoint solve): keep what is stored, ports and all, as
+            # long as nothing the port solves read moves
+            moved = sorted(k for k in set(given) & (_PORT_SOLVE_FIELDS | set(_decl.DECLARATIVE_FIELDS))
+                           if given[k] != getattr(self, k))
+            if moved:
+                raise ValueError(
+                    f"cannot change {moved} on this simulation: its {swapped} were replaced by model_copy over "
+                    "the sources and monitors its ports resolved, and a change of what the port solves read "
+                    "would leave them solved for the old scene. Make this change first and swap after it, or "
+                    "build the simulation again with ph.Simulation(...).")
+            kwargs["monitors"] = self.monitors
+            kept_rec, rec = rec, None
+        elif rec is not None:
+            # the caller's own sources and monitors: an explicit update replaces
+            # them (dropping the port planes it may carry re-snapped), otherwise
+            # what was passed at construction (or swapped in over a record that
+            # generates nothing, where the stored sources are the caller's);
+            # the ports are solved again below
+            generated = {p.monitor_name for p in rec.ports}
+            own = rec.user_sources if self._generated() else self.sources
+            update["sources"] = tuple(update.pop("sources", own))
+            update["monitors"] = tuple(m for m in update.pop("monitors", kwargs["monitors"])
+                                       if getattr(m, "name", None) not in generated)
+        new = type(self)(**{**kwargs, **update})
+        # the fields set as direct construction with the same fields sets them
+        new.__pydantic_fields_set__.clear()
+        new.__pydantic_fields_set__.update(
+            (set(self.model_fields_set) - set(self._auto_fields)) | set(given) | set(new._auto_fields))
+        if new._fold is None:
+            new._fold = self._fold
+        if new._run_transits is None and "run" not in given:
+            new._run_transits = self._run_transits
+        if self._inputs is not None:                     # stored coordinates of a domain= fit changed
+            new._inputs = self._inputs
+            new._frame_edits = tuple(sorted(set(self._frame_edits) | (set(given) & _FRAME_FIELDS)))
+        if kept_rec is not None:
+            for name in _decl.DECLARATIVE_FIELDS:          # the resolved ports, as stored
+                object.__setattr__(new, name, getattr(self, name))
+            new._declarative = kept_rec
+            new._user_monitors = self._user_monitors
+        elif rec is not None:
+            for name in _decl.DECLARATIVE_FIELDS:          # the resolved ports, in the corner frame
+                object.__setattr__(new, name, getattr(self, name))
+            new._apply_declarative(user_sources=new.sources, user_monitors=new.monitors)
+            # the merged wire-level content, as model_post_init checks it
+            type(self).model_validate(
+                new.model_dump(mode="python", exclude=set(_decl.DECLARATIVE_FIELDS) | {"origin_um"}),
+                context={"wire_ingest": True, "edit_copy": True})
         return new
 
+    @legacy_keywords(wavelength_um="wlen_um", steps_per_wvl="cells_per_wlen")
     def with_auto_mesh(
         self,
         *,
-        wavelength_um: Optional[float] = None,
-        steps_per_wvl: float = 20.0,
+        wlen_um: Optional[float] = None,
+        cells_per_wlen: float = 20.0,
         **auto_mesh_kwargs,
     ) -> "Simulation":
         """Return a COPY of this simulation whose ``grid`` is replaced by an
-        auto-meshed :class:`GradedMesh` derived from this scene — its
+        auto-meshed :class:`GradedMesh` derived from this scene, its
         domain ``size_um``, ``structures``, ``background`` index, and (if
-        ``wavelength_um`` is omitted) the wavelength inferred from the first
+        ``wlen_um`` is omitted) the wavelength inferred from the first
         source. A convenience wrapper over :func:`photonhub.auto_mesh`; extra
         keyword arguments (``max_grading``, ``axes``, ``dl_min_um``,
         ``refine_regions``, ...) pass straight through.
@@ -1053,13 +2338,21 @@ class Simulation(FrozenModel):
         existing scene's wire output moves. Use this when you want per-medium
         per-medium refinement without hand-building coordinate arrays::
 
-            sim = sim.with_auto_mesh(steps_per_wvl=20)
+            sim = sim.with_auto_mesh(cells_per_wlen=20)
 
         Axes whose boundary is PERIODIC are passed to :func:`auto_mesh` as
         ``periodic_axes`` (unless you override it explicitly), so a graded
-        periodic axis is generated seam-symmetrically — equal first/last
+        periodic axis is generated seam-symmetrically, equal first/last
         primary spacings, the §15.2 closure requirement the engine hard-checks.
         Non-periodic scenes are byte-identical to before.
+
+        An axis whose refinement set is already mirror-symmetric about the
+        domain centre gets a MIRROR-SYMMETRIC ladder, so the two halves of a
+        symmetric device are on the same discretization and a quantity
+        symmetry guarantees (a splitter's arm balance) is not thrown off by a
+        grid artifact. Pass ``mirror_axes=""`` to switch that off, or explicit
+        letters to force it; :func:`auto_mesh` documents the detection, and
+        :func:`photonhub.axis_mirror_mismatch` measures the result.
         """
         from .grid import auto_mesh as _auto_grid  # local: avoid import cycle
 
@@ -1071,58 +2364,60 @@ class Simulation(FrozenModel):
                 _AXES[a] for a in range(3) if kinds[a] == "periodic")
         spec = _auto_grid(
             size_um=tuple(self.size_um),
-            wavelength_um=wavelength_um,
-            source=None if wavelength_um is not None else src,
+            wlen_um=wlen_um,
+            source=None if wlen_um is not None else src,
             structures=self.structures,
             background_index=bg_index,
-            steps_per_wvl=steps_per_wvl,
+            cells_per_wlen=cells_per_wlen,
             **auto_mesh_kwargs,
         )
         update: dict = {"grid": spec}
-        # Re-run the §12 quarter-snap against the NEW cell ladder: the
-        # construction-time snap used the grid being replaced, and
-        # _validated_copy validates under ``wire_ingest`` (which skips the
-        # convenience), so without this a monitor face quarter-snapped for
-        # the old uniform grid could land on a graded cell boundary and be
+        # A constructed scene's copy quarter-snaps the monitors as written
+        # against the NEW cell ladder (§12). The copy of a document parsed
+        # from the wire is validated under ``wire_ingest``, which skips that
+        # convenience, so its faces are snapped here: a face snapped for the
+        # old uniform grid could land on a graded cell boundary and be
         # rejected by the engine.
-        snapped, notes = _quarter_snapped_dft_monitors(
-            self.monitors, size_um=self.size_um, grid=spec)
-        if notes:
-            update["monitors"] = snapped
-            for note in notes:
-                _LOG.debug("%s", note)
+        if self._wire_ingested:
+            snapped, notes = _quarter_snapped_dft_monitors(
+                self.monitors, size_um=self.size_um, grid=spec, axis_min_cells=self._axis_min_cells())
+            if notes:
+                update["monitors"] = snapped
+                for note in notes:
+                    _LOG.debug("%s", note)
         return self._validated_copy(update)
 
+    @legacy_keywords(wavelength_um="wlen_um", steps_per_wvl="cells_per_wlen")
     def with_mesh_overrides(
         self,
         *overrides,
-        wavelength_um: Optional[float] = None,
-        steps_per_wvl: float = 20.0,
+        wlen_um: Optional[float] = None,
+        cells_per_wlen: float = 20.0,
         **auto_mesh_kwargs,
     ) -> "Simulation":
         """Return a COPY whose ``grid`` is auto-meshed with one or more
-        geometry-based :class:`photonhub.MeshOverride` regions applied — the mesh
+        geometry-based :class:`photonhub.MeshOverride` regions applied, the mesh
         is forced fine inside each
         override's geometry regardless of the local material, on top of the
         ordinary per-medium refinement.
 
         A thin wrapper over :meth:`with_auto_mesh` that forwards the overrides as
         ``mesh_overrides=``; all other auto-mesh knobs (``max_grading``, ``axes``,
-        ``dl_min_um``, ``refine_pad_um``, ...) pass straight through — including
+        ``dl_min_um``, ``refine_pad_um``, ...) pass straight through, including
         the periodic-boundary seam handling: axes whose boundary is periodic get
         seam-symmetric coordinates (equal first/last primary spacings, the §15.2
         closure requirement). Opt-in only, like the other ``with_*`` mesh
-        helpers — no existing scene's wire output moves unless you call it::
+        helpers, no existing scene's wire output moves unless you call it::
 
             from photonhub import MeshOverride, Box
             sim = sim.with_mesh_overrides(
                 MeshOverride(geometry=Box(center_um=(2, 1, 0.5),
                                           size_um=(0.5, 0.5, 1.0)),
                              dl_um=(0.02, 0.02, None)),
-                steps_per_wvl=20)
+                cells_per_wlen=20)
         """
         return self.with_auto_mesh(
-            wavelength_um=wavelength_um, steps_per_wvl=steps_per_wvl,
+            wlen_um=wlen_um, cells_per_wlen=cells_per_wlen,
             mesh_overrides=overrides, **auto_mesh_kwargs)
 
     def with_stabilized_pml(
@@ -1132,43 +2427,52 @@ class Simulation(FrozenModel):
         kappa_max: float = _STABLE_PML_KAPPA_MAX,
         alpha_scale: float = _STABLE_PML_ALPHA_SCALE,
     ) -> "Simulation":
-        """Return a COPY with the stabilized CPML profile: more
-        layers, a higher real-stretch peak ``kappa_max``, and — the lever the
-        default profile keeps inert — a RAISED CFS ``alpha_max`` (NUMERICS.md
-        §11). The complex frequency shift is what moves the PML pole off DC and
-        cures the late-time / grazing-incidence / dispersive-medium divergences
-        that more layers alone do not fix; it costs a few percent of in-band
-        absorption, paid back by the extra layers.
+        """Return a copy with the stabilized CPML profile.
 
-        ``alpha_scale`` is quoted in dimensionless ``2*eps0/dt`` units —
-        the SAME convention as ``pml_sigma_max`` — and converted to the engine's
-        S/m ``pml_alpha_max`` at this scene's timestep, so the per-step CFS
-        damping is mesh-independent and lands on the intended value (a fixed absolute
-        alpha would weaken on finer grids). The defaults reproduce the stabilized profile's
-        the stabilized profile (40 layers, ``kappa_max`` 5, ``alpha_max`` 0.9);
-        ``pml_sigma_max`` is left at its default (1.5, already in 2*eps0/dt units —
-        a slightly stronger peak than the 1.0 reference, for a lower floor).
+        Increase the layer count, real-stretch peak ``kappa_max``, and complex
+        frequency shift ``alpha_max`` (NUMERICS.md §11).
+        ``alpha_scale`` uses dimensionless ``2*eps0/dt`` units, the same
+        convention as ``pml_sigma_max``. Convert it to ``pml_alpha_max`` in S/m
+        at the returned simulation's timestep. A fitted domain may change the
+        timestep, so the conversion is recalculated after fitting.
 
-        A dispersive (Lorentz) scene gets the alpha+kappa half of this
-        AUTOMATICALLY at construction (see ``_auto_stabilize_dispersive_pml``);
-        reach for this to ALSO thicken the slab, or on a non-dispersive scene
-        that leaks/drifts. Opt-in — no non-dispersive scene's wire output moves
-        unless you call it::
+        This helper keeps the timestep-based convention of the stabilized
+        profile (40 layers, ``kappa_max`` 5, ``alpha_max`` 0.9).
+        ``pml_sigma_max`` stays at its default (1.5 in ``2*eps0/dt`` units).
+        The automatic dispersive profile instead anchors alpha to the band
+        (NUMERICS.md §11); timestep-scaled alpha reflects more on finer grids.
 
-            sim = sim.with_stabilized_pml()                 # stabilized profile
+        Dispersive scenes receive alpha and kappa stabilization at construction.
+        Use this helper to also increase their layer count, or to opt in for a
+        non-dispersive scene::
+
+            sim = sim.with_stabilized_pml()
             sim = sim.with_stabilized_pml(num_layers=60, alpha_scale=1.2)
-
-        (Renamed from the earlier ``with_stable_pml``, which raised only layers
-        and kappa — never alpha, so it missed the actual stability lever.)
         """
-        return self._validated_copy({
+        unit = self._two_eps0_over_dt()
+        new = self._validated_copy({
             "pml_num_layers": num_layers,
             "pml_kappa_max": kappa_max,
             # alpha_scale is a fraction of 2*eps0/dt (the alpha_max unit),
-            # converted to the engine's S/m field at this scene's dt.
-            "pml_alpha_max": alpha_scale * self._two_eps0_over_dt(),
+            # converted to the engine's S/m field at the copy's dt.
+            "pml_alpha_max": alpha_scale * unit,
         })
+        if new._two_eps0_over_dt() != unit:
+            # a domain= fit is fitted again for the new layers and its mesh
+            # with it, so the time step can move: quote alpha at the copy's.
+            # Nothing the fit, the mesh or the port solves decide reads alpha,
+            # so the copy is the construction with that alpha once the value
+            # is set; its rules are checked again without a second build.
+            alpha = alpha_scale * new._two_eps0_over_dt()
+            object.__setattr__(new, "pml_alpha_max", alpha)
+            if new._inputs is not None:
+                new._inputs = {**new._inputs, "pml_alpha_max": alpha}
+            type(self).model_validate(
+                new.model_dump(mode="python", exclude=set(_decl.DECLARATIVE_FIELDS) | {"origin_um"}),
+                context={"wire_ingest": True, "edit_copy": True})
+        return new
 
+    @legacy_keywords(angle_theta="angle_theta_rad", angle_phi="angle_phi_rad")
     def with_oblique_plane_wave(
         self,
         *,
@@ -1177,8 +2481,8 @@ class Simulation(FrozenModel):
         position_um: float,
         polarization: str,
         source_time,
-        angle_theta: float,
-        angle_phi: float = 0.0,
+        angle_theta_rad: float,
+        angle_phi_rad: float = 0.0,
         n: Optional[float] = None,
         amplitude: float = 1.0,
     ) -> "Simulation":
@@ -1188,25 +2492,26 @@ class Simulation(FrozenModel):
 
         The in-plane Bloch wavevector is derived at the PULSE CENTRE:
         ``k_t = 2 pi n f0 / c * sin(theta)``, split onto the two cyclic
-        transverse axes by ``angle_phi`` (measured from the first cyclic
+        transverse axes by ``angle_phi_rad`` (measured from the first cyclic
         transverse axis ``(axis+1) % 3``). ``n`` defaults to
-        ``sqrt(background.permittivity)`` — the index of the medium the wave
+        ``sqrt(background.permittivity)``, the index of the medium the wave
         is launched in. NOTE (constant-k): across a broadband pulse the
         physical angle varies with frequency; keep the band narrow when the
-        angle matters (``sin theta(f) = f0 sin(theta) / f``).
+        angle matters (``sin theta(f) = f0 sin(theta) / f``). ``position_um``
+        is in your coordinates, as the rest of a ``domain=`` fit is written.
         """
         import math as _math
 
-        if not -0.5 * _math.pi < float(angle_theta) < 0.5 * _math.pi:
-            raise ValueError("angle_theta must be within (-pi/2, pi/2)")
-        c_phi = _math.cos(float(angle_phi))
-        s_phi = _math.sin(float(angle_phi))
+        if not -0.5 * _math.pi < float(angle_theta_rad) < 0.5 * _math.pi:
+            raise ValueError("angle_theta_rad must be within (-pi/2, pi/2)")
+        c_phi = _math.cos(float(angle_phi_rad))
+        s_phi = _math.sin(float(angle_phi_rad))
         # Engine v1 contract (NUMERICS.md §22): the tilt must lie along ONE
         # transverse axis — the single-aux-line s/p decomposition. Mirror the
         # engine's rejection here so it fails at authoring time.
         if min(abs(c_phi), abs(s_phi)) > 1e-9:
             raise ValueError(
-                "angle_phi must be a multiple of 90 degrees (pi/2) in this "
+                "angle_phi_rad must be a multiple of 90 degrees (pi/2) in this "
                 "release: the oblique tilt must lie along a single "
                 "transverse axis (NUMERICS.md §22)")
         n_bg = float(n) if n is not None else _math.sqrt(
@@ -1214,19 +2519,18 @@ class Simulation(FrozenModel):
         # Engine §22 CFL contract: the incident aux line runs at
         # eps_eff = (n cos theta)^2, phase velocity c/(n cos theta) — FASTER
         # than the 3-D wave — so courant <= sqrt(3) * n * cos(theta).
-        s_max = _math.sqrt(3.0) * n_bg * _math.cos(float(angle_theta))
+        s_max = _math.sqrt(3.0) * n_bg * _math.cos(float(angle_theta_rad))
         if float(self.run.courant) > s_max * (1.0 + 1e-9):
             raise ValueError(
                 f"run.courant = {self.run.courant} exceeds the oblique "
                 f"incident-line stability bound sqrt(3)*n*cos(theta) = "
                 f"{s_max:.4f} (NUMERICS.md §22); set run.courant to at most "
                 f"{0.95 * s_max:.4f}, e.g. "
-                f"sim.model_copy(update={{'run': sim.run.model_copy("
-                f"update={{'courant': {0.95 * s_max:.3f}}})}})")
+                f"sim.with_changes(run=sim.run.model_copy("
+                f"update={{'courant': {0.95 * s_max:.3f}}}))")
         f0 = float(source_time.freq0_hz)
-        c0 = 299792458.0
         k_t = 2.0 * _math.pi * n_bg * f0 / c0 * _math.sin(
-            float(angle_theta)) * 1e-6  # rad/um
+            float(angle_theta_rad)) * 1e-6  # rad/um
         ax = "xyz".index(axis)
         t1, t2 = (ax + 1) % 3, (ax + 2) % 3
         k = [0.0, 0.0, 0.0]
@@ -1238,48 +2542,120 @@ class Simulation(FrozenModel):
                  "z": self.boundaries.z}
         for a in (t1, t2):
             kinds["xyz"[a]] = "bloch"
+        # stored coordinates start at the fitted box's corner (origin_um)
+        position_um = float(position_um) - float(self.origin_um["xyz".index(axis)])
         pw = PlaneWave(
             axis=axis, direction=direction, position_um=position_um,
             polarization=polarization, amplitude=amplitude,
-            source_time=source_time, angle_theta=float(angle_theta),
-            angle_phi=float(angle_phi))
-        return self.model_copy(update={
+            source_time=source_time, angle_theta_rad=float(angle_theta_rad),
+            angle_phi_rad=float(angle_phi_rad))
+        return self._validated_copy({
             "sources": (pw,),
             "boundaries": Boundaries(**kinds),
             "bloch_k_per_um": tuple(k),
         })
 
-    def with_absorber(self, *, num_layers: int = 40) -> "Simulation":
+    def _absorber_layers(self, axes, *, keep_set: bool) -> int:
+        """Layers per face for a section 21 absorber on ``axes`` that is at
+        least ``_ABSORBER_WAVELENGTHS`` wavelengths thick in the background at
+        the lowest source frequency, and at least ``_ABSORBER_MIN_LAYERS``.
+        On a graded axis the cells are counted in from each face until they
+        span that thickness. The lowest frequency is the lower 1-sigma edge of
+        each pulse (floored at half its carrier), each cw carrier, and each
+        monitored frequency. With ``keep_set`` a count the scene already sets
+        is kept (it may have been sized for this mesh by an earlier call, or
+        a builder may have sized the domain around it). Without a source the
+        engine's 40 layers stand.
+        Slabs that do not fit the domain are not refused here: like any
+        run-time rule, :meth:`check_runnable` reports them before a run."""
+        if keep_set and "absorber_num_layers" in self.model_fields_set:
+            return self.absorber_num_layers
+        lows = []
+        for s in self.sources:
+            st = getattr(s, "source_time", None)
+            if st is None:
+                continue
+            width = getattr(st, "fwidth_hz", None)
+            lows.append(max(st.freq0_hz - width, 0.5 * st.freq0_hz) if width else st.freq0_hz)
+        if not lows:
+            return _ABSORBER_MIN_LAYERS
+        # A monitored frequency below the pulse's 1-sigma edge sets it instead.
+        for mon in self.monitors:
+            freqs = getattr(mon, "freqs_hz", None)
+            if freqs:
+                lows.append(min(float(f) for f in freqs))
+        n_bg = math.sqrt(float(self.background.permittivity))
+        wlen_um = _C0_M_PER_S / (min(lows) * n_bg) * 1e6
+        need_um = _ABSORBER_WAVELENGTHS * wlen_um
+        counts = resolved_cell_counts(self.size_um, self.grid, self._axis_min_cells())
+        layers = _ABSORBER_MIN_LAYERS
+        for a in axes:
+            q = self._axis_coords_um(a)
+            spacings = (graded_primary_spacings(q) if q is not None
+                        else [self.grid.dl_um] * counts[a])
+            for side in (spacings, spacings[::-1]):
+                total, cells = 0.0, 0
+                for dq in side:
+                    if total >= need_um * (1.0 - 1e-9):
+                        break
+                    total += dq
+                    cells += 1
+                if total < need_um * (1.0 - 1e-9):
+                    cells = counts[a]  # the axis is thinner than the absorber
+                layers = max(layers, cells)
+        return layers
+
+    def with_absorber(self, *, num_layers: Optional[int] = None) -> "Simulation":
         """Return a COPY with every face set to the adiabatic absorber
         (NUMERICS.md §21) instead of a PML. Use this when a structure crosses
-        the domain boundary or a dispersive/gain medium touches the edge — the
+        the domain boundary or a dispersive/gain medium touches the edge, the
         cases where a stretched-coordinate PML can diverge. The absorber trades
-        some reflection (≈ -28 dB at the default 40 layers, vs the PML's -68 dB)
-        for robustness; add layers if you need it tighter::
+        reflection for robustness: its reflection depends on its thickness in
+        wavelengths, not on the mesh. By default the slab is two wavelengths
+        thick in the background at the lowest source or monitor frequency
+        (``freq0_hz - fwidth_hz`` of a pulse), and never thinner than 40
+        layers (at 1550 nm: 3.9 um per face in vacuum, 2.7 um in SiO2); at
+        normal incidence, for a wave in a vacuum or SiO2 background, that
+        reflects about -52 to -60 dB at the band's low edge and less above it
+        (a PML: -68 dB and below). The count is recomputed on every call, so
+        call it again after changing the mesh; ``num_layers`` sets it instead
+        (one wavelength of the carrier reflects about -16 dB)::
 
-            sim = sim.with_absorber()                 # 40-layer absorber, 6 faces
+            sim = sim.with_absorber()                 # two wavelengths, 6 faces
             sim = sim.with_absorber(num_layers=60)
+
+        A domain too small for the slabs fails :meth:`check_runnable` (and so
+        ``run_local``) with the layer count; enlarge it, or pass a smaller
+        ``num_layers`` and accept the higher reflection. The count is one for
+        all axes, set by the axis that needs the most cells (on a graded mesh,
+        the one with the finest face cells). At normal incidence a plane wave
+        in a medium of index ``n`` inside the slab is reflected at least about
+        ``-139/n`` dB, however thick the slab: -40 dB in bulk silicon; a
+        guided mode's bound depends on its group index and field and is
+        usually lower (NUMERICS.md section 21).
         """
+        if num_layers is None:
+            num_layers = self._absorber_layers(range(3), keep_set=False)
         return self._validated_copy({
             "boundaries": Boundaries(x="absorber", y="absorber", z="absorber"),
             "absorber_num_layers": num_layers,
         })
 
-    def with_auto_boundaries(self) -> "Simulation":
+    def with_auto_boundaries(self, *, absorber_num_layers: Optional[int] = None) -> "Simulation":
         """Return a COPY whose OPEN (radiating) boundaries are chosen PER AXIS
-        from the materials that reach the domain edge — following standard
+        from the materials that reach the domain edge, following standard
         material-aware guidance that a stretched-coordinate PML wants a
         non-dispersive medium in its absorbing region:
 
         * an axis where a **dispersive (Lorentz) medium crosses the boundary**
           gets the adiabatic **absorber** (graded electric conductivity,
-          NUMERICS.md §21) — the robust fallback for the regime where a PML can
+          NUMERICS.md §21), the robust fallback for the regime where a PML can
           diverge (Oskooi & Johnson 2011);
         * every other open axis keeps the (thinner, lower-floor) **PML**.
 
         ``periodic`` and ``pec`` axes are left untouched: those encode explicit
         physics (a Bloch / transverse-infinite axis, a hard mirror), not an open
-        boundary to auto-select. Opt-in — the default boundaries are unchanged,
+        boundary to auto-select. Opt-in, the default boundaries are unchanged,
         so no existing scene's wire output moves unless you call this::
 
             sim = sim.with_auto_boundaries()   # PML, but absorber where dispersive
@@ -1291,6 +2667,15 @@ class Simulation(FrozenModel):
         the default PML; a scene that *diverges* without a dispersive edge
         (grazing / long run) wants ``with_stabilized_pml()``; a dispersive
         medium at the wall wants the absorber this method selects.
+
+        The absorber is sized as in :meth:`with_absorber`: two wavelengths in
+        the background at the lowest source or monitor frequency, at least 40
+        layers; ``absorber_num_layers`` gives the count instead (unused when
+        no axis gets the absorber). Unlike :meth:`with_absorber`, a count the
+        scene already sets is kept (a builder may have sized the domain
+        around it), and it is a count of cells: after changing the mesh, pass
+        ``absorber_num_layers`` or call :meth:`with_absorber`. A domain too
+        small for the slabs fails :meth:`check_runnable` before a run.
         """
         crossings = self._dispersive_boundary_crossings()
         kinds = (self.boundaries.x, self.boundaries.y, self.boundaries.z)
@@ -1302,9 +2687,13 @@ class Simulation(FrozenModel):
                 chosen.append("absorber")        # PML-hostile medium at the wall
             else:
                 chosen.append("pml")             # plain open boundary
-        return self._validated_copy({
-            "boundaries": Boundaries(x=chosen[0], y=chosen[1], z=chosen[2]),
-        })
+        update = {"boundaries": Boundaries(x=chosen[0], y=chosen[1], z=chosen[2])}
+        absorber_axes = [a for a in range(3) if chosen[a] == "absorber"]
+        if absorber_axes:
+            update["absorber_num_layers"] = (
+                absorber_num_layers if absorber_num_layers is not None
+                else self._absorber_layers(absorber_axes, keep_set=True))
+        return self._validated_copy(update)
 
     @model_validator(mode="after")
     def _symmetry_plane_rules(self) -> "Simulation":
@@ -1377,18 +2766,34 @@ class Simulation(FrozenModel):
         domain = (f"[0, {realized[0]:.9g}] x [0, {realized[1]:.9g}] x "
                   f"[0, {realized[2]:.9g}] um (realized)")
 
-        def check(center, label: str) -> None:
-            for c, r in zip(center, realized):
-                if not (0.0 <= c <= r):
+        def check(center, label: str, axis=None) -> None:
+            if len(center) == 2:
+                # A plane WINDOW centre is a (u, v) pair in the plane's CYCLIC
+                # transverse order u = (axis+1) % 3, v = (axis+2) % 3
+                # (PowerMonitor docstring; engine resolve.cpp): z-normal ->
+                # (x, y), x-normal -> (y, z), y-normal -> (z, x). Compare each
+                # entry against ITS axis, not against x then y.
+                if axis is None:
+                    return  # no plane to map against; phsolver validates
+                a = _AXES.index(axis)
+                order = ((a + 1) % 3, (a + 2) % 3)
+                pairs = list(zip(center, order))
+                where = (f" ({_AXES[order[0]]}, {_AXES[order[1]]} for the "
+                         f"{axis}-normal plane)")
+            else:
+                pairs = [(c, i) for i, c in enumerate(center)]
+                where = ""
+            for c, i in pairs:
+                if not (0.0 <= c <= realized[i]):
                     raise ValueError(
-                        f"{label}.center_um {tuple(center)} is outside the "
-                        f"domain {domain}"
+                        f"{label}.center_um {tuple(center)}{where} is outside "
+                        f"the domain {domain}"
                     )
 
         for i, s in enumerate(self.sources):
             center = getattr(s, "center_um", None)  # plane waves have none
             if center is not None:
-                check(center, f"sources[{i}]")
+                check(center, f"sources[{i}]", getattr(s, "axis", None))
             elif isinstance(s, PlaneWave):
                 axis = _AXES.index(s.axis)
                 if not (0.0 <= s.position_um <= realized[axis]):
@@ -1397,26 +2802,29 @@ class Simulation(FrozenModel):
                         f"axis) is outside the domain {domain}"
                     )
         for m in self.monitors:
-            center = getattr(m, "center_um", None)  # snapshots/flux have none
+            # Snapshots and full-plane flux monitors have none; a flux WINDOW
+            # carries a 2-tuple (u, v) centre in cyclic order.
+            center = getattr(m, "center_um", None)
             if center is not None:
-                check(center, f"monitor '{m.name}'")
+                check(center, f"monitor '{m.name}'", getattr(m, "axis", None))
         return self
 
     @model_validator(mode="after")
     def _plane_wave_transverse_axes_periodic(self) -> "Simulation":
-        # NUMERICS.md section 13 validator, mirrored exactly (no float math,
-        # safe to enforce strictly): a normal-incidence plane wave requires
-        # both transverse axes periodic.
+        # NUMERICS.md sections 13 and 22, mirrored exactly (no float math, safe
+        # to enforce strictly; engine resolve.cpp): a plane wave requires both
+        # transverse axes periodic or bloch (the wrap an oblique wave's phase
+        # advance needs, set by with_oblique_plane_wave).
         kinds = (self.boundaries.x, self.boundaries.y, self.boundaries.z)
         for i, s in enumerate(self.sources):
             if not isinstance(s, PlaneWave):
                 continue
             for t, kind in enumerate(kinds):
-                if _AXES[t] != s.axis and kind != "periodic":
+                if _AXES[t] != s.axis and kind not in ("periodic", "bloch"):
                     raise ValueError(
                         f"sources[{i}] (plane_wave along {s.axis}): transverse "
-                        f"axis '{_AXES[t]}' must be periodic, got '{kind}' "
-                        "(NUMERICS.md section 13)"
+                        f"axis '{_AXES[t]}' must be periodic (or bloch), got "
+                        f"'{kind}' (NUMERICS.md sections 13 and 22)"
                     )
         return self
 
@@ -1436,9 +2844,10 @@ class Simulation(FrozenModel):
         # The
         # resolved value is marked "set" so it serialises on the wire (the engine
         # field default is off), keeping CPU and GPU runs consistent with this
-        # choice. An explicit ``subpixel`` is always respected verbatim; an
-        # explicit subpixel-ON dispersive scene only gets a warning, never an
-        # override.
+        # choice, and recorded in ``_auto_fields`` so an edit (with_changes,
+        # the with_* helpers) resolves it again for the edited scene. An
+        # explicit ``subpixel`` is always respected verbatim; an explicit
+        # subpixel-ON dispersive scene only gets a warning, never an override.
         #
         # This is a CONSTRUCTION-time convenience only. When INGESTING an existing
         # wire document (``from_wire_json`` passes context ``wire_ingest``), the
@@ -1461,14 +2870,17 @@ class Simulation(FrozenModel):
             for s in self.structures
         )
         dispersive = dispersive or anisotropic
+        auto = set()
         if "subpixel" not in self.model_fields_set:
             if not dispersive:
                 # Enable + mark set so it serialises (engine field default = off).
                 object.__setattr__(self, "subpixel", True)
                 self.__pydantic_fields_set__.add("subpixel")
+                auto.add("subpixel")
                 if "subpixel_method" not in self.model_fields_set:
                     object.__setattr__(self, "subpixel_method", "contour")
                     self.__pydantic_fields_set__.add("subpixel_method")
+                    auto.add("subpixel_method")
             # Dispersive: leave ``subpixel`` at its unset default (off, omitted
             # from the wire = the engine default) — the auto-fallback.
         elif self.subpixel:
@@ -1491,7 +2903,14 @@ class Simulation(FrozenModel):
             if "subpixel_method" not in self.model_fields_set:
                 object.__setattr__(self, "subpixel_method", "contour")
                 self.__pydantic_fields_set__.add("subpixel_method")
-        if self.subpixel and dispersive and "subpixel" in self.model_fields_set:
+                auto.add("subpixel_method")
+        # an edit leaves these out, so this resolution runs again (_validated_copy)
+        self._auto_fields = self._auto_fields | auto
+        # the advice below is moot once the user set a CFS-active alpha
+        # (with_stabilized_pml, or pml_alpha_max by hand)
+        stabilized = ("pml_alpha_max" in self.model_fields_set and "pml_alpha_max" not in self._auto_fields
+                      and not self._pml_alpha_is_cfs_inert())
+        if self.subpixel and dispersive and "subpixel" in self.model_fields_set and not stabilized:
             warnings.warn(
                 "subpixel smoothing is enabled on a dispersive (Lorentz) scene. "
                 "Dispersive scenes with default-profile PML can diverge "
@@ -1509,59 +2928,68 @@ class Simulation(FrozenModel):
         return self
 
     @model_validator(mode="after")
-    def _warn_ade_resonance_margin(self, info) -> "Simulation":
-        """Warn when a Lorentz pole sits close to the ADE stability edge.
+    def _ade_stability(self, info) -> "Simulation":
+        """NUMERICS.md §19.4, mirrored from the engine's validate() (beta review
+        CORE-02): every Lorentz pole needs omega0*dt < 2, and then the medium's
+        discrete permittivity at the temporal Nyquist must cover the largest
+        spatial eigenvalue,
 
-        NUMERICS.md section 19 states the bound ``omega0*dt < 2`` and the
-        engine's ``validate()`` enforces it -- but that bound is not tight.
-        Measured (benchmarks/meep n03, Meep's own SiO2 fit carried across
-        pole-for-pole): ``omega0*dt = 1.064`` PASSES validation and then
-        diverges with ``non_finite_energy``; the same scene is stable at 0.75
-        and below. Lowering the Courant is what fixes it --
-        ``with_stabilized_pml()`` does not, so the dispersive-PML warning
-        alongside this one points at a different mechanism.
+            eps_inf - sum_Lorentz delta_eps*x/(1-x) - sum_Drude (wp*dt/2)^2 >= courant^2,
+            x = (omega0*dt/2)^2,
 
-        The trap is that nothing about such a scene looks aggressive: a
-        faithful fit of a transparent glass puts its resonance in the UV, which
-        is exactly what pushes ``omega0*dt`` up. Warn on the margin rather than
-        wait for the abort.
-        """
-        if (info.context or {}).get("wire_ingest"):
+        at the resolved dt. The omega0*dt < 2 rule alone passed specs that are
+        certain to diverge: a telecom glass fit at omega0*dt = 1.06 (it was a
+        warning here), a Drude metal with eps_inf near 1 at a 20 nm mesh. The
+        message quotes the largest courant that holds and the grid refinement
+        that would. Skipped on a document being loaded, where the engine is the
+        authority.
+        (The bound is also in materials.py's fit helpers; one copy should
+        serve both.)"""
+        if _loaded_document(info):
             return self
-        poles = []
-        for structure in self.structures:
-            m = structure.medium
-            for pole in _medium_poles(m):
-                poles.append((structure.name or "structure",
-                              pole.resonance_frequency_hz))
-        if not poles:
-            return self
+        courant = float(self.run.courant)
         dt = 2.0 * _EPS0 / self._two_eps0_over_dt()
-        worst = max(poles, key=lambda p: p[1])
-        w0_dt = 2.0 * math.pi * worst[1] * dt
-        if w0_dt > _ADE_MARGIN:
-            warnings.warn(
-                f"Lorentz pole in {worst[0]!r} gives omega0*dt = {w0_dt:.2f}. "
-                f"NUMERICS.md section 19's bound is 2 and the engine accepts "
-                "anything below it, but that bound is NOT tight: a measured "
-                "case at 1.06 passes validation and then aborts with "
-                "non_finite_energy (stable at 0.75). Lower run.courant "
-                f"(to about {self.run.courant * _ADE_MARGIN / w0_dt:.2f} here) "
-                "if the run diverges. Note with_stabilized_pml() does NOT help "
-                "this failure — it is the ADE recursion, not the PML.",
-                UserWarning,
-                stacklevel=2,
-            )
+        for i, st in enumerate(self.structures):
+            medium = st.medium
+            single = getattr(medium, "lorentz", None)
+            lorentz = []
+            for k, pole in enumerate(_medium_poles(medium)):
+                w0 = 2.0 * math.pi * pole.resonance_frequency_hz
+                field = "lorentz" if (single is not None and k == 0) else \
+                    f"poles[{k - (1 if single is not None else 0)}]"
+                if not w0 * dt < 2.0:
+                    raise ValueError(
+                        f"structures[{i}].medium.{field}: omega0*dt must be < 2 for ADE stability "
+                        f"(NUMERICS.md §19.4); got omega0*dt = {w0 * dt:.9g}. Refine the grid (a smaller dl "
+                        "lowers dt) or move the resonance below the time-step Nyquist.")
+                lorentz.append((w0, float(pole.delta_eps)))
+            drude = [2.0 * math.pi * p.plasma_frequency_hz for p in (getattr(medium, "drude", None) or ())]
+            if not lorentz and not drude:
+                continue
+            eps_inf = float(medium.permittivity)
+            e_nyq = _ade_nyquist_eps(eps_inf, lorentz, drude, dt)
+            if e_nyq >= courant * courant:
+                continue
+            c_max = math.floor(_ade_max_courant(eps_inf, lorentz, drude, dt, courant) * 1000.0) / 1000.0
+            dt_max = _ade_max_dt(eps_inf, lorentz, drude, dt, courant)
+            finer = math.ceil(dt / dt_max * 100.0) / 100.0
+            lower = f"lower run.courant to <= {c_max:.3f}, or " if c_max > 0.0 else ""
+            raise ValueError(
+                f"structures[{i}].medium: ADE stability (NUMERICS.md §19.4) needs the discrete Nyquist "
+                "permittivity eps_inf - sum_Lorentz delta_eps*x/(1-x) - sum_Drude (wp*dt/2)^2 "
+                f"(x = (omega0*dt/2)^2) >= courant^2 = {courant * courant:.9g}; got {e_nyq:.9g} at dt = "
+                f"{dt:.9g} s: {lower}refine the grid until dt <= {dt_max:.9g} s (about {finer:.2f}x finer at "
+                "this courant).")
         return self
 
     @model_validator(mode="after")
     def _warn_bloch_with_undamped_poles(self, info) -> "Simulation":
         """Bloch wrap x low-loss resonance: warn that stability is Courant-
-        NON-monotone (benchmarks/meep FINDINGS.md F6).
+        NON-monotone (validation/suites/meep FINDINGS.md F6).
 
         Measured on the Meep material-dispersion scene (two Lorentz poles, a
         4-cell Bloch axis): k = 1.8 (2 pi/a) is stable at courant 0.99 but
-        DIVERGES at 0.7, while k = 2.1 diverges at 0.99 and is stable at 0.7 —
+        DIVERGES at 0.7, while k = 2.1 diverges at 0.99 and is stable at 0.7 ,
         a resonance between dt, the undamped pole, and the Bloch phase, not a
         CFL margin. Until the NUMERICS 19/22 preflight covers the joint
         (pole, k, dt) spectrum, surface the failure mode and the remedy (a
@@ -1634,7 +3062,7 @@ class Simulation(FrozenModel):
         The engine accepts such a source and runs it, but the boundary layers
         absorb it in place, so every recorded spectrum comes out physically
         meaningless and near zero with no diagnostic. Construction does NOT
-        warn (geometry-only *shell* simulations legitimately carry a
+        warn (geometry-only simulations legitimately carry a
         placeholder dipole that is never run); :func:`photonhub.run_local`
         warns before launching. Uniform grids only (the band is
         ``layers * dl``). On a §20 symmetry axis the band is one-sided: the
@@ -1671,6 +3099,33 @@ class Simulation(FrozenModel):
                     break
         return hits
 
+    def _pml_band_hz(self) -> float:
+        """The frequency the dispersive PML profile is anchored to: the
+        highest source carrier, else the band the scene declares (wlen0_um,
+        then its shortest wlens_um), else 1550 nm."""
+        carriers = [s.source_time.freq0_hz for s in self.sources
+                    if getattr(s, "source_time", None) is not None]
+        if carriers:
+            return max(carriers)
+        declared = []
+        if self.wlen0_um is not None:
+            declared = [float(self.wlen0_um)]
+        elif self.wlens_um is not None:
+            wlens = self.wlens_um if isinstance(self.wlens_um, (tuple, list)) else (self.wlens_um,)
+            declared = [min(float(w) for w in wlens)]
+        if declared and declared[0] > 0.0:
+            return _C0_M_PER_S / (declared[0] * 1e-6)
+        # No usable band (none declared, or a non-positive wavelength): the
+        # nominal one, never a negative or infinite alpha.
+        return _C0_M_PER_S / (_NOMINAL_BAND_WLEN_UM * 1e-6)
+
+    def _pml_alpha_is_cfs_inert(self) -> bool:
+        """Whether ``pml_alpha_max`` is below ``_CFS_INERT_SCALE * eps0 *
+        omega0`` of the band (:meth:`_pml_band_hz`), too low to cure the
+        dispersive late-time divergence: the one test the explicit-profile
+        warning and the subpixel advice share."""
+        return self.pml_alpha_max < _CFS_INERT_SCALE * 2.0 * math.pi * _EPS0 * self._pml_band_hz()
+
     @model_validator(mode="after")
     def _auto_stabilize_dispersive_pml(self, info) -> "Simulation":
         # A dispersive (Lorentz) scene with ANY PML face and the default
@@ -1687,9 +3142,10 @@ class Simulation(FrozenModel):
         #
         # Mirroring _resolve_subpixel_default: when the user has NOT tuned any
         # PML knob, AUTO-APPLY the CFS stabilization — kappa_max 5.0 and the
-        # GENTLE alpha_max 0.1*(2*eps0/dt) (_AUTO_PML_ALPHA_SCALE; the reference-
-        # parity 0.9 dose reflects ~35% of a propagating guided mode at the
-        # default 12 layers), the two levers that never change the slab
+        # band-anchored alpha_max eps0*omega0 (_AUTO_PML_ALPHA_SCALE, omega0
+        # from the highest source carrier; the reference-parity 0.9*2*eps0/dt
+        # dose reflects ~35% of a propagating guided mode at the default 12
+        # layers), the two levers that never change the slab
         # thickness (so they can never over-thicken a small domain, unlike the
         # layer bump — engine resolve.cpp rejects 2*num_layers >= n_cells). Layer count and sigma_max stay at their
         # defaults; with_stabilized_pml() adds the layer bump for a tighter
@@ -1713,22 +3169,24 @@ class Simulation(FrozenModel):
             # Auto-stabilize: raise kappa + the CFS alpha (fit-safe), mark set so
             # they ride the wire. sigma_max (default 1.5, already in the stabilized profile's
             # 2*eps0/dt convention) and the 12-layer count are left untouched.
-            # The alpha DOSE is _AUTO_PML_ALPHA_SCALE (0.1*2*eps0/dt), NOT
-            # with_stabilized_pml's 0.9: at the default 12 layers
-            # the 0.9 dose de-tunes the slab for PROPAGATING waves and reflects
-            # ~35% of a guided mode crossing the boundary (measured 2026-07-17;
-            # see _AUTO_PML_ALPHA_SCALE above), while 0.1 keeps ~3x the measured
-            # stabilization threshold with reflection back at the ~1e-3 level.
+            # The alpha DOSE is _AUTO_PML_ALPHA_SCALE * eps0*omega0 at the
+            # highest carrier, the same S/m at every resolution (see
+            # _AUTO_PML_ALPHA_SCALE above): at the reflection floor of the
+            # default profile, 2x above the lowest dose the rod probe holds
+            # flat.
             object.__setattr__(self, "pml_kappa_max", _STABLE_PML_KAPPA_MAX)
             self.__pydantic_fields_set__.add("pml_kappa_max")
             object.__setattr__(self, "pml_alpha_max",
-                               _AUTO_PML_ALPHA_SCALE * self._two_eps0_over_dt())
+                               _AUTO_PML_ALPHA_SCALE * 2.0 * math.pi * _EPS0 * self._pml_band_hz())
             self.__pydantic_fields_set__.add("pml_alpha_max")
+            # the alpha is the grid's: an edit leaves both out so they resolve again
+            self._auto_fields = self._auto_fields | {"pml_kappa_max", "pml_alpha_max"}
             return self
         # The user owns the PML profile — respect it verbatim, but warn if the
-        # alpha they set is still CFS-inert (< 0.5% of the sigma peak): the
-        # divergence lever is unaddressed and the run may drift late-time.
-        if self.pml_alpha_max < _CFS_INERT_FRAC * self._pml_sigma_peak_Sm():
+        # alpha they set is still CFS-inert (below _CFS_INERT_SCALE * eps0 *
+        # omega0 of the band): the divergence lever is unaddressed and the run
+        # may drift late-time.
+        if self._pml_alpha_is_cfs_inert():
             warnings.warn(
                 "dispersive (Lorentz) scene with PML faces and an explicitly-set "
                 "but CFS-inert PML profile: an undamped pole can trap a high-Q "
@@ -1746,7 +3204,9 @@ class Simulation(FrozenModel):
     def _flux_planes_inside_domain(self) -> "Simulation":
         # Best-effort mirror of the engine's flux-plane bound (NUMERICS.md
         # section 12: snapped plane index 1 <= kp <= n_axis - 1); phsolver
-        # remains authoritative at exact half-cell positions.
+        # remains authoritative at exact half-cell positions. The engine's
+        # second rule, clearing the boundary layers, is a run check
+        # (check_runnable): a plotted scene or a shell may carry such a plane.
         dl = self.grid.dl_um
         for m in self.monitors:
             if not isinstance(m, PowerMonitor):
@@ -1770,6 +3230,226 @@ class Simulation(FrozenModel):
                 )
         return self
 
+    # ---- the engine's cheap checks (beta review INT-06) ------------------------
+    # Each mirrors a phsolver validate() rule the client has everything for (the
+    # realized cells, dt, the sources' spectra), so a mistake fails before a
+    # quote or the solver. The rules on a scene's own sources, media and
+    # smoothing are raised at construction, below. The rules on whether the
+    # scene can run at all (the boundary slabs fit, a flux plane clears them,
+    # a cw run outlasts its ramp, there is a source) are check_runnable's: a
+    # scene built to plot or to serve a mode solve may break them. A document
+    # loaded from the wire skips the construction rules: the engine is the
+    # authority on an ingested document, and one that breaks a rule must
+    # still load so it can be fixed.
+
+    @model_validator(mode="after")
+    def _monitor_freqs_in_source_band(self, info) -> "Simulation":
+        """engine resolve.cpp (NUMERICS.md §12): the first source is the
+        normalization source; every field or flux monitor frequency must lie
+        within 12 fwidth of its freq0 (beyond that 1/(A0*S(f)) is not
+        representable in float32), or be the carrier of a cw one. Warns (beta
+        review API-06) where the pulse's spectral amplitude is below 1e-3 of
+        its peak: the normalized spectrum there is noise over almost no drive,
+        silently orders of magnitude off."""
+        if _loaded_document(info) or not self.sources:
+            return self
+        pulse = self.sources[0].source_time
+        f0 = float(pulse.freq0_hz)
+        for m in self.monitors:
+            if not isinstance(m, (ProfileMonitor, PowerMonitor)):
+                continue
+            for k, f in enumerate(m.freqs_hz):
+                f = float(f)
+                if isinstance(pulse, CW):
+                    if abs(f - f0) > 1e-9 * f0:
+                        raise ValueError(
+                            f"monitor '{m.name}': freqs_hz[{k}] = {f:.9g} Hz is not the carrier {f0:.9g} Hz "
+                            "of the cw source that normalizes it (sources[0]); under a cw source every field "
+                            "or flux monitor reads the carrier only (NUMERICS.md §5-CW, §12). Set freqs_hz to "
+                            "the carrier, or put a GaussianPulse source first.")
+                    continue
+                fwidth = float(pulse.fwidth_hz)
+                sigmas = abs(f - f0) / fwidth
+                if sigmas > 12.0:
+                    raise ValueError(
+                        f"monitor '{m.name}': freqs_hz[{k}] = {f:.6g} Hz is {sigmas:.3g} fwidth from the freq0 "
+                        f"{f0:.6g} Hz of the source that normalizes it (sources[0], fwidth {fwidth:.6g} Hz); "
+                        "beyond 12 fwidth the 1/(A0*S(f)) normalization is not representable "
+                        "(NUMERICS.md §12). Keep monitor frequencies in the pulse's band: "
+                        "GaussianPulse.for_band(freqs_hz=...) fits a pulse to them.")
+        # the advice is construction's: an edit's copy re-checks the refusal
+        # above but repeats the advice only when the edit brings it in
+        weak = self._weak_drive()
+        if weak and not (info.context or {}).get("wire_ingest") and not _advised_before("_weak_drive", weak):
+            amplitude, name, f = min(weak)
+            names = sorted({w[1] for w in weak})
+            warnings.warn(
+                f"monitor(s) {names} read frequencies where the source that normalizes them (sources[0], "
+                f"freq0 {f0:.6g} Hz, fwidth {float(pulse.fwidth_hz):.6g} Hz) has under "
+                f"{_WEAK_SPECTRAL_AMPLITUDE:g} of its peak spectral amplitude (monitor {name!r} at {f:.6g} Hz: "
+                f"{amplitude:.1e}). The spectrum there is noise over almost no drive and can be off by orders "
+                "of magnitude. Keep monitor frequencies in the pulse's band: "
+                "GaussianPulse.for_band(freqs_hz=...) fits a pulse to them.",
+                UserWarning, stacklevel=_construction_caller_stacklevel())
+        return self
+
+    def _weak_drive(self) -> list:
+        """``[(amplitude, monitor name, frequency)]`` for every field or flux
+        monitor frequency within the 12-fwidth band where the first source's
+        pulse has under ``_WEAK_SPECTRAL_AMPLITUDE`` of its peak spectral
+        amplitude (none under a cw source)."""
+        if not self.sources or isinstance(self.sources[0].source_time, CW):
+            return []
+        pulse = self.sources[0].source_time
+        f0, fwidth = float(pulse.freq0_hz), float(pulse.fwidth_hz)
+        weak = []
+        for m in self.monitors:
+            if isinstance(m, (ProfileMonitor, PowerMonitor)):
+                for f in map(float, m.freqs_hz):
+                    amplitude = pulse.spectral_amplitude(f)
+                    if abs(f - f0) <= 12.0 * fwidth and amplitude < _WEAK_SPECTRAL_AMPLITUDE:
+                        weak.append((amplitude, m.name, f))
+        return weak
+
+    def _typed_wavelengths(self) -> list:
+        """``[(source index, freq0_hz)]`` for every source whose free-space
+        wavelength is over 1000 times the domain."""
+        extent_m = max(self._realized_um()) * 1e-6
+        return [(i, float(src.source_time.freq0_hz)) for i, src in enumerate(self.sources)
+                if _C0_M_PER_S / float(src.source_time.freq0_hz) > 1e3 * extent_m]
+
+    def _typed_frequencies(self) -> list:
+        """The ``freq0_hz`` of :meth:`_typed_wavelengths`, which an edit that
+        moves the sources compares (their indices shift)."""
+        return [f0 for _, f0 in self._typed_wavelengths()]
+
+    @model_validator(mode="after")
+    def _warn_non_optical_source(self, info) -> "Simulation":
+        """Beta review API-06: a free-space wavelength over 1000 times the
+        domain is almost always a wavelength typed where a frequency is
+        expected (``freq0_hz=1.55`` for 1.55 um), which runs to zeros. An edit
+        repeats it only when the edit brings it in."""
+        if (info.context or {}).get("wire_ingest") or not self.sources:
+            return self
+        extent_m = max(self._realized_um()) * 1e-6
+        long = self._typed_wavelengths()
+        if long and not _advised_before("_typed_frequencies", [f0 for _, f0 in long]):
+            i, f0 = long[0]
+            more = f" (and {len(long) - 1} more source(s))" if len(long) > 1 else ""
+            warnings.warn(
+                f"sources[{i}].source_time.freq0_hz = {f0:.6g} Hz{more} is a free-space wavelength of "
+                f"{_C0_M_PER_S / f0:.3g} m, over 1000 times the {extent_m * 1e6:.4g} um domain: a wavelength "
+                "typed where a frequency is expected? Frequencies are in Hz; 1.55 um is "
+                f"{_C0_M_PER_S / 1.55e-6:.6g} Hz (the speed of light over the wavelength).",
+                UserWarning, stacklevel=_construction_caller_stacklevel())
+        return self
+
+    @model_validator(mode="after")
+    def _full_tensor_subpixel_rules(self, info) -> "Simulation":
+        """engine resolve.cpp (NUMERICS.md §10.1/§16.6/§16.11): the full
+        off-diagonal methods ``tensor_full`` and ``contour_full`` are lossless
+        and uniform-grid only. Refused with an absorber axis, a dispersive
+        medium, a PEC structure (beta review SUB-01: the tensor overrides the
+        conductor's pinned field, so a curved conductor diverges and a box
+        leaks into its inside) or a graded axis (INT-07)."""
+        if _loaded_document(info) or not self.subpixel:
+            return self
+        method = self.subpixel_method
+        if method not in ("tensor_full", "contour_full"):
+            return self
+        diag = "tensor" if method == "tensor_full" else "contour_diag"
+        use = f"use subpixel_method='{diag}' (the diagonal form)"
+        if "absorber" in (self.boundaries.x, self.boundaries.y, self.boundaries.z):
+            raise ValueError(
+                f"subpixel_method='{method}' with an absorber boundary: the full off-diagonal tensor is "
+                "lossless-only and the absorber folds a graded conductivity into the same cells "
+                f"(NUMERICS.md §16.6/§16.11); {use}, or PML boundaries.")
+        for i, st in enumerate(self.structures):
+            if st.medium.is_dispersive:
+                raise ValueError(
+                    f"subpixel_method='{method}' with the dispersive medium of structures[{i}]: the ADE "
+                    "correction pairs with the diagonal update the full tensor overwrites "
+                    f"(NUMERICS.md §16.6/§16.11); {use}.")
+            if st.medium.pec:
+                raise ValueError(
+                    f"subpixel_method='{method}' with the PEC structures[{i}]: the full tensor does not honour "
+                    "the PEC pin (NUMERICS.md §10.1/§16.6), so a curved conductor diverges and a box leaks "
+                    f"field inside it; {use}.")
+        graded = [_AXES[a] for a in range(3) if self._axis_coords_um(a)]
+        if graded:
+            raise ValueError(
+                f"subpixel_method='{method}' on a graded mesh (axes {', '.join(graded)}): full-tensor "
+                f"smoothing on a graded mesh is deferred (NUMERICS.md §16.6/§16.11); {use}, 'volume', or "
+                "subpixel=False.")
+        return self
+
+    def check_runnable(self) -> None:
+        """Raise ``ValueError`` naming every rule this simulation breaks that
+        stops the solver from running it, each with its field and the fix. A
+        scene may break these and still serve a plot or a mode solve, so
+        construction allows them; :func:`photonhub.run_local` calls this before
+        it starts the solver. The rules mirror the solver's own validation:
+
+        - at least one source;
+        - on a PML or absorber axis the slabs (two, one on a symmetry axis)
+          leave cells between them: slabs * layers < cells (NUMERICS.md
+          §11/§21);
+        - a flux plane clears the boundary layers of its axis, L+1 <= kp <=
+          n-L-1, as the flux reads E at plane kp and H at kp-1 and kp
+          (NUMERICS.md §12; uniform axes, the solver judges graded ones);
+        - the run outlasts every cw source's ramp (NUMERICS.md §5-CW)."""
+        problems = []
+        if not self.sources:
+            problems.append(
+                "sources: at least one source is required to run a simulation; add a source (or ports= "
+                "with source=). A simulation without sources serves mode solves and plots.")
+        counts = resolved_cell_counts(self.size_um, self.grid, self._axis_min_cells())
+        for a, axis in enumerate(_AXES):
+            kind = getattr(self.boundaries, axis)
+            if kind not in ("pml", "absorber"):
+                continue
+            field = "pml_num_layers" if kind == "pml" else "absorber_num_layers"
+            layers = getattr(self, field)
+            slabs = 1 if self.symmetry[a] != 0 else 2
+            if slabs * layers >= counts[a]:
+                problems.append(
+                    f"boundaries.{axis}: {slabs} * {field} ({slabs * layers}) must be < the {counts[a]} "
+                    f"cells of axis {axis!r} (size_um[{a}] = {self.size_um[a]:g} um): the {kind} slabs "
+                    f"overlap (NUMERICS.md §11/§21). Enlarge size_um[{a}], refine the mesh or lower {field}.")
+        dl = self.grid.dl_um
+        for m in self.monitors:
+            if not isinstance(m, PowerMonitor):
+                continue
+            a = _AXES.index(m.axis)
+            kind = getattr(self.boundaries, m.axis)
+            layers = {"pml": self.pml_num_layers, "absorber": self.absorber_num_layers}.get(kind, 0)
+            if not layers or self._axis_coords_um(a) is not None:
+                continue
+            n = realized_cells(self.size_um[a], dl, self._axis_min_cells()[a])
+            kp = snapped_plane_index(m.position_um, dl)
+            if not (layers + 1 <= kp <= n - layers - 1):
+                label = "PML" if kind == "pml" else "absorber"
+                where = (f"a position_um between {(layers + 1) * dl:g} and {(n - layers - 1) * dl:g} um"
+                         if n - layers - 1 >= layers + 1 else "no position on this axis; enlarge it")
+                problems.append(
+                    f"monitor '{m.name}': flux plane at position_um {m.position_um} snaps to {m.axis}-plane "
+                    f"index {kp}, inside the {layers}-layer {label} on axis {m.axis!r}, where the boundary "
+                    f"attenuates the flux (NUMERICS.md §12). It needs {layers + 1} <= kp <= {n - layers - 1}: "
+                    f"{where}.")
+        ramps = [(i, src.source_time) for i, src in enumerate(self.sources) if isinstance(src.source_time, CW)]
+        if ramps and (self.run.n_steps is not None or self.run.run_time_s is not None):
+            total = (self.run.n_steps * (2.0 * _EPS0 / self._two_eps0_over_dt()) if self.run.n_steps is not None
+                     else float(self.run.run_time_s))
+            for i, pulse in ramps:
+                ramp = float(pulse.ramp_cycles) / float(pulse.freq0_hz)
+                if total < ramp:
+                    problems.append(
+                        f"sources[{i}].source_time: the run ({total:.4g} s) is shorter than the cw ramp "
+                        f"({ramp:.4g} s = ramp_cycles / freq0_hz), so the drive never reaches full amplitude "
+                        "(NUMERICS.md §5-CW). Lengthen the run (run_time_s or n_steps) or lower ramp_cycles.")
+        if problems:
+            raise ValueError("this simulation cannot run:\n" + "\n".join(problems))
+
     @classmethod
     def from_wire_json(cls, text: Union[str, bytes]) -> "Simulation":
         """Strictly-typed ingestion of wire JSON, matching the engine's
@@ -1785,7 +3465,9 @@ class Simulation(FrozenModel):
             text = text[1:]
         # context wire_ingest: do NOT apply the D2 construction-time subpixel
         # default to a parsed document — absent means the engine default (off),
-        # so older docs round-trip byte-identically (see _resolve_subpixel_default).
+        # so older docs round-trip byte-identically (see _resolve_subpixel_default),
+        # except that a subpixel-on document without a method gains the key
+        # (see _wire_exclude).
         return cls.model_validate_json(text, strict=True,
                                        context={"wire_ingest": True})
 
@@ -1816,9 +3498,13 @@ class Simulation(FrozenModel):
         # Omit additive-optional fields that were never explicitly set so
         # older documents round-trip byte-identically and stay consumable by
         # earlier-minor parsers that reject unknown keys; the engine applies
-        # the same defaults. pml_num_layers entered the wire in schema 1.1.0
+        # the same defaults. (subpixel_method is the exception, below.) pml_num_layers entered the wire in schema 1.1.0
         # (default 12); run.shutoff in 1.3.0 (default 1e-5, NUMERICS.md §7).
         exclude: dict = {}
+        for _f in _decl.DECLARATIVE_FIELDS:
+            exclude[_f] = True     # client-only setup fields (never on the wire)
+        exclude["origin_um"] = True
+        run_exclude = {"transits"}
         if "pml_num_layers" not in self.model_fields_set:
             exclude["pml_num_layers"] = True
         # The §11 CPML profile knobs entered the wire in schema 1.8.0 (defaults
@@ -1849,10 +3535,14 @@ class Simulation(FrozenModel):
         # the document and golden specs round-trip byte-identically.
         if "dft_precision" not in self.model_fields_set:
             exclude["dft_precision"] = True
-        # subpixel_method entered the wire in schema 1.7.0 (default "volume",
-        # NUMERICS.md §16.5); omit when unset so earlier-minor parsers accept the
-        # document and golden specs round-trip byte-identically.
-        if "subpixel_method" not in self.model_fields_set:
+        # subpixel_method entered the wire in schema 1.7.0 (NUMERICS.md §16.5);
+        # omit it when unset and smoothing is off, so earlier-minor parsers
+        # accept the document and golden specs round-trip byte-identically.
+        # With smoothing on it is always written: the engine's absent default
+        # has differed from the model's (volume against contour), so an
+        # omitted key ran an operator other than the one the model reports
+        # (beta review INT-01, M8).
+        if "subpixel_method" not in self.model_fields_set and not self.subpixel:
             exclude["subpixel_method"] = True
         # symmetry entered the wire in schema 1.11.0 (NUMERICS.md §20); omit when
         # all-zero (the no-symmetry default) so earlier-minor parsers accept the
@@ -1860,7 +3550,12 @@ class Simulation(FrozenModel):
         if self.symmetry == (0, 0, 0):
             exclude["symmetry"] = True
         if "shutoff" not in self.run.model_fields_set:
-            exclude["run"] = {"shutoff"}
+            run_exclude.add("shutoff")
+        # A zero guard means the legacy energy-only rule and is omitted so
+        # older GPU/cloud parsers receive the same wire as before this key.
+        if not self.run.dft_shutoff:
+            run_exclude.add("dft_shutoff")
+        exclude["run"] = run_exclude
         return exclude or None
 
     def to_wire_dict(self) -> dict:
@@ -1870,6 +3565,11 @@ class Simulation(FrozenModel):
                                exclude=self._wire_exclude())
 
     def to_wire_json(self, indent: int = 2) -> str:
+        """Serialize the resolved solver document as JSON with ``indent`` spacing.
+
+        Use the same aliases and exclusions as :meth:`to_wire_dict`. Client
+        authoring state, including declared ports and wavelengths, is omitted.
+        This is the solver contract, not a complete authoring-state round trip."""
         return self.model_dump_json(by_alias=True, exclude_none=True,
                                     exclude=self._wire_exclude(), indent=indent)
 
@@ -1924,13 +3624,16 @@ class Simulation(FrozenModel):
     # loaded when a plot is actually requested.
 
     def plot(self, x=None, y=None, z=None, *, ax=None, legend=True,
-             grid=False, **kw):
+             grid=False, unfold=True, **kw):
         """2D analytic cross-section of the scene on a cut plane (exactly one
         of x/y/z, in microns). ``grid=True`` overlays the Yee mesh cell edges
-        (the resolution sanity-check). Returns a matplotlib ``Axes``. See
-        :func:`photonhub.viz.plot`."""
+        (the resolution sanity-check). ``unfold`` (the default) mirrors a
+        NUMERICS §20 half domain back into the whole device; pass
+        ``unfold=False`` for the reduced domain the solver steps. Returns a
+        matplotlib ``Axes``. See :func:`photonhub.viz.plot`."""
         from ..viz import plot as _plot
-        return _plot(self, x=x, y=y, z=z, ax=ax, legend=legend, grid=grid, **kw)
+        return _plot(self, x=x, y=y, z=z, ax=ax, legend=legend, grid=grid,
+                     unfold=unfold, **kw)
 
     def plot_eps(self, *args, **kwargs):
         """Deprecated alias for :meth:`plot_index` (renamed 2026-09)."""
@@ -1945,12 +3648,19 @@ class Simulation(FrozenModel):
         return self.plot_index(*args, **kwargs)
 
     def plot_index(self, x=None, y=None, z=None, *, ax=None, cmap=None,
-                 grid=False, **kw):
-        """Rasterized permittivity heatmap (the §9 hard sample the solver
-        takes) on a cut plane. ``grid=True`` overlays the cell edges. Returns a
-        matplotlib ``Axes``. See :func:`photonhub.viz.plot_index`."""
+                 grid=False, unfold=True, **kw):
+        """Draw a heatmap of permittivity sampled on the mesh on a cut plane.
+
+        By default, follow ``Simulation.subpixel``: use the §16 volume-fraction
+        average when smoothing is enabled and the §9 hard point sample otherwise.
+        ``grid=True`` overlays the cell edges.
+        ``unfold`` (the default) mirrors a NUMERICS §20 half domain back into
+        the whole device; pass ``unfold=False`` for the reduced domain the
+        solver steps. Returns a matplotlib ``Axes``. See
+        :func:`photonhub.viz.plot_index`."""
         from ..viz import plot_index as _plot_eps
-        return _plot_eps(self, x=x, y=y, z=z, ax=ax, cmap=cmap, grid=grid, **kw)
+        return _plot_eps(self, x=x, y=y, z=z, ax=ax, cmap=cmap, grid=grid,
+                         unfold=unfold, **kw)
 
     def plot_3d(self, **kw):
         """Interactive 3D geometry as a plotly ``Figure`` (requires the

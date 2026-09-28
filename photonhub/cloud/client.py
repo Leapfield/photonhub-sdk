@@ -73,6 +73,12 @@ def _parse_detail(body: str) -> Any:
 
 
 class HttpClient:
+    """HTTP transport for the configured PhotonHub cloud service.
+
+    Requests use the API key and request timeout in ``cfg``. GET requests retry
+    server and network errors with bounded backoff. POST and DELETE requests
+    are attempted once. HTTP errors raise ``CloudError`` with parsed details.
+    Result redirects do not forward the bearer token to the redirected URL."""
     def __init__(self, cfg: CloudConfig):
         self.cfg = cfg
 
@@ -149,6 +155,13 @@ class HttpClient:
         return urllib.parse.quote(safe, safe="")
 
     def get_json(self, path: str, *, deadline: Optional[float] = None) -> dict:
+        """GET a service-relative path and decode its JSON response.
+
+        Enforce the JSON body-size limit. Response-body or socket-read timeouts
+        can propagate as ``TimeoutError``, even without a deadline. An optional
+        monotonic ``deadline`` bounds request opening and retry waits; expiry
+        also raises ``TimeoutError``. Other transport, body, or decoding
+        failures raise ``CloudError``."""
         try:
             with self._open("GET", path, deadline=deadline) as response:
                 raw = self._read_limited(
@@ -162,6 +175,10 @@ class HttpClient:
         return self._decode_json(raw, f"GET {path}")
 
     def post_json(self, path: str, body: dict) -> dict:
+        """POST a JSON body once to a service-relative path and decode the response.
+
+        Enforce the JSON body-size limit. Transport, body, and decoding failures
+        raise ``CloudError``. The request is not retried."""
         try:
             with self._open("POST", path, body=body) as response:
                 raw = self._read_limited(
@@ -173,6 +190,9 @@ class HttpClient:
         return self._decode_json(raw, f"POST {path}")
 
     def delete(self, path: str) -> int:
+        """Send one DELETE request to a service-relative path and return its status.
+
+        HTTP errors raise ``CloudError``. The request is not retried."""
         with self._open("DELETE", path) as r:
             return r.status
 
@@ -251,7 +271,10 @@ class HttpClient:
                     max_bytes: Optional[int] = None) -> int:
         """Stream one GET response into ``dest`` with a hard byte ceiling.
 
-        A rejected, truncated, or failed download leaves no partial file.
+        Overwrite an existing destination. A rejected, truncated, or failed
+        transfer removes ``dest``, even if it existed before the call or the
+        request failed before opening it. Use a new temporary destination to
+        retain a previous result. The parent directory must exist.
         Returns the number of bytes written.
         """
         limit = self._download_limit(
@@ -296,12 +319,21 @@ class HttpClient:
     # --- typed endpoint helpers -------------------------------------------
 
     def whoami(self) -> dict:
+        """Fetch the identity associated with the configured API key.
+
+        Response-body or socket-read timeouts can propagate as ``TimeoutError``.
+        Other transport and service errors raise ``CloudError``."""
         return self.get_json("/v1/auth/whoami")
 
     def account(self) -> dict:
+        """Fetch the service account balance and usage response without normalization."""
         return self.get_json("/v1/account")
 
     def estimate(self, spec: dict, *, device=None, solver=None) -> dict:
+        """Request a quote for a solver document and optional device and solver.
+
+        Return the raw service response. This transport method does not compare
+        grids, enforce a spend limit, or submit a job."""
         body = {"spec": spec}
         if device is not None:
             body["device"] = device
@@ -310,12 +342,20 @@ class HttpClient:
         return self.post_json("/v1/estimate", body)
 
     def create_api_key(self, name: str = "default") -> dict:
+        """Request a new API key with ``name`` and return the service response.
+
+        Treat the returned plaintext token as a secret."""
         return self.post_json("/v1/keys", {"name": name})
 
     def list_gpus(self) -> list:
+        """Return the service's GPU list, or an empty list when its key is absent."""
         return self.get_json("/v1/gpus").get("gpus", [])
 
     def list_jobs(self) -> list[dict]:
+        """Fetch recent job records from the service.
+
+        Raise ``CloudError`` if the response does not contain a list of dicts.
+        Ordering and retention depend on the service."""
         payload = self.get_json("/v1/jobs")
         jobs = payload.get("jobs")
         if (not isinstance(jobs, list)
@@ -325,6 +365,11 @@ class HttpClient:
 
     def submit_job(self, spec: dict, *, name=None, device=None,
                    solver=None, quote_id=None) -> dict:
+        """Submit a solver document with the supplied optional job metadata.
+
+        Return the service response. This low-level method does not perform
+        preflight or enforce a spend limit. Use ``ph.cloud.submit`` for the
+        checked submission path."""
         body: dict = {"spec": spec}
         if name is not None:
             body["name"] = name
@@ -337,17 +382,34 @@ class HttpClient:
         return self.post_json("/v1/jobs", body)
 
     def get_job(self, job_id: str, *, deadline: Optional[float] = None) -> dict:
+        """Validate the job identifier and fetch its raw service status.
+
+        An optional monotonic ``deadline`` bounds request time and retry waits."""
         return self.get_json(
             f"/v1/jobs/{self._job_path(job_id)}", deadline=deadline)
 
     def cancel_job(self, job_id: str) -> dict:
+        """Validate the job identifier and request cancellation.
+
+        Return the service response. This method does not poll for completion."""
         return self.post_json(f"/v1/jobs/{self._job_path(job_id)}/cancel", {})
 
     def download_result(self, job_id: str) -> bytes:
+        """Download a job's result bundle into memory under the configured byte limit.
+
+        Validate the job identifier. Oversized or truncated downloads raise
+        ``CloudError``."""
         return self.get_bytes(f"/v1/jobs/{self._job_path(job_id)}/result")
 
     def download_result_to(self, job_id: str, dest, *,
                            max_bytes: Optional[int] = None) -> int:
+        """Stream a job's result bundle to ``dest`` and return the bytes written.
+
+        Validate the job identifier and enforce ``max_bytes`` or the configured
+        download ceiling. Overwrite an existing destination. Failed transfers
+        remove ``dest``, even if it existed before the call or the request failed
+        before opening it. Use a new temporary destination to retain a previous
+        result. The parent directory must exist."""
         return self.get_to_file(
             f"/v1/jobs/{self._job_path(job_id)}/result", dest,
             max_bytes=max_bytes)
