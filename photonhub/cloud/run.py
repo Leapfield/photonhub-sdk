@@ -154,8 +154,7 @@ def _validate_web_device(device: Optional[str]) -> Optional[str]:
 _NO_JOB_SUBMITTED = "No job was submitted and no quote was bound."
 
 
-def _check_cloud_device_support(sim, device, *, entry=None,
-                                warn_dft=True) -> dict:
+def _check_cloud_device_support(sim, device, *, entry=None) -> dict:
     """Build a cloud wire spec and refuse unsupported required features.
 
     The optional DFT guard is omitted with a warning before this check.
@@ -174,13 +173,10 @@ def _check_cloud_device_support(sim, device, *, entry=None,
     from ..capabilities import (omit_unsupported_dft_shutoff,
                                 warn_implicit_dft_shutoff_unsupported)
     wire = sim.to_wire_dict()
-    if warn_dft:
-        if (sim.run.dft_shutoff is None and sim.run.shutoff > 0 and
-                any(m.type in ("field_dft", "flux") for m in sim.monitors)):
-            warn_implicit_dft_shutoff_unsupported("Cloud solver")
-        omit_unsupported_dft_shutoff(wire, "Cloud solver")
-    else:
-        wire["run"].pop("dft_shutoff", None)
+    if (sim.run.dft_shutoff is None and sim.run.shutoff > 0 and
+            any(m.type in ("field_dft", "flux") for m in sim.monitors)):
+        warn_implicit_dft_shutoff_unsupported("Cloud solver")
+    omit_unsupported_dft_shutoff(wire, "Cloud solver")
     check_device_support(wire, device, unset_may_be_gpu=True, note=note)
     return wire
 
@@ -285,7 +281,7 @@ def _stored_simulation(cfg: CloudConfig, job_id: str):
         warnings.warn(
             f"could not read the cached spec of cloud job {job_id} ({exc}); "
             "its frequency-domain arrays keep the engine's unit-amplitude "
-            "normalization", UserWarning, stacklevel=2)
+            "normalization", UserWarning, stacklevel=caller_stacklevel())
         return None
     state_path = cache.stored_client_state(cfg, job_id)
     if state_path is not None:
@@ -298,9 +294,28 @@ def _stored_simulation(cfg: CloudConfig, job_id: str):
 def _store_submission(cfg: CloudConfig, job_id: str, sim, wire: dict) -> None:
     """Keep exactly the document the service accepted, and the client state
     the document does not carry, so a later resume of this job restores the
-    amplitude and the frame this call is about to restore."""
-    if cache.store_spec(cfg, job_id, wire) is not None:
-        cache.store_client_state(cfg, job_id, sim, wire=wire)
+    amplitude and the frame this call is about to restore.
+
+    It runs after the paid submission and before the caller holds a handle,
+    so nothing it raises may escape: a lost handle would leave a billing job
+    the caller cannot name. Any failure warns with the job id instead."""
+    stored = None
+    try:
+        stored = cache.store_spec(cfg, job_id, wire)
+        if stored is not None:
+            cache.store_client_state(cfg, job_id, sim, wire=wire)
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        lost = ("its frame (origin, symmetry fold, ports)" if stored is not None
+                else "its absolute units and its frame")
+        try:
+            warnings.warn(
+                f"cloud job {job_id} was submitted, but storing its "
+                f"{'client state' if stored is not None else 'spec'} locally "
+                f"failed ({type(exc).__name__}: {exc}); pass simulation= to a "
+                f"later ph.cloud.resume({job_id!r}) to keep {lost}",
+                UserWarning, stacklevel=caller_stacklevel())
+        except Exception:  # noqa: BLE001, S110 - warnings turned into errors (-W error)
+            pass
 
 
 def _finish_cloud_job(http: HttpClient, cfg: CloudConfig, job_id: str, *,
@@ -377,6 +392,21 @@ def _bind_quote(http: HttpClient, sim, *, device, solver,
     accepted = _preflight(lambda: http, sim, device=device, solver=solver,
                           max_usd=max_usd, preflight_wire=preflight_wire)
     return accepted.device, accepted.solver, accepted.quote_id
+
+
+def _quoted(sim, *, device, solver, max_usd):
+    """The accepted quote of :func:`run_quoted` and :func:`submit_quoted`,
+    and the wire document it priced, which is the one they submit."""
+    from . import actions
+
+    device = _validate_web_device(device)
+    if device is None:
+        raise ValueError("cloud preflight requires an explicit device")
+    wire = _check_cloud_device_support(sim, device)
+    accepted = actions._preflight(
+        lambda: actions.HttpClient(get_config()), sim, device=device,
+        solver=solver, max_usd=max_usd, preflight_wire=wire)
+    return accepted, wire
 
 
 def _cancel_service_job(cfg: CloudConfig, job_id: str,
@@ -471,16 +501,11 @@ def run_quoted(sim, *, max_usd: float = DEFAULT_MAX_USD, name=None,
     separately, so this checks the quote, not the run.  The service remains
     the final authority for quote expiry and concurrent balance changes.
     """
-    from .actions import preflight
-
-    accepted = preflight(
-        sim, device=device, solver=solver, max_usd=max_usd,
-    )
+    accepted, wire = _quoted(sim, device=device, solver=solver, max_usd=max_usd)
     return _cloud_run(
         sim, name=name, device=accepted.device, solver=accepted.solver,
         progress=progress, timeout=wait_timeout_s, quote_id=accepted.quote_id,
-        preflight_wire=_check_cloud_device_support(
-            sim, accepted.device, warn_dft=False))
+        preflight_wire=wire)
 
 
 @_renamed_timeout
@@ -536,17 +561,11 @@ def submit_quoted(sim, *, max_usd: float = DEFAULT_MAX_USD, name=None,
                   progress: ProgressCb = None,
                   wait_timeout_s: Optional[float] = None) -> Job:
     """Async form of :func:`run_quoted`, returning the accepted service id."""
-    from .actions import preflight
-
-    accepted = preflight(
-        sim, device=device, solver=solver, max_usd=max_usd,
-    )
+    accepted, wire = _quoted(sim, device=device, solver=solver, max_usd=max_usd)
     return submit(
         sim, name=name, device=accepted.device, solver=accepted.solver,
         progress=progress, wait_timeout_s=wait_timeout_s,
-        quote_id=accepted.quote_id,
-        _preflighted_wire=_check_cloud_device_support(
-            sim, accepted.device, warn_dft=False))
+        quote_id=accepted.quote_id, _preflighted_wire=wire)
 
 
 @_renamed_timeout

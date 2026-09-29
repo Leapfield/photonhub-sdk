@@ -14,6 +14,7 @@ from pydantic import AliasChoices, Field, PlainValidator, field_validator, model
 from pydantic.json_schema import SkipJsonSchema
 
 from .base import AxisName, FrozenModel, NonNegativeUm, PositiveUm, Vec3Um
+from .._compat import caller_stacklevel
 
 
 # NUMERICS.md §19 — hard per-medium pole budget (lorentz + poles + drude
@@ -336,7 +337,7 @@ class Cylinder(FrozenModel):
         """Deprecated spelling of :attr:`angle_start_rad`."""
         warnings.warn("Cylinder.angle_start was renamed to angle_start_rad; the old "
                       "name will be removed in a future release",
-                      DeprecationWarning, stacklevel=2)
+                      DeprecationWarning, stacklevel=caller_stacklevel())
         return self.angle_start_rad
 
     @property
@@ -344,7 +345,7 @@ class Cylinder(FrozenModel):
         """Deprecated spelling of :attr:`angle_stop_rad`."""
         warnings.warn("Cylinder.angle_stop was renamed to angle_stop_rad; the old "
                       "name will be removed in a future release",
-                      DeprecationWarning, stacklevel=2)
+                      DeprecationWarning, stacklevel=caller_stacklevel())
         return self.angle_stop_rad
 
     @model_validator(mode="after")

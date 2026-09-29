@@ -32,6 +32,7 @@ from typing import Any, Optional
 import numpy as np
 
 from ..data import RunResult
+from .._compat import caller_stacklevel
 
 # complex -> real reducers for the `val` control
 _REDUCE = {"real": np.real, "imag": np.imag, "abs": np.abs, "phase": np.angle}
@@ -131,14 +132,14 @@ def _restorable_cloud_simulation(data: RunResult):
         warnings.warn(
             f"the cloud spec cached for {output_dir.name} did not parse "
             f"({exc}); this result's frequency-domain arrays keep the "
-            "engine's unit-amplitude normalization", UserWarning, stacklevel=3)
+            "engine's unit-amplitude normalization", UserWarning, stacklevel=caller_stacklevel())
         return None
     if digest != expected.lower():
         warnings.warn(
             f"the cloud spec cached for {output_dir.name} is not the input "
             "this result recorded running; its frequency-domain arrays keep "
             "the engine's unit-amplitude normalization", UserWarning,
-            stacklevel=3)
+            stacklevel=caller_stacklevel())
         return None
     return sim
 
@@ -1669,8 +1670,11 @@ def parse_sim_spec(spec: Any):
 #: The resolved-profile fingerprint. 2: the profile is sampled at each
 #: component's own Yee position (NUMERICS §18.2) and its normalization reads
 #: the boundaries (a pmc wall row counts half); a version-1 profile was sampled
-#: at cell centres, half a cell off.
-MODE_SOURCE_FINGERPRINT_VERSION = 2
+#: at cell centres, half a cell off. 3: a Yee mode is read at its node labels
+#: (its arrays carry the Yee offsets) and the profile is normalized on the
+#: flux the launch carries (true paired H, cos(beta h_s), NUMERICS §18.2b); a
+#: version-2 profile sat half a cell off and launched about 13 % over 1 W.
+MODE_SOURCE_FINGERPRINT_VERSION = 3
 
 
 def mode_source_input_sha256(sim, source_index: int, recipe=None, *,
@@ -1788,9 +1792,9 @@ def mode_source_statuses(sim, *, recorded: bool = False) -> list[dict]:
             message = ("Solved by an earlier release; this run used the profile "
                        "as solved, so its recorded results stand.")
         elif earlier:
-            message = ("Solved by an earlier release, which sampled the profile "
-                       "differently (release notes: mode source). Solve it again "
-                       "before running.")
+            message = ("Solved by an earlier release, which sampled or scaled the "
+                       "profile differently (release notes: mode source). Solve it "
+                       "again before running.")
         else:
             message = ("Geometry, grid, source placement/carrier, or solve settings "
                        "changed after this profile was solved. Re-solve it before running.")
@@ -2745,6 +2749,6 @@ def __getattr__(name):
     if name == "GdsImportError":
         warnings.warn("photonhub.viz.service.GdsImportError was renamed to GDSImportError; "
                       "the old name will be removed in a future release",
-                      DeprecationWarning, stacklevel=2)
+                      DeprecationWarning, stacklevel=caller_stacklevel())
         return GDSImportError
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

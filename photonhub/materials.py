@@ -1231,9 +1231,11 @@ def uniaxial_medium(
 
     >>> lno = uniaxial_medium(LiNbO3_o, LiNbO3_e, 1.55, optic_axis="z")
 
-    Absorption is ignored (the anisotropic engine path is lossless-dielectric
-    v1); the scalar ``permittivity`` carries the ordinary value (required by
-    the wire, ignored by the engine when ``permittivity_xyz`` is set).
+    Tabulated absorption is not mapped: the result is a lossless diagonal
+    tensor. The engine does accept a scalar ``conductivity_s_per_m`` on an
+    anisotropic medium, applied equally to all three axes. The scalar
+    ``permittivity`` carries the ordinary value (required by the wire,
+    ignored by the engine when ``permittivity_xyz`` is set).
     """
     if optic_axis not in ("x", "y", "z"):
         raise ValueError(f"optic_axis must be x/y/z, got {optic_axis!r}")
@@ -1409,7 +1411,7 @@ def get(name: str) -> Material:
             f"material {name!r} was renamed to {_RENAMED_MATERIALS[name]!r}; the old "
             "name will be removed in a future release.",
             DeprecationWarning,
-            stacklevel=2,
+            stacklevel=caller_stacklevel(),
         )
         name = _RENAMED_MATERIALS[name]
     try:
@@ -1433,7 +1435,7 @@ def __getattr__(name):
             f"photonhub.materials.{name} was renamed to photonhub.materials."
             f"{replacement}; the old name will be removed in a future release.",
             DeprecationWarning,
-            stacklevel=2,
+            stacklevel=caller_stacklevel(),
         )
         return globals()[replacement]
     raise AttributeError(f"module 'photonhub.materials' has no attribute {name!r}")

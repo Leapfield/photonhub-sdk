@@ -43,6 +43,7 @@ from typing import List, Optional, Sequence, Tuple, Union
 
 from .components.base import AxisName
 from .components.structures import Box, Cylinder, Medium, Polygon, Sphere, Structure
+from ._compat import caller_stacklevel
 
 __all__ = ["GDSLayer", "import_gds", "export_gds", "read_gds_cell_names"]
 
@@ -420,6 +421,6 @@ def read_gds_cell_names(gds_path: Union[str, Path]) -> Tuple[str, ...]:
 def __getattr__(name):
     if name == "GdsLayer":
         warnings.warn("photonhub.gds.GdsLayer was renamed to GDSLayer; the old name will be "
-                      "removed in a future release", DeprecationWarning, stacklevel=2)
+                      "removed in a future release", DeprecationWarning, stacklevel=caller_stacklevel())
         return GDSLayer
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -99,6 +99,7 @@ from .resonance import (
     _combine_time_series,
     select_resonances,
 )
+from .._compat import caller_stacklevel
 
 __all__ = ["CompletionRejected", "SpectrumCompleter"]
 
@@ -366,7 +367,7 @@ class SpectrumCompleter:
                 raise CompletionRejected(reason)
             warnings.warn(
                 "spectrum completion rejected — returning the truncated "
-                f"spectrum unchanged: {reason}", stacklevel=2)
+                f"spectrum unchanged: {reason}", stacklevel=caller_stacklevel())
             return self._package(
                 f_arr, truncated, np.zeros_like(truncated), None,
                 accepted=False, residual=residual, reason=reason,

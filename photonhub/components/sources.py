@@ -16,6 +16,7 @@ from .base import (
     Vec3Um,
 )
 from .source_time import SourceTimeType
+from .._compat import caller_stacklevel
 
 
 class PointDipole(FrozenModel):
@@ -70,9 +71,9 @@ class PlaneWave(FrozenModel):
     """Normal-incidence plane wave injected on a TF/SF plane perpendicular
     to ``axis`` at ``position_um``, fed by a dispersion-matched 1-D auxiliary
     solver (NUMERICS.md section 13). ``amplitude`` is the peak incident
-    E-field E0 in V/m. Both transverse axes must be periodic (enforced by
-    ``Simulation``) and the plane must not intersect PML (checked by
-    ``phsolver validate``)."""
+    E-field E0 in V/m. Both transverse axes must be periodic or Bloch
+    (enforced by ``Simulation``), and the plane must not intersect PML
+    (checked by ``phsolver validate``)."""
 
     model_config = ConfigDict(json_schema_extra=_PLANE_WAVE_TANGENTIAL)
 
@@ -105,7 +106,7 @@ class PlaneWave(FrozenModel):
         """Deprecated spelling of :attr:`angle_theta_rad`."""
         warnings.warn("PlaneWave.angle_theta was renamed to angle_theta_rad; the old "
                       "name will be removed in a future release",
-                      DeprecationWarning, stacklevel=2)
+                      DeprecationWarning, stacklevel=caller_stacklevel())
         return self.angle_theta_rad
 
     @property
@@ -113,7 +114,7 @@ class PlaneWave(FrozenModel):
         """Deprecated spelling of :attr:`angle_phi_rad`."""
         warnings.warn("PlaneWave.angle_phi was renamed to angle_phi_rad; the old "
                       "name will be removed in a future release",
-                      DeprecationWarning, stacklevel=2)
+                      DeprecationWarning, stacklevel=caller_stacklevel())
         return self.angle_phi_rad
 
     @field_validator("polarization")

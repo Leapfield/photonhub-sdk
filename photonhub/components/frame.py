@@ -57,6 +57,7 @@ from .authoring import GaussianBeam, Port
 from .monitors import PowerMonitor, ProfileMonitor, SnapshotMonitor, TimeMonitor
 from .sources import ModeSource, PlaneWave, PointDipole, TfsfBox
 from .structures import Box, Cylinder, Medium, Polygon, Sphere, Structure
+from .._compat import caller_stacklevel
 
 Vec3 = Tuple[float, float, float]
 _AXES = "xyz"
@@ -681,7 +682,7 @@ def _warn_not_restored(where: str, why: str) -> None:
         f"could not restore the client state in {where} ({why}); the result "
         "reads in the wire's corner frame, a plane across a symmetry plane "
         "stays as recorded and declared ports are not available",
-        UserWarning, stacklevel=4)
+        UserWarning, stacklevel=caller_stacklevel())
 
 
 def write_json_atomic(path, record) -> Path:
@@ -720,5 +721,5 @@ def write_client_state(sim, spec_path, *, wire: Optional[dict] = None) -> Option
             f"could not write the client state beside {spec_path} ({exc}); a "
             "reload of this result will read in the wire's corner frame, with "
             "no symmetry unfolding and no declared ports",
-            UserWarning, stacklevel=3)
+            UserWarning, stacklevel=caller_stacklevel())
         return None

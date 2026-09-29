@@ -87,6 +87,7 @@ from .components.base import (
     _monitor_name_key,
 )
 from .constants import c0
+from ._compat import caller_stacklevel
 
 _TIME_DIMS = ("t", "component")
 _SNAPSHOT_DIMS = ("t", "component", "z", "y", "x")
@@ -547,7 +548,7 @@ class RunResult:
                 "loading output of an ABORTED run (reason: "
                 f"{self._run.get('abort_reason') or 'unknown'}); monitor data "
                 "may be partial or non-finite",
-                UserWarning, stacklevel=2)
+                UserWarning, stacklevel=caller_stacklevel())
 
         self._entries: Dict[str, dict] = {}
         monitors = self.manifest.get("monitors", [])
@@ -931,7 +932,7 @@ class RunResult:
                     f"could not load the simulation of {self._source} ({exc}); "
                     "frequency-domain arrays keep the engine's unit-amplitude "
                     "normalization and coordinates stay in the wire's corner "
-                    "frame", UserWarning, stacklevel=3)
+                    "frame", UserWarning, stacklevel=caller_stacklevel())
         return self._simulation
 
     @property

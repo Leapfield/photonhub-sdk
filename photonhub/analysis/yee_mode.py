@@ -762,12 +762,6 @@ def _window_placement(geom: "_WindowGeom", h_center_um, v_center_um):
     return (off, geom.h_nodes - h_center_um, geom.v_nodes - v_center_um)
 
 
-def _caller_stacklevel() -> int:
-    """See :func:`photonhub._compat.caller_stacklevel` (kept under the old name).
-    """
-    return caller_stacklevel()
-
-
 #: Largest field amplitude a solved mode may carry on an ARTIFICIAL window
 #: face, as a fraction of its own peak, before :func:`solve_yee_mode` warns
 #: that the window is too tight. Every window truncates the mode's evanescent
@@ -844,7 +838,7 @@ def _warn_tight_window(mode, geom: "_WindowGeom", axis, plane_value_um):
         f"{_WINDOW_EDGE_TOL:.0%}), so the wall, not the guide, is setting its "
         f"n_eff and profile. Enlarge half_w_um/half_v_um until the reading "
         f"stops moving.{note}",
-        UserWarning, stacklevel=_caller_stacklevel())
+        UserWarning, stacklevel=caller_stacklevel())
 
 
 def _pick_yee(modes, pol, mode_index, axis, plane_value_um):

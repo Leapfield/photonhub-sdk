@@ -89,7 +89,7 @@ import numpy as np
 import xarray as xr
 
 from ._constants import C0 as _C0
-from .._compat import legacy_keywords
+from .._compat import caller_stacklevel, legacy_keywords
 import warnings
 
 __all__ = ["Mode", "ModeSolver"]
@@ -264,7 +264,7 @@ class ModeSolver:
         """Deprecated spelling of :meth:`at_wlen`."""
         warnings.warn(
             "ModeSolver.at_wavelength() was renamed to at_wlen(); the old name "
-            "will be removed in a future release", DeprecationWarning, stacklevel=2)
+            "will be removed in a future release", DeprecationWarning, stacklevel=caller_stacklevel())
         return self.at_wlen(wavelength_um)
 
     # -- convenience cross-section builder ---------------------------------

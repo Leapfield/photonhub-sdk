@@ -80,7 +80,7 @@ from .inverse_design import (
     value_and_gradient,
 )
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 __all__ = [
     "c0",
@@ -162,7 +162,6 @@ __all__ = [
 
 # --- deprecated aliases (2026-09 cross-solver rename; remove in 0.2) ---------
 _RENAMED = {
-    "web": "cloud",
     "PolySlab": "Polygon",
     "FluxMonitor": "PowerMonitor",
     "FieldTimeMonitor": "TimeMonitor",
@@ -184,15 +183,24 @@ _RENAMED = {
 
 
 def __getattr__(name):
+    if name == "web":
+        # The shim module, not ``cloud`` itself: only the shim carries the
+        # ``Web*`` class aliases (issue #451). Importing it issues the one
+        # DeprecationWarning and binds ``photonhub.web``, so this runs once.
+        import importlib
+
+        return importlib.import_module(f"{__name__}.web")
     replacement = _RENAMED.get(name)
     if replacement is not None:
         import warnings
+
+        from ._compat import caller_stacklevel
 
         warnings.warn(
             f"photonhub.{name} was renamed to photonhub.{replacement}; "
             "the old alias will be removed in a future release.",
             DeprecationWarning,
-            stacklevel=2,
+            stacklevel=caller_stacklevel(),
         )
         return globals()[replacement]
     raise AttributeError(f"module 'photonhub' has no attribute {name!r}")

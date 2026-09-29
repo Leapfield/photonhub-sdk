@@ -21,6 +21,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple, Union
 from ._bounds import geometry_bounds_um
 from .authoring import GaussianBeam, Port
 from .source_time import GaussianPulse, _C0_M_PER_S
+from .._compat import caller_stacklevel
 
 #: The ``Simulation`` fields this module resolves; never on the wire.
 DECLARATIVE_FIELDS = ("wlens_um", "wlen0_um", "ports", "source")
@@ -477,15 +478,7 @@ def clip_default_window(shell, port: Port, half_w_um: float, half_v_um: float) -
 def _warn_user(message: str) -> None:
     """A UserWarning attributed to the caller's own line, outside this package
     and pydantic's validation frames."""
-    import os
-    import sys
-
-    package = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    level, frame = 2, sys._getframe(1)
-    while frame is not None and (frame.f_code.co_filename.startswith(package)
-                                 or "pydantic" in frame.f_code.co_filename):
-        frame, level = frame.f_back, level + 1
-    warnings.warn(message, UserWarning, stacklevel=level)
+    warnings.warn(message, UserWarning, stacklevel=caller_stacklevel())
 
 
 def port_cell_um(shell, port: Port, half_w_um: float, half_v_um: float) -> float:

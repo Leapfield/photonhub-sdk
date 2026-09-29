@@ -67,6 +67,7 @@ from .smatrix import (SPort, assemble_smatrix, is_passive, is_reciprocal,
                       passivity_violation, reciprocity_error, smatrix)
 from .yee_mode import solve_yee_mode_bank
 from ._constants import C0 as _C0
+from .._compat import caller_stacklevel
 
 __all__ = [
     "SMatrixPort",
@@ -211,7 +212,7 @@ def _warn_if_in_absorbing_layers(sim, axis: str, position_um: float,
             f"{what} at {axis}={position_um:.4g} um lies inside the "
             f"~{slab:.4g} um {kind} slab on that wall — move the port plane "
             "or shrink source_offset_um",
-            stacklevel=3)
+            stacklevel=caller_stacklevel())
 
 
 @dataclass(frozen=True)

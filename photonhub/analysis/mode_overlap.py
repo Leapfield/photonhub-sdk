@@ -889,7 +889,7 @@ def _overlap_terms(
                 "destagger_dl was given but this plane carries no frequency "
                 "axis (needed to form beta = 2*pi*n_eff/lambda) — the "
                 "longitudinal de-stagger is being SKIPPED for this reading.",
-                UserWarning, stacklevel=2)
+                UserWarning, stacklevel=caller_stacklevel())
 
         out[f if f is not None else 0.0] = (complex(a_pm), float(p_mode))
     return out
@@ -1604,7 +1604,7 @@ def mode_overlap(
             "the two-term |a12|^2 (snyder_love) form for the backward "
             "coupling (correct ~0 orthogonality; may over-count across an "
             "index step).",
-            UserWarning, stacklevel=2)
+            UserWarning, stacklevel=caller_stacklevel())
         power = float(np.abs(a12) ** 2 / (p_a * p_b))
         method = "snyder_love"
     else:
@@ -1691,7 +1691,7 @@ def mode_overlap_matrix(
             "scalar/Gaussian operands): vector-vector entries use the "
             "snyder_love power form, scalar-involving entries the geomean — "
             "the matrix mixes normalization conventions and its entries are "
-            "not mutually comparable.", UserWarning, stacklevel=2)
+            "not mutually comparable.", UserWarning, stacklevel=caller_stacklevel())
     dtype = complex if quantity in ("coupling", "amplitude") else float
     out = np.zeros((len(rows), len(cols)), dtype=dtype)
     for i, a in enumerate(rows):

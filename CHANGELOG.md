@@ -5,6 +5,207 @@ The desktop application and the solver engine share this version number.
 
 ## Unreleased
 
+## 0.1.5 (2026-09-28)
+
+This release moves numbers. Inverse-design gradients are now exact and
+physically scaled, so their size changes by a scene-dependent factor, and
+design pixels sit a quarter cell off the mesh. The auxiliary mode launch of a
+mode from `solve_yee_mode` or `solve_mode_on_cross_section` now delivers the
+power asked for, so absolute powers from it fall by 12 to 15 % (ratios are
+unchanged). Local CPU runs guarded by
+`dft_shutoff` can stop earlier. Entries that move a reading say **numbers
+move**; entries that need a change in your code say **breaking**. The wire
+schema stays at `1.21.0-alpha.1`.
+
+### Changed
+
+- **Inverse-design gradients are exact and physically scaled.**
+  `value_and_gradient`, `optimize` and `optimize_parametric` now return
+  `dJ/drho` from one forward and one adjoint solve with every constant derived
+  from the simulation: the leapfrog frequency `(2/dt) sin(pi f dt)`, vacuum
+  permittivity and the solver's source-normalized frequency-domain fields. The
+  fitted `BETA` and `BETA_MODE` phase constants are gone. Before, the gradient
+  pointed the right way only to a cosine of 0.987 to 0.992 against central
+  finite differences, and its size was off by a scene-dependent factor of about
+  1e2 to 4e4. On four 3D CPU scenes (uniform mesh at 0.04 or 0.05 um, subpixel
+  off, no dispersion, 6 PML layers per axis, `shutoff=0` with a fixed window)
+  the cosine is 0.99999999 or better and the norm ratio within 2e-4 of 1
+  (`validation/suites/adjoint/README.md`).
+- **Numbers move: design pixels move by a quarter cell.** A `DesignRegion`'s
+  pixel boxes are shifted by 0.25 mesh cell on each axis by default, so no Yee
+  E sample lies on a pixel face and each E component takes its permittivity
+  from one pixel. Existing designs rendered from the same densities give a
+  slightly different structure. `box_face_offset_cells=0` restores faces on
+  cell boundaries, with the engine's last-wins ownership of face nodes.
+- **Numbers move: the `ModePower` objective.** Its output monitor leaves out
+  the transverse PML rows, so the objective value differs from the former
+  full-plane overlap where the boundary rows held field. Its adjoint source is
+  the transpose of the four-field overlap readout, a cloud of electric and
+  magnetic point currents, and Yee-staggered vector modes are accepted.
+- **Breaking: `GradientResult` has three new required fields**,
+  `forward_steps_run`, `adjoint_steps_run` and `shutoff`: the actual length of
+  each solve and the energy shutoff they used. Code that constructs a
+  `GradientResult` itself must pass them.
+- **Deprecated: `beta=`** on `value_and_gradient`, `optimize` and
+  `optimize_parametric` still works and emits a `DeprecationWarning`; omit it
+  to use the derived coefficient. `BETA` and `BETA_MODE` remain importable as
+  unused placeholders equal to 1. The `beta` field of `PointIntensity` and
+  `ModePower` is ignored and warns when set. `assemble_gradient` is the
+  low-level step and takes the coefficient as `beta`; its default of 1 gives
+  an unscaled gradient.
+- **Gradient solves keep the caller's run settings,** including the default
+  stop rule (decision 0011). The gradient is exact for the recorded window;
+  against a converged gradient its error follows the truncation of the forward
+  results. With the energy-only stop at `shutoff` 1e-5 that was about 0.2 % on
+  a measured point-source scene, and more on resonant designs. Local CPU runs
+  on a solver that supports it also wait for an estimate of the remaining
+  change in the recorded results (`run.dft_shutoff`), which is not a
+  guarantee; GPU runs stop on the field energy alone. For resonant designs
+  and validation, set `shutoff=0` with an explicit `n_steps` or `run_time_s`
+  after checking convergence.
+- **Objective and gradient use the subpixel-off model.** `value_and_gradient`
+  turns subpixel smoothing off for both solves and warns once per call when
+  the caller's simulation had it on.
+- **Checks before any solve.** Design E nodes or `ModePower` adjoint currents
+  inside the PML, a graded mesh, a region pitch different from the mesh,
+  symmetry planes, a simulation fitted with `domain=` (its stored frame is
+  shifted; give `size_um` and `grid`), and a `build_forward` whose last
+  structures are not the region's own pixel boxes at the supplied density now
+  raise `ValueError`.
+- **Added: an opt-in trilinear custom-medium parametrization**
+  (`DesignRegion(parametrization="trilinear")`), CPU only; `device="gpu"` with
+  it raises before a solve.
+- Temporary solver outputs of a gradient call are removed after the call; the
+  returned results keep their monitor data.
+
+### Fixed
+
+- **Numbers move: the `dft_shutoff` stop settles a slab resonator sooner.** A
+  local CPU run with the default `dft_shutoff` (`1e-4`) estimates each
+  recorded frequency's remaining change from windows of past changes. A decay
+  that falls in steps, such as a packet bouncing in a slab, fitted only at a
+  few window widths, so the zero-index pillar array ran on toward its 10 ps
+  cap long after the field had decayed. The windows now cover every doubling
+  from 16 to 8,192 progress blocks. Such runs stop earlier; on a
+  12-cells-per-pitch copy of that example the stop moved from step 51,300 to
+  41,700 with a recorded error of 1.3e-6 of the band peak, 0.013 of the
+  tolerance. Other guarded runs can also stop earlier; their recorded spectra
+  usually move well within the requested tolerance, but a fast decay into a
+  weak slow tail in one frequency can stop early with a larger error (engine
+  NUMERICS section 7).
+- The cap warning of a guarded run now says how many monitor frequencies were
+  still settling and names the furthest one, and it points at your own code
+  rather than at the SDK. The manifest's `run.dft_hold` and the solver's
+  `done` event carry `unsettled_bins` and `included_bins`.
+- **`ph.web.WebError`, `WebConfig` and `WebJobTimeout` work in a fresh
+  interpreter.** The deprecated `ph.web` alias returned `photonhub.cloud`,
+  which has none of the three names, so they resolved only after an explicit
+  `import photonhub.web`. `ph.web` now returns that module, with one
+  `DeprecationWarning`, and it still answers every other name
+  `photonhub.cloud` has (issue #451).
+- **Warnings point at your own line.** A warning raised inside model
+  validation (the `GaussianPulse.for_band` clamp of an octave band, the
+  dispersive-in-PML advisory) or reached through another SDK function (the
+  run-cap warning, readout advisories) named a file inside the installed
+  package, so an executed notebook printed that file's absolute path. SDK
+  warnings now name the first line of your code on the stack, looking
+  through the SDK, pydantic and the import machinery, also for an install
+  reached through a symlink. When no line of yours is on the stack (a
+  display hook, a job's background thread), they name the SDK function that
+  was called. Deprecation warnings that now name your script's line are
+  shown by Python's default filters where they were hidden before; the §18
+  aux-line deprecation warns only when you call `mode_source_vector` or
+  `mode_source` with a full-vector mode yourself, not when `mode_launch`
+  uses that path.
+- **A cloud submission always returns its job.** Storing the submitted spec
+  beside the cache runs after the paid submission; an unexpected error there
+  could escape before the call returned the job, leaving a billing job with
+  no handle. It now warns with the job id instead. `ph.cloud.run_quoted` and
+  `submit_quoted` submit the same wire document they quoted.
+- **Fixed** the auxiliary mode launch delivering 14 to 17 % more power than
+  asked for a mode from `solve_yee_mode` or `solve_mode_on_cross_section`.
+  `mode_launch(..., launch="aux")`, `mode_source` and `mode_source_vector`
+  with such a mode, and the Workbench mode source, scaled the profile on the
+  power a scalar-limit magnetic field would carry, while the solver injects
+  the mode's true magnetic field. For the TE0 of a 0.5 x 0.22 um silicon
+  strip at 1550 nm, a 1 W launch read 1.136, 1.157, 1.164 and 1.170 W at its
+  port at 50, 40, 31 and 25 nm cells, growing instead of converging. It now
+  reads 1.000 W to within 0.1 % at all four. The same launch also read such
+  a mode half a cell off the guide; folded on the strip's two mirrors it
+  carried 2.0 % less than without them, and now the same to 0.01 %. With
+  `paired_h=False` the port read 0.966 W at 50 nm and now reads within 0.3 %
+  of 1 W at every mesh; a broadband source with `paired_h=False` no longer
+  keeps the per-frequency true magnetic field it was meant to drop.
+  Transmission, S-parameters and every other ratio are unchanged; absolute
+  powers from these launches fall by 12 to 15 %. The equivalence-current
+  launch (the default for such a mode) and a mode from `VectorModeSolver` are
+  not affected. A Workbench mode source
+  solved before this release shows as stale and needs solving again before a
+  run; results recorded with one stay readable. The packaged mode-converter
+  Workbench example is re-solved: its launch power falls by 13.7 % and its
+  profile moves by up to 14 % of its peak pointwise (39 % for the minor
+  component, the half-cell shift).
+- **Fixed** `mode_launch` ignoring `power_watts` for a scalar `Mode` (a mode
+  with no magnetic field, from `ModeSolver`). It passed the square root of
+  the watts as the peak field, so a 1 W launch of the strip above carried
+  2.6e-16 W. The profile is now scaled to the watts; the port reads 1.032 W,
+  the 3 % a scalar-limit mode leaves. A broadband scalar launch is scaled at
+  its centre frequency.
+
+### Documentation
+
+- **The examples gallery is searchable.** The documentation site's gallery
+  filters by words and by topics; every word and every selected topic must
+  match, and the choice stays in the page address. Cards stay readable
+  without JavaScript. A feed of the examples is published at
+  `/docs/assets/examples-feed.json`. Cards no longer carry a status badge;
+  each example page keeps its own convergence statement. The "Waveguides"
+  and "Mesh studies" topics are gone; the crossing, the optimal bend and the
+  valley transport page carry a new "Bends and crossings" topic.
+- The valley transport page says the source sits beyond the PML.
+- **Eight gallery notebooks stop on field decay alone.** Notebooks 33, 36,
+  37, 40, 41, 45, 46 and 49 set `dft_shutoff=0`. Five were re-run on the CPU
+  solver at 0.1.4; 36, 45 and 49 were replayed from GPU runs, which stop on
+  field decay alone. Every printed number is unchanged.
+- **Known limitations.** Both pages list the limits of anisotropic media and
+  say that the 0.1.4 GPU solver image passed the GPU equivalence tests. The
+  Workbench's page now also lists the refusals of `tensor_full` and
+  `contour_full` (graded mesh, PEC, dispersive media, absorber boundaries)
+  and a scene the spectrum stop rule can hold to its time cap.
+- Course notebooks 13, 14 and 15 have titles that say what each teaches: the
+  GDS-to-port-numbers recipe, the split ratio of a narrow-gap coupler, and
+  self-imaging in an MMI.
+- A plane wave needs periodic or Bloch transverse axes, and an oblique one
+  needs Bloch axes; the quickstart said periodic only.
+- **Numbers move: example 39 reads the whole TE3 channel.** The mode and
+  polarization multiplexer page quotes the loss of the TE3 channel, with
+  bends measured on the paper's figure: 0.407 dB at 1550 nm at 16 cells per
+  wavelength (0.1.4 printed 0.107 dB for the TE3 target mode). A mesh ladder
+  to 32 cells reads 0.344 dB, not shown converged; the paper gives about
+  0.4 dB. Graded mesh, contour subpixel smoothing, constant indices, 12 PML
+  layers, one mirror plane.
+- Examples 35 and 43 quote their mesh ladders, extended on the 0.1.4 solver,
+  each "not shown converged"; their printed numbers do not move.
+- The course notebooks name no other solver, use no em-dashes, and print
+  warnings without a temporary file path. Course 13's check-yourself number
+  follows its re-executed output (about 0.005, was about 0.001).
+- The known-limitations pages describe the `dft_shutoff` stop as it now is,
+  and drop the warning-path item this release fixes. The `PlaneWave` and
+  `uniaxial_medium` docstrings say what the solver enforces, and
+  `mode_launch`'s says the inverse-design adjoint is exact.
+
+### Repository
+
+- The GPU runner (`scripts/gpu_run.py`) tries three rental providers in a
+  fixed order and moves on only when one refuses for capacity and nothing was
+  created. `scripts/gpu_promotion_evidence.py` writes the record a stable GPU
+  image tag needs before it moves, under `docs/validation/gpu-promotions/`.
+- `scripts/package-headless-solver.sh --closed-test` builds a headless
+  archive for a closed test under the draft legal texts (decision 0023),
+  stamped closed test in its name, README, notice and `provenance.json`.
+- The eigenmode expansion suite's 2026-09-08 validation evidence is recorded
+  under `validation/suites/eme/`.
+
 ## 0.1.4 (2026-09-27)
 
 This release moves numbers. Several fixes change what a port, a flux plane or

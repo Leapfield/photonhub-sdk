@@ -50,7 +50,7 @@ from .gaussian_beam import (_default_center, _modeled_watts, _plane_grids,
 from .mode_overlap import ETA0
 from .vector_modes import VectorMode
 from .yee_mode import _window_center_offset
-from .._compat import legacy_keywords
+from .._compat import caller_stacklevel, legacy_keywords
 
 __all__ = ["thin_lens_beam", "thin_lens_source"]
 
@@ -213,7 +213,7 @@ def thin_lens_beam(
         N = 8192
         warnings.warn(
             "thin_lens_beam FFT grid capped at 8192^2; extremely low NA at "
-            "coarse dl may sample the pupil disk sparsely", stacklevel=2)
+            "coarse dl may sample the pupil disk sparsely", stacklevel=caller_stacklevel())
     if max(nh, nv) > N:
         raise ValueError(
             f"beam window ({nh} x {nv} cells) exceeds the {N}^2 FFT "

@@ -74,6 +74,7 @@ from typing import Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import xarray as xr
+from .._compat import caller_stacklevel
 
 __all__ = ["ResonanceAnalysis", "select_resonances"]
 
@@ -188,7 +189,7 @@ class ResonanceAnalysis:
                 f"{nyquist:g} Hz (1/2dt); resonances above Nyquist cannot be "
                 "resolved -- sample the monitor more often (smaller "
                 "interval_steps) or narrow the window",
-                stacklevel=2,
+                stacklevel=caller_stacklevel(),
             )
 
         # Seed trial poles on the unit circle at evenly spaced frequencies.
@@ -553,8 +554,6 @@ def _gate_time_series(arrays, t_start, simulation, sim_data):
     """The arrays cut to ``t >= t_start`` (or, with only ``simulation``, to
     ``t >=`` its last source's end), with a warning when the first sample
     kept still precedes the last source's end."""
-    from .._compat import caller_stacklevel
-
     known = simulation
     if known is None and sim_data is not None:
         try:
@@ -643,11 +642,7 @@ def _uniform_dt(t: np.ndarray) -> Tuple[float, int]:
             "(NUMERICS.md section 6). Dropping that one sample to keep the "
             "analysis on a uniform grid.",
             UserWarning,
-            # _uniform_dt <- _signal_from_dataarray <- _combine_time_series <-
-            # the public entry point <- the caller. Every public path
-            # (run, run_time_series, SpectrumCompleter.complete) goes through
-            # _combine_time_series, so this depth reaches user code from all of them.
-            stacklevel=5,
+            stacklevel=caller_stacklevel(),
         )
         return dt, int(t.size) - 1
     raise ValueError(
@@ -795,7 +790,7 @@ def __getattr__(name):
             "ResonanceFinder was renamed to ResonanceAnalysis; "
             "the old alias will be removed in a future release.",
             DeprecationWarning,
-            stacklevel=2,
+            stacklevel=caller_stacklevel(),
         )
         return ResonanceAnalysis
     raise AttributeError(

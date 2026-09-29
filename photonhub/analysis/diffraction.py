@@ -74,6 +74,7 @@ from ..components.grid import (
 )
 from ._constants import _TANGENTIAL, C0
 from .mode_overlap import ETA0
+from .._compat import caller_stacklevel
 
 __all__ = ["DiffractionOrders", "diffraction_orders"]
 
@@ -516,7 +517,7 @@ def diffraction_orders(
     if np.any(grazing):
         warnings.warn(
             "grazing (Wood-anomaly) orders present — their directional "
-            "amplitudes are ill-conditioned", stacklevel=2)
+            "amplitudes are ill-conditioned", stacklevel=caller_stacklevel())
 
     kt = np.sqrt(kt2)
     with np.errstate(invalid="ignore", divide="ignore"):

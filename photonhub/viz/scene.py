@@ -14,6 +14,7 @@ from matplotlib.patches import Rectangle
 
 from . import _geometry as geom
 from . import _style
+from .._compat import caller_stacklevel
 
 
 def plot(sim, x=None, y=None, z=None, *, ax=None, legend=True, grid=False,
@@ -69,7 +70,7 @@ def plot(sim, x=None, y=None, z=None, *, ax=None, legend=True, grid=False,
             f"{axis}={value} um is outside the realized domain "
             f"[{origin[a]:.6g}, {origin[a] + realized[a]:.6g}] um on that axis; only the background and "
             "out-of-plane overlays are drawn",
-            UserWarning, stacklevel=2)
+            UserWarning, stacklevel=caller_stacklevel())
 
     drew_structure = False
     if not out_of_domain:

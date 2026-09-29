@@ -54,7 +54,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 
 from .vector_modes import VectorMode, VectorModeSolver
-from .._compat import legacy_keywords
+from .._compat import caller_stacklevel, legacy_keywords
 
 __all__ = [
     "Section",
@@ -298,7 +298,7 @@ class EMEResult:
                 "one of a degenerate TE/TM pair (a square or round core), "
                 "returned as an arbitrary mixture, so the element depends on "
                 "how the pair was mixed at each port. Read transmitted_power(0) for the "
-                "total transmitted power.", RuntimeWarning, stacklevel=3)
+                "total transmitted power.", RuntimeWarning, stacklevel=caller_stacklevel())
             return
         a = str(getattr(self.left_modes[0], "polarization", "") or "").upper()
         b = str(getattr(self.right_modes[0], "polarization", "") or "").upper()
@@ -311,7 +311,7 @@ class EMEResult:
                 f"{a}->{a} throughput. Use "
                 f"result.{what}_of('{a}') to resolve by mode identity.",
                 RuntimeWarning,
-                stacklevel=3,
+                stacklevel=caller_stacklevel(),
             )
 
     def transmitted_power(self, input_mode: int = 0) -> float:
@@ -1449,8 +1449,6 @@ def _warn_if_active(result: EMEResult, bases) -> None:
         return
     balance = result.energy_balance(0)
     if balance - 1.0 > _GAIN_TOLERANCE:
-        from .._compat import caller_stacklevel
-
         warnings.warn(
             f"EME cascade gains power: T + R = {balance:.6g} for input mode 0 "
             f"(more than 1 + {_GAIN_TOLERANCE:g}). The modal basis has not "

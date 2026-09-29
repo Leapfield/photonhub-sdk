@@ -5,11 +5,13 @@ import pkgutil as _pkgutil
 import sys as _sys
 import warnings as _warnings
 
+from .._compat import caller_stacklevel as _caller_stacklevel
+
 _warnings.warn(
     "photonhub.plugins was renamed to photonhub.analysis; the old module path "
     "will be removed in a future release.",
     DeprecationWarning,
-    stacklevel=2,
+    stacklevel=_caller_stacklevel(),
 )
 
 from .. import analysis as _analysis  # noqa: E402

@@ -58,7 +58,7 @@ from ._bounds import geometry_bounds_um
 from .authoring import Domain, GaussianBeam, Mesh, Port
 from .source_time import _C0_M_PER_S, CW
 from .structures import Box, MaterialEntry, Medium, Structure, is_material
-from .._compat import legacy_keywords
+from .._compat import caller_stacklevel, legacy_keywords
 
 # The run-length cap of a simulation that gives no ``run``: transits of the
 # longest domain extent at the highest index. The auto-shutoff ends a run
@@ -311,29 +311,6 @@ _ABSORBER_MIN_LAYERS = 40
 # four decimals, so two indices that fail the check never print alike.
 _PORT_MEDIUM_INDEX_TOL = 1e-3
 
-_SDK_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + os.sep
-
-
-def _construction_caller_stacklevel() -> int:
-    """``stacklevel`` that attributes a warning raised while a ``Simulation`` is
-    built to the caller's own line (the ``ph.Simulation(...)`` or
-    ``with_changes(...)`` call): the first frame outside this package AND
-    outside pydantic, whose ``BaseModel.__init__`` runs ``model_post_init``.
-    ``_compat.caller_stacklevel`` stops at that pydantic frame. Level 1 is
-    the function that calls ``warnings.warn``, i.e. this function's caller."""
-    import inspect
-
-    import pydantic
-
-    skip = (_SDK_ROOT, os.path.dirname(os.path.abspath(pydantic.__file__)) + os.sep)
-    here = inspect.currentframe()          # None only on an interpreter without frame support
-    frame, level = (here.f_back if here is not None else None), 1
-    while frame is not None:
-        if not os.path.abspath(frame.f_code.co_filename).startswith(skip):
-            return level
-        frame, level = frame.f_back, level + 1
-    return 2
-
 
 def _warn_port_medium_mismatch(port, containing, wlen0) -> None:
     """Warn when a port's declared ``medium`` is not the material of the
@@ -385,7 +362,7 @@ def _warn_port_medium_mismatch(port, containing, wlen0) -> None:
             "count as one material). A guide extension through the wall, when the fit builds one, is "
             "painted in medium=, so the port plane and the guide behind it would be different materials. "
             "Give the port the structure's medium, or drop medium= to take it.")
-    warnings.warn(message, UserWarning, stacklevel=_construction_caller_stacklevel())
+    warnings.warn(message, UserWarning, stacklevel=caller_stacklevel())
 
 
 def _quarter_snapped_dft_monitors(monitors, *, size_um, grid, axis_min_cells=(4, 4, 4)):
@@ -794,7 +771,7 @@ class Simulation(FrozenModel):
                         f"{mat.name}: the index moves {drift:.1%} across {lo:.4g} to {hi:.4g} um; the constant "
                         f"index at {wlen0:.4g} um is used. For dispersion pass "
                         f"ph.materials.{mat.name}.medium(band_um=({lo:.4g}, {hi:.4g})) explicitly.",
-                        stacklevel=4)
+                        stacklevel=caller_stacklevel())
             resolved[key] = mat
         structures = tuple(
             st.model_copy(update={"medium": st.medium.medium(wlen_um=wlen0)}) if is_material(st.medium) else st
@@ -1660,7 +1637,7 @@ class Simulation(FrozenModel):
                     f"{name} = 'periodic' if a quasi-2D reduction was "
                     "intended.",
                     UserWarning,
-                    stacklevel=2,
+                    stacklevel=caller_stacklevel(),
                 )
         return self
 
@@ -1715,7 +1692,7 @@ class Simulation(FrozenModel):
                     f"intends. Span the full 0..{extent:g} um (or beyond) on "
                     f"'{name}' for solid 2-D geometry.",
                     UserWarning,
-                    stacklevel=2,
+                    stacklevel=caller_stacklevel(),
                 )
                 return self
         return self
@@ -2920,7 +2897,7 @@ class Simulation(FrozenModel):
                 "it in production scenes "
                 "(engine/docs/subpixel-dispersion-instability.md). Use "
                 "sim.with_stabilized_pml() with subpixel+dispersive runs.",
-                stacklevel=2,
+                stacklevel=caller_stacklevel(),
             )
         # the resolved value of ``subpixel`` is only known here, so the
         # quasi-2-D dilution warning runs at the end of this validator
@@ -3019,7 +2996,7 @@ class Simulation(FrozenModel):
                 "LADDER (e.g. 0.99, 0.7, 0.5, 0.35) instead of assuming "
                 "lower is safer.",
                 UserWarning,
-                stacklevel=2,
+                stacklevel=caller_stacklevel(),
             )
         return self
 
@@ -3052,7 +3029,7 @@ class Simulation(FrozenModel):
                 "the adiabatic absorber (NUMERICS.md §21) — "
                 "sim.with_auto_boundaries() picks it per axis, or "
                 f"boundaries.{_AXES[hostile[0]]}='absorber' / sim.with_absorber().",
-                stacklevel=2,
+                stacklevel=caller_stacklevel(),
             )
         return self
 
@@ -3196,7 +3173,7 @@ class Simulation(FrozenModel):
                 "smoothing (engine/docs/subpixel-dispersion-instability.md). "
                 "Raise pml_alpha_max, or use sim.with_stabilized_pml() for the "
                 "Stabilized-CPML profile.",
-                stacklevel=2,
+                stacklevel=caller_stacklevel(),
             )
         return self
 
@@ -3290,7 +3267,7 @@ class Simulation(FrozenModel):
                 f"{amplitude:.1e}). The spectrum there is noise over almost no drive and can be off by orders "
                 "of magnitude. Keep monitor frequencies in the pulse's band: "
                 "GaussianPulse.for_band(freqs_hz=...) fits a pulse to them.",
-                UserWarning, stacklevel=_construction_caller_stacklevel())
+                UserWarning, stacklevel=caller_stacklevel())
         return self
 
     def _weak_drive(self) -> list:
@@ -3341,7 +3318,7 @@ class Simulation(FrozenModel):
                 f"{_C0_M_PER_S / f0:.3g} m, over 1000 times the {extent_m * 1e6:.4g} um domain: a wavelength "
                 "typed where a frequency is expected? Frequencies are in Hz; 1.55 um is "
                 f"{_C0_M_PER_S / 1.55e-6:.6g} Hz (the speed of light over the wavelength).",
-                UserWarning, stacklevel=_construction_caller_stacklevel())
+                UserWarning, stacklevel=caller_stacklevel())
         return self
 
     @model_validator(mode="after")
@@ -3643,7 +3620,7 @@ class Simulation(FrozenModel):
             "Simulation.plot_eps was renamed to plot_index; the old name will be "
             "removed in a future release.",
             DeprecationWarning,
-            stacklevel=2,
+            stacklevel=caller_stacklevel(),
         )
         return self.plot_index(*args, **kwargs)
 

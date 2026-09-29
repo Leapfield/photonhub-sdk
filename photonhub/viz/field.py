@@ -20,6 +20,7 @@ import numpy as np
 from ..constants import c0
 from . import _geometry as geom
 from . import _style
+from .._compat import caller_stacklevel
 
 _E_COMPONENTS = ("Ex", "Ey", "Ez")
 _H_COMPONENTS = ("Hx", "Hy", "Hz")
@@ -282,7 +283,7 @@ def _plot_field_on(ax, data, da, monitor, field, x, y, z, values, used_val,
                 warnings.warn(
                     "plot_field(structures=True) has no geometry to outline; "
                     "pass simulation= to overlay structure outlines",
-                    UserWarning, stacklevel=2)
+                    UserWarning, stacklevel=caller_stacklevel())
                 _NO_GEOMETRY_NOTED["flag"] = True
         elif slice_axis is not None:
             value_c = slice_val - origin[geom.axis_index(slice_axis)]

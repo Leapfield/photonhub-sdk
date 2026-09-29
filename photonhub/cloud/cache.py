@@ -33,6 +33,7 @@ from ..bundle import (
 from ._ids import validate_job_id
 from .client import HttpClient
 from .config import CloudConfig
+from .._compat import caller_stacklevel
 
 _CACHE_LOCKS = tuple(threading.Lock() for _ in range(64))
 _MAX_MANIFEST_BYTES = 64 * 1024 * 1024
@@ -197,7 +198,7 @@ def store_spec(cfg: CloudConfig, job_id: str, spec: dict) -> Optional[Path]:
             f"could not cache the spec of cloud job {job_id} ({exc}); "
             "ph.cloud.resume of this job will read the engine's "
             "unit-amplitude normalization instead of absolute watts and V/m",
-            UserWarning, stacklevel=2)
+            UserWarning, stacklevel=caller_stacklevel())
         return None
     return out
 
@@ -257,7 +258,7 @@ def store_client_state(cfg: CloudConfig, job_id: str, sim,
             f"could not cache the client state of cloud job {job_id} ({exc}); "
             "ph.cloud.resume of this job will read in the wire's corner frame, "
             "with no symmetry unfolding and no declared ports",
-            UserWarning, stacklevel=2)
+            UserWarning, stacklevel=caller_stacklevel())
         return None
 
 

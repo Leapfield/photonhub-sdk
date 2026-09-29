@@ -85,8 +85,8 @@ sim.plot_3d()                     # interactive 3D  (pip install photonhub[viz])
 Shipped surface as of schema **v1.21.0-alpha.1** (a dispersive solver core
 cross-checked against analytic references: multi-pole Lorentz + Drude ADE
 with a fitted metals library (Au/Ag/Cu/Al) and PEC structures, with recorded
-CPU↔GPU equivalence (full inventory 475/475 on 2026-08-27, a dated
-pre-merge record) under the numerical contract's tolerances; plus full-vector mode
+CPU↔GPU equivalence (the 0.1.4 GPU solver image passed all 65 GPU
+equivalence tests on 2026-09-28) under the numerical contract's tolerances; plus full-vector mode
 injection, GDS import (`ph.import_gds`), adjoint gradients, and silicon
 photonic-circuit tools):
 
@@ -112,8 +112,7 @@ photonic-circuit tools):
   the closed `TFSFBox` scattering box (single-run cross-sections with PML on
   all sides), and the `mode_launch` waveguide-mode builder that declared ports
   use, all driven by a `GaussianPulse` or a steady-state `CW` carrier. The
-  `ModeSource` wire type remains for legacy scalar and continuous-adjoint
-  compatibility.
+  `ModeSource` wire type remains for legacy scalar-mode compatibility.
 - **Monitors:** `TimeMonitor`, `SnapshotMonitor`, `ProfileMonitor`,
   and `PowerMonitor`: fp64 DFT field and flux power. A DFT plane may carry the
   optional `ModePort` authoring recipe; the engine strictly validates and then

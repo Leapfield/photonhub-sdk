@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable, Optional, Union
 
 from .components.simulation import SUPPORTED_SCHEMA_MAJOR
+from ._compat import caller_stacklevel
 
 
 # Public compatibility constant used by callers comparing the solver manifest.
@@ -36,7 +37,7 @@ def warn_implicit_dft_shutoff_unsupported(target: str) -> None:
         warnings.warn(
             f"{target} does not advertise dft_shutoff; recorded DFT/flux "
             "decay is not estimated and the energy-only stop is used",
-            UserWarning, stacklevel=2)
+            UserWarning, stacklevel=caller_stacklevel())
 
 
 def omit_unsupported_dft_shutoff(wire: dict, target: str) -> dict:
@@ -45,7 +46,7 @@ def omit_unsupported_dft_shutoff(wire: dict, target: str) -> dict:
         wire["run"].pop("dft_shutoff")
         warnings.warn(
             f"{target} does not advertise dft_shutoff; the run will use "
-            "energy-only auto-shutoff", UserWarning, stacklevel=2)
+            "energy-only auto-shutoff", UserWarning, stacklevel=caller_stacklevel())
     return wire
 
 # The feature flags the v1 engine advertises via ``phsolver --capabilities``

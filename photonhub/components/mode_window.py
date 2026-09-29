@@ -30,6 +30,7 @@ import re
 import warnings
 
 from ..constants import c0
+from .._compat import caller_stacklevel
 
 __all__ = ["MODE_WINDOW_FACTOR", "mode_window_um"]
 
@@ -174,5 +175,5 @@ def mode_window_um(width_um: float, thickness_um: float, n_core, n_clad, wlen_um
     if pad > 3.0 * wlen:
         warnings.warn(f"the {family}{order} mode is close to cut-off (n_eff {float(n_eff):.4g} against a cladding "
                       f"of {max(below, above):.4g}): its window pad is {pad:g} um, {pad / wlen:.1f} wavelengths",
-                      UserWarning, stacklevel=2)
+                      UserWarning, stacklevel=caller_stacklevel())
     return round(0.5 * width + pad, 10), round(0.5 * thickness + pad, 10)

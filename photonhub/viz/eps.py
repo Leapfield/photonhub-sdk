@@ -39,6 +39,7 @@ from ..components.grid import (graded_primary_spacings, realized_cells,
                                sim_axis_min_cells)
 from . import _geometry as geom
 from . import _style
+from .._compat import caller_stacklevel
 
 _AXES = "xyz"
 
@@ -638,7 +639,7 @@ def _plot_index_on(ax, sim, axis, value, owns_figure, *, cmap, legend, grid,
         warnings.warn(
             f"{axis}={value} um is outside the realized domain "
             f"[{origin[a]:.6g}, {origin[a] + realized[a]:.6g}] um on that axis; nothing to draw",
-            UserWarning, stacklevel=2)
+            UserWarning, stacklevel=caller_stacklevel())
         _finish_axes(ax, axis, value, sim, None)
         return ax
 
@@ -738,6 +739,6 @@ def plot_eps(*args, **kwargs):
         "photonhub.viz.plot_eps was renamed to plot_index; the old name will be "
         "removed in a future release.",
         DeprecationWarning,
-        stacklevel=2,
+        stacklevel=caller_stacklevel(),
     )
     return plot_index(*args, **kwargs)

@@ -33,6 +33,7 @@ from .run import (
     run_quoted,
     submit_quoted,
 )
+from .._compat import caller_stacklevel
 
 __all__ = [
     "configure",
@@ -74,7 +75,7 @@ def __getattr__(name):
             f"photonhub.cloud.{name} was renamed to photonhub.cloud.{replacement}; "
             "the old alias will be removed in a future release.",
             DeprecationWarning,
-            stacklevel=2,
+            stacklevel=caller_stacklevel(),
         )
         return globals()[replacement]
     raise AttributeError(f"module 'photonhub.cloud' has no attribute {name!r}")

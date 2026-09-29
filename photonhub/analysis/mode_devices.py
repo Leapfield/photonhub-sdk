@@ -48,6 +48,7 @@ from .mode_overlap import (
     vector_modal_fields,
 )
 from .modes import Mode
+from .._compat import called_from_package, caller_stacklevel
 
 _OPPOSITE = {"+": "-", "-": "+"}
 
@@ -119,6 +120,42 @@ def _node_weights(simulation, axis_name: str, nodes: np.ndarray) -> np.ndarray:
     if w.size and ((sym is not None and sym[a] != 0) or bnd == "pmc"):
         w[0] *= 0.5
     return w
+
+
+def _launch_half_cell_um(simulation, axis: str, position_um: float,
+                         direction: str) -> float:
+    """The distance (microns) between a §18 launch's E plane and the H plane
+    its correction sits on: half the local cell upstream of the plane (the
+    cell below it for ``direction='+'``, above it for ``'-'``), the plane
+    snapped to the nearest node as the engine snaps it (§15.9)."""
+    idx = _AXIS_IDX[axis]
+    q = simulation._axis_coords_um(idx)
+    if q is None:
+        return 0.5 * float(simulation.grid.dl_um)
+    qa = np.asarray(q, dtype=float)
+    dq = np.asarray(graded_primary_spacings(tuple(q)), dtype=float)
+    d = np.abs(qa - float(position_um))
+    k0 = int(qa.size - 1 - np.argmin(d[::-1]))    # ties to the higher node, as the engine
+    k = max(k0 - 1, 0) if direction == "+" else k0
+    return 0.5 * float(dq[k])
+
+
+def _scalar_launch_watts(simulation, src: ModeSource, mode, direction: str) -> float:
+    """The watts a unit-amplitude scalar §18 source ``src`` launches: the
+    scalar-H flux ``(n_eff / 2 eta0) integral profile^2 dA`` over its major
+    component's Yee positions, times ``cos(beta h)`` with ``h`` the launch
+    half cell. A scalar mode carries no true H, so this is the scalar-limit
+    estimate; a broadband source is scaled at its band centre."""
+    t1, t2 = _TRANSVERSE[src.axis]
+    grid1, grid2 = _yee_plane_grids(simulation, src.axis)
+    if src.polarization == "E" + t1:
+        dA = np.outer(_node_weights(simulation, t2, grid1[1]), _cell_widths(grid1[0]))
+    else:
+        dA = np.outer(_cell_widths(grid2[1]), _node_weights(simulation, t1, grid2[0]))
+    prof = np.asarray(src.profile, dtype=float).reshape(dA.shape)
+    p = float(src.n_eff) / (2.0 * ETA0) * float(np.sum(prof ** 2 * dA)) * 1e-12
+    beta = 2.0 * math.pi * float(src.n_eff) / float(mode.wavelength_um)
+    return p * math.cos(beta * _launch_half_cell_um(simulation, src.axis, src.position_um, direction))
 
 
 def _default_center(simulation, axis: str) -> Tuple[float, float]:
@@ -226,9 +263,11 @@ def mode_source(
         (:func:`~photonhub.analysis.yee_mode.solve_yee_mode` /
         :func:`~photonhub.analysis.kfj_smoothing.solve_mode_on_cross_section`). The
         Phased-dipole launch works on uniform AND graded grids, supports
-        broadband, and sheds less near-source radiation. Full-vector calls here
-        delegate to :func:`mode_source_vector` (which emits the deprecation
-        warning); §18 is retained for the adjoint and scalar/FLM modes.
+        broadband, and sheds less near-source radiation. A direct call here
+        with a full-vector mode emits the deprecation warning and delegates to
+        :func:`mode_source_vector`; the package's own calls (``mode_launch``
+        with ``launch="aux"``, the adjoint source) stay silent. §18 is
+        retained for the adjoint and scalar/FLM modes.
 
     **Full-vector launch is the default (NUMERICS.md §18.2a / launch_fidelity).**
     When ``mode`` is a full-vector mode (it carries the true paired ``H``, e.g. a
@@ -239,8 +278,11 @@ def mode_source(
     instead of the scalar-impedance-H approximation. The launch is then power-normalized
     (``power_watts = amplitude²``
     so a non-unit ``amplitude`` still scales power as a peak-field would). Pass
-    ``paired_h=False`` to force the legacy scalar-limit launch, or pass a scalar
-    :class:`Mode` (no H), both give the prior single-component behavior.
+    ``paired_h=False`` to force the legacy scalar-limit launch; for a
+    ``solve_yee_mode`` mode its profiles are scaled so the mode it launches
+    still carries ``amplitude²`` watts (NUMERICS §18.2b), any other
+    full-vector mode keeps the scalar-H scaling. A scalar :class:`Mode` (no H) gives the prior
+    single-component behavior.
 
     The mode's major transverse-E profile is resampled (peak-normalized) at
     that component's own Yee positions on the plane (NUMERICS §18.2).
@@ -270,15 +312,19 @@ def mode_source(
     # (major+minor) E. A scalar Mode (no H) always falls through to the scalar
     # path below.
     if _is_full_vector(mode):
+        if not called_from_package():
+            _warn_aux_line_deprecated()
         src = mode_source_vector(
             simulation, mode, axis=axis, position_um=position_um,
             source_time=source_time, direction=direction,
             power_watts=float(amplitude) ** 2, center_um=center_um,
             thickness_axis=thickness_axis, modes_by_freq=modes_by_freq,
+            _paired_h=paired_h,
         )
         if not paired_h:
-            src = src.model_copy(
-                update={"profile_h": None, "profile_h_minor": None})
+            src = src.model_copy(update={
+                "profile_h": None, "profile_h_minor": None,
+                "profiles_h_by_freq": None, "profiles_h_minor_by_freq": None})
         return src
     t1_name, t2_name = _TRANSVERSE[axis]
     # each component at its own Yee position on the plane (NUMERICS §18.2)
@@ -472,8 +518,9 @@ def mode_launch(
     from the mode's recorded placement, so the launch registers on the solve
     grid.
 
-    The continuous-adjoint pipeline uses :func:`mode_source`, whose gradient
-    normalization is tied to that excitation."""
+    The inverse-design driver (:mod:`photonhub.inverse_design`, an exact
+    discrete adjoint) builds its adjoint excitation from the objective's
+    transposed sources, not from this launch."""
     if launch not in ("auto", "eq_current", "aux"):
         raise ValueError(
             f"launch must be 'auto', 'eq_current', or 'aux', got {launch!r}")
@@ -545,12 +592,36 @@ def mode_launch(
     # the reorder is correct for every propagation axis.
     coord = {h_letter: h_center, v_letter: v_center}
     t1, t2 = _TRANSVERSE[axis]
-    return [mode_source(
+    watts = modeled_watts(h_center, v_center)
+    src = mode_source(
         simulation, mode, axis=axis, position_um=position_um,
         source_time=source_time, direction=direction,
-        amplitude=math.sqrt(modeled_watts(h_center, v_center)),
+        amplitude=math.sqrt(watts),
         center_um=(coord[t1], coord[t2]), thickness_axis=thickness_axis,
-        modes_by_freq=modes_by_freq)]
+        modes_by_freq=modes_by_freq)
+    if not _is_full_vector(mode):
+        # A scalar mode's profile is peak-normalized (amplitude is the peak
+        # field), so the square root of the watts above launched about 1e-16 W
+        # of a silicon strip's TE0. Scale it to the watts: the scalar-H flux
+        # of the profile, times the Yee scheme's cos(beta h) (NUMERICS §18.2b).
+        src = src.model_copy(update={"amplitude": math.sqrt(
+            watts / _scalar_launch_watts(simulation, src, mode, direction))})
+    return [src]
+
+
+def _warn_aux_line_deprecated() -> None:
+    """The §18 aux-line deprecation, for a user's direct call only: the
+    package's own launches (``mode_launch(launch="aux")``, its fallback, the
+    adjoint source) still run this path without the user naming it."""
+    warnings.warn(
+        "mode_source_vector / the §18 aux-line ModeSource is deprecated: prefer "
+        "mode_launch(...) with a discrete Yee mode (solve_yee_mode / "
+        "solve_mode_on_cross_section), which injects a per-cell equivalence-"
+        "current Huygens sheet that works on uniform AND graded grids and now "
+        "supports broadband (num_freqs>1). The §18 path is retained only for the "
+        "adjoint (its gradient is pinned to it) and scalar/FLM modes.",
+        DeprecationWarning, stacklevel=caller_stacklevel(),
+    )
 
 
 def mode_source_vector(
@@ -565,6 +636,7 @@ def mode_source_vector(
     center_um: Optional[Tuple[float, float]] = None,
     thickness_axis: Optional[str] = None,
     modes_by_freq: Optional[Mapping[float, object]] = None,
+    _paired_h: bool = True,
 ) -> ModeSource:
     """Build a FULL-VECTOR, power-normalized :class:`ModeSource` from a
     ``VectorMode`` (NUMERICS.md §18).
@@ -580,40 +652,47 @@ def mode_source_vector(
     with its own scalar-limit paired H.
 
     **1 W normalization (computed here, on the Python side; the engine stays
-    power-agnostic).** The engine injects ``E_t = amplitude * profile`` and the
-    scalar-limit paired ``H = (n_eff/eta0)(z_hat x E_t)``, so the launched modal
-    Poynting flux is
+    power-agnostic; NUMERICS §18.2b).** For a ``solve_yee_mode`` mode
+    (``yee_staggered``, the grid's own eigenmode) the engine injects
+    ``E_t = amplitude * profile`` and the mode's true paired H (``profile_h``,
+    ``profile_h_minor``), so the mode leaves the plane with the continuum
+    Poynting flux of that pair,
 
-        P_inj = (1/2) integral Re(E x H*) . z_hat dA
-              = (n_eff / (2 eta0)) * amplitude^2
-                * integral (|profile_major|^2 + |profile_minor|^2) dA .
+        P_t = (1/2) integral Re(E x H*) . z_hat dA ,
 
-    We resample the *unnormalized* transverse-E pair, evaluate that integral on
-    each sample's area: the cell width along a cell-centered axis and the dual
-    width along a node axis, halved on a symmetry plane or pmc wall. Scale
-    BOTH packed profiles by
-    ``1/sqrt(P_inj_at_unit_scale / power_watts)`` so the injected mode carries
-    exactly ``power_watts`` in the engine's own (scalar-H) convention. (The
-    field-only L2 normalization the FDE solver applies has arbitrary units, so a
-    power normalization here is what makes the launch physically meaningful and
-    lets transmission read an absolute fraction.) ``amplitude`` is left at 1.0;
-    the whole power scaling lives in the profiles.
+    and, with the H half a local cell ``h`` from the E plane, the Yee scheme
+    carries ``P_t cos(beta h)`` through every plane downstream. The profiles
+    are scaled so that product is ``power_watts``: a ``PowerMonitor`` and the
+    port's modal power read it back. The integral runs over each sample's
+    area: the cell width along a cell-centred axis and the dual width along a
+    node axis, halved on a symmetry plane or pmc wall. (The field-only L2
+    normalization the FDE solver applies has arbitrary units, so a power
+    normalization here is what makes the launch physically meaningful.)
+    ``amplitude`` is left at 1.0; the whole power scaling lives in the
+    profiles. Until this rule the profiles were normalized on the scalar-H
+    flux ``P_s = (n_eff / 2 eta0) integral |E_t|^2 dA``, which for a silicon
+    strip's TE0 is some 12 % below ``P_t``, so the launch read about 14 % over
+    its watt. With ``paired_h=False`` (the scalar-limit H) the launched mode
+    carries ``(P_s + P_t)^2 / (4 P_t)`` of the pair, and the profiles are
+    normalized on that. Any other full-vector mode (``VectorModeSolver``'s
+    node-collocated solution) is not the grid's eigenmode, so the flux of its
+    own pair over-reads what it launches; it keeps the ``P_s`` normalization,
+    which carries about 0.98 W per watt at the port for that strip at 50 nm
+    cells.
+
+    A ``solve_yee_mode`` mode (``yee_staggered``) carries the Yee offsets in
+    its arrays, so it is read at the node labels of the plane (each entry
+    lands on its own component's Yee position when the engine stamps it); any
+    other full-vector mode is sampled at the Yee positions themselves. The
+    rule keys on ``yee_staggered``, so the beam, imported-field and thin-lens
+    profiles that carry the same flag take it too; they are built for the
+    equivalence-current launch, and their aux-launch power is not measured.
 
     Phase note: for a lossless guided mode both transverse-E components are
     co-real (relative phase 0 or π), so the real signed ``profile``/
     ``profile_minor`` capture the launch exactly; any out-of-phase (quadrature)
     part of the minor-E would need a second carrier and is dropped (a no-op for
     the lossless guided modes this targets).
-
-    Accuracy note (absolute power): the 1 W normalization above integrates the
-    SCALAR-LIMIT paired H (``P = n_eff/(2 eta0) * integral |E_t|^2``), while
-    the source also ships the mode's TRUE-H profiles (``profile_h`` /
-    ``profile_h_minor``) for the engine's injection. Where the true H deviates
-    from the scalar limit (high-contrast cores, ~1%), the actually injected
-    modal power differs from ``power_watts`` by that correction, transmission
-    RATIOS cancel it (both planes read the same launch), only the absolute
-    wattage carries the bias. Left as-is pending an engine-side verification
-    of the injected-power convention.
 
     **Broadband injection (``num_freqs`` analogue, NUMERICS.md §18.3).** Pass
     ``modes_by_freq`` (``{freq_hz: VectorMode}`` from :func:`solve_modes_by_freq`
@@ -623,15 +702,8 @@ def mode_source_vector(
     them. The positional ``mode`` stays the band-centre representative and the
     sign reference. Fewer than two entries is a no-op (single ``mode``).
     """
-    warnings.warn(
-        "mode_source_vector / the §18 aux-line ModeSource is deprecated: prefer "
-        "mode_launch(...) with a discrete Yee mode (solve_yee_mode / "
-        "solve_mode_on_cross_section), which injects a per-cell equivalence-"
-        "current Huygens sheet that works on uniform AND graded grids and now "
-        "supports broadband (num_freqs>1). The §18 path is retained only for the "
-        "adjoint (its gradient is pinned to it) and scalar/FLM modes.",
-        DeprecationWarning, stacklevel=2,
-    )
+    if not called_from_package():
+        _warn_aux_line_deprecated()
     if axis not in _TRANSVERSE:
         raise ValueError(f"axis must be one of x/y/z, got {axis!r}")
     if not power_watts > 0.0:
@@ -643,86 +715,109 @@ def mode_source_vector(
     # centre). The dA of each: the cell width along a cell-centred axis, the
     # dual width along a node axis, whose row on a §20 plane counts half.
     grid1, grid2 = _yee_plane_grids(simulation, axis)
+    # A Yee-staggered mode (solve_yee_mode) already carries each component's
+    # intra-cell offset: its ex[i] IS the field half a cell past node i, which
+    # vector_modal_fields labels with node i. So it is read at the node labels,
+    # where the engine stamps entry i on that component's own Yee position.
+    # Read at the Yee positions themselves, it landed half a cell off along
+    # the axis its component is cell-centred on (NUMERICS §18.2b).
+    nodes = (_axis_nodes(simulation, t1_name), _axis_nodes(simulation, t2_name))
     if center_um is None:
         center_um = _default_center(simulation, axis)
     dA1_m2 = np.outer(_node_weights(simulation, t2_name, grid1[1]), _cell_widths(grid1[0])) * 1e-12
     dA2_m2 = np.outer(_cell_widths(grid2[1]), _node_weights(simulation, t1_name, grid2[0])) * 1e-12
+    half_um = _launch_half_cell_um(simulation, axis, position_um, direction)
 
     def _fields(m):
         """(e1, e2, h1, h2) each at its own Yee positions: e1 with the h2 it
         pairs with, e2 with h1."""
-        f1 = vector_modal_fields(m, *grid1, axis=axis, direction=direction,
+        g1, g2 = (nodes, nodes) if getattr(m, "yee_staggered", False) else (grid1, grid2)
+        f1 = vector_modal_fields(m, *g1, axis=axis, direction=direction,
                                  center_um=center_um, thickness_axis=thickness_axis)
-        f2 = vector_modal_fields(m, *grid2, axis=axis, direction=direction,
+        f2 = vector_modal_fields(m, *g2, axis=axis, direction=direction,
                                  center_um=center_um, thickness_axis=thickness_axis)
         return f1["e1"], f2["e2"], f2["h1"], f1["h2"]
 
-    def _resample(m):
-        """Power-normalized (major, minor) real profiles + major polarization,
-        resampled onto this plane, the shared full-vector source readout."""
-        e1, e2, _, _ = _fields(m)  # transverse-E along t1, t2 ([iv, iu])
-        # The MAJOR transverse axis carries the larger transverse-E energy.
-        if float(np.sum(np.abs(e1) ** 2)) >= float(np.sum(np.abs(e2) ** 2)):
-            e_major, pol_maj, e_minor = e1, "E" + t1_name, e2
+    def _launch(m):
+        """The launch of mode ``m``: its real (major, minor) E profiles, the
+        paired true-H profiles in E-equivalent units (``h eta0 / n_eff``, so
+        each reduces to its E profile in the scalar limit), and the major
+        polarization, all scaled so the launch carries ``power_watts``."""
+        c1, c2, g1, g2 = _fields(m)
+        # The MAJOR transverse axis carries the larger transverse-E energy
+        # (complex, so the E and H profiles route to the same axes).
+        major_t1 = (float(np.sum(np.abs(c1) ** 2))
+                    >= float(np.sum(np.abs(c2) ** 2)))
+        e1, e2, h1, h2 = (np.real(f) for f in (c1, c2, g1, g2))
+        if major_t1:
+            e_maj, e_min, pol_maj = e1, e2, "E" + t1_name
+            h_maj, h_min = h2, h1   # E_t pairs with the H of the OTHER axis
             dA_maj, dA_min = dA1_m2, dA2_m2
         else:
-            e_major, pol_maj, e_minor = e2, "E" + t2_name, e1
+            e_maj, e_min, pol_maj = e2, e1, "E" + t2_name
+            h_maj, h_min = h1, h2
             dA_maj, dA_min = dA2_m2, dA1_m2
-        if not float(np.sum(np.abs(e_major) ** 2)) > 0.0:
+        if not float(np.sum(e_maj ** 2)) > 0.0:
             raise ValueError(
                 "the resampled mode profile is identically zero on this plane "
                 "— check the mode window vs the simulation transverse extent / "
                 "center"
             )
-        # Real signed profiles (lossless guided mode -> transverse-E co-real;
-        # the real part is exact there). Keep the major/minor RATIO.
-        maj = np.real(e_major)
-        minr = np.real(e_minor)
-        # power_watts normalization in the engine's scalar-H convention (see the
-        # docstring P_inj derivation), evaluated AT this mode's n_eff.
-        p_unit = (float(m.n_eff) / (2.0 * ETA0)) * float(
-            np.sum(maj ** 2 * dA_maj) + np.sum(minr ** 2 * dA_min)
-        )
-        if not p_unit > 0.0:
+        n_eff = float(m.n_eff)
+        # True H in E-equivalent units, sign-aligned to its E so it reduces to
+        # +profile in the scalar limit (the engine's §18.2a convention).
+        hq_maj, hq_min = h_maj * (ETA0 / n_eff), h_min * (ETA0 / n_eff)
+        if float(np.vdot(e_maj.ravel(), hq_maj.ravel())) < 0.0:
+            hq_maj = -hq_maj
+        if float(np.vdot(e_min.ravel(), hq_min.ravel())) < 0.0:
+            hq_min = -hq_min
+        # The launch power (NUMERICS §18.2b). For a Yee mode, the grid's own
+        # eigenmode, the engine injects E and its true paired H, so the mode
+        # leaves with the continuum flux of that pair, (n_eff / 2 eta0)
+        # sum(e hq dA): about 13 % above the scalar-H (n_eff / 2 eta0)
+        # sum(e^2 dA) for a silicon strip's TE0. With the scalar-limit H
+        # (paired_h=False) the pair is not the mode; the mode it launches
+        # carries (P_s + P_t)^2 / (4 P_t), the projection of the pair onto
+        # the mode. The H sits half a local cell h_s from the E plane, so the
+        # Yee scheme then carries cos(beta h_s) of that through every plane
+        # downstream (the §18.7 conserved flux). Any other full-vector mode
+        # (the node-collocated VectorModeSolver) is not the grid's mode
+        # either, and the flux of its own pair over-reads what it launches
+        # (a 1 W launch of the strip's TE0 would carry 0.94 W); it keeps the
+        # scalar-H normalization, which carries 0.98 W at its port.
+        k = n_eff / (2.0 * ETA0)
+        p_s = k * float(np.sum(e_maj ** 2 * dA_maj) + np.sum(e_min ** 2 * dA_min))
+        if not p_s > 0.0:
             raise ValueError(
                 "modal power integral is non-positive; cannot normalize")
+        p_unit = p_s
+        if getattr(m, "yee_staggered", False):
+            p_t = k * float(np.sum(e_maj * hq_maj * dA_maj) + np.sum(e_min * hq_min * dA_min))
+            if not p_t > 0.0:
+                raise ValueError(
+                    "modal power integral is non-positive; cannot normalize")
+            p_unit = p_t if _paired_h else (p_s + p_t) ** 2 / (4.0 * p_t)
+            p_unit *= math.cos(2.0 * math.pi * n_eff / float(m.wavelength_um) * half_um)
         scale = float(np.sqrt(power_watts / p_unit))
         # C-order [iv*nu + iu] = [cv*nu + cu]
-        return (maj * scale).reshape(-1), (minr * scale).reshape(-1), pol_maj
+        return ((e_maj * scale).reshape(-1), (e_min * scale).reshape(-1), pol_maj,
+                (hq_maj * scale).reshape(-1), (hq_min * scale).reshape(-1))
 
-    maj, minr, pol_major = _resample(mode)
-    pol_minor = ("E" + t2_name) if pol_major == "E" + t1_name else ("E" + t1_name)
+    def _resample(m):
+        """Power-normalized (major, minor) real E profiles + major
+        polarization, resampled onto this plane."""
+        return _launch(m)[:3]
 
     def _resample_h(m):
-        """True paired-H profiles (E-equivalent units h·η0/n_eff) for mode ``m``,
-        evaluated at ITS OWN n_eff, sign-aligned to the E profiles so each reduces
-        to +profile in the scalar limit (matching the legacy engine path), the
-        deviation IS the true-H correction the engine's E-correction needs to stop
-        radiating the scalar-limit-H mismatch (~few %). Called once per band-centre
-        and once per broadband carrier (each at its own frequency's n_eff)."""
-        c1, c2, g1, g2 = _fields(m)
-        # SAME major/minor criterion as _resample above (complex transverse-E
-        # energy) — a real-part criterion could route the E and H profiles to
-        # opposite axes for a mode with residual imaginary content; for the
-        # lossless co-real modes this targets the two coincide.
-        major_t1 = (float(np.sum(np.abs(c1) ** 2))
-                    >= float(np.sum(np.abs(c2) ** 2)))
-        e1, e2, h1, h2 = (np.real(f) for f in (c1, c2, g1, g2))
-        e_maj, e_min = (e1, e2) if major_t1 else (e2, e1)
-        h_maj, h_min = (h2, h1) if major_t1 else (h1, h2)  # E_t pairs with H of the OTHER axis
-        dA_maj, dA_min = (dA1_m2, dA2_m2) if major_t1 else (dA2_m2, dA1_m2)
-        p_unit = (float(m.n_eff) / (2.0 * ETA0)) * float(
-            np.sum(e_maj ** 2 * dA_maj) + np.sum(e_min ** 2 * dA_min))
-        sc = float(np.sqrt(power_watts / p_unit))
-        fac = (ETA0 / float(m.n_eff)) * sc
-        hmaj, hmin = h_maj * fac, h_min * fac
-        if float(np.vdot(e_maj.ravel(), hmaj.ravel())) < 0.0:
-            hmaj = -hmaj
-        if float(np.vdot(e_min.ravel(), hmin.ravel())) < 0.0:
-            hmin = -hmin
-        return hmaj.reshape(-1), hmin.reshape(-1)
+        """The true paired-H profiles of ``m`` (E-equivalent units, at its own
+        n_eff), scaled with its E profiles. Their deviation from the E profiles
+        IS the true-H correction the engine's E-correction needs to stop
+        radiating the scalar-limit-H mismatch (~few %). Called once per
+        band-centre and once per broadband carrier."""
+        return _launch(m)[3:]
 
-    h_maj_prof, h_min_prof = _resample_h(mode)
+    maj, minr, pol_major, h_maj_prof, h_min_prof = _launch(mode)
+    pol_minor = ("E" + t2_name) if pol_major == "E" + t1_name else ("E" + t1_name)
 
     bb = _broadband_arrays(
         modes_by_freq, _resample, pol_major, maj, central_minor=minr,
@@ -861,7 +956,7 @@ class ModeMonitor:
                     "back to the frozen band-centre mode. Pass "
                     "per_freq_modes=False to silence, or an explicit "
                     "modes_by_freq.",
-                    UserWarning, stacklevel=3)
+                    UserWarning, stacklevel=caller_stacklevel())
                 bank = None
         # Cache the outcome (a failed build too — warn once, not per reading).
         object.__setattr__(self, "_auto_bank_cache", bank)

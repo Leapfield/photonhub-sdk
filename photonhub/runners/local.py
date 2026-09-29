@@ -15,6 +15,7 @@ from typing import Callable, Optional, Union
 
 from pydantic_core import to_json
 
+from .._compat import caller_stacklevel
 from ..capabilities import (check_device_support, engine_capabilities,
                             omit_unsupported_dft_shutoff, selects_gpu,
                             warn_implicit_dft_shutoff_unsupported)
@@ -28,6 +29,7 @@ from .phsolver import (
     run_phsolver,
 )
 from .progress import default_renderer
+from .._compat import caller_stacklevel
 
 # The phsolver process layer (discovery, command grammar, subprocess + event
 # contract) lives in .phsolver, shared with the cloud executor. SolverRunError
@@ -145,9 +147,21 @@ def _describe_dft_hold(hold: dict) -> str:
         estimate = f"{tail:.3g}"
         ratio = (f" (tail/threshold {tail / threshold:.3g})" if threshold > 0
                  else " (tail/threshold undefined)")
-    return (f"monitor {hold['monitor']} at {hold['frequency_hz']:.9g} Hz: "
+    held = (f"monitor {hold['monitor']} at {hold['frequency_hz']:.9g} Hz: "
             f"estimated tail {estimate} against threshold {threshold:.3g}"
             f"{ratio}")
+    # Counts are (monitor, frequency) pairs over every guarded monitor. The
+    # named frequency is only the one furthest from its threshold.
+    unsettled, included = hold.get("unsettled_bins"), hold.get("included_bins")
+    if unsettled is not None and included:
+        if unsettled:
+            held = (f"{unsettled} of {included} monitor frequencies were still "
+                    f"settling; the furthest was {held}")
+        else:
+            held = (f"all {included} monitor frequencies had settled at the "
+                    "last check, but a stop needs two consecutive settled "
+                    f"checks and the energy rule; the closest was {held}")
+    return held
 
 
 def run_local(
@@ -229,7 +243,7 @@ def run_local(
             "source in place and the recorded spectra are physically "
             "meaningless. Move the source into the interior or thin the "
             "boundary layers.",
-            stacklevel=2,
+            stacklevel=caller_stacklevel(),
         )
 
     out_dir = Path(output_dir) if output_dir is not None else Path(
@@ -277,7 +291,7 @@ def run_local(
                         cancel_event=cancel_event) or {}
     advisory = decay_trail.plateau_advisory()
     if advisory:
-        warnings.warn(advisory, stacklevel=2)
+        warnings.warn(advisory, stacklevel=caller_stacklevel())
     cap = getattr(sim, "_run_transits", None)
     if sim.run.shutoff and not done.get("shut_off", True):
         decay = done.get("field_decay")
@@ -297,14 +311,14 @@ def run_local(
                 f"{effective_dft_shutoff:g}; {held}. The energy rule {energy}. "
                 "The spectra may carry a tail. Increase transits or run_time_s "
                 "or n_steps, or choose dft_shutoff=1e-3 or 0.",
-                stacklevel=2)
+                stacklevel=caller_stacklevel())
         elif cap is not None:
             left = f"{float(decay):.1e} of its peak energy" if decay is not None else "above the shutoff"
             warnings.warn(
                 f"the run reached its cap of {cap:g} transits with the field still at {left} "
                 f"(shutoff {sim.run.shutoff:g}); the spectra may carry the tail. Raise "
                 "run=RunSpec(transits=...) or give run_time_s for a device that rings this long.",
-                stacklevel=2)
+                stacklevel=caller_stacklevel())
 
     # "Solver lies" guard: a clean exit with a missing/malformed manifest or
     # .bin is still a solver failure — surface it as SolverRunError so callers

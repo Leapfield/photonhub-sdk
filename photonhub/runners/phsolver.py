@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Callable, Optional, Tuple, Union
 
 from .._env import env, without_credentials
+from .._compat import caller_stacklevel
 
 _STDERR_TAIL_CHARS = 4000
 
@@ -648,5 +649,5 @@ def run_phsolver(cmd: list, *, on_event: EventCb = None,
                              returncode=returncode, stderr_tail=stderr_tail)
     for line in stderr_text.splitlines():
         if line.startswith("PHOTONHUB_DFT_GUARD_IGNORED: "):
-            warnings.warn(line.split(": ", 1)[1], UserWarning, stacklevel=2)
+            warnings.warn(line.split(": ", 1)[1], UserWarning, stacklevel=caller_stacklevel())
     return done_event

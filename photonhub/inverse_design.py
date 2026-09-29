@@ -1,62 +1,17 @@
-"""Adjoint-method gradients for inverse design (topology optimization).
+"""Single-frequency discrete-Yee adjoint gradients for inverse design.
 
-A *continuous* (frequency-domain) adjoint built entirely on the existing
-forward solver, no engine change. The whole point: one gradient over the whole
-design region costs **two** simulations (one forward, one adjoint) regardless of
-the number of design variables, where a central finite-difference check of the
-same gradient costs **2N** simulations. ``validation/suites/adjoint/gradient_check.py``
-verifies the two agree.
-
-Physics
--------
-Time-harmonic Maxwell in second-order (curl-curl) form, ``e^{-i w t}``::
-
-    A(eps) E = i w mu0 J ,     A = curl curl - k0^2 eps ,   k0 = w/c .
-
-Expose the design as the relative permittivity ``eps_i`` of each design *pixel*
-(a small box of Yee cells). For a figure of merit ``J(E)`` read at frequency
-``w``, first-order perturbation + the reciprocity ``A = A^T`` of a lossless
-reciprocal medium gives the textbook adjoint sensitivity
-
-    dJ/deps_i  =  Re[ beta . conj(u) . sum_{cells in i} sum_c E^c_fwd E^c_adj ]
-
-where
-
-* ``E_fwd`` is the forward field (the DFT monitor over the design region),
-* ``E_adj`` is the field of an **adjoint** run whose *unit* source sits at the
-  objective monitor, polarized along the objective (here a point dipole),
-* ``u`` is the complex forward objective amplitude (e.g. ``E_z`` at the probe),
-  and ``conj(u)`` is the objective's adjoint excitation coefficient,
-* the sum runs over the Yee cells of pixel ``i`` and the three E-components, each
-  sampled at its own Yee node, matching how the engine assigns ``eps`` per
-  component (``sample_component_eps``, ``reference_solver.cpp``), and
-* ``beta`` is one complex normalization constant.
-
-Only the *direction* of the gradient carries physics; ``beta`` is a
-units/normalization factor (it absorbs the section-12 DFT-phasor normalization
-and the Gaussian-pulse delay phase) that is **pinned once** against finite
-differences (``BETA``, confirmed in ``validation/suites/adjoint/gradient_check.py``). A
-step-normalized optimizer (Adam, line search) sees only the gradient direction,
-i.e. only ``arg(beta)``; ``|beta|`` rescales every component equally and never
-changes a design.
-
-The recorded phasors are normalized by the first source's ``A0 . S(f)``
-(``NUMERICS.md`` section 12). Running both the forward and adjoint sources at
-unit amplitude with the pulse centred on the objective frequency (``S(f0)=1``)
-makes the recorded field the per-unit-drive Green's response, so ``arg(beta)`` is
-a property of the discretization and transfers across geometry (the benchmark's
-second problem freezes ``beta`` from the first and still agrees).
-
-This is the *continuous* adjoint (it differentiates the frequency-domain Maxwell
-operator, not the discrete time-stepper), so it matches a finite-difference
-gradient of the FDTD solver up to discretization error, a few percent on a
-coarse grid, shrinking as ``dl`` falls.
+The default design uses scalar pixel boxes; trilinear custom media are optional.
+Each E-component sample of permittivity has a density derivative. The frequency
+derivative uses the leapfrog frequency `(2/dt)*sin(pi*f*dt)` and the
+engine's source-normalized DFT fields.
 """
 
 from __future__ import annotations
 
 import warnings
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
 
 import numpy as np
@@ -70,50 +25,38 @@ from .components import (
     Structure,
 )
 from .data import RunResult
+from .components.simulation import realized_cells
+from .components.grid import UniformMesh
+from .constants import c0 as _C0, eps0 as _EPS0
 from .runners import run_local
 from .analysis.mode_devices import _TANGENTIAL, mode_monitor, mode_source
 from .analysis.mode_overlap import mode_amplitude
+from .analysis.mode_overlap import (
+    _plane_component, _widths_with_grid, modal_fields, vector_modal_fields,
+)
 from .analysis.modes import Mode
+from .analysis.vector_modes import VectorMode
+from ._compat import caller_stacklevel
 
-# Complex adjoint normalization constant, pinned against central finite
-# differences (validation/suites/adjoint/gradient_check.py). The structural physics
-# (gradient ∝ Re[beta . conj(u) . sum_c E_fwd.E_adj]) is exact; BETA fixes the
-# overall complex scale set by the §12 phasor normalization and the pulse delay
-# phase. arg(BETA) sets the gradient DIRECTION (what a step-normalized optimizer
-# uses); |BETA| is an arbitrary overall scale. Value from the benchmark fit,
-# normalized to |BETA|=1 (direction is all that matters downstream):
-# arg = -1.440 rad, the e^{-iwt} §12-phasor + Gaussian-pulse-delay phase. The
-# source/probe propagation phases cancel, so arg is ~geometry-independent (the
-# benchmark's two problems agree to ~0.2 rad -> cos > 0.98 frozen).
-# NOTE THE MAGNITUDE: |BETA| == 1 by construction. This constant is a fitted
-# PHASE, pinned by aligning the adjoint direction with finite differences
-# (gradient_check.py) — it carries no magnitude normalization, so the returned
-# gradient is meaningful in DIRECTION but NOT in scale. Measured against
-# central finite differences the norm is off by a scene-, grid- and
-# objective-dependent factor (from ~1e2 on the SOI mode-power scenes to ~1e4
-# on the earlier point-intensity records), and the factor is NOT a constant:
-# it moves ~45% across pixel counts and region thicknesses, so it cannot be
-# absorbed into this constant. Consequence for callers: use it with a
-# scale-adaptive optimizer (Adam, the `optimize` default) or a line-searching
-# one (L-BFGS-B, the `optimize_parametric` default), never with a fixed step
-# size, a gradient-norm stopping rule, or a cross-problem sensitivity
-# comparison.
-BETA: complex = 0.1304 - 0.9915j    # exp(-1.440j); see gradient_check.py
+# Deprecated legacy import names. Gradients derive their coefficients from
+# each simulation; these sentinel values are never used by the driver.
+BETA: complex = 1.0 + 0.0j
+BETA_MODE: complex = 1.0 + 0.0j
 
-# Same role as BETA but for a MODE-SOURCE adjoint (ModePower): the adjoint
-# excitation is a backward guided mode (peak-normalized profile), not a unit
-# point dipole, and the objective coefficient is the P_mode-normalized overlap
-# c, so the constant differs from BETA. Pinned the same way (mode_power_check.py,
-# SOI TE0 transmission): cos(adjoint, finite-diff) = 0.992.
-BETA_MODE: complex = -0.1928 + 0.9812j   # exp(1.765j); see mode_power_check.py
+
+def _warn_objective_beta(beta: complex, placeholder: complex) -> None:
+    if beta != placeholder:
+        warnings.warn(
+            "the objective's beta field is deprecated and ignored; the gradient "
+            "derives its coefficient from the simulation",
+            DeprecationWarning, stacklevel=caller_stacklevel())
 
 
 def _axis_box(c0: int, c1: int, dl: float, quarter: bool) -> Tuple[float, float]:
     """(center, size) microns for a box spanning integer cells ``[c0, c1)``.
 
-    ``quarter=False`` puts the faces on cell boundaries ``k*dl``, cell centres
-    ``(k+0.5)*dl`` then fall strictly inside exactly one such box, so adjacent
-    pixel boxes tile the design region with no last-wins ambiguity (§9).
+    ``quarter=False`` puts faces on ``k*dl``. Yee nodes on shared faces
+    require the engine's inclusive, last-wins ownership rule (§9).
     ``quarter=True`` shifts the faces to ``(k+0.25)*dl`` so a *multi-component*
     DFT monitor snaps Ex/Ey/Ez to the same cells (§12)."""
     off = 0.25 if quarter else 0.0
@@ -129,9 +72,11 @@ class DesignRegion:
     The region occupies integer Yee-cell ranges ``[i0,i1) x [j0,j1) x [k0,k1)``
     on a uniform grid of pitch ``dl_um``; ``shape = (npx, npy, npz)`` pixels must
     divide each range evenly. Each pixel is a density ``rho in [0, 1]`` mapped to
-    a relative permittivity ``eps = eps_min + rho*(eps_max - eps_min)`` and
-    emitted as one :class:`~photonhub.Structure` box. ``eps_min >= 1`` (the
-    client forbids sub-vacuum permittivity).
+    a relative permittivity ``eps = eps_min + rho*(eps_max - eps_min)``. The
+    controls become quarter-cell-offset pixel boxes by default, so no Yee E
+    sample lies on any pixel face. ``box_face_offset_cells=0`` retains integer
+    faces and uses exact engine-style face ownership. ``parametrization="trilinear"`` selects one
+    trilinear custom medium instead and is CPU only. ``eps_min >= 1``.
 
     Build with :meth:`on_grid` from physical microns; the raw constructor takes
     cell indices.
@@ -142,6 +87,8 @@ class DesignRegion:
     shape: Tuple[int, int, int]
     eps_min: float = 1.0
     eps_max: float = 12.25  # ~Si at 1.55 um
+    parametrization: str = "boxes"
+    box_face_offset_cells: float = 0.25
     # background permittivity for the *gap* between region and pixels is the
     # simulation's own background; pixels fully tile the region so every region
     # cell belongs to a pixel.
@@ -162,6 +109,12 @@ class DesignRegion:
                              "sub-vacuum permittivity")
         if self.eps_max < self.eps_min:
             raise ValueError("eps_max must be >= eps_min")
+        if self.parametrization not in ("boxes", "trilinear"):
+            raise ValueError("parametrization must be 'boxes' or 'trilinear'")
+        if self.box_face_offset_cells not in (0.0, 0.25):
+            raise ValueError("box_face_offset_cells must be 0 or 0.25")
+        if self.parametrization == "trilinear" and self.box_face_offset_cells != 0.25:
+            raise ValueError("trilinear requires box_face_offset_cells=0.25")
 
     # -- construction -------------------------------------------------------
 
@@ -175,13 +128,15 @@ class DesignRegion:
         shape: Tuple[int, int, int],
         eps_min: float = 1.0,
         eps_max: float = 12.25,
+        parametrization: str = "boxes",
+        box_face_offset_cells: float = 0.25,
     ) -> "DesignRegion":
         """Snap a physical region (centre/size in microns) to integer cells.
 
         The low corner snaps to ``round((center-size/2)/dl)`` and the span to
         ``round(size/dl)`` cells, then rounded UP so each axis divides into its
-        pixel count. Use :attr:`size_um` / :attr:`center_um` afterwards to read
-        the realized (snapped) extent."""
+        pixel count. :attr:`size_um` and :attr:`center_um` describe the snapped
+        integer-cell extent; box faces shift by ``box_face_offset_cells``."""
         cells = []
         for c, s, n in zip(center_um, size_um, shape):
             lo = int(round((c - 0.5 * s) / dl_um))
@@ -189,7 +144,9 @@ class DesignRegion:
             span += (-span) % n  # round span up to a multiple of n
             cells.append((lo, lo + span))
         return cls(dl_um=dl_um, cells=tuple(cells), shape=shape,
-                   eps_min=eps_min, eps_max=eps_max)
+                   eps_min=eps_min, eps_max=eps_max,
+                   parametrization=parametrization,
+                   box_face_offset_cells=box_face_offset_cells)
 
     # -- geometry -----------------------------------------------------------
 
@@ -220,8 +177,34 @@ class DesignRegion:
         return self.eps_min + np.asarray(rho) * (self.eps_max - self.eps_min)
 
     def structures(self, rho: np.ndarray) -> Tuple[Structure, ...]:
-        """One box :class:`~photonhub.Structure` per pixel for the density grid
-        ``rho`` (shape ``self.shape`` or flat, row-major ``[ix, iy, iz]``)."""
+        """Material structures for this region's parametrization."""
+        if self.parametrization == "boxes":
+            return self.box_structures(rho)
+        return self.trilinear_structure(rho)
+
+    def trilinear_structure(self, rho: np.ndarray) -> Tuple[Structure, ...]:
+        """One CPU-only trilinear custom-medium box for the density grid.
+
+        The control at node ``(i,j,k)`` is density
+        ``rho[min(i,nx-1),min(j,ny-1),min(k,nz-1)]``. The box faces are a
+        quarter cell past integer planes. No Yee E node lies on a face.
+        """
+        rho = np.asarray(rho, dtype=float).reshape(self.shape)
+        node = np.indices(tuple(n + 1 for n in self.shape))
+        owners = tuple(np.minimum(node[a], self.shape[a] - 1)
+                       for a in range(3))
+        eps = self.eps(rho)[owners]
+        lo = np.array([a for a, _ in self.cells], dtype=float)
+        hi = np.array([b for _, b in self.cells], dtype=float)
+        low_um = (lo + 0.25) * self.dl_um
+        high_um = (hi + 0.25) * self.dl_um
+        return (Structure(
+            geometry=Box(center_um=tuple((low_um + high_um) / 2),
+                         size_um=tuple(high_um - low_um)),
+            medium=Medium.from_eps_array(eps)),)
+
+    def box_structures(self, rho: np.ndarray) -> Tuple[Structure, ...]:
+        """Pixel boxes with quarter-cell faces unless integer faces are selected."""
         rho = np.asarray(rho, dtype=float).reshape(self.shape)
         eps = self.eps(rho)
         (i0, _), (j0, _), (k0, _) = self.cells
@@ -231,11 +214,11 @@ class DesignRegion:
             for iy in range(self.shape[1]):
                 for iz in range(self.shape[2]):
                     cx, sx = _axis_box(i0 + ix * cpx, i0 + (ix + 1) * cpx,
-                                       self.dl_um, quarter=False)
+                                       self.dl_um, quarter=self.box_face_offset_cells == 0.25)
                     cy, sy = _axis_box(j0 + iy * cpy, j0 + (iy + 1) * cpy,
-                                       self.dl_um, quarter=False)
+                                       self.dl_um, quarter=self.box_face_offset_cells == 0.25)
                     cz, sz = _axis_box(k0 + iz * cpz, k0 + (iz + 1) * cpz,
-                                       self.dl_um, quarter=False)
+                                       self.dl_um, quarter=self.box_face_offset_cells == 0.25)
                     out.append(Structure(
                         geometry=Box(center_um=(cx, cy, cz),
                                      size_um=(sx, sy, sz)),
@@ -283,6 +266,99 @@ class DesignRegion:
         flat = np.where(bad, -1, flat)
         return flat  # shape (nz, ny, nx)
 
+    def _box_pixel_index(self, da, component: str) -> np.ndarray:
+        """Pixel owner at each component's Yee point, or -1 outside boxes."""
+        offsets = {"Ex": (0.5, 0.0, 0.0),
+                   "Ey": (0.0, 0.5, 0.0),
+                   "Ez": (0.0, 0.0, 0.5)}
+        off = offsets[component]
+        if self.box_face_offset_cells == 0.0:
+            # At an integer face, two inclusive boxes can both contain a Yee
+            # point. Compare the same SI coordinates and box arithmetic as
+            # the engine, then let the later structure overwrite the owner.
+            axes_si = [
+                (np.rint(np.asarray(da.coords[key]) / self.dl_um) + off[a])
+                * (self.dl_um * 1e-6)
+                for a, key in enumerate("xyz")
+            ]
+            x = axes_si[0][None, None, :]
+            y = axes_si[1][None, :, None]
+            z = axes_si[2][:, None, None]
+            owner = np.full((len(axes_si[2]), len(axes_si[1]),
+                             len(axes_si[0])), -1, dtype=int)
+            for pi, structure in enumerate(self.box_structures(
+                    np.zeros(self.shape))):
+                center = np.asarray(structure.geometry.center_um) * 1e-6
+                size = np.asarray(structure.geometry.size_um) * 1e-6
+                lo, hi = center - size / 2, center + size / 2
+                mask = ((x >= lo[0]) & (x <= hi[0]) &
+                        (y >= lo[1]) & (y <= hi[1]) &
+                        (z >= lo[2]) & (z <= hi[2]))
+                owner[mask] = pi
+            return owner
+        axes = []
+        for a, key in enumerate("xyz"):
+            index = np.rint(np.asarray(da.coords[key]) / self.dl_um)
+            low = self.cells[a][0] + self.box_face_offset_cells
+            high = self.cells[a][1] + self.box_face_offset_cells
+            point = index + off[a]
+            owner = np.floor((point - low) / self.cells_per_pixel[a]).astype(int)
+            owner = np.minimum(owner, self.shape[a] - 1)
+            owner[(point < low) | (point > high)] = -1
+            axes.append(owner)
+        px, py, pz = axes
+        PX, PY, PZ = px[None, None, :], py[None, :, None], pz[:, None, None]
+        flat = (PX * self.shape[1] + PY) * self.shape[2] + PZ
+        return np.where((PX < 0) | (PY < 0) | (PZ < 0), -1, flat)
+
+    def _density_weights(self, da, component: str) -> np.ndarray:
+        """Exact d(eps at Yee point)/d(rho), without contrast.
+
+        Shape is ``(n_params,nz,ny,nx)``. This mirrors the engine's
+        ``eps_data_at`` interpolation and the node-to-control replication in
+        :meth:`structures`.
+        """
+        offsets = {"Ex": (0.5, 0.0, 0.0),
+                   "Ey": (0.0, 0.5, 0.0),
+                   "Ez": (0.0, 0.0, 0.5)}
+        off = np.asarray(offsets[component])
+        lo = np.asarray([a for a, _ in self.cells], dtype=float)
+        hi = np.asarray([b for _, b in self.cells], dtype=float)
+        box_lo = lo + self.box_face_offset_cells
+        box_hi = hi + self.box_face_offset_cells
+        ns = np.asarray(self.shape) + 1
+        shape = (da.sizes["z"], da.sizes["y"], da.sizes["x"])
+        out = np.zeros((self.n_params, *shape), dtype=float)
+        # DFT coordinates are base-cell positions for every component.
+        ix = np.rint(np.asarray(da.coords["x"]) / self.dl_um).astype(int)
+        iy = np.rint(np.asarray(da.coords["y"]) / self.dl_um).astype(int)
+        iz = np.rint(np.asarray(da.coords["z"]) / self.dl_um).astype(int)
+        if self.parametrization == "boxes":
+            owner = self._box_pixel_index(da, component)
+            for pi in range(self.n_params):
+                out[pi] = owner == pi
+            return out
+        for kz, z in enumerate(iz):
+            for jy, y in enumerate(iy):
+                for xi, x in enumerate(ix):
+                    point = np.asarray((x, y, z), dtype=float) + off
+                    if np.any(point < box_lo) or np.any(point > box_hi):
+                        continue
+                    t = (point - box_lo) / (box_hi - box_lo) * (ns - 1)
+                    low = np.minimum(t.astype(int), ns - 2)
+                    q = t - low
+                    for sx in (0, 1):
+                        for sy in (0, 1):
+                            for sz in (0, 1):
+                                corner = np.asarray((sx, sy, sz))
+                                node = low + corner
+                                pix = tuple(min(node[a], self.shape[a] - 1)
+                                            for a in range(3))
+                                flat = np.ravel_multi_index(pix, self.shape)
+                                out[flat, kz, jy, xi] += np.prod(
+                                    np.where(corner, q, 1.0 - q))
+        return out
+
 
 # ---------------------------------------------------------------------------
 # Objectives
@@ -304,8 +380,11 @@ class PointIntensity:
     component: str = "Ez"
     name: str = "probe"
 
-    #: Normalization constant for this objective's adjoint (unit point dipole).
+    #: Deprecated and ignored; the driver derives its coefficient.
     beta: complex = BETA
+
+    def __post_init__(self) -> None:
+        _warn_objective_beta(self.beta, BETA)
 
     def monitor(self) -> ProfileMonitor:
         """Build the single-point DFT monitor for this objective component and frequency."""
@@ -338,7 +417,9 @@ class PointIntensity:
 
 @dataclass(frozen=True)
 class ModePower:
-    """Maximize the power coupled into a guided ``mode`` at an output port, ``J = |c|^2``, where ``c`` is the P_mode-normalized complex modal amplitude
+    """Maximize the power coupled into a guided ``mode`` at an output port.
+
+    ``J = |c|^2``, where ``c`` is the P_mode-normalized complex modal amplitude
     of the recorded plane (``mode_amplitude``). This is THE objective for
     waveguide inverse design: bends, mode converters, (de)multiplexers,
     grating couplers.
@@ -348,20 +429,18 @@ class ModePower:
        ``c_in == 1`` on an input plane, but ``mode_source(power_watts=1)``
        normalizes to SI watts, so ``J`` carries a scene/grid-dependent
        positive scale (measured ``~4/dl_um`` on SOI strip scenes: J = 23.4
-       at dl = 0.05 um where T ~ 0.29). Maximizing J still maximizes T, optimization and relative comparisons are unaffected, but do NOT
+       at dl = 0.05 um where T ~ 0.29). Maximizing J still maximizes T;
+       optimization and relative comparisons are unaffected, but do NOT
        report J as transmission; use the S-matrix path
        (:func:`photonhub.analysis.smatrix`), which normalizes by the driven
        port's incident amplitude and is calibrated (|S21|^2).
 
-    By reciprocity the adjoint excitation is the SAME mode launched BACKWARD from
-    the output plane (a `ModeSource` with ``direction`` reversed), with the
-    post-multiplied coefficient ``conj(c)``. Build the recording monitor with
-    :meth:`monitor` (a 4-tangential `ProfileMonitor` on the output plane), pass
-    a `Simulation` that carries the run's grid (any geometry-only simulation with the right
-    ``size_um``/``grid`` works; the domain is fixed across the optimization).
+    The adjoint uses electric and magnetic point currents built from the
+    transpose of the actual four-field overlap, including transverse Yee
+    co-location for scalar modes. The recording monitor excludes transverse PML rows.
     """
 
-    mode: Mode
+    mode: Union[Mode, VectorMode]
     axis: str                 # propagation axis (x/y/z)
     position_um: float        # output plane position along `axis`
     freq_hz: float
@@ -370,8 +449,11 @@ class ModePower:
     center_um: Optional[Tuple[float, float]] = None
     thickness_axis: Optional[str] = None
 
-    #: Normalization constant for this objective's adjoint (backward mode source).
+    #: Deprecated and ignored; the driver derives its coefficient.
     beta: complex = BETA_MODE
+
+    def __post_init__(self) -> None:
+        _warn_objective_beta(self.beta, BETA_MODE)
 
     def _mm(self, simulation: Simulation):
         return mode_monitor(
@@ -380,9 +462,31 @@ class ModePower:
             center_um=self.center_um, thickness_axis=self.thickness_axis)
 
     def monitor(self, simulation: Simulation) -> ProfileMonitor:
-        """The 4-tangential DFT monitor on the output plane (add to the sim's
-        monitors). ``simulation`` supplies the grid/size only."""
-        return self._mm(simulation).field_monitor
+        """Four-field output plane with transverse PML rows excluded.
+
+        The finite-aperture overlap differs from the former full-plane
+        objective; it keeps the adjoint current cloud in the physical
+        interior where the reciprocal Yee operator applies.
+        """
+        monitor = self._mm(simulation).field_monitor
+        if not isinstance(simulation.grid, UniformMesh):
+            return monitor
+        dl = simulation.grid.dl_um
+        center = list(monitor.center_um)
+        size = list(monitor.size_um)
+        for a, name in enumerate("xyz"):
+            if name == self.axis or getattr(simulation.boundaries, name) != "pml":
+                continue
+            n = round(simulation.size_um[a] / dl)
+            layers = simulation.pml_num_layers
+            low = (0.0 if simulation.symmetry[a] else (layers + 2.25) * dl)
+            high = (n - layers - 2.75) * dl
+            if high <= low:
+                continue
+            center[a] = (low + high) / 2
+            size[a] = high - low
+        return monitor.model_copy(update={"center_um": tuple(center),
+                                          "size_um": tuple(size)})
 
     def amplitude(self, data: RunResult) -> complex:
         """The complex normalized modal amplitude ``c`` on the output plane.
@@ -406,9 +510,10 @@ class ModePower:
         return float(abs(self.amplitude(data)) ** 2)
 
     def adjoint_source(self, forward_sim: Simulation):
-        """The target mode launched BACKWARD from the output plane (unit
-        amplitude, reusing the forward pulse); the ``conj(c)`` coefficient is
-        applied in post-processing."""
+        """Legacy backward mode launch for direct callers.
+
+        Gradient evaluation uses :meth:`transpose_sources` instead.
+        """
         back = "-" if self.direction == "+" else "+"
         pulse = forward_sim.sources[0].source_time
         return mode_source(
@@ -420,6 +525,92 @@ class ModePower:
         """The complex excitation coefficient ``conj(c)``."""
         return complex(np.conjugate(self.amplitude(data)))
 
+    def transpose_sources(self, simulation: Simulation, data: RunResult):
+        """Point-current cloud equal to the transpose of the modal readout.
+
+        Returns ``(sources, coefficient)``. The first electric dipole has
+        positive unit amplitude, fixing the engine's DFT normalization.
+        """
+        if not isinstance(simulation.grid, UniformMesh):
+            raise ValueError("ModePower adjoint requires a uniform mesh")
+        dl = simulation.grid.dl_um
+        t1, t2 = {"x": ("y", "z"), "y": ("z", "x"),
+                  "z": ("x", "y")}[self.axis]
+        e1, e2, h1, h2 = (f"E{t1}", f"E{t2}", f"H{t1}", f"H{t2}")
+        plane = data[self.name]
+        arrays = {c: plane.sel(component=c) for c in (e1, e2, h1, h2)}
+        _, c1, c2 = _plane_component(arrays, e1, self.freq_hz, t1, t2)
+        w1 = _widths_with_grid(c1, self.mode, t1, t1, t2)
+        w2 = _widths_with_grid(c2, self.mode, t2, t1, t2)
+        area = np.outer(w2, w1)
+        cen = self.center_um or (float(np.mean(c1)), float(np.mean(c2)))
+        mode_fields = vector_modal_fields if hasattr(self.mode, "hx") else modal_fields
+        mode = mode_fields(self.mode, c1, c2, axis=self.axis,
+                           direction=self.direction, center_um=cen,
+                           thickness_axis=self.thickness_axis)
+        me1, me2, mh1, mh2 = (mode[k] for k in ("e1", "e2", "h1", "h2"))
+        power = 0.5 * np.sum(np.real(me1 * np.conj(mh2)
+                                    - me2 * np.conj(mh1)) * area)
+        if power == 0:
+            raise ValueError("mode has zero power on the objective plane")
+        q = {e1: 0.25 * np.conj(mh2) * area / power,
+             e2: -0.25 * np.conj(mh1) * area / power,
+             h1: -0.25 * np.conj(me2) * area / power,
+             h2: 0.25 * np.conj(me1) * area / power}
+
+        # Transpose of node[j] = (raw[j-1] + raw[j])/2.
+        if not getattr(self.mode, "yee_staggered", False):
+            for comp, arr in q.items():
+                axis = 1 if comp in (e1, h2) else 0
+                half = 0.5 * arr
+                shifted = np.roll(half, -1, axis=axis)
+                edge = [slice(None)] * 2
+                edge[axis] = -1
+                shifted[tuple(edge)] = 0
+                q[comp] = half + shifted
+
+        electric = (e1, e2)
+        anchor = max(electric, key=lambda c: np.max(np.abs(q[c])))
+        anchor_pos = np.unravel_index(np.argmax(np.abs(q[anchor])), q[anchor].shape)
+        scale = abs(q[anchor][anchor_pos])
+        if scale == 0:
+            raise ValueError("mode has no electric overlap weights")
+        rotate = np.exp(-1j * np.angle(q[anchor][anchor_pos]))
+        offsets = {"Ex": (0.5, 0, 0), "Ey": (0, 0.5, 0),
+                   "Ez": (0, 0, 0.5), "Hx": (0, 0.5, 0.5),
+                   "Hy": (0.5, 0, 0.5), "Hz": (0.5, 0.5, 0)}
+        omega_dt = 2.0 * np.pi * self.freq_hz * _time_step(simulation)
+        pulse = simulation.sources[0].source_time
+        sources = []
+        order = (anchor, *(c for c in (e1, e2, h1, h2) if c != anchor))
+        for comp in order:
+            values = q[comp] * rotate / scale
+            indices = [(int(anchor_pos[0]), int(anchor_pos[1]))] if comp == anchor else []
+            indices.extend((j, i) for j in range(values.shape[0])
+                           for i in range(values.shape[1])
+                           if comp != anchor or (j, i) != anchor_pos)
+            for j, i in indices:
+                value = complex(values[j, i])
+                if value == 0:
+                    continue
+                if comp.startswith("H"):
+                    # Magnetic injection is half a step late (§5).
+                    value *= -np.exp(0.5j * omega_dt)
+                loc = {a: float(plane.coords[a].values[0])
+                       for a in "xyz"}
+                loc[t1] = float(c1[i])
+                loc[t2] = float(c2[j])
+                point = tuple(loc[a] + offsets[comp][k] * dl
+                              for k, a in enumerate("xyz"))
+                sources.append(PointDipole(
+                    center_um=point, polarization=comp,
+                    amplitude=abs(value),
+                    source_time=pulse.model_copy(
+                        update={"phase": -float(np.angle(value))})))
+        # The unit-amplitude, zero-phase anchor is emitted first for §12.
+        coefficient = complex(np.conjugate(self.amplitude(data) * rotate) * scale)
+        return tuple(sources), coefficient
+
 
 # ---------------------------------------------------------------------------
 # Gradient assembly
@@ -427,11 +618,20 @@ class ModePower:
 
 @dataclass
 class GradientResult:
+    """Objective and gradient for the subpixel-off model.
+
+    ``shutoff`` is shared by the forward and adjoint solves. Their actual
+    lengths are ``forward_steps_run`` and ``adjoint_steps_run``; they can differ
+    when the caller's shutoff ends either solve early.
+    """
     value: float                 # figure of merit J
     grad: np.ndarray             # dJ/drho, shape DesignRegion.shape (flat order)
     forward: RunResult
     adjoint: RunResult
     amplitude: complex           # forward objective phasor u
+    forward_steps_run: Optional[int]
+    adjoint_steps_run: Optional[int]
+    shutoff: float
 
 
 def _region_field(data: RunResult, region: DesignRegion, freq_hz: float,
@@ -452,33 +652,82 @@ def assemble_gradient(
     monitor_name: str = "design_region",
     beta: complex = BETA,
 ) -> np.ndarray:
-    """dJ/drho per pixel from the forward and adjoint region fields.
+    """Contract the field product with exact trilinear control weights.
 
-    ``coeff`` is the objective's adjoint coefficient (``conj(u)`` for
-    :class:`PointIntensity`). Returns a flat array of length
-    ``region.n_params`` in row-major ``[ix, iy, iz]`` order.
-
-    **Direction, not magnitude.** ``BETA`` is a unit-magnitude fitted phase, so
-    the result is proportional to dJ/drho with an uncalibrated (and
-    configuration-dependent) constant, see the note on ``BETA``. Fine for a
-    line-searching optimizer; wrong for anything that reads the gradient's
-    size.
+    ``beta`` is the derived physical coefficient supplied by the driver.
+    The default is retained solely for old direct assembly callers.
     """
     da = forward[monitor_name].sel(f=freq_hz)
-    pix = region._pixel_index(da).ravel()                 # (Ncells,)
     e_fwd = _region_field(forward, region, freq_hz, monitor_name)
     e_adj = _region_field(adjoint, region, freq_hz, monitor_name)
-    # sum_c E_fwd^c . E_adj^c at each cell (NOT conjugated — reciprocity pairs
-    # the un-conjugated phasors), summed into pixels, then weighted by the
-    # objective coefficient and the complex normalization constant.
-    prod = np.sum(e_fwd * e_adj, axis=0).ravel()          # complex (Ncells,)
-    n = region.n_params
-    pix_prod = np.zeros(n, dtype=complex)
-    good = pix >= 0
-    np.add.at(pix_prod, pix[good], prod[good])
-    g = np.real(beta * coeff * pix_prod)                  # real per pixel
+    pix_prod = np.zeros(region.n_params, dtype=complex)
+    for c, comp in enumerate(("Ex", "Ey", "Ez")):
+        product = e_fwd[c] * e_adj[c]
+        if region.parametrization == "boxes":
+            owner = region._box_pixel_index(da, comp).ravel()
+            good = owner >= 0
+            np.add.at(pix_prod, owner[good], product.ravel()[good])
+        else:
+            weights = region._density_weights(da, comp)
+            pix_prod += np.sum(weights * product[None, ...],
+                               axis=(1, 2, 3))
+    g = np.real(beta * coeff * pix_prod)
     g *= (region.eps_max - region.eps_min)                # chain rule rho->eps
     return g
+
+
+def _time_step(simulation: Simulation) -> float:
+    """The resolved uniform-grid Courant time step in seconds."""
+    if not isinstance(simulation.grid, UniformMesh):
+        raise ValueError("inverse-design gradient requires a uniform mesh")
+    dl_m = simulation.grid.dl_um * 1e-6
+    active = sum(int(realized_cells(length, simulation.grid.dl_um, floor) > 1)
+                 for length, floor in zip(simulation.size_um,
+                                          simulation._axis_min_cells()))
+    return float(simulation.run.courant * dl_m /
+                 (_C0 * np.sqrt(max(active, 1))))
+
+
+def _discrete_omega(simulation: Simulation, freq_hz: float) -> float:
+    """The leapfrog frequency corresponding to a DFT frequency."""
+    dt = _time_step(simulation)
+    return float(2.0 * np.sin(np.pi * freq_hz * dt) / dt)
+
+
+def _validate_pml_clear(simulation: Simulation, region: DesignRegion,
+                        objective: Objective) -> None:
+    """Reject E design nodes and modal adjoint currents in CPML slabs."""
+    dl = simulation.grid.dl_um
+    n_cells = [realized_cells(length, dl, floor)
+               for length, floor in zip(simulation.size_um,
+                                        simulation._axis_min_cells())]
+    face = region.box_face_offset_cells
+    e_offsets = ((0.5, 0, 0), (0, 0.5, 0), (0, 0, 0.5))
+    for a, name in enumerate("xyz"):
+        if getattr(simulation.boundaries, name) != "pml":
+            continue
+        left, right = region.cells[a]
+        for offsets in e_offsets:
+            off = offsets[a]
+            first = np.ceil(left + face - off) + off
+            last = np.floor(right + face - off) + off
+            if first < simulation.pml_num_layers or last > n_cells[a] - simulation.pml_num_layers:
+                raise ValueError(f"design E node lies inside the {name} PML slab")
+    if not isinstance(objective, ModePower):
+        return
+    monitors = [m for m in simulation.monitors if m.name == objective.name]
+    if not monitors:
+        return
+    monitor = monitors[0]
+    for a, name in enumerate("xyz"):
+        if getattr(simulation.boundaries, name) != "pml":
+            continue
+        low = (monitor.center_um[a] - 0.5 * monitor.size_um[a]) / dl
+        high = (monitor.center_um[a] + 0.5 * monitor.size_um[a]) / dl
+        # The source cloud adds up to half a cell of Yee displacement.
+        if (low < simulation.pml_num_layers + 0.5 or
+                high >= n_cells[a] - simulation.pml_num_layers - 0.5):
+            raise ValueError(f"ModePower adjoint cloud would enter the {name} PML slab")
 
 
 # ---------------------------------------------------------------------------
@@ -492,8 +741,7 @@ include BOTH ``region.monitor(freq)`` and ``objective.monitor()`` plus
 
 
 Objective = Union[PointIntensity, ModePower]
-"""An adjoint objective: provides ``value``, ``amplitude``, ``adjoint_source``,
-``adjoint_coeff``, ``freq_hz`` and a ``beta`` normalization constant."""
+"""A single-frequency objective with a transpose-matched adjoint source."""
 
 
 def value_and_gradient(
@@ -506,75 +754,140 @@ def value_and_gradient(
     run_kwargs: Optional[dict] = None,
     beta: Optional[complex] = None,
     monitor_name: str = "design_region",
+    _warn_beta: bool = True,
 ) -> GradientResult:
-    """One adjoint gradient: a forward solve + an adjoint solve (2 total).
+    """Return the objective and physical ``dJ/drho`` from two solves.
 
-    .. warning:: The gradient is validated in DIRECTION
-       (adjoint/FD cosine gate); its MAGNITUDE carries the same
-       scene/grid-dependent scale as :class:`ModePower`'s J
-       (measured ~81x vs finite differences at dl = 0.05 um).
-       Scale-adaptive optimizers (the default Adam) are
-       unaffected; line searches, custom optimizers, and
-       physical sensitivity numbers must not trust the raw
-       magnitude until the launch is c_in-calibrated.
-
-    **The returned gradient is calibrated in DIRECTION only.** Its magnitude is
-    uncalibrated and configuration-dependent (the factor against central
-    finite differences ranges from ~1e2 to ~1e4 across the recorded scenes and
-    varies ~45% with pixel count and region thickness). Pass it to a
-    scale-adaptive optimizer such as :func:`optimize` (Adam) or a
-    line-searching one such as :func:`optimize_parametric` (L-BFGS-B); do NOT
-    use it for a fixed step size, a gradient-norm convergence test, or
-    comparing sensitivities between two problems.
-
-    ``build_forward(rho)`` returns the forward :class:`~photonhub.Simulation`.
-    The adjoint simulation is derived from it by swapping in the objective's
-    unit adjoint source and keeping only the design-region monitor. ``beta``
-    defaults to the objective's own normalization constant.
-
-    ``device`` (``"cpu"`` / ``"gpu"`` / ``"gpu:N"``) runs BOTH solves, the
-    overwhelming majority of the gradient's compute, on that backend (it is
-    forwarded to ``run_local``); it overrides any ``device`` in ``run_kwargs``.
-    The host-side gradient assembly (``assemble_gradient``) is a negligible
-    NumPy reduction over the design-region phasors and always runs on the CPU."""
+    The returned value and gradient use the caller's simulation with subpixel
+    smoothing off, with a warning when the caller's simulation enables it.
+    The adjoint run injects the transpose of the objective readout and records
+    the E field over the design. ``beta`` is a compatibility override; the
+    default is derived from the leapfrog frequency and vacuum permittivity.
+    Supplying ``beta`` is deprecated. Both solves use the caller's run settings,
+    including the default stop rule. The gradient is exact for the recorded
+    window; its error relative to a converged gradient follows the truncation
+    of the forward results. With the energy-only stop (``shutoff`` 1e-5) that
+    was about 0.2% on a measured point-source scene, and more on resonant
+    designs. On a local CPU solver the default stop also waits for an estimate
+    of the remaining change in the recorded frequency-domain results
+    (``RunSpec.dft_shutoff``) when the solver supports it; the estimate is not
+    a guarantee, and GPU runs and older solvers stop on the field energy
+    alone. For resonant designs and validation, set ``shutoff=0`` with an
+    explicit ``n_steps`` or ``run_time_s`` after checking convergence. A
+    simulation fitted with ``domain=`` is refused; give ``size_um`` and
+    ``grid``.
+    Quarter-cell pixel boxes support CPU and GPU; the optional trilinear
+    custom medium supports CPU only.
+    """
     run_kwargs = dict(run_kwargs or {})
     run_kwargs.setdefault("quiet", True)
     if device is not None:
         run_kwargs["device"] = device
-    if beta is None:
-        beta = objective.beta
-
+    if region.parametrization == "trilinear" and str(
+            run_kwargs.get("device", "cpu")).startswith("gpu"):
+        raise ValueError(
+            "trilinear custom-medium parametrization is CPU only; "
+            "use parametrization='boxes' for GPU gradients")
     fwd_sim = build_forward(np.asarray(rho, dtype=float))
-    # The continuous adjoint gradient is derived for the pixel-eps = rho
-    # rasterization WITHOUT subpixel smoothing (chaining the smoothing weights
-    # into d(eps)/d(rho) is the deferred curved-adjoint work). Pin subpixel OFF
-    # for both the forward and adjoint solves so the gradient stays FD-consistent
-    # regardless of the project-wide subpixel default (D2, NUMERICS §16). This is
-    # backward-compatible: the pre-D2 default was already off here.
+    if any(fwd_sim.symmetry):
+        raise ValueError("symmetric gradients are not validated")
+    if any(fwd_sim.origin_um):
+        # A domain= fit stores positions in a shifted frame; the region, the
+        # objective and its adjoint sources are in the caller's frame.
+        raise ValueError(
+            "inverse-design gradients need a simulation sized by hand "
+            "(size_um and grid); a domain= fit shifts the stored frame")
+    if not isinstance(fwd_sim.grid, UniformMesh):
+        raise ValueError("inverse-design gradient requires a uniform mesh")
+    if region.dl_um != fwd_sim.grid.dl_um:
+        raise ValueError("DesignRegion.dl_um must equal the simulation grid dl_um")
+    if region.parametrization == "trilinear":
+        expected_shape = tuple(n + 1 for n in region.shape)
+        expected = region.structures(rho)[0]
+        if not fwd_sim.structures or (
+                fwd_sim.structures[-1].geometry != expected.geometry or
+                fwd_sim.structures[-1].medium.permittivity_data is None or
+                fwd_sim.structures[-1].medium.permittivity_data.shape != expected_shape):
+            raise ValueError(
+                "build_forward must place region.structures(rho) last so the "
+                "trilinear density map matches the adjoint derivative")
+    elif (len(fwd_sim.structures) < region.n_params or
+          any(s.geometry != expected.geometry or
+              s.medium.permittivity_data is not None or
+              s.medium.permittivity != expected.medium.permittivity
+              for s, expected in zip(fwd_sim.structures[-region.n_params:],
+                                     region.box_structures(rho)))):
+        raise ValueError(
+            "build_forward must place region.structures(rho) last so the "
+            "pixel boxes match the adjoint derivative")
+    _validate_pml_clear(fwd_sim, region, objective)
+    if fwd_sim.subpixel:
+        warnings.warn("inverse-design objective and gradient use the subpixel-off model",
+                      UserWarning, stacklevel=caller_stacklevel())
+    if beta is not None and _warn_beta:
+        warnings.warn("beta= is deprecated; omit it to use the derived discrete adjoint coefficient",
+                      DeprecationWarning, stacklevel=caller_stacklevel())
+    shutoff = fwd_sim.run.shutoff
+    # Both box indicators and custom-medium weights assume smoothing is off.
     fwd_sim = fwd_sim.model_copy(update={"subpixel": False})
-    forward = run_local(fwd_sim, **run_kwargs)
-    if forward.aborted:
-        raise RuntimeError(f"forward run aborted: {forward.abort_reason}")
+    def solve_pair(output_root: Path) -> tuple[RunResult, RunResult, complex, np.ndarray, float]:
+        forward = run_local(fwd_sim, **{**run_kwargs,
+                                       "output_dir": output_root / "forward"})
+        if forward.aborted:
+            raise RuntimeError(f"forward run aborted: {forward.abort_reason}")
 
-    u = objective.amplitude(forward)
-    coeff = objective.adjoint_coeff(forward)
+        u = objective.amplitude(forward)
+        if isinstance(objective, ModePower):
+            adj_sources, coeff = objective.transpose_sources(fwd_sim, forward)
+        else:
+            adj_sources = (objective.adjoint_source(fwd_sim),)
+            coeff = objective.adjoint_coeff(forward)
+        derived_beta = beta
+        if derived_beta is None:
+            derived_beta = (-2j * _discrete_omega(fwd_sim, objective.freq_hz)
+                            * _EPS0)
+            if isinstance(objective, PointIntensity) and objective.component.startswith("H"):
+                derived_beta *= -np.exp(1j * np.pi * objective.freq_hz * _time_step(fwd_sim))
 
-    adj_sim = fwd_sim.model_copy(update={
-        "sources": (objective.adjoint_source(fwd_sim),),
-        "monitors": (region.monitor(objective.freq_hz, monitor_name),),
-    })
-    adjoint = run_local(adj_sim, **run_kwargs)
-    if adjoint.aborted:
-        raise RuntimeError(f"adjoint run aborted: {adjoint.abort_reason}")
+        adj_sim = fwd_sim.model_copy(update={
+            "sources": adj_sources,
+            "monitors": (region.monitor(objective.freq_hz, monitor_name),),
+        })
+        adjoint = run_local(adj_sim, **{**run_kwargs,
+                                       "output_dir": output_root / "adjoint"})
+        if adjoint.aborted:
+            raise RuntimeError(f"adjoint run aborted: {adjoint.abort_reason}")
 
-    g = assemble_gradient(region, forward, adjoint, coeff, objective.freq_hz,
-                          monitor_name=monitor_name, beta=beta)
-    return GradientResult(value=objective.value(forward), grad=g,
-                          forward=forward, adjoint=adjoint, amplitude=u)
+        g = assemble_gradient(region, forward, adjoint, coeff, objective.freq_hz,
+                              monitor_name=monitor_name, beta=derived_beta)
+        value = objective.value(forward)
+        # RunResult reads monitors lazily. Cache them before removing temporary
+        # solver output, so the returned results remain usable.
+        for result in (forward, adjoint):
+            for name in result.monitor_names:
+                result._raw(name)
+        return forward, adjoint, u, g, value
+
+    output_dir = run_kwargs.pop("output_dir", None)
+    if output_dir is None:
+        with tempfile.TemporaryDirectory(prefix="photonhub-gradient-") as directory:
+            forward, adjoint, u, g, value = solve_pair(Path(directory))
+    else:
+        forward, adjoint, u, g, value = solve_pair(Path(output_dir))
+    return GradientResult(value=value, grad=g,
+                          forward=forward, adjoint=adjoint, amplitude=u,
+                          forward_steps_run=forward.steps_run,
+                          adjoint_steps_run=adjoint.steps_run,
+                          shutoff=shutoff)
 
 
 @dataclass
 class OptimizeResult:
+    """Optimization history and best value for the subpixel-off model.
+
+    ``history``, ``grads``, and ``best`` all refer to that same model even if
+    the caller's constructed simulation enabled subpixel smoothing.
+    """
     rho: np.ndarray              # final density grid (region.shape)
     history: List[float]         # objective per iteration
     grads: List[np.ndarray]
@@ -590,12 +903,9 @@ def _descend(method, fg, x0, bounds, n_iters, step, maximize):
     Default ``method="lbfgs"`` is SciPy L-BFGS-B, a quasi-Newton method that
     builds curvature from the gradient history and line-searches each step, the
     standard choice for adjoint inverse design. Unlike Adam, L-BFGS USES the
-    gradient magnitude, but the adjoint gradient's magnitude is a normalization
-    constant (only ``arg(beta)``, the direction, is physically pinned; the raw
-    magnitude is ~1e-21). So we CALIBRATE that constant once, probe ``J`` along
-    the gradient at the start to recover the scale that makes ``grad`` consistent
-    with ``J`` (the scale is constant across the design, so one probe suffices) ,
-    then hand SciPy a consistent, ``J(x0)``-normalized ``(f, grad)``.
+    gradient magnitude. The older one-probe calibration remains for optimizer
+    compatibility while the adjoint gradient now has physical scale. It probes
+    ``J`` along the first gradient and hands SciPy a ``J(x0)``-normalized pair.
     ``method="adam"`` keeps the scale-free normalized-gradient Adam (``step`` =
     max per-variable change per iteration); only Adam uses ``step``."""
     sign = 1.0 if maximize else -1.0
@@ -623,15 +933,15 @@ def _descend(method, fg, x0, bounds, n_iters, step, maximize):
                     cal = ((Jp - J0) / hh) / dderiv_adj
         if not np.isfinite(cal) or cal <= 0.0:
             # A non-positive cal claims the adjoint gradient points downhill
-            # along itself — with the BETA phase pinned, that means the FD
-            # probe was noise-dominated (solver jitter ~ (Jp-J0)); freezing a
+            # along itself, which usually means the FD probe was dominated by
+            # solver jitter. Freezing a
             # flipped/garbage scale would corrupt every subsequent step. The
             # calibration is an efficiency aid, not correctness-critical, so
             # fall back to the raw adjoint gradient scale.
             warnings.warn(
                 f"gradient-scale calibration probe returned cal={cal:.3g} "
                 "(noise-dominated FD probe?); falling back to cal=1.0",
-                stacklevel=2)
+                stacklevel=caller_stacklevel())
             cal = 1.0
         gscale = cal / absJ0                          # makes (f, grad) consistent + O(1)
 
@@ -683,9 +993,7 @@ def optimize(
 
     ``method`` is ``"adam"`` (default, normalized-gradient Adam) or ``"lbfgs"``
     (SciPy L-BFGS-B); see :func:`_descend`. Adam is the default HERE because for
-    high-dimensional topology the continuous-adjoint gradient is slightly noisy
-    (cos ~0.98 vs finite differences), which perturbs L-BFGS's curvature estimates, empirically Adam reaches a better design in fewer evaluations
-    (``validation/suites/adjoint/optimizer_compare.py``). For a FEW smooth shape
+    high-dimensional topology a scale-free update can be convenient. For a FEW smooth shape
     parameters, prefer :func:`optimize_parametric`, which defaults to L-BFGS-B.
     ``n_iters`` bounds the optimizer iterations. Densities are box-constrained to
     ``bounds``. Maximizes ``objective`` by default; returns the BEST design seen.
@@ -699,7 +1007,16 @@ def optimize(
     mapped through it, a proper projected gradient. For a LINEAR, self-adjoint
     projection (e.g. a symmetry-averaging map, which is its own adjoint) this is
     exact; ``best`` and ``rho`` are reported in the mapped (constrained) space.
-    Use it to enforce device symmetry or a density filter."""
+    Use it to enforce device symmetry or a density filter. Returned values and
+    gradients use the subpixel-off model. ``beta=`` is deprecated. Both solves
+    retain the caller's run settings and are exact for their recorded window;
+    the error against a converged gradient follows the truncation of the
+    forward results (see :func:`value_and_gradient`). For resonant designs and
+    validation, set ``shutoff=0`` with an explicit ``n_steps`` or
+    ``run_time_s`` after checking convergence."""
+    if beta is not None:
+        warnings.warn("beta= is deprecated; omit it to use the derived discrete adjoint coefficient",
+                      DeprecationWarning, stacklevel=caller_stacklevel())
     pm = param_map if param_map is not None else (lambda r: r)
     shape = region.shape
     sign = 1.0 if maximize else -1.0
@@ -712,7 +1029,8 @@ def optimize(
     def fg(x):
         eff = pm(x.reshape(shape)).ravel()            # constrained design
         res = value_and_gradient(build_forward, region, objective, eff,
-                                 device=device, run_kwargs=run_kwargs, beta=beta)
+                                 device=device, run_kwargs=run_kwargs, beta=beta,
+                                 _warn_beta=False)
         history.append(res.value)
         grads.append(res.grad)
         if state["best"] is None or (sign * res.value > sign * state["best"].value):
@@ -731,7 +1049,7 @@ def optimize(
 
 
 # ---------------------------------------------------------------------------
-# Parameter (shape) optimization — a handful of geometric design variables
+# Parameter (shape) optimization: a handful of geometric design variables
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -780,7 +1098,16 @@ def optimize_parametric(
     well-defined. ``method`` is ``"lbfgs"`` (default, SciPy L-BFGS-B, well suited
     to a few smooth parameters) or ``"adam"``; see :func:`_descend`. ``bounds``
     (lo, hi) box-constrains every parameter. Returns the BEST parameters seen.
-    Maximizes ``objective`` by default."""
+    Maximizes ``objective`` by default. Returned values and gradients use the
+    subpixel-off model. ``beta=`` is deprecated. Both solves retain the
+    caller's run settings and are exact for their recorded window; the error
+    against a converged gradient follows the truncation of the forward results
+    (see :func:`value_and_gradient`). For resonant designs and validation, set
+    ``shutoff=0`` with an explicit ``n_steps`` or ``run_time_s`` after checking
+    convergence."""
+    if beta is not None:
+        warnings.warn("beta= is deprecated; omit it to use the derived discrete adjoint coefficient",
+                      DeprecationWarning, stacklevel=caller_stacklevel())
     sign = 1.0 if maximize else -1.0
     history: List[float] = []
     params_history: List[np.ndarray] = []
@@ -790,7 +1117,8 @@ def optimize_parametric(
         p = np.asarray(p, dtype=float)
         rho = np.asarray(expand(p), dtype=float)
         res = value_and_gradient(build_forward, region, objective, rho,
-                                 device=device, run_kwargs=run_kwargs, beta=beta)
+                                 device=device, run_kwargs=run_kwargs, beta=beta,
+                                 _warn_beta=False)
         g_rho = res.grad                              # dJ/drho per pixel (flat)
         history.append(res.value)
         params_history.append(p.copy())
