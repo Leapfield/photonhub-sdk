@@ -1,6 +1,6 @@
 """Shared styling and overlay glyphs: the ε colormap, field-colormap /
 normalization selection, overlay glyph colors + drawing, PML bands, and the
-compact legend (design §6, §7).
+compact legend.
 
 Kept free of plotting-method orchestration so both the 2D views and the 3D
 builder map the same permittivity to the same color and draw the same glyphs.
@@ -15,13 +15,13 @@ from . import _geometry as geom
 
 _AXES = "xyz"
 
-# Overlay glyph colors (design §6 — matching the approved mockup's legend).
+# Overlay glyph colors (matching the approved mockup's legend).
 SOURCE_COLOR = "#ff7f5c"      # coral
 MONITOR_COLOR = "#f0a800"     # amber: field (profile) and flux monitors
 MODE_MONITOR_COLOR = "#1a9850"  # green: a port's mode monitor
 MODE_MONITOR_STYLE = "-."     # dash-dot, apart from the dashed field monitor
 PML_COLOR = "#7a7a7a"         # neutral grey
-SYMMETRY_COLOR = "#6a6a6a"    # the §20 mirror plane, when a view unfolds it
+SYMMETRY_COLOR = "#6a6a6a"    # the mirror plane, when a view unfolds it
 STRUCTURE_EDGE = "#222222"    # structure outline on the light epsilon views
 
 # Structure outline over a FIELD heatmap. The epsilon views draw on a
@@ -49,7 +49,7 @@ GRID_Z = 2.5
 # and it frees yellow/orange/cyan to mean source, monitor, and selection.
 EPS_CMAP = "Blues"
 
-# Field colormaps by kind (design §7).
+# Field colormaps by kind.
 _SIGNED_CMAP = "RdBu_r"       # diverging, centered on 0 (real/imag time-domain)
 _MAGNITUDE_CMAP = "magma"     # sequential (abs / E / intensity / H)
 _PHASE_CMAP = "twilight"      # cyclic, [-pi, pi]
@@ -79,8 +79,7 @@ def eps_facecolor(permittivity: float, vmin: float, vmax: float):
 
 
 def field_cmap_and_norm(field: str, val: str, data, cmap: Optional[str] = None):
-    """Pick the colormap and a matplotlib ``Normalize`` for a field slice
-    (design §7).
+    """Pick the colormap and a matplotlib ``Normalize`` for a field slice.
 
     - ``val`` "real"/"imag" of a signed field, or a real (time-domain) field ->
       diverging ``RdBu_r`` centered on 0 (symmetric vmin/vmax).
@@ -122,7 +121,7 @@ def field_cmap_and_norm(field: str, val: str, data, cmap: Optional[str] = None):
 
 def field_colorbar_label(field: str, val: str, attrs: dict) -> str:
     """Colorbar label from the field/``val`` and the DataArray's attrs (units /
-    normalization), design §7."""
+    normalization)."""
     if field in ("E", "H"):
         base = f"|{field}|"
     elif field == "intensity":
@@ -162,7 +161,7 @@ def add_legend(ax, *, source: bool, monitor: bool, pml: bool, structure: bool,
                loc: str = "best", source_kinds=None, monitor_kinds=None,
                mode_monitor: bool = False, flux_monitor: bool = False):
     """A compact legend identifying whichever of source / monitor / PML /
-    structure / mirror plane are present (design §6). No-op when nothing is
+    structure / mirror plane are present. No-op when nothing is
     present. ``over_field`` draws the structure swatch the way the field view
     outlines a structure — white on a dark halo — so the key matches the
     picture.
@@ -585,7 +584,7 @@ def glyph_label(ax, text: str, xy, *, color: str, offset=(3, 3), ha="left",
 
 
 def add_structure_patch(ax, kind, params, *, style, clip=None) -> list:
-    """Add one structure patch for a §5 cut-plane spec
+    """Add one structure patch for a cut-plane spec
     (``rect``/``circle``/``polygon``/``annulus``) with the given matplotlib
     ``style`` dict, and return the patches added. Shared by the filled scene
     view (:func:`scene.plot`) and the 3D/CLI builders so a new geometry kind is
@@ -624,9 +623,7 @@ def add_structure_patch(ax, kind, params, *, style, clip=None) -> list:
 
 def _axis_spacings_um(sim, axis_index: int):
     """(low-edge spacing, high-edge spacing, realized length) in microns for an
-    axis. The PML band is ``pml_num_layers`` cells thick translated to µm via
-    the boundary's LOCAL spacing — the first/last primary spacing for a graded
-    axis, ``dl`` for a uniform one (design §6)."""
+    axis. Used to keep schematic bands when no nonabsorbing cells remain."""
     dl = sim.grid.dl_um
     q = sim._axis_coords_um(axis_index)
     if q is None:
@@ -641,12 +638,12 @@ def _axis_spacings_um(sim, axis_index: int):
 def pml_bands(sim, axis: str):
     """The PML shaded bands for a 2D cut on ``axis``: a list of
     ``(in_plane_axis, lo_um, hi_um)`` spans, one per in-plane axis whose
-    boundary kind is 'pml', covering ``pml_num_layers`` cells at each face.
+    boundary kind is 'pml', covering ``pml_num_layers`` realized cells at each face.
     Bands on the cut axis itself are not drawable in a 2D slice and are
     omitted.
 
-    A §20 symmetry axis carries NO low-face band: the absorber there is
-    one-sided (§20.3), the min face being a mirror rather than an exit. The
+    A symmetry axis carries NO low-face band: the absorber there is
+    one-sided, the min face being a mirror rather than an exit. The
     same rule governs ``Simulation._pml_bounds``, so the picture and the
     scene checks agree on where the absorber is."""
     bands = []
@@ -656,16 +653,23 @@ def pml_bands(sim, axis: str):
         if getattr(boundaries, letter) != "pml":
             continue
         i = _AXES.index(letter)
-        lo_dl, hi_dl, realized = _axis_spacings_um(sim, i)
+        realized = sim._realized_um()[i]
+        try:
+            inner_lo, inner_hi, _ = sim._nonabsorbing_bounds_um(i)
+        except ValueError:
+            # Small schematic scenes can have no nonabsorbing cells. Keep
+            # drawing their bands from edge spacing in that case.
+            lo_dl, hi_dl, realized = _axis_spacings_um(sim, i)
+            inner_lo = layers * lo_dl
+            inner_hi = realized - layers * hi_dl
         if sim.symmetry[i] == 0:
-            bands.append((letter, 0.0, layers * lo_dl))              # low face
-        bands.append((letter, realized - layers * hi_dl, realized))  # high face
+            bands.append((letter, 0.0, inner_lo))              # low face
+        bands.append((letter, inner_hi, realized))  # high face
     return bands
 
 
 def unfold_in_plane(sim, axis: str, unfold: bool = True):
-    """``(mirror_h, mirror_v)`` — which of the cut's in-plane axes carry a §20
-    symmetry plane that a view should unfold.
+    """``(mirror_h, mirror_v)`` — which of the cut's in-plane axes carry a symmetry plane that a view should unfold.
 
     A symmetry plane means the run solved HALF the device and the other half
     was never stepped. Left folded, the picture is half a device with the
@@ -695,7 +699,7 @@ def mirror_copies(mirror_h: bool, mirror_v: bool):
 
 def draw_symmetry_planes(ax, sim, axis: str, mirror_h: bool,
                          mirror_v: bool) -> bool:
-    """Mark each unfolded §20 mirror at coordinate 0 with a thin line. Half
+    """Mark each unfolded mirror at coordinate 0 with a thin line. Half
     the picture was mirrored, not simulated, and the reader is entitled to see
     where that starts. Returns whether anything was drawn."""
     drew = False
@@ -713,7 +717,7 @@ def translate_artists(ax, before, dh: float, dv: float) -> None:
     """Move every artist added to ``ax`` since ``before`` (a set of its
     children) by ``(dh, dv)`` in data units. The views sample, reflect and
     clip the scene in the wire's corner frame, where the mirror planes sit at
-    0, and show it in the user's frame (design spec §4.4): a data-space
+    0, and show it in the user's frame: a data-space
     artist gets a translated transform, a blended transform keeps its
     axes-fraction side, an annotation moves its anchors, and a clip path moves
     with its patch."""
@@ -761,13 +765,13 @@ def translate_artists(ax, before, dh: float, dv: float) -> None:
 
 
 def has_pml(sim) -> bool:
-    """True iff any axis boundary is a PML (design §6 legend gate)."""
+    """True iff any axis boundary is a PML (the legend gate)."""
     b = sim.boundaries
     return any(getattr(b, a) == "pml" for a in "xyz")
 
 
 # --------------------------------------------------------------------------- #
-# Overlay drawing — sources, monitors, PML — on a 2D Axes (design §6).
+# Overlay drawing — sources, monitors, PML — on a 2D Axes.
 # --------------------------------------------------------------------------- #
 
 def draw_grid(ax, sim, axis: str, unfold: bool = True) -> None:
@@ -803,10 +807,7 @@ def axis_tolerance_um(sim, axis_index: int) -> float:
     ``dl_um``. Graded: the LARGEST realized spacing, since ``dl_um`` on a
     :class:`GradedMesh` is the BASE spacing and a coarse region is wider than
     it."""
-    q = sim._axis_coords_um(axis_index)
-    if q is None:
-        return float(sim.grid.dl_um)
-    return float(max(graded_primary_spacings(q)))
+    return sim._coarsest_cell_um(axis_index)
 
 
 def local_spacing_um(sim, axis_index: int, value: float) -> float:
@@ -1001,14 +1002,14 @@ def draw_overlays(ax, sim, axis: str, value: float,
                   unfold: bool = True) -> Dict[str, bool]:
     """Draw source / monitor / PML overlays for a cut plane onto ``ax``.
     Returns which kinds were actually drawn (for the legend gate). Reuses the
-    §5 cut-plane geometry so glyphs match across all views.
+    shared cut-plane geometry so glyphs match across all views.
 
     Every feature that is a PLANE in the scene is drawn as a line (or a
     rectangle, on the cut it faces) rather than a marker: a mode-launch sheet,
-    a plane wave, a §18 mode source, a monitor plane. A marker is reserved for
+    a plane wave, a mode source, a monitor plane. A marker is reserved for
     a feature that really is a point — a lone dipole, a time probe.
 
-    ``unfold`` mirrors every glyph across each in-plane §20 symmetry plane, so
+    ``unfold`` mirrors every glyph across each in-plane symmetry plane, so
     the overlays land on the unfolded device rather than on half of it."""
     h_ax, v_ax = geom.in_plane_axes(axis)
     half_cell = 0.5 * local_spacing_um(sim, geom.axis_index(axis), value)
@@ -1210,7 +1211,7 @@ def _draw_box_copies(ax, center_um, size_um, axis: str, value: float,
 
 def _unfolded_arrow(rect, arrow, copies, plane_tol):
     """The arrow spec, re-anchored when the sheet continues across a mirror.
-    A launch sheet clipped at a §20 plane is half a sheet; its mirror is the
+    A launch sheet clipped at a plane is half a sheet; its mirror is the
     other half, and the arrow belongs at the centre of the whole, which is
     the plane itself, not the centre of the simulated half. The sheet's first
     dipole row sits up to a cell off the plane (Yee stagger), so "touches the
@@ -1244,7 +1245,7 @@ def _feature_rect(center_um, size_um, axis: str, value: float,
                   half_cell: float):
     """Cut-plane rectangle of an overlay box. A box that is FLAT on the cut
     axis is matched within half a cell: it carries no thickness to intersect,
-    and the §12 quarter-cell auto-snap moves a monitor plane off whatever round
+    and the quarter-cell auto-snap moves a monitor plane off whatever round
     coordinate the cut was asked for, so exact containment would drop the
     monitor out of the very view meant to place it."""
     a = geom.axis_index(axis)
@@ -1338,4 +1339,3 @@ def _draw_region(ax, rect: Tuple[float, float, float, float], color: str,
         glyph_label(ax, name, (x0, y0 + h), color=color, offset=(3, -3),
                     ha="left", va="top")
     return {"rect"}
-

@@ -1,9 +1,13 @@
 """Run phsolver as a local subprocess.
 
-The solver streams JSON-lines events on stdout (NUMERICS.md section 7), e.g.
+The solver streams JSON-lines events on stdout, e.g.
 ``{"event": "progress", "step": 100, ...}`` and on failure
-``{"event": "error", "reason": "divergence"}``; outputs land in the output
-directory as monitor binaries plus ``manifest.json`` (photonhub.data).
+``{"event": "error", "reason": "divergence"}``. A host setup longer than 15 s
+also reports ``{"event": "setup_progress", "stage": "materials",
+"done_units": ..., "total_units": ..., "percent": ..., "eta_s": ...}`` before
+the first step. Readers dispatch on ``"event"`` and skip kinds they do not
+know. Outputs land in the output directory as monitor binaries plus
+``manifest.json`` (photonhub.data).
 """
 
 import json
@@ -80,7 +84,7 @@ class _DecayTrail:
     A pulsed current whose spectrum has nonzero DC content (e.g. a PointDipole
     GaussianPulse with fwidth >~ 0.25*freq0) deposits net charge on its source
     cells; the resulting static field is not a wave, no PML drains it on run
-    timescales, and it anchors the engine's NUMERICS section-7 energy-decay
+    timescales, and it anchors the engine's auto-shutoff energy-decay
     ratio at a level that can sit orders of magnitude above ``run.shutoff``
     (measured: fwidth = 0.3*f0 pins decay at ~1.2e-2 vs the 1e-5 default,
     and the run silently rides its full step cap, ~25x the physical duration).
@@ -174,6 +178,7 @@ def run_local(
     quiet: bool = False,
     log_file: Union[str, Path, None] = None,
     cancel_event: Optional[threading.Event] = None,
+    allow_sources_in_boundary: bool = False,
 ) -> RunResult:
     """Run ``phsolver run sim.json --output <dir>`` and load the results.
 
@@ -184,20 +189,21 @@ def run_local(
     silence it. Either way the child runs with ``--progress none`` so Python is
     the only thing drawing the status line.
     ``log_file`` (if given) is forwarded to ``phsolver --log-file`` so the engine
-    mirrors the full JSON-lines event stream (start/progress/done/error, field
-    decay, phase, stability, throughput) to that path *as it runs*. The engine
+    mirrors the full JSON-lines event stream (start, setup_progress during a
+    long host setup, progress, done or error: field decay, phase, stability,
+    throughput) to that path *as it runs*. The engine
     writes it directly, so the record survives even if this process is killed or
     crashes; it is independent of ``progress``/``quiet``. The parent directory is
     created if needed.
     ``timeout`` (seconds) kills the solver and raises. Outputs go to
     ``output_dir`` (created if needed) or a fresh persistent temp directory.
     ``device`` selects the backend, ``"cpu"`` (default when ``None``), ``"gpu"``,
-    ``"gpu:N"``, ``"gpu:all"``, or ``"gpu:N,M,..."`` (multi-GPU z-decomposition;
-    see ``engine/docs/multi-gpu-decomposition.md``); it is passed to ``phsolver
+    ``"gpu:N"``, ``"gpu:all"``, or ``"gpu:N,M,..."`` (multi-GPU z-decomposition);
+    it is passed to ``phsolver
     --device``. Selection is vendor-neutral: ``"gpu"`` runs on whichever GPU the
     ``phsolver`` binary was built for, so switching hardware is a matter of
     pointing ``$PHOTONHUB_SOLVER`` at the matching build. GPU↔CPU equivalence
-    follows the tolerances in NUMERICS §8 (including ``ModeSource`` §18), not a
+    follows per-feature tolerances (``ModeSource`` included), not a
     blanket bit-exact guarantee. Hardware records are dated snapshots: the then-current
     suite passed 29/29 on a workstation GPU on 2026-06-27 and 47/47 on a
     data-center GPU on 2026-07-12. Those counts do not attest a newer source
@@ -207,8 +213,13 @@ def run_local(
     ``cancel_event`` is an optional :class:`threading.Event`; setting it
     terminates the solver subprocess and raises :class:`SolverRunError`.  It is
     used by interactive callers such as the desktop Stop button.
+    A simulation that fails :meth:`Simulation.check_runnable` is refused
+    before anything starts, a source inside the PML or absorber layers
+    included. ``allow_sources_in_boundary=True`` runs such a source anyway
+    and warns once per logical source instead: the recorded spectra are
+    physically meaningless, so it is for boundary diagnostics only.
     """
-    sim.check_runnable()
+    sim.check_runnable(allow_sources_in_boundary=allow_sources_in_boundary)
     # Refuse a GPU target the engine would throw SpecError on anyway. Ahead of
     # solver discovery on purpose: the spec is wrong for this device whether or
     # not an engine is installed, so the answer must not depend on the machine.
@@ -218,6 +229,12 @@ def run_local(
 
     solver = find_solver(solver_path)
     if solver is None:
+        from ..cloud import config as cloud_config
+        if cloud_config._NOTEBOOK_WORKER_MODE:
+            raise SolverRunError(
+                "The Workbench notebook worker cannot launch the bundled solver. "
+                "Use wb.run() for a local run from a cell, or pass a separate "
+                "solver_path to the SDK local runner.")
         raise SolverRunError(
             "phsolver engine binary not found. Local runs need the engine; "
             "pip installs the Python client only. Either run on the cloud "
@@ -231,20 +248,9 @@ def run_local(
             "cmake -S engine -B build && cmake --build build"
         )
 
-    for index, axis, band in sim.point_sources_in_boundary_layers():
-        center = tuple(sim.sources[index].center_um)
-        # NUMERICS.md §20: on a symmetry axis only the far face is a slab.
-        faces = ("on the far face; the min face is a symmetry plane"
-                 if sim.symmetry["xyz".index(axis)] != 0 else "on each side")
-        warnings.warn(
-            f"sources[{index}] (point_dipole at {center} um) lies inside the "
-            f"boundary layers on axis '{axis}' ({band:g} um thick {faces}): "
-            "the engine will run it, but the boundary absorbs the "
-            "source in place and the recorded spectra are physically "
-            "meaningless. Move the source into the interior or thin the "
-            "boundary layers.",
-            stacklevel=caller_stacklevel(),
-        )
+    for report in sim.sources_in_boundary_layers():
+        warnings.warn(f"{report} It runs because allow_sources_in_boundary=True.",
+                      stacklevel=caller_stacklevel())
 
     out_dir = Path(output_dir) if output_dir is not None else Path(
         tempfile.mkdtemp(prefix="photonhub-"))

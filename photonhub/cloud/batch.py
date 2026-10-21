@@ -9,9 +9,14 @@ across capacity.
 from __future__ import annotations
 
 import math
-from concurrent.futures import ThreadPoolExecutor
+import threading
+import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Mapping, Optional
 
+from .._compat import caller_stacklevel
 from ..components import Simulation
 from ..runners.batch import BatchResults, _check_batch_name
 from ..runners.local import SolverRunError
@@ -21,12 +26,25 @@ from .config import CloudError, get_config
 from .run import (
     CloudJobTimeout,
     _check_cloud_device_support,
-    _cloud_run,
+    _finish_cloud_job,
     _poll_timeout,
     _renamed_timeout,
+    _store_submission,
+    _submitted_job_id,
     _validate_quote_id,
     _validate_web_device,
 )
+
+
+class _TotalCeilingRefused(CloudError):
+    """A whole-batch quote refused by the total spend ceiling."""
+
+    def __init__(self, total_quote_usd: float, limit_usd: float):
+        self.total_quote_usd = total_quote_usd
+        self.limit_usd = limit_usd
+        super().__init__(
+            f"summed quote (${total_quote_usd:.4f}) exceeds max_usd_total "
+            f"ceiling (${limit_usd:.4f}); nothing was submitted")
 
 
 def _spend_limit(value, *, label: str) -> float:
@@ -65,10 +83,24 @@ def _spend_limits(max_usd, names) -> dict[str, float]:
     return {name: limit for name in names}
 
 
+@dataclass(frozen=True)
+class _AcceptedQuote:
+    quote_id: str
+    usd: float
+    expires_at: Optional[datetime]
+    refresh_margin_s: float
+
+    def needs_refresh(self) -> bool:
+        return (self.expires_at is not None and
+                self.expires_at <= datetime.now(timezone.utc)
+                + timedelta(seconds=self.refresh_margin_s))
+
+
 def _accepted_quote(http: HttpClient, name: str, sim: Simulation,
-                    limit: float, device: Optional[str], wire: dict) -> str:
+                    limit: float, device: Optional[str], wire: dict,
+                    solver=None) -> _AcceptedQuote:
     """Get and validate one server quote without submitting the job."""
-    estimate = http.estimate(wire, device=device)
+    estimate = http.estimate(wire, device=device, solver=solver)
     if not isinstance(estimate, dict):
         raise CloudError(
             f"server estimate for batch entry {name!r} was not an object")
@@ -94,7 +126,20 @@ def _accepted_quote(http: HttpClient, name: str, sim: Simulation,
         raise CloudError(
             f"server estimate for batch entry {name!r} (${float(usd):.4f}) "
             f"exceeds its max_usd limit (${limit:.4f})")
-    return quote_id
+    expires_at = estimate.get("expires_at")
+    if expires_at is not None:
+        try:
+            expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            if expires_at.tzinfo is None:
+                raise ValueError("expiry must include a timezone")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise CloudError(
+                f"server estimate for batch entry {name!r} has an invalid 'expires_at'") from exc
+    # Fix the margin at receipt, rather than shrinking it on every check (which
+    # would never refresh before expiry). A short-lived quote must remain usable.
+    margin_s = (0.0 if expires_at is None else
+                min(60.0, max(0.0, (expires_at - datetime.now(timezone.utc)).total_seconds()) / 4))
+    return _AcceptedQuote(quote_id, float(usd), expires_at, margin_s)
 
 
 class Batch:
@@ -125,8 +170,9 @@ class Batch:
         return per, total
 
     @_renamed_timeout
-    def run(self, *, device="gpu", max_workers: int = 4,
-            wait_timeout_s: Optional[float] = None, max_usd=None) -> BatchResults:
+    def run(self, *, device="gpu", solver=None, max_workers: int = 4,
+            wait_timeout_s: Optional[float] = None, max_usd=None,
+            max_usd_total=None, on_submit=None, on_complete=None) -> BatchResults:
         """Quote every entry, then submit within its accepted spend limit.
 
         ``max_usd`` is required and is either one per-job limit applied to all
@@ -135,12 +181,35 @@ class Batch:
         reports a quote's ``cells_per_axis`` and ``dt_s``, that they match the
         grid its simulation realizes locally (a quote that omits them warns
         and is still submitted), and each accepted quote id is bound to its
-        corresponding submission. ``device`` defaults to ``"gpu"`` as in every
-        cloud call. ``wait_timeout_s`` bounds only how long each entry is
+        corresponding submission. ``solver`` is forwarded unchanged on every
+        estimate and submission; the closed-test service requires an explicit
+        build and a curated GPU device. ``device`` defaults to ``"gpu"`` as in
+        every cloud call. ``wait_timeout_s`` bounds only how long each entry is
         waited for: an entry past it is reported as a
         :class:`~photonhub.cloud.CloudJobTimeout` and its service job keeps
         running, and billing (``timeout`` is its old name and warns).
+        ``max_usd_total`` optionally caps the sum of accepted quotes. A quote
+        above either ceiling in the initial pass refuses the whole batch.
+        Batches larger than service concurrency run in waves: set
+        ``max_workers`` to the service's active-job limit (1 for the beta).
+        Immediately before submission, quotes near expiry are refreshed and
+        both ceilings checked again against accepted spend. The refresh margin
+        is one quarter of the remaining lifetime when the quote is received,
+        capped at 60 seconds and fixed for that quote.
+        A missing ``expires_at`` means no expiry. A refresh refusal fails only
+        that entry; earlier jobs may already have been charged.
+        ``on_submit(name, job_id, quote_usd)`` runs on a worker thread after
+        submission. ``on_complete(name, result, error)`` runs on the calling
+        thread as each entry finishes. Submit hooks have their own lock.
+        ``on_submit`` exceptions are reported as warnings, never raised,
+        because the job is already paid. ``on_complete`` exceptions propagate.
+        If collection is interrupted, queued entries are cancelled before the
+        exception is raised; entries already running are waited for first.
+        A submit-time CloudError carries its accepted ``quote_usd`` because
+        the service may have accepted a job before the response was lost.
         """
+        total_limit = (None if max_usd_total is None else
+                       _spend_limit(max_usd_total, label="max_usd_total"))
         timeout = _poll_timeout(wait_timeout_s)
         device = _validate_web_device(device)
         # Every entry is checked against the device before ANY of them is
@@ -155,27 +224,91 @@ class Batch:
         quote_http = HttpClient(cfg)
         quotes = {
             name: _accepted_quote(
-                quote_http, name, sim, limits[name], device, wires[name])
+                quote_http, name, sim, limits[name], device, wires[name], solver)
             for name, sim in self.simulations.items()
         }
-        results = {}
-        errors = {}
+        total_quote = sum(quote.usd for quote in quotes.values())
+        if total_limit is not None and total_quote > total_limit + 1e-9:
+            raise _TotalCeilingRefused(total_quote, total_limit)
+        completed = {}
+        submit_lock = threading.Lock()
+        spend_lock = threading.Lock()
+        accepted_usd = 0.0
 
         def _one(item):
+            nonlocal accepted_usd
             name, sim = item
+            quote = quotes[name]
+            submission_attempted = False
             try:
-                return name, _cloud_run(sim, name=name, device=device,
-                                        timeout=timeout, quote_id=quotes[name],
-                                        cfg=cfg, preflight_wire=wires[name]), None
+                http = HttpClient(cfg)
+                # Refresh, reserve and submit under one lock so concurrent
+                # workers cannot spend the same remaining budget. Polling and
+                # downloads run outside it. Ambiguous submissions stay reserved.
+                with spend_lock:
+                    if quote.needs_refresh():
+                        quote = _accepted_quote(
+                            http, name, sim, limits[name], device, wires[name], solver)
+                    if quote.needs_refresh():
+                        raise CloudError(f"fresh quote for batch entry {name!r} expires too soon")
+                    if total_limit is not None and accepted_usd + quote.usd > total_limit + 1e-9:
+                        raise CloudError(
+                            f"quote for batch entry {name!r} (${quote.usd:.4f}) "
+                            f"exceeds remaining max_usd_total "
+                            f"(${max(0.0, total_limit - accepted_usd):.4f}); entry was not submitted")
+                    accepted_usd += quote.usd
+                    submission_attempted = True
+                    try:
+                        response = http.submit_job(wires[name], name=name, device=device,
+                                                   solver=solver, quote_id=quote.quote_id)
+                    except CloudError as exc:
+                        if exc.status_code is not None and 400 <= exc.status_code < 500:
+                            accepted_usd -= quote.usd
+                        raise
+                job_id = _submitted_job_id(response)
+                _store_submission(cfg, job_id, sim, wires[name])
+            except CloudError as e:
+                e.quote_usd = quote.usd if submission_attempted else 0.0
+                e.submission_attempted = submission_attempted
+                return name, None, e
+            except (SolverRunError, CloudJobTimeout) as e:
+                return name, None, e
+            if on_submit is not None:
+                with submit_lock:
+                    try:
+                        on_submit(name, job_id, quote.usd)
+                    except Exception as exc:
+                        try:
+                            warnings.warn(
+                                f"cloud job {job_id} was submitted, but on_submit failed "
+                                f"({type(exc).__name__}: {exc})",
+                                UserWarning, stacklevel=caller_stacklevel())
+                        except Exception:
+                            pass
+            try:
+                return name, _finish_cloud_job(http, cfg, job_id,
+                                               timeout=timeout, simulation=sim), None
             except (SolverRunError, CloudJobTimeout, CloudError) as e:
                 return name, None, e
 
         with ThreadPoolExecutor(max_workers=max(1, max_workers)) as ex:
-            for name, data, err in ex.map(_one, self.simulations.items()):
-                if err is None:
-                    results[name] = data
-                else:
-                    errors[name] = err
+            futures = [ex.submit(_one, item) for item in self.simulations.items()]
+            try:
+                for future in as_completed(futures):
+                    name, data, err = future.result()
+                    completed[name] = (data, err)
+                    if on_complete is not None:
+                        on_complete(name, data, err)
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                ex.shutdown(cancel_futures=True)
+                raise
+
+        results = {name: completed[name][0] for name in self.simulations
+                   if completed[name][1] is None}
+        errors = {name: completed[name][1] for name in self.simulations
+                  if completed[name][1] is not None}
 
         return BatchResults(results, errors, cfg.cache_dir,
                          list(self.simulations))

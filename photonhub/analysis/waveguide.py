@@ -162,8 +162,9 @@ class WaveguideModes:
             extra = ""
             if ng is not None and not np.isnan(ng[i]):
                 extra += f"  n_g {ng[i]:.4f}"
-            if loss is not None and not np.isnan(loss[i]):
-                extra += f"  loss {loss[i]:.3g} dB/cm"
+            if loss is not None:
+                extra += ("  loss unavailable" if not np.isfinite(loss[i])
+                          else f"  loss {loss[i]:.3g} dB/cm")
             lines.append(
                 f"  #{i} {m.polarization}  n_eff {np.real(m.n_eff):.4f}  "
                 f"te_frac {m.te_fraction:.3f}{extra}")
@@ -218,8 +219,9 @@ def rectangular_waveguide(
         with float indices it defers to the solver's built-in
         (waveguide-dispersion-only) central difference.
     bend_radius_um, num_pml, pml_strength:
-        Bend analysis passthrough to ``VectorModeSolver.solve`` (complex
-        ``n_eff``; add PML for the radiation loss, see the solver docs).
+        Bend analysis passthrough to ``VectorModeSolver.solve``. When
+        ``num_pml=0``, the solver adds layers at strength 30 and warns;
+        the default ``pml_strength=1`` applies only with explicit layers.
 
     Returns
     -------
@@ -244,9 +246,11 @@ def rectangular_waveguide(
                     wlen_um / (12.0 * n_core))
     if clad_pad_um is None:
         clad_pad_um = max(0.5, wlen_um / 2.0)
-    if window_w_um is None:
+    default_window_w = window_w_um is None
+    default_window_h = window_h_um is None
+    if default_window_w:
         window_w_um = core_w_um + 2.0 * clad_pad_um
-    if window_h_um is None:
+    if default_window_h:
         window_h_um = core_h_um + 2.0 * clad_pad_um
 
     material_aware = not (isinstance(core, (int, float))
@@ -273,7 +277,24 @@ def rectangular_waveguide(
                             pml_strength=pml_strength)
 
     want_builtin_ng = group_index and not material_aware
-    modes = solver.solve(group_index=want_builtin_ng, **solve_kwargs)
+    try:
+        modes = solver.solve(group_index=want_builtin_ng, **solve_kwargs)
+    except ValueError as exc:
+        if "exceeding MAX_UNKNOWNS" not in str(exc):
+            raise
+        adjustments = ["increase dl_um"]
+        if default_window_w or default_window_h:
+            adjustments.append("reduce clad_pad_um")
+        if not default_window_w:
+            adjustments.append("reduce window_w_um")
+        if not default_window_h:
+            adjustments.append("reduce window_h_um")
+        raise ValueError(
+            f"The cross-section uses dl_um={dl_um:.6g} um and a "
+            f"{solver.eps.shape[1]} x {solver.eps.shape[0]} grid "
+            f"({solver.eps.size} cells), above the full-vector solve's "
+            f"{solver.MAX_UNKNOWNS}-cell limit. To fit, "
+            f"{', or '.join(adjustments)}.") from exc
 
     if group_index and material_aware:
         # material-aware n_g: central difference with the material's own

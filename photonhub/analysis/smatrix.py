@@ -58,7 +58,7 @@ Normalization
 =============
 ``a`` and ``b`` are built from the **source-spectrum-normalized** complex modal
 amplitudes already living in the run data: the recorded phasors are divided by
-``A0*S(f)`` (NUMERICS.md section 12), so that normalization cancels in the ratio
+``A0*S(f)``, so that normalization cancels in the ratio
 ``S_ij = b_i / a_j`` and leaves a dimensionless scattering parameter. Each port's
 amplitude is the power-normalized ``c * sqrt(|P_mode| * 1e-12)`` (see above, the µm²→m² factor keeps ``|b|^2`` equal to the flux-commensurate
 ``ModeMonitor.mode_power``), so
@@ -194,7 +194,7 @@ class SPort:
             modes_by_freq=mon._resolved_modes_by_freq(),
             colocate=colocate,
             destagger_dl=(mon.dl_um if colocate else None),
-            # §20 folded-domain quadrature: half-weight a node-registered sample
+            # folded-domain quadrature: half-weight a node-registered sample
             # row sitting ON a symmetry plane, exactly as ModeMonitor.mode_power /
             # mode_decomposition do — else the S-matrix readout reverts to the
             # pre-fix quadrature and inflates fold-antinode mode power (a
@@ -208,7 +208,7 @@ class SPort:
         # units — the same flux-commensurate value ModeMonitor.mode_power
         # reports — so per-port P_mode no longer biases S. The unit factor is
         # shared by every port, so S ratios are unchanged by it. The fold
-        # factor is not shared: a port centred on a §20 symmetry plane records
+        # factor is not shared: a port centred on a symmetry plane records
         # half its power per plane, and |.|^2 must be the whole plane's power
         # as mode_power reports it, or S between a port on the plane and one
         # off it reads sqrt(2) high.
@@ -377,7 +377,7 @@ def assemble_smatrix(
         attrs={
             "description": "scattering matrix S_ij(f) = b_i / a_j",
             "normalization": (
-                "source-spectrum-normalized (NUMERICS.md section 12), "
+                "source-spectrum-normalized, "
                 "power-normalized wave amplitudes c*sqrt(|P_mode|); |S_ij|^2 is "
                 "a power ratio (also across unequal-mode ports), S† S <= I "
                 "for a passive device"),
@@ -430,6 +430,13 @@ def assert_reciprocal(S, *, atol: float = 1e-6) -> None:
             f"S-matrix not reciprocal: max |S_ij - S_ji| = {err:.3e} > {atol:.1e}")
 
 
+def _passivity_excess(matrices):
+    """Power excess for each finite matrix in a batch (last two axes)."""
+    gram = matrices.conj().swapaxes(-1, -2) @ matrices
+    gram = 0.5 * (gram + gram.conj().swapaxes(-1, -2))
+    return np.linalg.eigvalsh(gram)[..., -1] - 1.0
+
+
 def passivity_violation(S) -> float:
     """Worst passivity excess ``max(eig(S† S)) - 1`` over all frequencies.
 
@@ -439,15 +446,8 @@ def passivity_violation(S) -> float:
     passive; a small positive value is numerical slack). Frequencies with any
     ``nan`` S entry are skipped."""
     stack, _ = _as_matrices(S)
-    worst = -np.inf
-    for Sf in stack:
-        if not np.all(np.isfinite(Sf)):
-            continue
-        gram = Sf.conj().T @ Sf
-        # Hermitian by construction; eigvalsh is real and stable.
-        lam = np.linalg.eigvalsh(0.5 * (gram + gram.conj().T))
-        worst = max(worst, float(np.max(lam)) - 1.0)
-    return worst if np.isfinite(worst) else 0.0
+    finite = stack[np.all(np.isfinite(stack), axis=(-2, -1))]
+    return float(np.max(_passivity_excess(finite))) if len(finite) else 0.0
 
 
 def is_passive(S, *, atol: float = 1e-6) -> bool:

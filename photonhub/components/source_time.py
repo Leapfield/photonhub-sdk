@@ -1,4 +1,4 @@
-"""Source time dependences (NUMERICS.md section 5)."""
+"""Source time dependences."""
 
 import math
 import warnings
@@ -11,7 +11,7 @@ from .._compat import caller_stacklevel, legacy_keywords
 from ..constants import c0
 
 # Free-space speed of light (m/s), identical to the engine's kC0
-# (engine/include/phcore/types.h) and to grid.py / cost.py, so the wavelength
+# and to grid.py / cost.py, so the wavelength
 # <-> frequency conversion used by :meth:`GaussianPulse.for_band` round-trips
 # bit-comparably with the rest of the client.
 _C0_M_PER_S = c0
@@ -22,9 +22,9 @@ class GaussianPulse(FrozenModel):
     tau = 1/(2 pi fwidth), t0 = offset * tau.
 
     The frequency-domain envelope is a Gaussian whose standard deviation in Hz
-    is exactly ``fwidth_hz`` (NUMERICS.md §12). Two facts drive source tuning:
+    is exactly ``fwidth_hz``. Two facts drive source tuning:
     the run cannot auto-shutoff before the source stops injecting at
-    ``(offset+8)*tau`` (NUMERICS.md §7), so settling scales as ``1/fwidth``; and
+    ``(offset+8)*tau``, so settling scales as ``1/fwidth``; and
     too broad a pulse puts spectral weight on DC and goes unstable. The
     :meth:`for_band` constructor tunes ``freq0_hz``/``fwidth_hz`` for both, and
     :attr:`source_end_time_s` / :attr:`dc_amplitude` expose them for auditing.
@@ -36,18 +36,18 @@ class GaussianPulse(FrozenModel):
     offset: float = Field(default=5.0, ge=0)
     phase: float = 0.0
     # Broadband eq-current WINDOWED CARRIER (schema 1.14.0, additive/optional —
-    # NUMERICS.md §5/§18.3, the dipole-sheet analogue of ModeSource.freqs_hz).
+    # the dipole-sheet analogue of ModeSource.freqs_hz).
     # Both None (the default) = the plain single-frequency Gaussian carrier,
     # byte-identical wire (they are dropped by the exclude_none wire dump). When
     # set, this pulse is one WINDOWED carrier of the broadband launch: it rides
     # the partition-of-unity-windowed slice of the pulse spectrum centred on
-    # ``band_freqs_hz[carrier_index]`` (the same tent window as the §18.3 mode
+    # ``band_freqs_hz[carrier_index]`` (the same tent window as the mode
     # source). All N per-frequency dipole sheets of one launch share the same
     # ``band_freqs_hz``; each sheet's dipoles carry that sheet's ``carrier_index``.
     # ``freq0_hz``/``fwidth_hz`` remain the underlying source pulse (its spectrum
     # is the one being windowed); ``phase``/``amplitude`` ride the per-dipole
     # phasor as usual. Built by ``equivalence_current_source`` — hand
-    # construction is rare. Not for plane waves / §18 mode sources (eq-current
+    # construction is rare. Not for plane waves / mode sources (eq-current
     # dipole launch only).
     band_freqs_hz: Optional[Tuple[FreqHz, ...]] = Field(default=None, min_length=2)
     carrier_index: Optional[int] = Field(default=None, ge=0)
@@ -74,7 +74,7 @@ class GaussianPulse(FrozenModel):
                 )
         return self
 
-    # --- settling / spectral diagnostics (mirror engine source_time.h) ---
+    # --- settling / spectral diagnostics (mirror the engine's) ---
 
     @property
     def tau_s(self) -> float:
@@ -89,7 +89,7 @@ class GaussianPulse(FrozenModel):
     @property
     def source_end_time_s(self) -> float:
         """Instant the source is considered done injecting, ``(offset+8)*tau``
-        (engine ``source_end_time``). Auto-shutoff (NUMERICS.md §7) may not
+        (engine ``source_end_time``). Auto-shutoff may not
         terminate the run before this time, so it is the settling floor on the
         step count, inversely proportional to ``fwidth_hz``."""
         return (self.offset + 8.0) * self.tau_s
@@ -133,7 +133,7 @@ class GaussianPulse(FrozenModel):
         min_dc_sigmas: float = 4.0,
     ) -> "GaussianPulse":
         """Pick ``freq0_hz``/``fwidth_hz`` to cover a measurement band with the
-        SHORTEST settling that band justifies (NUMERICS.md §5/§7).
+        SHORTEST settling that band justifies.
 
         Exactly one of ``freqs_hz`` or ``wlens_um`` defines the band (only
         its extremes matter). ``freq0_hz`` (or its wavelength form ``wlen0_um``,
@@ -223,13 +223,12 @@ class GaussianPulse(FrozenModel):
 
 # Single member today; new time dependences slot into the union.
 class CW(FrozenModel):
-    """Continuous wave (NUMERICS.md §5-CW, schema 1.18):
+    """Continuous wave (schema 1.18):
     ``J(t) = amplitude * ramp(t) * cos(2 pi freq0 t + phase)`` with a C¹
     smooth sin² turn-on over ``ramp_cycles`` carrier periods, then constant
-    forever. For steady-state analysis: the source never ends, so §7
-    auto-shutoff never fires, set ``run_time_s`` long enough to ring up.
+    forever. For steady-state analysis: the source never ends, so auto-shutoff never fires, set ``run_time_s`` long enough to ring up.
 
-    §12 normalization is defined AT THE CARRIER only: when a CW is the
+    The source-spectrum normalization is defined AT THE CARRIER only: when a CW is the
     normalization source (first in wire order), every DFT/flux monitor
     frequency must equal ``freq0_hz`` (``phsolver validate`` enforces);
     the normalized phasors then converge to the steady-state response per

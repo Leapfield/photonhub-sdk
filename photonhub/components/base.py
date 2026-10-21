@@ -15,11 +15,11 @@ BoundaryKind = Literal["periodic", "pec", "pml", "absorber", "bloch", "pmc"]
 SubpixelMethodName = Literal[
     "volume", "tensor", "tensor_full", "contour", "contour_diag", "contour_full"
 ]
-# NUMERICS.md §23 — field STORAGE precision. "fp16" narrows only the six
+# field STORAGE precision. "fp16" narrows only the six
 # field arrays (behind exact power-of-two per-run scales); every arithmetic
 # operation and all stiff state stay fp32/fp64. Opt-in bandwidth fast lane.
 FieldPrecisionName = Literal["fp32", "fp16"]
-# NUMERICS.md §12.6 — storage precision of the field_dft running-DFT
+# storage precision of the field_dft running-DFT
 # accumulators. "fp64" (default) is byte-identical to prior releases;
 # "fp32c" is a compensated fp32 pair (same bytes, fp64-class accuracy);
 # "fp32" is a plain fp32 pair (half the accumulator bytes and traffic, at a
@@ -32,7 +32,7 @@ PositiveUm = Annotated[float, Field(gt=0)]
 NonNegativeUm = Annotated[float, Field(ge=0)]
 Vec3Um = Tuple[float, float, float]
 
-# Frequency lists for the DFT monitors (NUMERICS.md section 12): non-empty,
+# Frequency lists for the DFT monitors: non-empty,
 # every entry strictly positive.
 FreqHz = Annotated[float, Field(gt=0)]
 
@@ -68,7 +68,7 @@ def _is_portable_filename_token(name: str, *, max_length: int) -> bool:
 
 
 def _filename_safe(name: str) -> str:
-    """Engine parity (engine/src/core/resolve.cpp check_name): the engine
+    """Engine parity (the engine's name check): the engine
     writes ``<name>.bin``. Restrict names to a portable ASCII token so output
     paths have the same meaning on Linux, macOS, and Windows, including their
     case and device-name rules."""
@@ -103,8 +103,8 @@ MonitorName = Annotated[
     AfterValidator(_filename_safe),
 ]
 
-# Engine parity: phsolver's as_int rejects integers outside int32
-# (engine/src/io/spec_io.cpp), so step counts/intervals are bounded here too.
+# Engine parity: phsolver's as_int rejects integers outside int32,
+# so step counts/intervals are bounded here too.
 MAX_INT32 = 2**31 - 1
 
 

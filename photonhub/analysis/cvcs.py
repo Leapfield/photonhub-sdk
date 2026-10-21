@@ -48,8 +48,7 @@ needs more. The hard case is a **sharp avoided crossing** (near-degenerate modes
 swapping over a tiny z-window): interpolation cannot resolve the rapid mode
 variation there, so it needs near-staircase key-plane density, at which point the
 plain :mod:`~photonhub.analysis.eme` staircase is the simpler tool. CVCS's ``N/K``
-eigensolve saving is realized wherever the modes are smooth (the common case);
-see ``validation/suites/eme/cvcs_taper.py``.
+eigensolve saving is realized wherever the modes are smooth (the common case).
 
 CVCS currently interpolates only ordinary ``"guided"`` modes on a real,
 non-PML transverse contour. Radiation, evanescent, PML, and complex-contour

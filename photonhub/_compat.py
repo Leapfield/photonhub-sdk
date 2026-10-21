@@ -5,8 +5,7 @@ The public vocabulary abbreviates wavelength as ``wlen`` (``wlen_um``,
 published under an older spelling keep accepting it through
 :func:`legacy_keywords`, so existing scripts run unchanged. Whether the old
 spelling warns is a package-wide switch: off in this release, turned on once
-the notebooks and the docs use the new spellings (design spec
-``docs/superpowers/specs/2026-09-10-setup-api-simplification-design.md`` §6).
+the notebooks and the docs use the new spellings.
 """
 
 from __future__ import annotations
@@ -23,11 +22,13 @@ WARN_LEGACY_KEYWORDS = False
 
 # Packages a warning looks through on its way to the user's line: pydantic
 # (``BaseModel.__init__`` runs the validators and ``model_post_init``), the
-# import machinery (a warning at a module's import), ``runpy`` (``python -m``)
-# and the stdlib wrappers that add a frame (``contextlib``, and ``functools``
-# for ``cached_property``).
+# import machinery (a warning at a module's import), ``runpy`` (``python -m``),
+# the stdlib wrappers that add a frame (``contextlib``, and ``functools``
+# for ``cached_property``) and SciPy, whose minimizer calls back into the
+# package during ``optimize_parametric``.
 _TRANSPARENT_PACKAGES = frozenset(
-    {"pydantic", "pydantic_core", "importlib", "runpy", "contextlib", "functools"})
+    {"pydantic", "pydantic_core", "importlib", "runpy", "contextlib", "functools",
+     "scipy"})
 # Packages that call into this one with no user frame in between (a display
 # hook rendering a result, the kernel's event loop): reaching one means the
 # stack holds no user line, so the warning points at this package's outermost

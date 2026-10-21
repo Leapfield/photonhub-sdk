@@ -1,4 +1,4 @@
-"""Translation between the user's frame and the wire frame (design spec §4.4).
+"""Translation between the user's frame and the wire frame.
 
 A simulation fitted around its device is built in the user's coordinates; the
 wire document is corner-anchored. :func:`translate` moves every positional
@@ -8,8 +8,9 @@ the plotters call, so the inventory of positional fields lives here:
 - ``Box``, ``Sphere``, ``Cylinder``: ``center_um``;
 - ``Polygon``: ``vertices_um`` (natural (u, v) order of its transverse axes)
   and ``slab_bounds_um`` (along ``axis``);
-- ``Structure``: its geometry (a ``PermittivityArray`` medium is sampled over
-  the geometry and carries no position);
+- ``Structure``: its geometry, and the node coordinates of a
+  ``PermittivityArray`` placed by ``coords_um`` (schema 1.22); a box-spanning
+  array is sampled over the geometry and carries no position;
 - ``PointDipole``, ``TimeMonitor``, ``ProfileMonitor``, ``TFSFBox``:
   ``center_um``; a ``ProfileMonitor``'s ``mode_port`` centre (natural order);
 - ``PlaneWave``, ``ModeSource``: ``position_um`` along ``axis``; a
@@ -27,7 +28,7 @@ wire frame and take the origin off again through :func:`wire_array`.
 
 :func:`mirror` reflects the same inventory through a plane, and
 :func:`mirror_image_missing` checks a structure set for the mirror symmetry
-the fold of a declared ``symmetry`` plane relies on (design spec §4.5).
+the fold of a declared ``symmetry`` plane relies on.
 
 The wire document carries none of that client state: not ``origin_um``, not
 the fold, not the declared ports and wavelengths. :func:`client_state` records
@@ -96,7 +97,13 @@ def translate(value: Any, delta: Sequence[float]) -> Any:
         return value.model_copy(update={"vertices_um": verts,
                                         "slab_bounds_um": (float(lo) + d[a], float(hi) + d[a])})
     if isinstance(value, Structure):
-        return value.model_copy(update={"geometry": translate(value.geometry, d)})
+        update = {"geometry": translate(value.geometry, d)}
+        pd = getattr(value.medium, "permittivity_data", None)
+        if pd is not None and pd.coords_um is not None:
+            coords = tuple(tuple(float(c) + d[a] for c in pd.coords_um[a]) for a in range(3))
+            update["medium"] = value.medium.model_copy(update={
+                "permittivity_data": pd.model_copy(update={"coords_um": coords})})
+        return value.model_copy(update=update)
     if isinstance(value, ProfileMonitor):
         update: dict = {"center_um": _add3(value.center_um, d)}
         if value.mode_port is not None:
@@ -188,6 +195,27 @@ def _reflect3(c, a: int, plane: float) -> Vec3:
     return (out[0], out[1], out[2])
 
 
+def _mirror_data(pd, a: int, plane: float):
+    """A ``PermittivityArray`` reflected through ``axis a = plane``: the node
+    order along ``a`` reverses (a box-spanning grid follows its mirrored box),
+    and node coordinates, when the grid carries them, are reflected."""
+    import numpy as np
+
+    shape = tuple(int(n) for n in pd.shape)
+
+    def flip(flat):
+        return tuple(float(v) for v in np.flip(np.asarray(flat, dtype=float).reshape(shape), axis=a).reshape(-1))
+
+    update: dict = {"values": flip(pd.values)}
+    if pd.conductivity_s_per_m is not None:
+        update["conductivity_s_per_m"] = flip(pd.conductivity_s_per_m)
+    if pd.coords_um is not None:
+        coords = [tuple(float(c) for c in axis_c) for axis_c in pd.coords_um]
+        coords[a] = tuple(2.0 * plane - float(c) for c in reversed(pd.coords_um[a]))
+        update["coords_um"] = tuple(coords)
+    return pd.model_copy(update=update)
+
+
 def mirror(value: Any, axis: str, plane: float) -> Any:
     """``value`` reflected through the plane ``axis = plane`` (microns): the
     inventory :func:`translate` covers, with a sector's angles, a slanted
@@ -230,7 +258,11 @@ def mirror(value: Any, axis: str, plane: float) -> Any:
             verts.append((q[0], q[1]))
         return value.model_copy(update={"vertices_um": tuple(reversed(verts))})   # counter-clockwise again
     if isinstance(value, Structure):
-        return value.model_copy(update={"geometry": mirror(value.geometry, axis, p)})
+        update = {"geometry": mirror(value.geometry, axis, p)}
+        pd = getattr(value.medium, "permittivity_data", None)
+        if pd is not None:
+            update["medium"] = value.medium.model_copy(update={"permittivity_data": _mirror_data(pd, a, p)})
+        return value.model_copy(update=update)
     if isinstance(value, ProfileMonitor):
         update = {"center_um": _reflect3(value.center_um, a, p)}
         if value.mode_port is not None:
@@ -553,6 +585,14 @@ class _UnrecordedInputs(Mapping):
         "RunResult(path, client_state=False) to edit it in the wire's corner "
         "frame")
 
+    @staticmethod
+    def helper_message(helper: str) -> str:
+        return (
+            f"{helper} cannot edit this Simulation reloaded from a result: "
+            "the original inputs needed to rebuild its setup were not saved. "
+            "To rebuild it, use the original inputs with "
+            f"ph.Simulation(...), or apply {helper} before running.")
+
     def __getitem__(self, name):
         raise ValueError(self._MESSAGE)
 
@@ -637,6 +677,12 @@ def restore_client_state(sim, state, *, where: str) -> bool:
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         _warn_not_restored(where, str(exc))
         return False
+    _install_client_state(sim, origin, fold, wlens, wlen0, transits, declared)
+    return True
+
+
+def _install_client_state(sim, origin, fold, wlens, wlen0, transits, declared):
+    """Install an already validated client record on a wire-ingested scene."""
     object.__setattr__(sim, "origin_um", origin)
     object.__setattr__(sim, "wlens_um", wlens)
     object.__setattr__(sim, "wlen0_um", wlen0)
@@ -648,7 +694,19 @@ def restore_client_state(sim, state, *, where: str) -> bool:
         object.__setattr__(sim, "ports", ports)
         object.__setattr__(sim, "source", source)
         sim._declarative = resolved
-    return True
+
+
+def _copy_restored_client_state(source, target) -> None:
+    """Bind a restored result's frame to a validated, frame-safe wire copy."""
+    state = client_state(source)
+    if state is None:
+        raise ValueError(_UnrecordedInputs._MESSAGE)
+    state["wire_sha256"] = wire_digest(target)
+    try:
+        origin, fold, (wlens, wlen0, transits), declared = _parse_client_state(target, state)
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise ValueError(_UnrecordedInputs._MESSAGE) from exc
+    _install_client_state(target, origin, fold, wlens, wlen0, transits, declared)
 
 
 def loads_client_state(text: Optional[str], *, where: str):

@@ -258,8 +258,7 @@ _AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
 
 
 def _quarter_points(sim, axis_index: int, length_um: float, dl_um: float):
-    """The ``(k + 1/4)``-cell positions along one axis of ``sim`` — the §12
-    positions every Yee component snaps into the same cell. Uniform axis:
+    """The ``(k + 1/4)``-cell positions along one axis of ``sim`` — the positions every Yee component snaps into the same cell. Uniform axis:
     ``(k + 0.25) * dl``; graded axis: ``q_k + 0.25 * dq_k`` from the grid's own
     coordinate array. Returns ``(positions, n_cells)``."""
     q = sim._axis_coords_um(axis_index) if hasattr(sim, "_axis_coords_um") else None
@@ -312,7 +311,7 @@ def _snap_transverse_faces(
     margin_cells: int = 3,
 ) -> ModeMonitor:
     """Pull a mode monitor's TRANSVERSE plane faces inside the PML and land each
-    on a ``(k + 1/4)*dl`` position (NUMERICS.md §12).
+    on a ``(k + 1/4)*dl`` position.
 
     A full-domain plane touches the realized boundary (rejected as outside); an
     integer-cell inset lands the faces exactly on a cell boundary, where the
@@ -405,7 +404,7 @@ def build_simulation(
     wavelength dependence — needed to reproduce a paper's IL(λ) *slope*, not just
     its band-centre level. A dispersive scene gets two boundary changes: the
     routing arms carry the dispersive core THROUGH the in-plane walls, which is
-    the regime where a stretched-coordinate PML diverges (NUMERICS.md §21), so
+    the regime where a stretched-coordinate PML diverges, so
     those axes switch to the adiabatic absorber (``with_auto_boundaries``) of
     ``absorber_num_layers`` cells, and the remaining PML axes get the
     stabilized CFS profile. Every wall clearance (mode planes, arm length,
@@ -660,7 +659,7 @@ def build_simulation(
         )
 
     # Pull every monitor plane's transverse faces inside the PML, onto (k+1/4)*dl
-    # positions so they never touch the boundary or a cell edge (NUMERICS.md §12).
+    # positions so they never touch the boundary or a cell edge.
     if monitor_span not in ("mode_window", "domain"):
         raise ValueError(
             f"monitor_span must be 'mode_window' or 'domain', got {monitor_span!r}")
@@ -731,7 +730,7 @@ def build_simulation(
         monitors = monitors + tuple(flux)
     # Optional xy field slice (for the |E|^2 intensity figure): a band-centre DFT
     # over the whole in-plane at the core mid-height. Its z-plane is snapped to
-    # (k+1/4)*dl so every Yee component lands in one cell (NUMERICS.md §12).
+    # (k+1/4)*dl so every Yee component lands in one cell.
     field_slice_name = None
     field_slice_cf = None
     if field_slice:
@@ -739,7 +738,7 @@ def build_simulation(
         z_quarters, _ = _quarter_points(shell, 2, size_z, dl)
         z_plane = min(z_quarters, key=lambda zq: abs(zq - cz))
         # Pull the in-plane slice faces to (k+1/4)*dl inside the PML — the same
-        # §12 snap the mode monitors use. A full-domain plane both pokes past the
+        # snap the mode monitors use. A full-domain plane both pokes past the
         # realized boundary (non-dl-commensurate rectangular box) AND lands on cell
         # edges where Ex/Ey snap to different cells (rejected); quarter-cell faces
         # avoid both and the slice covers the physical (non-PML) region.
@@ -766,8 +765,8 @@ def build_simulation(
     )
     # A dispersive (Lorentz-pole) core needs a stabilized CFS-PML or the
     # pole-assisted resonance the plain sigma-graded PML re-amplifies drives a
-    # late-time divergence (the cpw=30 case). PR #158 auto-applies the aligned
-    # profile at construction — but ONLY when no PML knob is user-set, and we DO
+    # late-time divergence (the cpw=30 case). The simulation auto-applies the
+    # aligned profile at construction — but ONLY when no PML knob is user-set, and we DO
     # pass pml_num_layers (to size the domain around the mode planes), which
     # suppresses it. So apply the same stabilized-CPML alpha+kappa here,
     # keeping our layer count (with_stabilized_pml's default 40-layer slab would

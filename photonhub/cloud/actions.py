@@ -129,7 +129,7 @@ def _check_quote_grid(sim, quote: dict, *, context: str = "estimate",
     The service quotes the wire document with its own bundled SDK, which can
     differ in version from this client in either direction and then resolve
     the same document to a different grid: one without quasi-2-D support
-    floors a one-cell periodic axis (NUMERICS.md section 1) at four cells and
+    floors a one-cell periodic axis at four cells and
     counts it in the Courant limit. Compare the quote's ``cells_per_axis``
     and ``dt_s`` with :meth:`Simulation.cost_estimate`, which matches the
     engine's resolver. Any cell-count difference, or a dt outside

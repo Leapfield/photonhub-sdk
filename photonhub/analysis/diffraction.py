@@ -13,7 +13,7 @@ On a plane normal to ``axis`` with both in-plane axes periodic (periods
 ``(m1, m2)`` with in-plane wavevectors ``k1 = k_B1 + 2 pi m1 / L1``,
 ``k2 = k_B2 + 2 pi m2 / L2``, where ``k_B`` is the Bloch wavevector of the
 boundaries (0 on plain periodic axes; ``Simulation.bloch_k_per_um`` on
-``"bloch"`` axes, the oblique-incidence order ladder, NUMERICS.md §22).
+``"bloch"`` axes, the oblique-incidence order ladder).
 The recorded field is only QUASI-periodic under a nonzero ``k_B``, so each
 component is demodulated by ``e^{-i k_B x}`` at its own sample coordinates
 before the FFT. Each order with ``|k_t|^2 < (n w / c)^2`` is a propagating
@@ -51,7 +51,7 @@ bookkeeping cross-check, not a physics reference.
 
 What's not handled
 ==================
-* **Symmetry-folded planes**, a §20 symmetry plane on an in-plane axis
+* **Symmetry-folded planes**, a symmetry plane on an in-plane axis
   reduces the recorded half-domain by symmetry; rebuild is not implemented (raises).
 * **Decimated planes**, ``interval_space`` strides > 1 on an in-plane axis
   alias high orders (raises).
@@ -214,7 +214,7 @@ def _degenerate_spacing(simulation, letter: str) -> Optional[float]:
     """Cell size of a 1-cell plain-periodic in-plane axis, else ``None``.
 
     A quasi-2-D (or quasi-1-D) run reduces one axis to a single plain-periodic
-    cell (NUMERICS.md section 1), so the recorded plane carries ONE sample
+    cell, so the recorded plane carries ONE sample
     there and ``np.diff`` cannot supply the spacing.  The physics is exact and
     trivial: the axis is invariant, its order ladder is the single ``m = 0``
     term, and the sampled period is one cell.  Only a uniform-at-dl axis can be
@@ -255,7 +255,7 @@ def _uniform_spacing(coords: np.ndarray, letter: str,
 
 
 def _plane_media(simulation, axis: str, position_um: float) -> list:
-    """The distinct media the §9 hard sample puts on the cut's cell centres,
+    """The distinct media the hard sample puts on the cut's cell centres,
     ordered by owner: ``None`` for the background, then structure media in
     list order. Painted with each structure's list index in place of its
     permittivity, so the owner of every cell is exact."""
@@ -287,7 +287,7 @@ def _infer_n_medium(simulation, axis: str, position_um: float,
     frame the structures are painted in). The plane must lie in a homogeneous
     region for plane-wave orders to be well-defined, so the analytic eps is
     sampled on the cut and required uniform. For a pole medium the
-    ``permittivity`` field is only eps_inf (NUMERICS.md §19), so a plane in a
+    ``permittivity`` field is only eps_inf, so a plane in a
     dispersive medium takes ``Re eps(f)`` at each recorded frequency."""
     from ..viz.eps import sample_eps_plane
     _, _, eps2d = sample_eps_plane(simulation, axis, position_um)
@@ -391,7 +391,7 @@ def diffraction_orders(
 
     # --- physics preconditions ---------------------------------------------
     # In-plane Bloch offsets (0 on plain periodic axes): the Floquet order
-    # ladder is k_B + 2 pi m / L (NUMERICS.md §22).
+    # ladder is k_B + 2 pi m / L.
     bk = getattr(simulation, "bloch_k_per_um", None) or (0.0, 0.0, 0.0)
     kb1 = float(bk[_AXIS_IDX[u1]])
     kb2 = float(bk[_AXIS_IDX[u2]])

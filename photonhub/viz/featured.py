@@ -105,9 +105,9 @@ class Scene:
 
 def _corner_frame(data, name, sim):
     """The recorded plane as the engine wrote it, in the wire's corner frame the
-    exporter works in (design spec §4.4): a result hands out user-frame
+    exporter works in: a result hands out user-frame
     coordinates, and the plane of a folded device unfolded, while the
-    exporter mirrors a §20 half plane itself."""
+    exporter mirrors a half plane itself."""
     from ..components.frame import wire_array
     return wire_array(data, name)
 
@@ -177,7 +177,7 @@ def _interior(sim, dl3, periodic_extent_um: float):
         else:
             lo.append(t)
             hi.append(size - t)
-    # NUMERICS.md §20: on a symmetry axis the min face is a mirror, not a
+    # on a symmetry axis the min face is a mirror, not a
     # wall, and only half the device was simulated. The figure shows the whole
     # device: the shown region is unfolded about that face.
     for i, s in enumerate(_symmetry(sim)):
@@ -329,7 +329,7 @@ def _structures(sim, dl3, lo, hi, periodic_extent_um: float, simplify_um: float,
     bodies = []
     for (z0, z1), polys in sorted(by_extent.items()):
         merged = unary_union(polys).intersection(clip)
-        # §9 last-wins: only an air structure listed AFTER the body it overlaps
+        # last-wins: only an air structure listed AFTER the body it overlaps
         # replaces its material, and only where their z extents meet.
         cut = [p for (a0, a1, p, i) in carves
                if i > last_body[(round(z0, 6), round(z1, 6))]
@@ -654,7 +654,7 @@ def _plane(sim, da, *, freq_hz, dl3, lo, hi, origin, structures_z, max_samples: 
         else:
             v, amp, phasor = coord_t[keep], amp_t[keep, :], ph_t[:, keep, :]
 
-    # Unfold about a symmetry face (NUMERICS.md §20): |E| is even; each
+    # Unfold about a symmetry face: |E| is even; each
     # animated component's phasor carries its parity — a PEC mirror (-1) keeps
     # the component normal to the face and flips the tangential ones, a PMC
     # (+1) the reverse. The recorded samples start at the first cell centre

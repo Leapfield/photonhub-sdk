@@ -1,4 +1,4 @@
-"""Geometry/material structures (NUMERICS.md sections 9-10).
+"""Geometry/material structures.
 
 ``structures`` is an ordered list; materials are sampled on the mesh per E component
 at that component's own Yee point and the LAST structure containing the
@@ -17,14 +17,14 @@ from .base import AxisName, FrozenModel, NonNegativeUm, PositiveUm, Vec3Um
 from .._compat import caller_stacklevel
 
 
-# NUMERICS.md §19 — hard per-medium pole budget (lorentz + poles + drude
+# hard per-medium pole budget (lorentz + poles + drude
 # combined); mirrors the engine's kMaxAdePoles.
 MAX_ADE_POLES = 6
 
 
 class LorentzPole(FrozenModel):
-    """One Lorentz pole of a frequency-dependent (dispersive) medium
-    (NUMERICS.md §19). Under the engine's e^{-i omega t} convention the pole
+    """One Lorentz pole of a frequency-dependent (dispersive) medium.
+    Under the engine's e^{-i omega t} convention the pole
     contributes
 
         chi(omega) = delta_eps * omega0^2
@@ -38,7 +38,7 @@ class LorentzPole(FrozenModel):
 
     Passivity (Im eps >= 0 for omega > 0) requires delta_eps >= 0 and
     gamma >= 0; the engine validates these. ``gamma = 0`` (a lossless,
-    undamped resonance) is allowed. Stability (NUMERICS.md §19.4) needs
+    undamped resonance) is allowed. Stability needs
     omega0*dt < 2 per pole and, over all the medium's poles, the
     discrete-Nyquist bound eps_inf - sum delta_eps*x/(1-x) - sum
     (wp*dt/2)^2 >= courant^2 with x = (omega0*dt/2)^2; the engine rejects a
@@ -50,7 +50,7 @@ class LorentzPole(FrozenModel):
 
 
 class DrudePole(FrozenModel):
-    """One Drude (free-carrier) term of a dispersive medium (NUMERICS.md §19),
+    """One Drude (free-carrier) term of a dispersive medium,
     the metal/plasmonics building block. Under e^{-i omega t} it contributes
 
         chi(omega) = -wp^2 / (omega^2 + i*gamma*omega)
@@ -61,7 +61,7 @@ class DrudePole(FrozenModel):
     metal. The engine realizes it as the omega0 = 0 ADE pole with strength
     wp^2. It lowers the medium's permittivity at the time-step Nyquist by
     (wp*dt/2)^2, so a metal fit with eps_inf near 1 needs a fine grid or a
-    low courant (NUMERICS.md §19.4; the engine rejects a spec that fails the
+    low courant (the engine rejects a spec that fails the
     bound and names the largest stable courant)."""
 
     plasma_frequency_hz: float = Field(gt=0.0)        # wp / 2pi
@@ -69,17 +69,36 @@ class DrudePole(FrozenModel):
 
 
 class PermittivityArray(FrozenModel):
-    """Node-based permittivity data grid for a custom medium (NUMERICS.md
-    §10.3, schema 1.18). ``shape`` = (nx, ny, nz), each >= 2; ``values`` is
+    """Node-based permittivity data grid for a custom medium (schema 1.18). ``shape`` = (nx, ny, nz), each >= 2; ``values`` is
     the flat C-order (x-major) array of nx*ny*nz node values, each >= 1.
     Node [0, 0, 0] sits ON the structure box's low corner and
     [nx-1, ny-1, nz-1] on the high corner; the engine trilinear-interpolates
-    at its §9 Yee sample points. Prefer :meth:`Medium.from_eps_array`.
+    at its Yee sample points. Prefer :meth:`Medium.from_eps_array`.
+
+    Schema 1.22 adds ``coords_um``, which places the nodes by their own
+    coordinates (any geometry; constant extrapolation beyond the outermost
+    node), and a per-node ``conductivity_s_per_m``. Build those with
+    :func:`photonhub.perturbed_medium` from an imported map.
     CPU solver only in this release: a GPU run carrying custom media is
     refused before it starts."""
 
     shape: Tuple[int, int, int]
     values: Tuple[float, ...] = Field(min_length=8, repr=False)
+    # Schema 1.22 — optional node coordinates per axis (microns, wire frame;
+    # the client's frame translation moves them with the structure). When
+    # set, the grid is placed by its coordinates instead of spanning the box:
+    # any geometry may carry it, each axis strictly increasing with
+    # ``shape[a]`` entries, and a sample beyond the outermost node takes that
+    # node's value. None omitted from the wire (byte-back-compat).
+    coords_um: Optional[Tuple[Tuple[float, ...], Tuple[float, ...],
+                              Tuple[float, ...]]] = Field(default=None,
+                                                          repr=False)
+    # Schema 1.22 — optional per-node conductivity (S/m, >= 0), same C order
+    # and length as ``values``, interpolated with the same weights. The
+    # medium's scalar ``conductivity_s_per_m`` must then be 0. None omitted
+    # from the wire (byte-back-compat).
+    conductivity_s_per_m: Optional[Tuple[float, ...]] = Field(default=None,
+                                                              repr=False)
 
     @model_validator(mode="after")
     def _consistent(self) -> "PermittivityArray":
@@ -103,25 +122,55 @@ class PermittivityArray(FrozenModel):
             raise ValueError(
                 f"permittivity_data values must be finite and >= 1, "
                 f"found {bad}")
+        if self.coords_um is not None:
+            for a, (axis, c) in enumerate(zip("xyz", self.coords_um)):
+                if len(c) != self.shape[a]:
+                    raise ValueError(
+                        f"permittivity_data coords_um[{a}] ({axis}) has "
+                        f"{len(c)} entries, shape says {self.shape[a]}")
+                if not all(math.isfinite(v) for v in c):
+                    raise ValueError(
+                        f"permittivity_data coords_um[{a}] ({axis}) must be "
+                        "finite")
+                if any(not (c[i + 1] > c[i]) for i in range(len(c) - 1)):
+                    raise ValueError(
+                        f"permittivity_data coords_um[{a}] ({axis}) must be "
+                        "strictly increasing")
+        if self.conductivity_s_per_m is not None:
+            if len(self.conductivity_s_per_m) != want:
+                raise ValueError(
+                    f"permittivity_data conductivity_s_per_m length "
+                    f"{len(self.conductivity_s_per_m)} != shape product "
+                    f"{want} (C order, x-major)")
+            bad = next((v for v in self.conductivity_s_per_m
+                        if not (v >= 0.0) or not math.isfinite(v)), None)
+            if bad is not None:
+                raise ValueError(
+                    "permittivity_data conductivity_s_per_m values must be "
+                    f"finite and >= 0, found {bad}")
         return self
+
+    @property
+    def has_coords(self) -> bool:
+        """True when the grid is placed by ``coords_um``, not by the box."""
+        return self.coords_um is not None
 
 
 class Medium(FrozenModel):
     """Isotropic nonmagnetic medium: scalar relative permittivity plus an
-    electric conductivity entering the lossy Ca/Cb update (NUMERICS.md
-    section 10). ``sigma = 0`` gives the lossless update.
+    electric conductivity entering the lossy Ca/Cb update. ``sigma = 0`` gives the lossless update.
 
     A non-dispersive medium leaves ``lorentz``/``poles``/``drude`` unset and
     the fields are omitted from the wire entirely (back-compat: schema < 1.9
     documents and every existing scene round-trip byte-identically). With any
     poles supplied, ``permittivity`` is the high-frequency limit eps_inf
-    (NUMERICS.md §19) and the medium is dispersive (the ADE polarization
+    and the medium is dispersive (the ADE polarization
     update engages only in cells carrying poles). The engine consumes the
     poles in WIRE ORDER, ``lorentz`` first, then ``poles``, then ``drude``, up to ``MAX_ADE_POLES`` combined."""
 
     permittivity: float = Field(ge=1.0)
     conductivity_s_per_m: float = Field(default=0.0, ge=0.0)
-    # NUMERICS.md §19 — the legacy single Lorentz pole (additive/back-compat;
+    # the legacy single Lorentz pole (additive/back-compat;
     # kept alongside the lists so schema 1.9-1.16 documents parse unchanged).
     lorentz: Optional[LorentzPole] = None
     # Schema 1.17 — additional Lorentz poles and Drude terms (additive;
@@ -138,16 +187,15 @@ class Medium(FrozenModel):
     # flips off automatically for anisotropic scenes). None omitted from the
     # wire (byte-back-compat).
     permittivity_xyz: Optional[Tuple[float, float, float]] = None
-    # Schema 1.17 — perfect electric conductor STRUCTURE material (NUMERICS.md
-    # §10.1): every E component whose Yee point falls inside is pinned to 0
+    # Schema 1.17 — perfect electric conductor STRUCTURE material: every E component whose Yee point falls inside is pinned to 0
     # (staircased hard mirror — the structure analogue of the 'pec' outer
     # boundary). ``permittivity`` is required by the wire but ignored (write 1);
     # conductivity and dispersion poles are contradictions and rejected.
     # None/False are equivalent and omitted from the wire (byte-back-compat).
     pec: Optional[bool] = None
-    # Schema 1.18 — optional spatially-varying ISOTROPIC permittivity
-    # (NUMERICS.md §10.3): a node-based data grid spanning the structure's
-    # Box extent, trilinear-interpolated at the engine's §9 sample points.
+    # Schema 1.18 — optional spatially-varying ISOTROPIC permittivity:
+    # a node-based data grid spanning the structure's
+    # Box extent, trilinear-interpolated at the engine's sample points.
     # When set, ``permittivity`` is required by the wire but IGNORED (write
     # e.g. the mean). Build with :meth:`Medium.from_eps_array`. v1
     # exclusions: Box geometry only, no dispersion poles, no pec, no
@@ -175,14 +223,20 @@ class Medium(FrozenModel):
         if self.permittivity_data is not None:
             if self.is_dispersive:
                 raise ValueError(
-                    "custom media cannot carry dispersion poles (deferred; "
-                    "NUMERICS.md §10.3)")
+                    "custom media cannot carry dispersion poles (not yet "
+                    "supported)")
             if self.pec:
                 raise ValueError("permittivity_data contradicts pec")
             if self.permittivity_xyz is not None:
                 raise ValueError(
                     "permittivity_data contradicts permittivity_xyz "
                     "(anisotropic custom media are deferred)")
+            if (self.permittivity_data.conductivity_s_per_m is not None
+                    and self.conductivity_s_per_m != 0.0):
+                raise ValueError(
+                    "a permittivity_data grid that carries "
+                    "conductivity_s_per_m needs the medium's scalar "
+                    "conductivity_s_per_m = 0 (one source of loss)")
         return self
 
     @property
@@ -198,8 +252,8 @@ class Medium(FrozenModel):
     @classmethod
     def from_eps_array(cls, values, *, conductivity_s_per_m: float = 0.0
                        ) -> "Medium":
-        """A custom medium from a 3-D array of permittivity node values
-        (NUMERICS.md §10.3). ``values`` is any (nx, ny, nz) nested sequence /
+        """A custom medium from a 3-D array of permittivity node values.
+        ``values`` is any (nx, ny, nz) nested sequence /
         numpy array with nx, ny, nz >= 2 and every value >= 1; node [0,0,0]
         sits on the structure box's low corner, node [-1,-1,-1] on the high
         corner, C order on the wire. ``permittivity`` is set to the mean
@@ -246,7 +300,7 @@ class Medium(FrozenModel):
             raise ValueError(
                 f"medium carries {n} dispersion poles (lorentz + poles + "
                 f"drude combined); the engine supports at most "
-                f"{MAX_ADE_POLES} (NUMERICS.md §19)")
+                f"{MAX_ADE_POLES}")
         return self
 
     @property
@@ -262,7 +316,7 @@ class Medium(FrozenModel):
 
     def permittivity_at_hz(self, freq_hz: float) -> float:
         """Real relative permittivity ``Re eps(omega)`` at ``freq_hz`` under
-        the §19 pole model, for a non-dispersive medium this is just
+        the pole model, for a non-dispersive medium this is just
         ``permittivity``; with poles, ``permittivity`` alone is only the
         high-frequency limit eps_inf and is the WRONG value to hand a mode
         solver or any other frequency-anchored consumer (a Si pole fit reads
@@ -308,7 +362,7 @@ class Sphere(FrozenModel):
 
 
 class Cylinder(FrozenModel):
-    """Annular sector / solid disk / ring (NUMERICS.md §17). ``axis`` is the
+    """Annular sector / solid disk / ring. ``axis`` is the
     extrusion (= propagation) axis; the two transverse axes carry the radial
     test. ``inner_radius_um = 0`` is a solid disk; a full 2*pi sweep is a
     ring/cylinder (no angular test). A 90-degree waveguide bend is an annulus
@@ -366,7 +420,7 @@ class Cylinder(FrozenModel):
 
 class Polygon(FrozenModel):
     """Polygon cross-section extruded along ``axis`` with optional slanted
-    sidewalls (NUMERICS.md §17). ``vertices_um`` are the ordered (u, v) polygon
+    sidewalls. ``vertices_um`` are the ordered (u, v) polygon
     in the two transverse axes (u = lower-indexed, v = higher-indexed),
     counter-clockwise. ``sidewall_angle > 0`` (radians) narrows the
     cross-section toward +axis; the given vertices live at ``reference_plane``.
@@ -414,14 +468,14 @@ def _material_entry(value):
 # A materials-library entry, which the client resolves (a Structure's medium,
 # the Simulation background) and which never reaches the wire or the schema.
 # The only other member of the unions it sits in is the wire model, so a dict
-# or a number is validated as that model (and fails with its errors, beta
-# review INT-05) instead of passing through as an unchecked value.
+# or a number is validated as that model (and fails with its errors)
+# instead of passing through as an unchecked value.
 MaterialEntry = SkipJsonSchema[Annotated[Any, PlainValidator(_material_entry)]]
 
 
 class Structure(FrozenModel):
     """One geometry filled with one medium; list order is paint order
-    (last wins, NUMERICS.md section 9). ``name`` is optional authoring/display
+    (last wins). ``name`` is optional authoring/display
     metadata and never changes mesh sampling or paint-order semantics."""
 
     geometry: GeometryType
@@ -451,10 +505,12 @@ class Structure(FrozenModel):
 
     @model_validator(mode="after")
     def _custom_medium_needs_box(self) -> "Structure":
-        # NUMERICS.md §10.3: the data grid spans the structure's Box extent.
+        # the data grid spans the structure's Box extent, unless it is placed
+        # by its own node coordinates (schema 1.22), which any geometry takes.
         if getattr(self.medium, "is_custom", False) and (
-                self.geometry.type != "box"):
+                self.geometry.type != "box"
+                and not self.medium.permittivity_data.has_coords):
             raise ValueError(
-                "permittivity_data (custom media) requires a Box geometry — "
-                f"got '{self.geometry.type}' (NUMERICS.md §10.3)")
+                "permittivity_data (custom media) without coords_um requires "
+                f"a Box geometry — got '{self.geometry.type}'")
         return self

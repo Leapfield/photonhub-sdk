@@ -7,13 +7,61 @@ JSON wire format; the published simulation schema is generated from them via
 
 ## Install
 
-Python 3.11+:
+Python 3.11 or newer is required. Check the version before creating `.venv`.
+If Python is missing or the version is older than 3.11, install Python 3.11
+or newer, open a new terminal, and check again. If `.venv` was created with an
+older Python, delete it before trying again; creating it over the old directory
+keeps the old interpreter. On macOS or Linux, run `rm -rf .venv`. On Windows,
+run `rmdir /s /q .venv` in Command Prompt or
+`Remove-Item -Recurse -Force .venv` in PowerShell. The `.venv` folder is
+hidden in Finder because its name starts with a dot.
+
+On macOS or Linux, check:
 
 ```sh
+python3 --version
+```
+
+If the newer Python has a versioned name (for example `python3.12`), use that
+name in the version check and environment command instead of `python3`.
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install photonhub
 ```
 
-(From a monorepo checkout: `python -m pip install -e ./photonhub`.)
+For this published package, pip on an older Python reports
+`No matching distribution found for photonhub`.
+
+On Windows, in Command Prompt or PowerShell, check:
+
+```bat
+py -3 --version
+```
+
+If `py` is not found, install Python from python.org with its launcher.
+`py -3 --version` must report 3.11 or newer.
+
+```bat
+py -3 -m venv .venv
+```
+
+Run Python as `.venv\Scripts\python.exe`, or activate the environment with
+`.venv\Scripts\activate.bat` in Command Prompt or `.venv\Scripts\Activate.ps1`
+in PowerShell (which the default script policy may refuse); the path form
+always works.
+
+```bat
+.venv\Scripts\python.exe -m pip install photonhub
+```
+
+For later pip commands on Windows, use `.venv\Scripts\python.exe -m pip`.
+Run `photonhub` as `.venv\Scripts\photonhub.exe` unless the environment is
+activated.
+From the monorepo root, use `python -m pip install -e ./photonhub` after
+activation, or `.venv\Scripts\python.exe -m pip install -e ./photonhub` on
+Windows.
 
 That installs the full scripting client: build simulations, estimate cost,
 run on the **cloud GPU** (`ph.cloud.run_quoted(sim, max_usd=...)` with your beta
@@ -54,13 +102,14 @@ data = ph.run_local(sim)        # finds phsolver, runs it, parses outputs
 probe = data["probe"]           # xarray.DataArray, dims ('t', 'component')
 ```
 
-Optional command-line services are kept out of the base SDK dependency set:
+Optional command-line services are kept out of the base SDK dependency set.
+Install them with the environment activated:
 
 ```sh
-python -m pip install 'photonhub[mcp]'
+python -m pip install "photonhub[mcp]"
 photonhub-mcp                    # optionally pass a result directory to preload
 
-python -m pip install 'photonhub[server]'
+python -m pip install "photonhub[server]"
 photonhub-serve-viz              # local result/preview HTTP service (loopback, unauthenticated:
                                  # single-user machines only; --enable-notebook opts into code cells)
 ```
@@ -77,12 +126,12 @@ for 3D). `grid=True` overlays the mesh cell edges so you can check resolution:
 ```python
 sim.plot(z=2.0)                   # scene cross-section through the source
 sim.plot_index(z=2.0, grid=True)    # the permittivity the run sees + the mesh overlay
-sim.plot_3d()                     # interactive 3D  (pip install photonhub[viz])
+sim.plot_3d()                     # interactive 3D  (python -m pip install "photonhub[viz]")
 ```
 
 ## What you can do today
 
-Shipped surface as of schema **v1.21.0-alpha.1** (a dispersive solver core
+Shipped surface as of schema **v1.22.0-alpha.1** (a dispersive solver core
 cross-checked against analytic references: multi-pole Lorentz + Drude ADE
 with a fitted metals library (Au/Ag/Cu/Al) and PEC structures, with recorded
 CPU↔GPU equivalence (the 0.1.4 GPU solver image passed all 65 GPU
@@ -168,9 +217,8 @@ This is a **dispersive** solver core cross-checked against analytic references,
 plus silicon photonic-circuit tools:
 
 - Dispersion is **multi-pole ADE**: Lorentz + Drude poles per medium
-  (metals/plasmonics; numerical definition in the numerics reference, §19; the
-  single- and multi-pole/Drude scenes are in the recorded GPU equivalence
-  inventory under §8 tolerances, dated 2026-08-27) on
+  (metals/plasmonics; the single- and multi-pole/Drude scenes are in the
+  recorded GPU equivalence inventory, dated 2026-08-27) on
   top of relative permittivity + Ohmic conductivity; a passivity-enforced
   pole fitter and anisotropic poles are still open. Explicit
   subpixel + Lorentz runs are supported and equivalence-tested, but the client

@@ -37,7 +37,7 @@ def plot_mode(mode, *, ax=None, cmap=None, legend=False, **kw):
     if ax is None:
         _, ax = plt.subplots()
 
-    # Signed field -> the §7 diverging map, symmetric about 0 (reuse the field
+    # Signed field -> the diverging map, symmetric about 0 (reuse the field
     # colormap/normalization selection so a mode and a field slice match).
     cmap_name, norm = _style.field_cmap_and_norm(component, "real", arr, cmap)
     mesh = ax.pcolormesh(xs, ys, arr, cmap=cmap_name, norm=norm,
@@ -103,7 +103,7 @@ def plot_overlap(mode_a, mode_b, *, axes=None, center_a=(0.0, 0.0),
         ax.figure.colorbar(mesh, ax=ax)
         ax.set_title(title)
 
-    # Overlap integrand: signed → the §7 diverging map, symmetric about 0.
+    # Overlap integrand: signed → the diverging map, symmetric about 0.
     cmap_name, norm = _style.field_cmap_and_norm("Ex", "real", integrand, None)
     mesh = axes[2].pcolormesh(c1, c2, integrand, cmap=cmap_name, norm=norm,
                               shading="nearest")

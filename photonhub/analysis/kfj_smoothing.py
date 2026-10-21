@@ -6,8 +6,8 @@ its launch/readout modes on an *idealized* rectangular core (``_asym_strip_eps``
 cross-section with a subpixel tensor. This module closes that gap: it samples the
 actual ``Simulation`` geometry on a transverse plane, builds the **diagonal
 Kottke-Farjadpour-Johnson** effective-permittivity tensor (the same
-``averaged_eps_kfj`` math the FDTD engine uses, mirrored from
-``engine/include/phcore/smoothing.h`` and from
+``averaged_eps_kfj`` math the FDTD engine uses, mirrored from the
+engine and from
 :meth:`VectorModeSolver._kfj_tensor_rect`), and hands it to the full-vector FDE
 solver.
 
@@ -46,8 +46,8 @@ _AXES = "xyz"
 
 def _paint_indices(sim, axis: str, plane_value_um: float,
                    h_centers: np.ndarray, v_centers: np.ndarray) -> np.ndarray:
-    """Last-structure-wins GEOMETRY paint on an arbitrary ``(v, h)`` center grid
-    (NUMERICS §9): ``idx[iy=v, ix=h]`` with ``-1`` = background and ``i`` =
+    """Last-structure-wins GEOMETRY paint on an arbitrary ``(v, h)`` center grid:
+    ``idx[iy=v, ix=h]`` with ``-1`` = background and ``i`` =
     ``sim.structures[i]``. Painting indices (not eps values) lets a per-frequency
     consumer sample the geometry on the mesh ONCE and re-map material values per frequency
     (dispersive media, :meth:`Medium.permittivity_at_hz`)."""
@@ -84,16 +84,112 @@ def _paint_indices(sim, axis: str, plane_value_um: float,
     return idx
 
 
+def _anchored(sim, eps_of_medium: Optional[Mapping[int, float]], *, warn: bool = True):
+    """``eps_of_medium`` with an entry for each medium of ``sim.structures``
+    that stands for a keyed one (a moved coordinate-placed map, a port guide
+    extension: the domain fit's record, the simulation's
+    ``_medium_aliases``), so an anchor keyed on the medium the caller passed,
+    or on the host's medium in ``sim.structures``, holds on those structures
+    too. A key on the structure's own medium wins. A medium object several
+    structures hold stands only for what every one of them stands for: an
+    anchor is keyed per object, and one structure's record must not carry it
+    to another. With ``warn``, a key that matches no medium of the
+    simulation, the record's included, warns: it is ignored."""
+    if not eps_of_medium:
+        return eps_of_medium
+    structures = tuple(getattr(sim, "structures", ()) or ())
+    record = getattr(sim, "_medium_aliases", None)
+    stands = record.standing_for(structures) if record else {}
+    if warn:
+        _warn_unmatched_anchors(eps_of_medium, structures, stands)
+    holders = {}                                 # id(medium) -> the positions holding it
+    for i, s in enumerate(structures):
+        holders.setdefault(id(s.medium), []).append(i)
+    extra = {}
+    for key, at in holders.items():
+        if key in eps_of_medium or at[0] not in stands:
+            continue
+        keyed = [m for m in stands[at[0]] if id(m) in eps_of_medium]
+        for i in at[1:]:
+            if not keyed:
+                break
+            shared = {id(m) for m in stands.get(i, ())}
+            keyed = [m for m in keyed if id(m) in shared]
+        if keyed:
+            extra[key] = eps_of_medium[id(keyed[0])]
+    return {**eps_of_medium, **extra} if extra else eps_of_medium
+
+
+def _warn_unmatched_anchors(eps_of_medium, structures, stands) -> None:
+    """Warn when an ``eps_of_medium`` key is ``id()`` of no medium a
+    structure holds and of none the domain fit's record names. A key for a
+    structure outside the solve window is legitimate and stays silent."""
+    known = {id(s.medium) for s in structures}
+    for media in stands.values():
+        known.update(id(m) for m in media)
+    lost = sum(1 for key in eps_of_medium if key not in known)
+    if not lost:
+        return
+    import warnings
+    what = "1 key matches" if lost == 1 else f"{lost} keys match"
+    warnings.warn(
+        f"eps_of_medium: {what} no medium of this simulation and "
+        f"{'is' if lost == 1 else 'are'} ignored ({len(eps_of_medium)} given). Key id() of the "
+        "medium a structure holds (sim.structures[i].medium). A materials-library entry such "
+        "as ph.materials.Si is not a key: the simulation holds a Medium made from it.",
+        UserWarning, stacklevel=caller_stacklevel())
+
+
+def _custom_overlay(sim, axis: str, plane_value_um: float,
+                    h_centers: np.ndarray, v_centers: np.ndarray, idx: np.ndarray,
+                    eps_of_medium: Optional[Mapping[int, float]] = None):
+    """``[(mask, eps)]`` for each painted structure whose medium carries a
+    permittivity array (a custom medium, e.g. ``ph.perturbed_medium``): the
+    array's own value at every sub-sample it owns, by the solver's node lookup
+    (:func:`viz.eps.custom_eps_at`), so a port inside a heated or doped region
+    solves the perturbed cross-section rather than the scalar
+    ``permittivity`` (the reference state). Frequency independent (custom
+    media carry no poles); an ``eps_of_medium`` anchor for the medium wins."""
+    out = []
+    if not any(getattr(s.medium, "permittivity_data", None) is not None for s in sim.structures):
+        return out
+    a = _geom.axis_index(axis)
+    h_letter, v_letter = _geom.in_plane_axes(axis)
+    h_idx, v_idx = _AXES.index(h_letter), _AXES.index(v_letter)
+    HH, VV = np.meshgrid(h_centers, v_centers)
+    for si, s in enumerate(sim.structures):
+        pd = getattr(s.medium, "permittivity_data", None)
+        if pd is None or (eps_of_medium is not None and id(s.medium) in eps_of_medium):
+            continue
+        mask = idx == si
+        if not mask.any():
+            continue
+        xyz = [None, None, None]
+        xyz[h_idx], xyz[v_idx], xyz[a] = HH[mask], VV[mask], float(plane_value_um)
+        out.append((mask, _veps.custom_eps_at(pd, s.geometry, *xyz)))
+    return out
+
+
+def _with_overlay(eps: np.ndarray, overlay) -> np.ndarray:
+    """``eps`` (a fresh LUT-mapped paint) with each custom structure's own
+    values written over its scalar."""
+    for mask, values in overlay:
+        eps[mask] = values
+    return eps
+
+
 def _paint_hard(sim, axis: str, plane_value_um: float,
                 h_centers: np.ndarray, v_centers: np.ndarray,
-                eps_of_struct) -> np.ndarray:
-    """Last-structure-wins hard permittivity on an arbitrary ``(v, h)`` center grid
-    (NUMERICS §9), mirroring :func:`viz.eps.sample_eps_plane` but on a grid we
+                eps_of_struct, eps_of_medium=None) -> np.ndarray:
+    """Last-structure-wins hard permittivity on an arbitrary ``(v, h)`` center grid,
+    mirroring :func:`viz.eps.sample_eps_plane` but on a grid we
     choose (so we can supersample). Returns ``eps[iy=v, ix=h]``; ``eps_of_struct``
     maps a structure to its permittivity *value* (so dispersive media can be anchored
-    to a band-centre n rather than ``eps_inf``)."""
+    to a band-centre n rather than ``eps_inf``); a custom medium paints its
+    array (:func:`_custom_overlay`) unless ``eps_of_medium`` anchors it."""
     idx = _paint_indices(sim, axis, plane_value_um, h_centers, v_centers)
-    return _eps_lut(sim, eps_of_struct)[idx + 1]
+    overlay = _custom_overlay(sim, axis, plane_value_um, h_centers, v_centers, idx, eps_of_medium)
+    return _with_overlay(_eps_lut(sim, eps_of_struct)[idx + 1], overlay)
 
 
 def _any_dispersive(sim, eps_of_medium=None) -> bool:
@@ -218,18 +314,20 @@ def cross_section_kfj_sampler(
     # arbitrary sub-cell offset and the wall placement (hence n_eff) drifts.
     h_lo_um, v_lo_um, nh, nv = _snap_window(
         h_lo_um, h_hi_um, v_lo_um, v_hi_um, dl_um)
+    eps_of_medium = _anchored(sim, eps_of_medium)
     ss = int(supersample)
     fine_dl = dl_um / ss
     hf = h_lo_um + (np.arange(nh * ss) + 0.5) * fine_dl
     vf = v_lo_um + (np.arange(nv * ss) + 0.5) * fine_dl
     state = {"idx": _paint_indices(sim, axis, plane_value_um, hf, vf)}
+    overlay = _custom_overlay(sim, axis, plane_value_um, hf, vf, state["idx"], eps_of_medium)
     frozen = not _any_dispersive(sim, eps_of_medium)
 
     def sample(freq_hz):
         if "cached" in state:
             return state["cached"]
         lut = _eps_lut(sim, _default_eps_of(eps_of_medium, freq_hz))
-        result = _kfj_tensor_reduce(lut[state["idx"] + 1], nh, nv, ss, dl_um)
+        result = _kfj_tensor_reduce(_with_overlay(lut[state["idx"] + 1], overlay), nh, nv, ss, dl_um)
         if frozen:
             # eps is frequency-independent here: keep the (small) tensor,
             # release the supersampled geometry raster.
@@ -299,7 +397,7 @@ def solve_mode_on_cross_section(
     Both read the real geometry + diagonal KFJ subpixel and return the ``mode_index``-th
     ``pol`` mode (n_eff-descending).
 
-    Symmetry: the Yee path honors ``sim.symmetry`` §20 planes AUTOMATICALLY
+    Symmetry: the Yee path honors ``sim.symmetry`` planes AUTOMATICALLY
     (window clipped at the plane + the matching parity BC; see
     :func:`~photonhub.analysis.yee_mode.window_min_face_bcs`), nothing to pass.
     A plain periodic in-plane axis is honored too: the window is the whole
@@ -330,7 +428,22 @@ def solve_mode_on_cross_section(
 
     Dispersive media are anchored at the solve frequency automatically
     (:meth:`Medium.permittivity_at_hz`); an explicit ``eps_of_medium`` overrides
-    that per medium. Unless ``eps_of_medium`` is given, the returned mode carries
+    that per medium. Its keys are ``id()`` of media: the one you passed in,
+    or the one ``sim.structures`` holds. A materials-library entry such as
+    ``ph.materials.Si`` is not a medium: the simulation holds a Medium made
+    from it, so key that one (``sim.structures[i].medium``). A key that
+    matches no medium of the simulation warns and is ignored; a key on a
+    structure outside the window is fine. A domain fit (``domain=ph.Domain()``)
+    makes media of its own: a medium placed by node coordinates
+    (``ph.perturbed_medium``) moves into the wire frame as a copy, and the
+    guide extension the fit adds behind a port owns the port plane with the
+    guide's medium, or with a box-spanning grid (``Medium.from_eps_array``)
+    placed by node coordinates. Each records the media it stands for, so an
+    anchor keyed on the guide's medium, as you passed it or as
+    ``sim.structures`` holds it, holds on the moved copy and on the
+    extensions too; a key on a structure's own medium wins. That record is
+    not on the wire: on a simulation read back from a file every structure
+    holds a medium of its own, so key each one. Unless ``eps_of_medium`` is given, the returned mode carries
     its ``solve_params`` provenance, which lets :class:`ModeMonitor` re-solve the
     SAME mode identity at every monitor frequency (the automatic per-frequency
     readout mode mapping)."""
@@ -377,7 +490,7 @@ def solve_mode_on_cross_section(
 
 
 def _warn_flm_symmetry_blind(sim):
-    """The FLM (use_yee=False) path does NOT honor §20 symmetry planes: the
+    """The FLM (use_yee=False) path does NOT honor symmetry planes: the
     eps paint happily samples the mirror geometry on the mesh below the domain min
     face, so a half-domain sim gets a FULL-cross-section mode that does not
     match the engine's half-domain field. Warn, the Yee default handles it."""
@@ -385,7 +498,7 @@ def _warn_flm_symmetry_blind(sim):
 
     if any(s != 0 for s in (getattr(sim, "symmetry", None) or (0, 0, 0))):
         warnings.warn(
-            "use_yee=False on a simulation with a §20 symmetry plane: the FLM "
+            "use_yee=False on a simulation with a symmetry plane: the FLM "
             "solver ignores sim.symmetry and solves the FULL (mirror-painted) "
             "cross-section — its mode does not match the engine's half-domain "
             "field. Use the Yee default (use_yee=True), which clips the window "

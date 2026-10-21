@@ -66,8 +66,7 @@ def load_result(path: str | Path) -> RunResult:
     module memmap caveat).
 
     A cloud job's downloaded result carries no ``sim.json``, so nothing in the
-    directory says what amplitude the engine normalized by (NUMERICS.md
-    section 12) and the Workbench would show unit-amplitude flux and phasors
+    directory says what amplitude the engine normalized by and the Workbench would show unit-amplitude flux and phasors
     for the very job ``ph.cloud.run`` reads in watts and V/m. For a cloud cache
     entry the spec the client stored when it submitted that job is recovered
     and handed to the reader — see :func:`_restorable_cloud_simulation` for
@@ -508,7 +507,13 @@ def field_stats(data: RunResult, monitor: str, *, field: str = "Ex",
 
 def spectrum_values(data: RunResult, monitor: str) -> dict:
     """A flux/DFT monitor's spectrum as plain numbers (wavelength_nm + value),
-    sorted by wavelength."""
+    sorted by wavelength. ``unit`` says what a flux value is: ``"W"`` when the
+    reader knew the simulation and restored the source amplitude (power in
+    watts for the sources as declared), ``"per unit source amplitude"`` when it
+    did not (a result without its ``sim.json``), ``None`` for a non-flux
+    monitor."""
+    from ..data import _FLUX_ABSOLUTE, _FLUX_NORMALIZATION
+
     da = data[monitor]
     if "f" not in da.dims:
         raise ValueError(f"monitor {monitor!r} has no frequency axis (not a spectrum)")
@@ -516,11 +521,14 @@ def spectrum_values(data: RunResult, monitor: str) -> dict:
     y = np.real(da.values) if np.iscomplexobj(da.values) else np.asarray(da.values, dtype=float)
     lam = _C / f * 1e9
     order = np.argsort(lam)
+    unit = {_FLUX_ABSOLUTE: "W", _FLUX_NORMALIZATION: "per unit source amplitude"}.get(
+        da.attrs.get("normalization"))
     return {
         "monitor": monitor,
         "wavelength_nm": lam[order].tolist(),
         "freq_hz": f[order].tolist(),
         "value": np.asarray(y, dtype=float)[order].tolist(),
+        "unit": unit,
     }
 
 
@@ -1560,7 +1568,7 @@ def sim_for(data: RunResult):
 
 
 def _spec_loops(spec) -> list:
-    """A §5 cut-plane patch spec -> closed (h, v) point loops (one per ring)."""
+    """A cut-plane patch spec -> closed (h, v) point loops (one per ring)."""
     kind = spec[0]
     if kind == "rect":
         h0, v0, w, hh = spec[1]
@@ -1668,11 +1676,11 @@ def parse_sim_spec(spec: Any):
 
 
 #: The resolved-profile fingerprint. 2: the profile is sampled at each
-#: component's own Yee position (NUMERICS §18.2) and its normalization reads
+#: component's own Yee position and its normalization reads
 #: the boundaries (a pmc wall row counts half); a version-1 profile was sampled
 #: at cell centres, half a cell off. 3: a Yee mode is read at its node labels
 #: (its arrays carry the Yee offsets) and the profile is normalized on the
-#: flux the launch carries (true paired H, cos(beta h_s), NUMERICS §18.2b); a
+#: flux the launch carries (true paired H, cos(beta h_s)); a
 #: version-2 profile sat half a cell off and launched about 13 % over 1 W.
 MODE_SOURCE_FINGERPRINT_VERSION = 3
 
@@ -2012,7 +2020,7 @@ def solve_mode_source(sim, source_index: int, settings: dict):
             f"({sim.grid.dl_um:.6g} um)",
         )
 
-    # Mirror the native §18 injection-plane bound so Configure fails next to
+    # Mirror the native injection-plane bound so Configure fails next to
     # the position control rather than much later in phsolver preflight.
     q_axis = sim._axis_coords_um(axis_i)
     if q_axis is None:
@@ -2118,7 +2126,7 @@ def solve_mode_source(sim, source_index: int, settings: dict):
     # Keep the Workbench document compact: use the auxiliary ModeSource rather
     # than expanding a full Huygens sheet into thousands of PointDipoles.  The
     # solved profile is always normalized at 1 W of the whole, unfolded device
-    # (NUMERICS §20.8): on a folded document a profile centred on k symmetry
+    #: on a folded document a profile centred on k symmetry
     # planes carries 1/2^k W in the modeled part, and a full-plane PowerMonitor
     # and the port read 1 W. Amplitude stays the explicit top-level multiplier
     # it was before re-solving.
@@ -2575,6 +2583,7 @@ def _gds_read_cell(gds, gds_path: str, cell_name: Optional[str]):
         lib = gdstk.read_gds(gds_path, unit=1e-6)
     except Exception as exc:
         raise GDSImportError(f"not a readable GDSII file: {exc}") from exc
+    gds._strip_nonpolygon_data(lib)
     tops = {c.name for c in lib.top_level()}
     cells = [c.name for c in lib.cells if c.name in tops]
     cells += [c.name for c in lib.cells if c.name not in tops]
@@ -2583,6 +2592,21 @@ def _gds_read_cell(gds, gds_path: str, cell_name: Optional[str]):
     chosen = cells[0] if cell_name is None else cell_name
     for cell in lib.cells:
         if cell.name == chosen:
+            try:
+                elements, vertices = gds._flattened_layout_size(cell)
+            except gds._GDSExpansionLimitError as exc:
+                raise GDSImportError(
+                    str(exc), code="gds_expansion_limit") from exc
+            except ValueError as exc:
+                raise GDSImportError(str(exc)) from exc
+            if (elements > gds.GDS_MAX_FLATTENED_ELEMENTS
+                    or vertices > gds.GDS_MAX_FLATTENED_VERTICES):
+                raise GDSImportError(
+                    gds._flattened_limit_message(
+                        elements, vertices, gds.GDS_MAX_FLATTENED_ELEMENTS,
+                        gds.GDS_MAX_FLATTENED_VERTICES),
+                    code="gds_expansion_limit",
+                )
             return cell.copy(cell.name + "__phinspect").flatten(), chosen, cells
     have = ", ".join(repr(name) for name in cells)
     raise GDSImportError(

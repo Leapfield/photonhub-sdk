@@ -1,6 +1,5 @@
 """Resolution of the declarative ``Simulation`` fields: ``wlens_um``, ``ports``
-and ``source`` (design spec ``docs/superpowers/specs/2026-09-10-setup-api-
-simplification-design.md`` §4.2 steps 2, 7 and 8).
+and ``source``.
 
 A :class:`~photonhub.Simulation` given these fields solves each port's mode on
 its own grid at construction and carries the launch and the readout planes as
@@ -31,7 +30,7 @@ _SIGN = {"+": 1.0, "-": -1.0}
 
 @dataclass(frozen=True)
 class Fold:
-    """The symmetry fold a fitted simulation applied (design spec §4.5): the
+    """The symmetry fold a fitted simulation applied: the
     folded axes (index to the mirror plane's position in the user's frame),
     the dropped ports and the kept ports they mirror, and the user monitors
     the fold clipped or that span the plane, returned unfolded."""
@@ -123,9 +122,9 @@ def default_margin_um(wlen0_um: float, n_background: float) -> float:
 
 
 # How far the driven port's launch sits behind its readout plane, in wavelengths
-# in the background. This is a LENGTH and never a cell count: NUMERICS §18.2a
+# in the background. This is a LENGTH and never a cell count: the full-vector launch
 # leaves the longitudinal E_z/H_z out of the injection (they re-form from the
-# transverse fields downstream) and §18.3 bounds the residual by the mismatch
+# transverse fields downstream), which leaves a residual bounded by the mismatch
 # between the FDE continuous mode and the FDTD discrete one, so what the launch
 # injects that is NOT the discrete mode co-propagates and interferes with it at
 # the readout plane, at a phase set by the distance in MICRONS (it is not a
@@ -136,8 +135,7 @@ def default_margin_um(wlen0_um: float, n_background: float) -> float:
 # Measured on a lossless 400 x 220 nm silicon strip in oxide at 1550 nm: a
 # ten-cell standoff read -0.0000259 dB at 12 cells per wavelength, +0.0000503 at
 # 20, +0.0001390 at 28 and +0.0001591 at 32; the same 0.37163 um standoff held
-# -0.0000259, -0.0000104 and -0.0000142 across 12, 20 and 28. See NUMERICS §18.6,
-# which also records what a standoff does NOT fix.
+# -0.0000259, -0.0000104 and -0.0000142 across 12, 20 and 28.
 #
 # One third, not the window's two thirds. Sweeping the standoff on that strip at
 # a FIXED mesh gives a bounded OSCILLATION, not a convergence: +0.00015 dB at
@@ -156,13 +154,13 @@ LAUNCH_STANDOFF_WLENS = 1.0 / 3.0
 def default_source_offset_um(wlen0_um: float, n_background: float) -> float:
     """The default standoff between the driven port's readout plane and its
     launch: ``LAUNCH_STANDOFF_WLENS`` wavelengths in the background. A port may
-    override it with ``source_offset_um``. See NUMERICS §18.6."""
+    override it with ``source_offset_um``."""
     return LAUNCH_STANDOFF_WLENS * float(wlen0_um) / float(n_background)
 
 
 @dataclass(frozen=True)
 class WindowPlan:
-    """How a port's default mode window was sized (NUMERICS §18.8)."""
+    """How a port's default mode window was sized."""
 
     half_w_um: float
     half_v_um: float
@@ -180,8 +178,7 @@ class WindowPlan:
 
 
 class _Painter:
-    """Which structure fills a point (paint order, last containing wins,
-    NUMERICS §9), with each structure's bounding box as a cheap first test:
+    """Which structure fills a point (paint order, last containing wins), with each structure's bounding box as a cheap first test:
     a metasurface of thousands of posts is probed at a few dozen points per
     port."""
 
@@ -306,8 +303,8 @@ def _probe_faces(painter: _Painter, port: Port, freq_hz: float):
 
 def plan_default_window(shell, port: Port, wlen0_um: float, wlen_max_um: float,
                         n_background: float, painter: Optional[_Painter] = None) -> WindowPlan:
-    """The default mode window of ``port`` from the port-window rule (decision
-    0018, NUMERICS §18.8): beyond each core face a pad of 1.2 times the -30 dB
+    """The default mode window of ``port`` from the port-window rule:
+    beyond each core face a pad of 1.2 times the -30 dB
     bound, ``1.2 * ln(1000) / (2 k0 sqrt(n_eff^2 - n_clad^2))``, rounded up to
     0.05 um, at the longest wavelength the port reads, with the cladding the
     mode decays into on that side.
@@ -406,8 +403,8 @@ def neighbour_in_window(shell, port: Port, half_w_um: float, half_v_um: float,
                         plan: WindowPlan) -> Optional[Tuple[float, Tuple[float, float, float]]]:
     """A point of the window, outside the port's core, whose painted index is
     above the claddings' painted index: another guide or layer the window
-    reaches, as ``(index, point)``, or None (decision 0017: a window should not
-    reach a neighbouring guide). Sampled on a 25 x 25 grid at the port's plane;
+    reaches, as ``(index, point)``, or None (a window should not reach a
+    neighbouring guide). Sampled on a 25 x 25 grid at the port's plane;
     the slab of a rib or of a periodic axis is not a neighbour, so the scan is
     then across the thickness only."""
     import numpy as np
@@ -507,13 +504,13 @@ def port_cell_um(shell, port: Port, half_w_um: float, half_v_um: float) -> float
 
 
 def paraxial_beam_source(shell, beam: GaussianBeam, wlen0: float, pulse, n_bg: float):
-    """A ``paraxial=True`` beam ships as ONE profile source (NUMERICS §18): the
+    """A ``paraxial=True`` beam ships as ONE profile source: the
     Gaussian sampled over the plane once, the medium's index as its ``n_eff``,
     where the cell-by-cell launch is a pair of dipoles per cell of the window.
     ``power_watts`` sets the beam power through the plane in watts, as a
     :class:`~photonhub.PowerMonitor` reads it: the whole, unfolded device's
-    power (NUMERICS §20.8). The amplitude is the whole Gaussian's, so a
-    profile centred on k §20 symmetry planes carries ``power_watts / 2^k``
+    power. The amplitude is the whole Gaussian's, so a
+    profile centred on k symmetry planes carries ``power_watts / 2^k``
     into the modeled part with no factor of its own. ``n`` defaults to the
     background index."""
     from ..analysis.mode_devices import _TRANSVERSE, mode_source
@@ -545,7 +542,7 @@ def paraxial_beam_source(shell, beam: GaussianBeam, wlen0: float, pulse, n_bg: f
     if beam.center_um is not None:
         center = (float(beam.center_um[_AXES.index(t1)]), float(beam.center_um[_AXES.index(t2)]))
     else:
-        # the domain centre, or the mirror plane (0) on a §20-folded axis: the
+        # the domain centre, or the mirror plane (0) on a folded axis: the
         # device's centre either way, where the unfolded simulation puts it
         from ..analysis.gaussian_beam import _default_center
         center = (_default_center(shell, t1), _default_center(shell, t2))

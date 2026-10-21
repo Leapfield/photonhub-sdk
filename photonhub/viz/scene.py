@@ -1,7 +1,7 @@
 """``plot()``, analytic 2D cross-section of a :class:`Simulation` on a cut
 plane.
 
-Each Box/Sphere is intersected with the plane (the §5 cut-plane geometry) and
+Each Box/Sphere is intersected with the plane (the cut-plane geometry) and
 drawn as a matplotlib patch (Rectangle/Circle), facecolor mapped from
 ``medium.permittivity`` via the shared ε colormap over a background fill. The
 shared overlay glyphs (sources, monitors, PML) and a compact legend are added.
@@ -28,7 +28,7 @@ def plot(sim, x=None, y=None, z=None, *, ax=None, legend=True, grid=False,
     overlays, symmetry markers, and domain limits are retained.
     ``grid=True`` overlays the realized Yee
     cell edges (the mesh-resolution sanity check). ``unfold`` (the default)
-    mirrors the half domain back across each in-plane §20 symmetry plane, so
+    mirrors the half domain back across each in-plane symmetry plane, so
     the picture is the whole device; ``unfold=False`` draws the reduced domain
     the solver actually steps. Extra ``**kw`` is forwarded to each structure
     patch."""
@@ -42,7 +42,7 @@ def plot(sim, x=None, y=None, z=None, *, ax=None, legend=True, grid=False,
     realized = sim._realized_um()
     a = geom.axis_index(axis)
     # The cut is given in the user's frame; the scene is drawn, reflected and
-    # clipped in the corner frame, then moved into the user's (spec §4.4).
+    # clipped in the corner frame, then moved into the user's.
     origin = geom.frame_origin(sim)
     oh, ov = geom.plane_offsets(origin, axis)
     value_c = value - origin[a]
@@ -53,7 +53,7 @@ def plot(sim, x=None, y=None, z=None, *, ax=None, legend=True, grid=False,
     mirror_h, mirror_v = _style.unfold_in_plane(sim, axis, unfold)
     copies = _style.mirror_copies(mirror_h, mirror_v)
 
-    # Background fill across the whole domain (the §6 background ε fill).
+    # Background fill across the whole domain (the background ε fill).
     eps_vals = ([sim.background.permittivity]
                 + [s.medium.permittivity for s in sim.structures])
     vmin, vmax = _style.eps_norm(eps_vals)
@@ -77,7 +77,7 @@ def plot(sim, x=None, y=None, z=None, *, ax=None, legend=True, grid=False,
         for structure in sim.structures:
             spec = geom.structure_patch_spec(structure.geometry, axis, value_c)
             if spec is None:
-                continue  # structure does not intersect the plane (design §9)
+                continue  # structure does not intersect the plane
             color = _style.eps_facecolor(structure.medium.permittivity,
                                          vmin, vmax)
             for sign_h, sign_v in copies:
@@ -163,7 +163,7 @@ def _quadrant_clip(ax, realized, h_i, v_i, sign_h, sign_v, mirror_h,
 
 
 def _add_filled_patch(ax, kind, params, color, clip=None, **kw):
-    """Add one ε-colored, edged structure patch for a §5 cut-plane spec.
+    """Add one ε-colored, edged structure patch for a cut-plane spec.
     Delegates the kind dispatch to :func:`_style.add_structure_patch`, which
     also applies the unfold clip after attaching the patch."""
     style = dict(facecolor=color, edgecolor=_style.STRUCTURE_EDGE,

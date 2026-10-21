@@ -93,7 +93,7 @@ def _sphere_intersects(center, radius, bounds):
     for ci, (lo, hi) in zip(center, bounds):
         nearest = min(max(ci, lo), hi)
         d2 += (nearest - ci) ** 2
-    return d2 <= radius ** 2
+    return d2 < radius ** 2
 
 
 def _clip_box(center, size, bounds):
@@ -139,7 +139,7 @@ def _clip_polygon_uv(verts, u_bounds, v_bounds):
 
 
 # Axis-letter -> (transverse u index, transverse v index, axial index). Mirrors
-# the (u, v) transverse convention in viz/_geometry.in_plane_axes.
+# the fixed (u, v) transverse convention in viz/_geometry.physical_in_plane_axes.
 _AXIS_FRAME = {
     "x": (1, 2, 0),  # u=y, v=z, axial=x
     "y": (0, 2, 1),  # u=x, v=z, axial=y
@@ -351,6 +351,11 @@ def _clipped_prism(go, axis, verts, lo, hi, color, name, bounds,
         verts = _clip_polygon_uv(verts, bounds[u_i], bounds[v_i])
         if hi <= lo or len(verts) < 3:
             return None
+        u_span = max(point[0] for point in verts) - min(point[0] for point in verts)
+        v_span = max(point[1] for point in verts) - min(point[1] for point in verts)
+        area_eps = 1e-12 * max(u_span, v_span, 1.0) ** 2
+        if abs(_polygon_area2(verts)) <= area_eps:
+            return None
     cap_triangles = _triangulate_polygon(verts) if triangulate_caps else None
     return _prism_mesh(
         go, axis, verts, lo, hi, color, name,
@@ -433,42 +438,44 @@ def _tag_monitor_trace(trace, monitor, index, uid_suffix=""):
     return trace
 
 
-def _interior_bounds_um(sim):
-    """Per-axis ``(lo, hi)`` of the physical interior, the realized domain
-    minus the PML slabs. An axis whose PML halves meet or overlap (possible in
-    tiny schematic scenes) falls back to the full axis extent."""
+def _pml_axis_geometry(sim, axis_i):
+    """The solver's interior bounds and the corresponding visible PML faces."""
     from ._style import _axis_spacings_um
 
-    realized = sim._realized_um()
-    layers = sim.pml_num_layers
-    bounds = []
-    for axis_i, letter in enumerate("xyz"):
-        lo, hi = 0.0, realized[axis_i]
-        if getattr(sim.boundaries, letter) == "pml":
-            lo_dl, hi_dl, length = _axis_spacings_um(sim, axis_i)
-            inner_lo, inner_hi = layers * lo_dl, length - layers * hi_dl
-            if inner_hi > inner_lo:
-                lo, hi = inner_lo, inner_hi
-        bounds.append((lo, hi))
-    return bounds
+    letter = "xyz"[axis_i]
+    realized = sim._realized_um()[axis_i]
+    if getattr(sim.boundaries, letter) != "pml":
+        return (0.0, realized), []
+    try:
+        lo, hi, _ = sim._nonabsorbing_bounds_um(axis_i)
+        faces = []
+        if sim.symmetry[axis_i] == 0:
+            faces.append((0.0, lo, "low"))
+        faces.append((hi, realized, "high"))
+        return (lo, hi), faces
+    except ValueError:
+        # A tiny schematic may have no nonabsorbing cells. Preserve the full
+        # scene and its PML shells for that display-only case.
+        lo_dl, hi_dl, length = _axis_spacings_um(sim, axis_i)
+        faces = []
+        if sim.symmetry[axis_i] == 0:
+            faces.append((0.0, sim.pml_num_layers * lo_dl, "low"))
+        faces.append((length - sim.pml_num_layers * hi_dl, length, "high"))
+        return (0.0, realized), faces
+
+
+def _interior_bounds_um(sim):
+    """Per-axis physical interior, using the solver's absorbing-cell bounds."""
+    return [_pml_axis_geometry(sim, i)[0] for i in range(3)]
 
 
 def _pml_shells(go, sim):
     """Translucent slab shells on each non-periodic (PML) boundary face."""
-    from ._style import _axis_spacings_um
-
     shells = []
     realized = sim._realized_um()
-    layers = sim.pml_num_layers
     for axis_i, letter in enumerate("xyz"):
-        if getattr(sim.boundaries, letter) != "pml":
-            continue
-        lo_dl, hi_dl, length = _axis_spacings_um(sim, axis_i)
-        lo_t = layers * lo_dl
-        hi_t = layers * hi_dl
-        for face_lo, face_hi, tag in (
-            (0.0, lo_t, "low"), (length - hi_t, length, "high"),
-        ):
+        _, faces = _pml_axis_geometry(sim, axis_i)
+        for face_lo, face_hi, tag in faces:
             size = list(realized)
             center = [r / 2.0 for r in realized]
             size[axis_i] = face_hi - face_lo
@@ -544,10 +551,23 @@ def plot_3d(sim, show_pml=False, **kw):
         for shell in _pml_shells(go, sim):
             fig.add_trace(shell)
 
-    # Sources.
+    # Sources. A mode launch or a beam arrives as thousands of point dipoles on
+    # one plane; each such sheet is one trace with one legend entry.
+    sheets = {first: last for first, last in sim._dipole_groups() if last > first}
+    in_sheet = {i for first, last in sheets.items() for i in range(first, last + 1)}
     for n, s in enumerate(sim.sources):
         stype = getattr(s, "type", None)
         if stype == "point_dipole":
+            if n in sheets:
+                last = sheets[n]
+                xs, ys, zs = zip(*(d.center_um for d in sim.sources[n:last + 1]))
+                fig.add_trace(go.Scatter3d(
+                    x=list(xs), y=list(ys), z=list(zs), mode="markers",
+                    marker=dict(size=2, color=_style.SOURCE_COLOR),
+                    name=f"sources {n}-{last} ({last - n + 1} point dipoles)"))
+                continue
+            if n in in_sheet:
+                continue
             cx, cy, cz = s.center_um
             fig.add_trace(go.Scatter3d(
                 x=[cx], y=[cy], z=[cz], mode="markers",

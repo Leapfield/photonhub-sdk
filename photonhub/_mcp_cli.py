@@ -2,11 +2,47 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
+
+from ._skill import read_skill
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The ``photonhub-mcp`` command line. It needs no MCP support, so
+    ``--help`` and option errors work in a base install too."""
+    parser = argparse.ArgumentParser(
+        prog="photonhub-mcp",
+        description=(
+            "Serve PhotonHub's result-inspection and local-run tools to an MCP "
+            "client over stdio. Point the client's command at this program."
+        ),
+    )
+    parser.add_argument(
+        "result_dir",
+        nargs="?",
+        default=None,
+        help=(
+            "a result directory to open at start (default: $PHOTONHUB_RESULT_DIR); "
+            "without one, the client calls open_result first"
+        ),
+    )
+    parser.add_argument("--print-skill", action="store_true",
+                        help="print the packaged PhotonHub agent skill and exit")
+    return parser
 
 
 def main(argv=None) -> int:
     """Load MCP support on demand and give base installs an actionable error."""
+    argv = sys.argv[1:] if argv is None else list(argv)
+    args = build_parser().parse_args(argv)  # --help exits 0, an unknown option exits 2
+    if args.print_skill:
+        try:
+            print(read_skill(), end="")
+        except (FileNotFoundError, OSError):
+            print("photonhub-mcp: packaged skill file is missing", file=sys.stderr)
+            return 2
+        return 0
     try:
         from .mcp_server import main as run
     except ModuleNotFoundError as exc:

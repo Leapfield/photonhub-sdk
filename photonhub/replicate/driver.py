@@ -13,15 +13,17 @@ report into one call that writes a self-contained artifacts directory.
 from __future__ import annotations
 
 import json
+import math
 import shutil
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from typing import Callable, Optional
 
 from ..constants import c0
 from ..gds import export_gds
 from .build import BuiltSim, build_simulation
-from .convergence import ConvergenceReport, converge_through_transmission
+from .convergence import ConvergenceReport, _budget_limit, _budget_quote, _record_spent, converge_through_transmission
 from .geometry import build_geometry
 from .report import build_markdown_report, plot_spectrum_png
 from .spec import PaperSpec
@@ -31,7 +33,12 @@ __all__ = ["ReplicationResult", "replicate"]
 
 @dataclass
 class ReplicationResult:
-    """What :func:`replicate` produced (also written to ``outdir``)."""
+    """What :func:`replicate` produced (also written to ``outdir``).
+
+    ``spent_usd`` is the sum of planning estimates for runs started in this
+    call, including failed runs. Without a budget, an unusable estimate adds
+    nothing. It is an estimate, not a provider bill.
+    """
 
     spec: PaperSpec
     outdir: Path
@@ -40,6 +47,9 @@ class ReplicationResult:
     convergence: Optional[ConvergenceReport]
     report_md: str
     artifacts: dict = field(default_factory=dict)
+    spent_usd: float = 0.0
+    """Sum of usable planning estimates for runs started in this call, including
+    failed runs. An unusable unbudgeted estimate contributes zero."""
 
 
 def _default_runner(device: Optional[str]) -> Callable:
@@ -70,9 +80,15 @@ def replicate(
 
     ``run`` is the run function applied to each ``Simulation`` (defaults to
     :func:`photonhub.run_local` on ``device``). With ``converge=True`` a resolution
-    ladder is run (the finest rung's data is the reported result and the
+    ladder is run (the finest resolution's data is the reported result and the
     convergence report is stamped in); with ``converge=False`` a single run at
     ``cells_per_wavelength`` (or the ladder's finest) is done.
+    A finite ``budget_usd`` applies per call and bounds the SDK's planning
+    estimate, not a provider's bill. A caller that retries must subtract prior
+    spending. Every run needs a usable estimate within the remaining amount.
+    Refusal before the first run raises ``ValueError`` with the reason and
+    amounts. Spent covers admitted runs, including failed ones, and earlier
+    runs if later build or callback work is interrupted.
 
     With ``save_notebook=True`` (the default), the bundle also contains a
     runnable ``notebook.ipynb`` tutorial. It teaches the device physics,
@@ -81,6 +97,7 @@ def replicate(
     """
     if not isinstance(spec, PaperSpec):
         spec = PaperSpec.from_yaml(spec)
+    budget_limit = _budget_limit(budget_usd) if budget_usd is not None else None
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     runner = run if run is not None else _default_runner(device)
@@ -117,8 +134,15 @@ def replicate(
         return built.sim, extract
 
     convergence: Optional[ConvergenceReport] = None
+    spent_usd = 0.0
     if converge:
         from .convergence import auto_converge
+
+        unavailable_cause = None
+
+        def keep_cause(cause):
+            nonlocal unavailable_cause
+            unavailable_cause = cause
 
         convergence = auto_converge(
             make_run, runner,
@@ -126,12 +150,27 @@ def replicate(
             tol=spec.convergence.tol_pp / 100.0,
             metric_name=metric_name,
             budget_usd=budget_usd,
+            _on_estimate_unavailable=keep_cause,
         )
+        if convergence.stop_reason in ("budget", "estimate_unavailable") and not convergence.ladder:
+            raise ValueError(convergence.budget_detail) from unavailable_cause
+        spent_usd = convergence._spent_usd
         finest_cpw = convergence.ladder[-1].cells_per_wavelength
     else:
         finest_cpw = cells_per_wavelength or max(spec.convergence.ladder_cpw)
         sim, extract = make_run(finest_cpw)
-        extract(runner(sim))
+        if budget_limit is not None:
+            cost, _, refusal, cause = _budget_quote(sim, None, budget_limit, Decimal(0))
+            if refusal is not None:
+                raise ValueError(refusal) from cause
+            spent_usd = cost
+            try:
+                extract(runner(sim))
+            except BaseException as exc:
+                _record_spent(exc, cost)
+                raise
+        else:
+            extract(runner(sim))
 
     built = captured[finest_cpw]["built"]
     data = captured[finest_cpw]["data"]
@@ -223,9 +262,20 @@ def replicate(
 
         artifacts["notebook"] = str(generate_notebook(outdir))
 
+    if not converge and budget_limit is None:
+        # Only the new result field needs this optional estimate. Read it after
+        # every pre-existing output has been produced, and leave failures alone.
+        try:
+            estimate = float(sim.cost_estimate().usd)
+            if math.isfinite(estimate) and estimate >= 0:
+                spent_usd = estimate
+        except BaseException:
+            pass
+
     return ReplicationResult(
         spec=spec, outdir=outdir, built=built, metrics_db=metrics_db,
         convergence=convergence, report_md=report_md, artifacts=artifacts,
+        spent_usd=spent_usd,
     )
 
 

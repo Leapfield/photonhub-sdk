@@ -63,7 +63,10 @@ __all__ = [
 
 
 # --- deprecated aliases (2026-09 cross-solver rename; remove in 0.2) ---------
-_RENAMED = {"run_async": "submit", "run_quoted_async": "submit_quoted"}
+_RENAMED = {"run_quoted_async": "submit_quoted"}
+
+# Removed in 0.1.6: fails with the current spelling.
+_REMOVED = {"run_async": "submit"}
 
 
 def __getattr__(name):
@@ -78,4 +81,8 @@ def __getattr__(name):
             stacklevel=caller_stacklevel(),
         )
         return globals()[replacement]
+    current = _REMOVED.get(name)
+    if current is not None:
+        raise AttributeError(
+            f"photonhub.cloud.{name} was removed in 0.1.6; use photonhub.cloud.{current}")
     raise AttributeError(f"module 'photonhub.cloud' has no attribute {name!r}")

@@ -46,10 +46,10 @@ __all__ = [
     "y_branch",
 ]
 
-# Default material/geometry for the SOI strip platform (NUMERICS.md / Phase-2
-# MVP). n ~= 3.5 silicon core, 220 nm slab, 450 nm strip width.
+# Default material/geometry for the SOI strip platform. n ~= 3.5 silicon
+# core, 220 nm slab, 450 nm strip width.
 # NOTE: n = 3.5 is a generic library default; the GDS benchmark suite
-# (validation/suites/gds/) uses the convention n = 3.478 (permittivity 3.478**2,
+# uses the convention n = 3.478 (permittivity 3.478**2,
 # Si at 1.55 um) — pass an explicit medium when matching those results.
 SILICON = Medium(permittivity=12.25)
 DEFAULT_WIDTH_UM = 0.45
@@ -202,7 +202,8 @@ def bend(
     first quadrant in the transverse (u, v) plane, so the two arc ends point
     along the two in-plane axes. With the default ``thickness_axis="z"`` the
     transverse plane is (x, y): the start end (angle 0) sits at +u and
-    propagates along that axis; the stop end (angle pi/2) sits at +v.
+    has a tangent along +v; the stop end (angle pi/2) sits at +v with a
+    tangent along -u. A port's ``axis`` names the normal of its mode plane.
     """
     u_axis, v_axis = _bend_plane_axes(thickness_axis)
     geometry = Cylinder(
@@ -215,14 +216,14 @@ def bend(
         angle_stop_rad=math.pi / 2.0,
     )
     structure = Structure(geometry=geometry, medium=medium)
-    # Arc endpoints on the centerline radius. Start end faces +u, propagating
-    # along u_axis; stop end faces +v, propagating along v_axis.
+    # Arc endpoints on the centerline radius. Their mode planes are normal to
+    # the arc tangent: +v at the start, -u at the stop.
     p_start = _vec(center_um, **{u_axis: radius_um})
     p_stop = _vec(center_um, **{v_axis: radius_um})
     ports = (
-        Port("in", p_start, u_axis, width_um,
+        Port("in", p_start, v_axis, width_um,
             thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
-        Port("out", p_stop, v_axis, width_um,
+        Port("out", p_stop, u_axis, width_um,
             thickness_um=thickness_um, medium=medium, thickness_axis=thickness_axis),
     )
     return Component(structures=(structure,), ports=ports)
@@ -840,12 +841,13 @@ def ring(
     half = bus_length_um / 2.0
     ports = (
         Port("in", _vec(bus_center, **{bus_axis: -half}), bus_axis, bus_width_um,
-            thickness_um=thickness_um, medium=medium),
+            thickness_um=thickness_um, medium=medium, thickness_axis=axis_normal),
         Port(
             "through",
             _vec(bus_center, **{bus_axis: +half}),
             bus_axis,
             bus_width_um, thickness_um=thickness_um, medium=medium,
+            thickness_axis=axis_normal,
         ),
     )
     return Component(structures=(ring_structure, bus_structure), ports=ports)

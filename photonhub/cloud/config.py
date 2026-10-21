@@ -86,6 +86,21 @@ class CloudConfig:
 
 
 _CONFIG: Optional[CloudConfig] = None
+_NOTEBOOK_WORKER_MODE = False
+_PRIVATE_DELIVERY_MODE = False
+
+
+def set_private_delivery_mode() -> None:
+    """Require explicit configuration after the desktop launch pipe is used."""
+    global _PRIVATE_DELIVERY_MODE
+    _PRIVATE_DELIVERY_MODE = True
+
+
+def set_notebook_worker_mode() -> None:
+    """Give keyless Workbench cells a useful cloud setup error."""
+    global _NOTEBOOK_WORKER_MODE
+    _NOTEBOOK_WORKER_MODE = True
+    reset()
 
 
 def _finite_seconds(value, label: str, *, allow_zero: bool) -> float:
@@ -168,8 +183,17 @@ def configure(api_key: Optional[str] = None, url: Optional[str] = None, *,
               max_bundle_members: int = DEFAULT_MAX_MEMBERS) -> CloudConfig:
     """Set the active cloud configuration. Returns it for inspection."""
     global _CONFIG
-    key = env("API_KEY") if api_key is None else api_key
+    key = api_key
+    if key is None and not (_NOTEBOOK_WORKER_MODE or _PRIVATE_DELIVERY_MODE):
+        key = env("API_KEY")
     if not key:
+        if _NOTEBOOK_WORKER_MODE:
+            raise CloudError(
+                "Workbench notebook cells have no cloud key. Use the Run dialog "
+                "for Workbench cloud runs, or configure photonhub.cloud with a "
+                "key supplied explicitly in this cell.")
+        if _PRIVATE_DELIVERY_MODE:
+            raise CloudError("Workbench cloud configuration was not delivered; sign in again")
         raise CloudError(
             "no API key: pass api_key= or set $PHOTONHUB_API_KEY "
             "(create one with ph.cloud.create_api_key after signing in)")
@@ -177,12 +201,14 @@ def configure(api_key: Optional[str] = None, url: Optional[str] = None, *,
     if base is None:
         # An explicitly passed (even invalid) url= falls through to
         # CloudConfig's ValueError; only a genuinely *absent* URL raises here.
-        base = env("URL")
+        base = None if (_NOTEBOOK_WORKER_MODE or _PRIVATE_DELIVERY_MODE) else env("URL")
         if not base:
+            instruction = "pass url=" if (_NOTEBOOK_WORKER_MODE or _PRIVATE_DELIVERY_MODE) else "pass url= or set $PHOTONHUB_URL"
             raise CloudError(
-                "no service URL: pass url= or set $PHOTONHUB_URL. During the "
+                f"no service URL: {instruction}. During the "
                 "beta the endpoint is issued by the operator together with "
-                "your API key (see docs/cloud.md). For a local development "
+                "your API key (see https://leapfield.ai/docs/guides/cloud/). For a "
+                "local development "
                 f"server, pass url={DEFAULT_URL!r} explicitly.")
         try:
             _validate_url(base, allow_insecure_http)
@@ -208,6 +234,13 @@ def get_config() -> CloudConfig:
     """The active config, building one from the environment on first use."""
     if _CONFIG is not None:
         return _CONFIG
+    if _NOTEBOOK_WORKER_MODE:
+        raise CloudError(
+            "Workbench notebook cells have no cloud key. Use the Run dialog "
+            "for Workbench cloud runs, or configure photonhub.cloud with a "
+            "key supplied explicitly in this cell.")
+    if _PRIVATE_DELIVERY_MODE:
+        raise CloudError("Workbench cloud configuration was not delivered; sign in again")
     if env("API_KEY"):
         return configure()
     raise CloudError(
@@ -218,5 +251,6 @@ def get_config() -> CloudConfig:
 
 def reset() -> None:
     """Clear the active config (mainly for tests)."""
-    global _CONFIG
+    global _CONFIG, _PRIVATE_DELIVERY_MODE
     _CONFIG = None
+    _PRIVATE_DELIVERY_MODE = False

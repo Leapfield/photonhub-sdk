@@ -263,6 +263,7 @@ class Batch:
         progress: Optional[Callable[[str, dict], None]] = None,
         timeout: Optional[float] = None,
         device: Optional[str] = None,
+        on_complete: Optional[Callable[[str, Optional[RunResult], Optional[SolverRunError]], None]] = None,
     ) -> BatchResults:
         """Run every simulation, writing ``<path_dir>/<name>/`` per entry, and
         block until all finish. ``max_workers`` runs that many concurrently
@@ -271,7 +272,10 @@ class Batch:
         always suppressed (concurrent entries would interleave).
         ``device`` selects the backend for every entry, as in
         :func:`run_local`. Per-simulation failures are captured in
-        the returned :attr:`BatchResults.errors`, not raised."""
+        the returned :attr:`BatchResults.errors`, not raised. ``on_complete``
+        receives ``(name, result, error)`` once per entry on the calling thread,
+        after its result or error is stored. Callback exceptions propagate.
+        Queued entries are cancelled; runs already started finish first."""
         base = (Path(path_dir) if path_dir is not None
                 else Path(tempfile.mkdtemp(prefix="photonhub-batch-")))
         base.mkdir(parents=True, exist_ok=True)
@@ -290,13 +294,21 @@ class Batch:
         with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
             futs = {ex.submit(_run_one, n, s): n
                     for n, s in self.simulations.items()}
-            for fut in as_completed(futs):
-                name = futs[fut]
-                try:
-                    results[name] = fut.result()
-                except SolverRunError as exc:
-                    # Partial-failure semantics: one bad sim never sinks the
-                    # batch. Non-SolverRunError (programming bugs) still
-                    # propagate and abort the run.
-                    errors[name] = exc
+            try:
+                for fut in as_completed(futs):
+                    name = futs[fut]
+                    try:
+                        results[name] = fut.result()
+                    except SolverRunError as exc:
+                        # Partial-failure semantics: one bad sim never sinks the
+                        # batch. Non-SolverRunError (programming bugs) still
+                        # propagate and abort the run.
+                        errors[name] = exc
+                    if on_complete is not None:
+                        on_complete(name, results.get(name), errors.get(name))
+            except BaseException:
+                for fut in futs:
+                    fut.cancel()
+                ex.shutdown(wait=True, cancel_futures=True)
+                raise
         return BatchResults(results, errors, base, list(self.simulations))

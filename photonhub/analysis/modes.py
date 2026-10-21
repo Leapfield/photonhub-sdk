@@ -2,8 +2,8 @@
 
 This mode solver computes the guided eigenmodes of a *2-D
 dielectric cross-section* that is **invariant along the propagation axis**
-(a straight waveguide). It promotes the proven numpy reference solver in
-``validation/suites/waveguide/mode_solver.py``, which cross-validated a silicon strip
+(a straight waveguide). It promotes a proven numpy reference solver, which
+cross-validated a silicon strip
 waveguide against the FDTD engine (FDTD n_eff = 2.700 vs mode-solver 2.718,
 0.6 %; TE0 |Ex| profile overlap 0.98), into a documented, frozen public API.
 
@@ -334,8 +334,7 @@ class ModeSolver:
         core_w_um: float, core_h_um: float,
         eps_core: float, eps_clad: float,
     ) -> np.ndarray:
-        """Centered rectangular core on a uniform grid. Returns ``eps[iy, ix]``.
-        (Same mesh sampling as ``validation/suites/waveguide/mode_solver.build_eps``.)"""
+        """Centered rectangular core on a uniform grid. Returns ``eps[iy, ix]``."""
         eps = np.full((ny, nx), eps_clad, dtype=float)
         xs = (np.arange(nx) - (nx - 1) / 2.0) * dl_x_um
         ys = (np.arange(ny) - (ny - 1) / 2.0) * dl_y_um
@@ -350,8 +349,7 @@ class ModeSolver:
     def _operator(self, k0: float, polarization: PolarizationName) -> np.ndarray:
         """Assemble the dense ``(N, N)`` transverse operator, ``N = nx*ny``.
 
-        Generalizes ``validation/suites/waveguide/mode_solver._operator`` to anisotropic
-        grid spacing (separate ``dl_x``, ``dl_y``) and a selectable flux-
+        Supports anisotropic grid spacing (separate ``dl_x``, ``dl_y``) and a selectable flux-
         conservative direction. The ``"TE"`` (Ex-major) branch with
         ``dl_x == dl_y`` reproduces the benchmark operator exactly.
         """

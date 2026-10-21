@@ -14,7 +14,7 @@ normalized to counter-clockwise (the orientation :class:`Polygon` and the
 mesh sampler expect).
 
 It pairs a GDS layout with a layer stack: each layer becomes an extruded
-medium. It is what the GDS benchmark suite (``validation/suites/gds/``) uses to
+medium. It is what the GDS benchmark suite uses to
 build devices from the JPPhotonics ``fdtd-pipeline`` layouts (arXiv:2506.16665).
 
 >>> import photonhub as ph
@@ -48,6 +48,18 @@ from ._compat import caller_stacklevel
 __all__ = ["GDSLayer", "import_gds", "export_gds", "read_gds_cell_names"]
 
 _AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
+_ANGLE_TOL_RAD = 1e-9
+# These bounds cover ordinary array layouts while keeping a Workbench import
+# to a few seconds and roughly 0.5 GB at both limits on the measured machine.
+GDS_MAX_FLATTENED_ELEMENTS = 100_000
+GDS_MAX_FLATTENED_VERTICES = 1_000_000
+# Repository layouts are only a few levels deep. Keep native flatten well
+# below worker-thread stack limits, including the smaller Windows stacks.
+GDS_MAX_HIERARCHY_DEPTH = 256
+
+
+class _GDSExpansionLimitError(ValueError):
+    """A layout exceeds a limit before the native reader copies its cells."""
 
 
 @dataclass(frozen=True)
@@ -145,6 +157,70 @@ def _select_cell(gdstk, lib, cell_name: Optional[str], gds_path: str):
     return tops[0]
 
 
+def _strip_nonpolygon_data(lib) -> None:
+    """Keep only the polygon geometry consumed by layout import."""
+    for cell in lib.cells:
+        if cell.labels or cell.paths:
+            cell.remove(*cell.labels, *cell.paths)
+        for polygon in cell.polygons:
+            polygon.properties = []
+
+
+def _flattened_layout_size(cell) -> tuple[int, int]:
+    """Count polygon expansion and depth without copying the hierarchy."""
+    counts: dict[int, tuple[int, int, int]] = {}
+    active: set[int] = set()
+    stack = [(cell, False)]
+    while stack:
+        current, ready = stack.pop()
+        key = id(current)
+        if key in counts:
+            continue
+        if ready:
+            elements = len(current.polygons)
+            vertices = sum(poly.size for poly in current.polygons)
+            depth = 1
+            for reference in current.references:
+                child = reference.cell
+                if hasattr(child, "polygons"):
+                    child_elements, child_vertices, child_depth = counts[id(child)]
+                    repetitions = max(1, reference.repetition.size)
+                    elements += child_elements * repetitions
+                    vertices += child_vertices * repetitions
+                    depth = max(depth, child_depth + 1)
+            if depth > GDS_MAX_HIERARCHY_DEPTH:
+                raise _GDSExpansionLimitError(
+                    f"GDS cell hierarchy depth {depth:,} exceeds the "
+                    f"{GDS_MAX_HIERARCHY_DEPTH:,}-level limit. "
+                    "Select a shallower cell or simplify the layout."
+                )
+            counts[key] = (elements, vertices, depth)
+            active.remove(key)
+            continue
+        if key in active:
+            raise ValueError(f"GDS cell reference cycle at {current.name!r}")
+        active.add(key)
+        stack.append((current, True))
+        for reference in reversed(current.references):
+            child = reference.cell
+            # A name-only reference is an undefined black-box cell. The reader
+            # skips it during flattening, so it contributes no copies.
+            if hasattr(child, "polygons") and id(child) not in counts:
+                stack.append((child, False))
+    elements, vertices, _depth = counts[id(cell)]
+    return elements, vertices
+
+
+def _flattened_limit_message(
+    elements: int, vertices: int, max_elements: int, max_vertices: int,
+) -> str:
+    return (
+        f"GDS cell would expand to {elements:,} elements and {vertices:,} vertices; "
+        f"limits are {max_elements:,} elements and {max_vertices:,} vertices. "
+        "Select a smaller cell or simplify the layout."
+    )
+
+
 def import_gds(
     gds_path: Union[str, Path],
     layers: Sequence[GDSLayer],
@@ -153,8 +229,14 @@ def import_gds(
     axis: AxisName = "z",
     flatten: bool = True,
     min_area_um2: float = 0.0,
+    max_flattened_elements: int = GDS_MAX_FLATTENED_ELEMENTS,
+    max_flattened_vertices: int = GDS_MAX_FLATTENED_VERTICES,
 ) -> Tuple[Structure, ...]:
     """Import a GDSII layout as a tuple of extruded :class:`Structure`.
+
+    Labels, paths and polygon properties are discarded after reading because
+    only polygons become structures. With ``flatten=True``, hierarchies deeper
+    than 256 levels are refused to protect the reader's thread stack.
 
     Parameters
     ----------
@@ -181,19 +263,30 @@ def import_gds(
         own polygons are read.
     min_area_um2:
         Drop polygons whose absolute area is below this (default 0 = keep all), a guard against zero-area slivers from boolean ops.
+    max_flattened_elements:
+        Maximum polygons in the flattened cell (default 100,000). Each polygon
+        counts once per reference repetition.
+    max_flattened_vertices:
+        Maximum polygon outline vertices in the flattened cell (default
+        1,000,000). Each vertex counts once per reference repetition. Increase
+        either limit deliberately for a trusted layout if memory is available.
 
     Returns
     -------
     tuple[Structure, ...]
         One :class:`Polygon` structure per polygon, grouped in the given
-        ``layers`` order (file order within a layer). Paint order is last-wins
-        (NUMERICS.md §9); same-material overlaps from a flattened hierarchy are
+        ``layers`` order (file order within a layer). Paint order is last-wins;
+        same-material overlaps from a flattened hierarchy are
         therefore harmless.
     """
     if axis not in ("x", "y", "z"):
         raise ValueError(f"axis must be one of x/y/z, got {axis!r}")
     if not layers:
         raise ValueError("import_gds: pass at least one GDSLayer")
+    if not isinstance(max_flattened_elements, int) or max_flattened_elements < 1:
+        raise ValueError("max_flattened_elements must be a positive integer")
+    if not isinstance(max_flattened_vertices, int) or max_flattened_vertices < 1:
+        raise ValueError("max_flattened_vertices must be a positive integer")
 
     gdstk = _import_gdstk()
     gds_path = str(gds_path)
@@ -205,8 +298,15 @@ def import_gds(
     # was authored with (e.g. an nm-authored file comes back 1000x too large),
     # silently scaling the device; PhotonHub geometry is always microns.
     lib = gdstk.read_gds(gds_path, unit=1e-6)
+    _strip_nonpolygon_data(lib)
     cell = _select_cell(gdstk, lib, cell_name, gds_path)
     if flatten:
+        elements, vertices = _flattened_layout_size(cell)
+        if elements > max_flattened_elements or vertices > max_flattened_vertices:
+            raise ValueError(
+                _flattened_limit_message(elements, vertices,
+                                         max_flattened_elements, max_flattened_vertices)
+            )
         # Work on a copy so the library cell is not mutated; flatten() resolves
         # all references (applying their transforms) into this cell's polygons.
         cell = cell.copy(cell.name + "__phflat").flatten()
@@ -332,12 +432,18 @@ def export_gds(
     on the ``axis`` drawing plane becomes one polygon: a :class:`Box` -> a
     rectangle, a :class:`Polygon` -> its vertex polygon, a :class:`Cylinder` ->
     a faceted (annular/wedge) polygon at ``cylinder_tolerance_um``. Structures
-    are grouped into GDS layers by their ``(z-extent, medium)``:
+    are grouped into GDS layers by their ``(z-extent, medium, sidewall_angle,
+    reference_plane)``:
 
     * ``layers=None`` (default) auto-assigns ``(1, 0), (2, 0), ...`` in
-      first-occurrence order, one per distinct ``(slab, medium)``.
+      first-occurrence order, one per distinct slab, medium, and sidewall
+      setting. A vertical polygon uses the same layer as a flat shape of the
+      same slab and medium, regardless of its reference plane.
     * pass an explicit ``layers`` list (e.g. the one :func:`import_gds` used) to
-      pin the layer numbers; every structure must match one of them.
+      pin the layer numbers; every structure must match one of them, including
+      its sidewall angle and, for nonvertical walls, reference plane. Angles
+      match within 1e-9 radians. A mismatched layer is refused. Repeated layer
+      identifiers remain valid, as in :func:`import_gds`.
 
     Gotchas handled: ``max_points=0`` disables gdstk's default 199-vertex polygon
     fracturing (a tolerance-faceted ring stays one polygon); ``unit``/``precision``
@@ -356,45 +462,65 @@ def export_gds(
     ai = _AXIS_INDEX[axis]
     u, v = [i for i in range(3) if i != ai]
 
-    # Per-structure: slab extent, medium, gdstk polygon(s).
+    # Per-structure: slab extent, medium, sidewall settings, gdstk polygon(s).
     entries = []
     for s in structs:
         lo, hi = _slab_bounds_of(s.geometry, ai, axis)
         polys = _to_gds_polygons(gdstk, s.geometry, u, v, cylinder_tolerance_um)
-        entries.append((lo, hi, s.medium, polys))
+        angle = s.geometry.sidewall_angle if isinstance(s.geometry, Polygon) else 0.0
+        plane = s.geometry.reference_plane if isinstance(s.geometry, Polygon) else "middle"
+        if angle == 0.0:
+            # The reference plane cannot change a vertical solid. Canonicalize
+            # it so flat and vertical scenes retain their original layer IDs.
+            angle, plane = 0.0, "middle"
+        entries.append((lo, hi, s.medium, angle, plane, polys))
 
     def _matches(lo, hi, gl: GDSLayer) -> bool:
         glo, ghi = gl.slab_bounds_um
         return abs(lo - glo) <= z_tol_um and abs(hi - ghi) <= z_tol_um
 
     if layers is None:
-        # auto-infer one layer per distinct (rounded slab, medium)
+        # auto-infer one layer per distinct slab, medium, and sidewall setting
         assigned: dict = {}
         out_layers: List[GDSLayer] = []
-        for lo, hi, med, _ in entries:
-            key = (round(lo, 6), round(hi, 6), _medium_key(med))
+        for lo, hi, med, angle, plane, _ in entries:
+            key = (round(lo, 6), round(hi, 6), _medium_key(med), angle, plane)
             if key not in assigned:
                 n = len(out_layers) + 1
                 assigned[key] = (n, 0)
-                out_layers.append(GDSLayer(layer=(n, 0), medium=med, zmin_um=lo, thickness_um=hi - lo))
-        layer_of = {i: assigned[(round(lo, 6), round(hi, 6), _medium_key(med))]
-                    for i, (lo, hi, med, _) in enumerate(entries)}
+                out_layers.append(GDSLayer(layer=(n, 0), medium=med, zmin_um=lo,
+                                           thickness_um=hi - lo,
+                                           sidewall_angle=angle, reference_plane=plane))
+        layer_of = {i: assigned[(round(lo, 6), round(hi, 6), _medium_key(med), angle, plane)]
+                    for i, (lo, hi, med, angle, plane, _) in enumerate(entries)}
     else:
         out_layers = list(layers)
         layer_of = {}
-        for i, (lo, hi, med, _) in enumerate(entries):
-            match = [gl for gl in out_layers
-                     if _matches(lo, hi, gl) and _medium_key(gl.medium) == _medium_key(med)]
-            if not match:
+        for i, (lo, hi, med, angle, plane, _) in enumerate(entries):
+            matches = [gl for gl in out_layers
+                       if _matches(lo, hi, gl) and _medium_key(gl.medium) == _medium_key(med)
+                       and abs(gl.sidewall_angle - angle) <= _ANGLE_TOL_RAD
+                       and (angle == gl.sidewall_angle == 0.0 or gl.reference_plane == plane)]
+            if not matches:
+                candidates = [gl for gl in out_layers if _matches(lo, hi, gl)
+                              and _medium_key(gl.medium) == _medium_key(med)]
+                rules = ", ".join(
+                    f"{gl.layer}: sidewall_angle={gl.sidewall_angle:.17g}, "
+                    f"reference_plane={gl.reference_plane!r}" for gl in candidates
+                )
                 raise ValueError(
                     f"structure {i} (z=[{lo:.4g},{hi:.4g}], eps="
-                    f"{med.permittivity:.4g}) matches none of the provided layers"
+                    f"{med.permittivity:.4g}, sidewall_angle={angle:.17g}, "
+                    f"reference_plane={plane!r}) matches none of the provided layers; "
+                    f"available rules for this slab and medium: [{rules}]; "
+                    "add a GDSLayer with matching slab, medium, sidewall_angle, "
+                    "and reference_plane"
                 )
-            layer_of[i] = match[0].layer
+            layer_of[i] = matches[0].layer
 
     lib = gdstk.Library(unit=unit, precision=precision)
     cell = lib.new_cell(cell_name)
-    for i, (lo, hi, med, polys) in enumerate(entries):
+    for i, (lo, hi, med, angle, plane, polys) in enumerate(entries):
         L, D = layer_of[i]
         for p in polys:
             p.layer = L

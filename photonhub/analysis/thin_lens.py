@@ -101,7 +101,7 @@ def thin_lens_beam(
     Parameters
     ----------
     sim:
-        Simulation whose grid/size/§20 symmetry the beam is sampled on (a
+        Simulation whose grid, size and symmetry the beam is sampled on (a
         placeholder geometry-only simulation is fine).
     axis:
         Propagation axis ('x' | 'y' | 'z'), the injection plane's normal.
@@ -341,12 +341,15 @@ def thin_lens_source(
     per-cell source-current Huygens source plane. ``power_watts`` (default 1 W)
     normalizes the launched power on the engine's discrete Poynting
     quadrature like every other launch, as the whole, unfolded device's
-    power (a beam centred on k §20 symmetry planes puts ``power_watts / 2^k``
-    into the modeled part, NUMERICS §20.8); parameters match
+    power (a beam centred on k symmetry planes puts ``power_watts / 2^k``
+    into the modeled part); parameters match
     :func:`thin_lens_beam` / :func:`~photonhub.analysis.gaussian_beam.gaussian_beam_source`.
     The beam converges onto ``focus_distance_um`` past the source plane: its
     recorded-convention mode is conjugated once for the source plane, which stamps
-    ``e^{+i omega t}`` phasors."""
+    ``e^{+i omega t}`` phasors. ``amplitude_threshold`` compares each field
+    with its own peak (default fraction 1e-6). Electric and magnetic currents
+    at a sample are kept or dropped together, and power is normalized on the
+    kept samples."""
     if direction not in ("+", "-"):
         raise ValueError(f"direction must be '+' or '-', got {direction!r}")
     if not power_watts > 0.0:

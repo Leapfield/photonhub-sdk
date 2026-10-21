@@ -1,4 +1,4 @@
-"""Current sources (NUMERICS.md sections 5 and 13)."""
+"""Current sources: dipoles, plane waves, mode sources and TF/SF boxes."""
 
 from typing import Annotated, Literal, Optional, Tuple, Union
 
@@ -23,8 +23,8 @@ class PointDipole(FrozenModel):
     """Soft point current source at the nearest Yee node. An ELECTRIC
     polarization (``Ex``/``Ey``/``Ez``) injects an electric current density
     onto E after the E-update; a MAGNETIC polarization (``Hx``/``Hy``/``Hz``)
-    injects a magnetic current density onto H right after the H-update
-    (NUMERICS.md sections 5 and 12). ``amplitude`` is the peak current density
+    injects a magnetic current density onto H right after the H-update.
+    ``amplitude`` is the peak current density
     J0 [A/m^2] (electric) or M0 [V/m^2] (magnetic); the injected current
     MOMENT is ``J0 * dl^3`` on a uniform grid, so the Hertzian radiated power
     of an electric dipole in vacuum is ``eta0 * k^2 * (J0*dl^3)^2 / (12*pi)``.
@@ -34,11 +34,11 @@ class PointDipole(FrozenModel):
     sources as declared (fields scale with ``amplitude``, flux with its
     square). A dipole placed inside the PML/absorber layers is NOT
     rejected by the engine and radiates almost nothing: keep sources inside
-    the interior (``run_local`` warns before launching such a scene; see
-    ``Simulation.point_sources_in_boundary_layers``).
+    the interior (``Simulation.check_runnable`` refuses such a run; see
+    ``Simulation.sources_in_boundary_layers``).
 
     Magnetic dipoles are supported on both the CPU reference solver and the
-    GPU (NUMERICS.md sections 5 and 12)."""
+    GPU."""
 
     type: Literal["point_dipole"] = "point_dipole"
     center_um: Vec3Um
@@ -70,7 +70,7 @@ _PLANE_WAVE_TANGENTIAL = {
 class PlaneWave(FrozenModel):
     """Normal-incidence plane wave injected on a TF/SF plane perpendicular
     to ``axis`` at ``position_um``, fed by a dispersion-matched 1-D auxiliary
-    solver (NUMERICS.md section 13). ``amplitude`` is the peak incident
+    solver. ``amplitude`` is the peak incident
     E-field E0 in V/m. Both transverse axes must be periodic or Bloch
     (enforced by ``Simulation``), and the plane must not intersect PML
     (checked by ``phsolver validate``)."""
@@ -178,15 +178,15 @@ class ModeSolveProvenance(FrozenModel):
 
 
 class ModeSource(FrozenModel):
-    """Inject a guided mode on a TF/SF plane (NUMERICS.md §18).
+    """Inject a guided mode on a TF/SF plane.
 
     .. deprecated::
-        The §18 aux-line ModeSource is deprecated in favour of the source current Huygens launch (per-cell ``PointDipole`` source planes via
+        The aux-line ModeSource is deprecated in favour of the source current Huygens launch (per-cell ``PointDipole`` source planes via
         ``mode_launch`` over a discrete Yee mode). Both paths support uniform and
-        graded transverse/propagation axes; §18 uses the graded auxiliary-line
-        construction in NUMERICS §§15.9 and 18.4. The source-current path is
+        graded transverse/propagation axes; the aux-line source uses the graded auxiliary-line
+        construction. The source-current path is
         preferred for solved Yee modes because it carries their discrete paired-H
-        fields and grid provenance. §18 remains for the adjoint (gradient pinned
+        fields and grid provenance. The auxiliary-line path remains for the adjoint (gradient pinned
         to it) and scalar/FLM modes; new solved-mode code should use ``mode_launch``.
 
     The 1-D
@@ -241,7 +241,7 @@ class ModeSource(FrozenModel):
     profile_h: Optional[Tuple[float, ...]] = Field(default=None, min_length=1)
     profile_h_minor: Optional[Tuple[float, ...]] = Field(default=None, min_length=1)
     # Broadband injection (schema 1.11.0, additive/optional — the broadband
-    # `num_freqs` analogue, NUMERICS.md §18.3). When `freqs_hz` is set the engine
+    # `num_freqs` analogue). When `freqs_hz` is set the engine
     # injects the mode with a FREQUENCY-DEPENDENT transverse profile and phase
     # index, partition-of-unity-windowed across the band from these N >= 2
     # samples (each a mode solved AT that frequency). The scalar `n_eff`/
@@ -355,7 +355,7 @@ class ModeSource(FrozenModel):
         """Validate the optional broadband (num_freqs) sample arrays. Either
         none of them are set (the single frozen mode) or `freqs_hz`,
         `n_eff_by_freq`, and `profiles_by_freq` are all set, parallel, and
-        consistent with the scalar fields (NUMERICS.md §18.3)."""
+        consistent with the scalar fields."""
         bb = self.freqs_hz is not None
         # All-or-nothing on the core triple; the minor array follows the scalar
         # minor's presence.
@@ -463,8 +463,7 @@ class ModeSource(FrozenModel):
 
 
 class TfsfBox(FrozenModel):
-    """Closed total-field/scattered-field box (NUMERICS.md section 13.5,
-    schema 1.18): a normal-incidence plane wave injected on all SIX faces of
+    """Closed total-field/scattered-field box (schema 1.18): a normal-incidence plane wave injected on all SIX faces of
     an axis-aligned box, so the incident field exists ONLY inside, everything
     outside is pure scattered field. Single-run scattering cross-sections with
     PML on every side (no periodic transverse boundaries needed). CPU solver
@@ -473,7 +472,7 @@ class TfsfBox(FrozenModel):
     scatterer, or strictly outside), faces clear of the PML/absorber layers,
     and no Bloch boundaries or symmetry planes. Accuracy note: scattering
     cross-sections of curved bodies at ~20 cells per wavelength carry a
-    ~3-5 % band-mean staircase/smoothing bias (NUMERICS.md section 14.4);
+    ~3-5 % band-mean staircase/smoothing bias;
     refine the grid or use a convergence ladder for absolute values."""
 
     type: Literal["tfsf_box"] = "tfsf_box"

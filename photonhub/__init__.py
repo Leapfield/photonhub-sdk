@@ -65,24 +65,48 @@ from .runners import (
     run_local,
 )
 from . import cloud
+from . import study
+from .spec_hash import spec_sha256
+from . import perturbation
+from .perturbation import SpatialMap, carrier_plasma, perturbed_medium, thermo_optic_index
 from .cloud import gpus  # convenience: ph.gpus() == ph.cloud.gpus() (the GPU menu)
 from . import inverse_design
 from .inverse_design import (
+    BroadbandGradientResult,
+    BroadbandModeTransmission,
     DesignRegion,
+    FiniteDifferenceResult,
     GradientResult,
     ModePower,
+    ModeTransmission,
     OptimizeResult,
+    ParametricGradientResult,
     ParametricResult,
     PointIntensity,
+    PolygonProfile,
+    TransmissionPort,
+    WidthProfile,
     assemble_gradient,
+    build_adjoint_simulation,
+    curvature_penalty,
+    finite_difference_check,
     optimize,
     optimize_parametric,
+    parametric_finite_difference_check,
+    parametric_value_and_gradient,
     value_and_gradient,
 )
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 __all__ = [
+    "study",
+    "perturbation",
+    "SpatialMap",
+    "carrier_plasma",
+    "perturbed_medium",
+    "thermo_optic_index",
+    "spec_sha256",
     "c0",
     "eps0",
     "mode_window_um",
@@ -147,12 +171,25 @@ __all__ = [
     # inverse design (adjoint topology optimization)
     "inverse_design",
     "DesignRegion",
+    "WidthProfile",
+    "PolygonProfile",
+    "curvature_penalty",
     "PointIntensity",
     "ModePower",
+    "TransmissionPort",
+    "ModeTransmission",
+    "BroadbandModeTransmission",
     "GradientResult",
+    "BroadbandGradientResult",
+    "FiniteDifferenceResult",
+    "build_adjoint_simulation",
+    "finite_difference_check",
     "OptimizeResult",
+    "ParametricGradientResult",
     "ParametricResult",
     "value_and_gradient",
+    "parametric_value_and_gradient",
+    "parametric_finite_difference_check",
     "assemble_gradient",
     "optimize",
     "optimize_parametric",
@@ -160,8 +197,17 @@ __all__ = [
 ]
 
 
-# --- deprecated aliases (2026-09 cross-solver rename; remove in 0.2) ---------
+# --- deprecated aliases (2026-09 naming convention; remove in 0.2) -----------
 _RENAMED = {
+    # acronyms in caps
+    "GdsLayer": "GDSLayer",
+    "TfsfBox": "TFSFBox",
+}
+
+# Removed in 0.1.6. These were renamed in 0.1.2 (the cross-solver rename) and
+# kept as deprecated aliases until then; each now fails with the current
+# spelling.
+_REMOVED = {
     "PolySlab": "Polygon",
     "FluxMonitor": "PowerMonitor",
     "FieldTimeMonitor": "TimeMonitor",
@@ -176,16 +222,13 @@ _RENAMED = {
     "auto_grid": "auto_mesh",
     "run_async": "submit",
     "estimate_cost": "quote",
-    # 2026-09 naming convention (CONTRIBUTING.md, Names): acronyms in caps
-    "GdsLayer": "GDSLayer",
-    "TfsfBox": "TFSFBox",
 }
 
 
 def __getattr__(name):
     if name == "web":
         # The shim module, not ``cloud`` itself: only the shim carries the
-        # ``Web*`` class aliases (issue #451). Importing it issues the one
+        # ``Web*`` class aliases. Importing it issues the one
         # DeprecationWarning and binds ``photonhub.web``, so this runs once.
         import importlib
 
@@ -203,4 +246,7 @@ def __getattr__(name):
             stacklevel=caller_stacklevel(),
         )
         return globals()[replacement]
+    current = _REMOVED.get(name)
+    if current is not None:
+        raise AttributeError(f"photonhub.{name} was removed in 0.1.6; use photonhub.{current}")
     raise AttributeError(f"module 'photonhub' has no attribute {name!r}")

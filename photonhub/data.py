@@ -1,6 +1,6 @@
 """Load a phsolver output directory into xarray.
 
-Output contract (NUMERICS.md section 6, engine/include/phcore/output.h): one
+Output contract (the solver's output directory): one
 raw little-endian float32 ``.bin`` per monitor plus ``manifest.json``::
 
     {
@@ -33,12 +33,12 @@ raw little-endian float32 ``.bin`` per monitor plus ``manifest.json``::
       "provenance": {"solver_version": "...", "device_name": "...", ...}
     }
 
-Frequency-domain monitors (NUMERICS.md section 12) are emitted as float32
+Frequency-domain monitors are emitted as float32
 ``[re, im]`` pairs in binary order ``[freq][component][k][j][i][re,im]``
 (de-pitched) and reconstructed here as ``complex64`` DataArrays with dims
 ``('f', 'component', 'z', 'y', 'x')``; flux monitors are one float32 power
 per frequency, dims ``('f',)``, positive toward +axis. The engine writes both
-with the section-12 normalization, phasors divided by ``A0 * S(f)`` (the
+with the source-spectrum normalization, phasors divided by ``A0 * S(f)`` (the
 first wire-order source's amplitude times its unit-amplitude analytic
 spectrum), flux therefore scaled by ``1/|A0*S(f)|^2``. This reader multiplies
 ``A0`` back in (``field_dft`` by ``A0``, ``flux`` by ``A0^2``) whenever it
@@ -49,15 +49,15 @@ declared: fields in V/m and A/m, flux in watts. Without the simulation the
 engine's unit-amplitude values come back unchanged. Either way the
 ``normalization`` attr says which convention the array carries and
 ``norm_amplitude`` holds ``A0`` (None when unknown). On a domain folded by
-§20 symmetry planes ``data[name]`` reports a flux as the whole device's
+symmetry planes ``data[name]`` reports a flux as the whole device's
 power, the modeled part times 2 for every plane that cuts the monitor plane
-(NUMERICS §20.8, attr ``symmetry_factor``); ``data.wire(name)`` keeps the
+(attr ``symmetry_factor``); ``data.wire(name)`` keeps the
 modeled part.
 field_dft coordinates are base-node positions with
 NO per-component Yee half-cell destaggering applied, see the warning on
 ``_load_field_dft`` before hand-computing E x H* flux from them.
 
-Aborted runs (NUMERICS.md section 7: ``divergence`` / ``non_finite_energy``)
+Aborted runs (``divergence`` / ``non_finite_energy``)
 still write a complete manifest with truncated monitor data; loading one
 emits a ``UserWarning`` and surfaces ``aborted`` / ``abort_reason`` here and
 in every DataArray's attrs, so partial fields are never silently presented
@@ -108,35 +108,35 @@ _MAX_SHAPE_DIM = (1 << 31) - 1
 _RESERVED_RESULT_FILES = {"sim.json", "manifest.json", "solver-events.jsonl",
                           "client.json"}
 
-# NUMERICS.md section 12 normalization, surfaced on every frequency-domain
+# The engine's source-spectrum normalization, surfaced on every frequency-domain
 # DataArray so absolute-magnitude use is never silent. NOTE for apodized
-# monitors (ProfileMonitor(apodization=...), §12): the phasors are a WINDOWED
+# monitors (ProfileMonitor(apodization=...)): the phasors are a WINDOWED
 # DFT but are still normalized by the FULL-pulse A0*S(f) — the window is not
 # divided out — so their absolute magnitudes are NOT comparable to an
 # unapodized monitor's (or to another window's); only ratios within the same
 # apodization are.
 _DFT_NORMALIZATION = (
     "phasors normalized by A0*S(f): the first wire-order source's amplitude "
-    "times the unit-amplitude analytic pulse spectrum (NUMERICS.md section "
-    "12, e^{-i omega t} convention) — the response to a UNIT-amplitude "
+    "times the unit-amplitude analytic pulse spectrum (e^{-i omega t} "
+    "convention) — the response to a UNIT-amplitude "
     "harmonic drive, not restored to the declared amplitude because the "
     "simulation was not available to the reader; an apodized monitor's "
     "windowed-DFT phasors keep this full-pulse normalization, so their "
     "absolute magnitudes are not comparable to unapodized monitors")
 _DFT_ABSOLUTE = (
     "continuous-wave phasors of the sources as declared, in V/m and A/m "
-    "(e^{-i omega t}): the engine's A0*S(f)-normalized phasors (NUMERICS.md "
-    "section 12) multiplied back by A0, the first wire-order source's "
+    "(e^{-i omega t}): the engine's A0*S(f)-normalized phasors "
+    "multiplied back by A0, the first wire-order source's "
     "amplitude (attr norm_amplitude); an apodized monitor's windowed-DFT "
     "phasors are not comparable in magnitude to unapodized monitors")
 _FLUX_NORMALIZATION = (
-    "power normalized by 1/|A0*S(f)|^2 (shared normalized phasors, "
-    "NUMERICS.md section 12) — the response to a UNIT-amplitude harmonic "
+    "power normalized by 1/|A0*S(f)|^2 (shared normalized phasors) "
+    "— the response to a UNIT-amplitude harmonic "
     "drive, NOT absolute watts because the simulation was not available to "
     "the reader; positive values flow toward +axis")
 _FLUX_ABSOLUTE = (
     "time-averaged power in watts for the sources as declared: the engine's "
-    "1/|A0*S(f)|^2-normalized flux (NUMERICS.md section 12) multiplied back "
+    "1/|A0*S(f)|^2-normalized flux multiplied back "
     "by A0^2, the first wire-order source's amplitude squared (attr "
     "norm_amplitude); positive values flow toward +axis")
 
@@ -677,19 +677,19 @@ class RunResult:
 
     @property
     def aborted(self) -> bool:
-        """True when the solver aborted this run (NUMERICS.md section 7)."""
+        """True when the solver aborted this run."""
         return bool(self._run.get("aborted", False))
 
     @property
     def abort_reason(self) -> Optional[str]:
-        """The section-7 reason string (``divergence`` /
+        """The abort reason string (``divergence`` /
         ``non_finite_energy``), or None for a healthy run."""
         reason = self._run.get("abort_reason")
         return str(reason) if reason else None
 
     @property
     def shut_off(self) -> bool:
-        """True when the run ended early via NUMERICS.md section 7 auto-shutoff
+        """True when the run ended early via auto-shutoff
         after the energy rule (field energy below ``run.shutoff`` of peak, or
         the fp16 plateau rule) and any DFT guard passed: a clean finish, not
         an abort."""
@@ -736,10 +736,10 @@ class RunResult:
 
     def __getitem__(self, name: str) -> xr.DataArray:
         """The recorded array in the user's frame. On a simulation that folded
-        a declared ``symmetry`` (design spec §4.5) a monitor the fold clipped,
+        a declared ``symmetry`` a monitor the fold clipped,
         or that spans the mirror plane, comes back unfolded: the plane the
         whole device would have recorded. A flux on a folded domain is the
-        whole device's power through the plane (NUMERICS §20.8; its
+        whole device's power through the plane (its
         ``symmetry_factor`` attr is the 2^k it carries, and is absent when no
         plane cuts the monitor). :meth:`wire` is the array
         as the engine wrote it, the modeled part."""
@@ -769,8 +769,8 @@ class RunResult:
 
     def _whole_device_flux(self, name: str, raw: xr.DataArray, sim) -> xr.DataArray:
         """A flux as the whole, unfolded device reads it: the modeled part
-        times 2 for every §20 symmetry plane that cuts the monitor's plane
-        (NUMERICS §20.8). Unchanged, bit for bit, when no plane cuts it."""
+        times 2 for every symmetry plane that cuts the monitor's plane.
+        Unchanged, bit for bit, when no plane cuts it."""
         factor = self._flux_symmetry_factor(name, sim)
         if factor == 1.0:
             return raw
@@ -782,12 +782,12 @@ class RunResult:
             whole.attrs["power"] = (
                 "the whole, unfolded device's power through the plane: the "
                 "modeled part (RunResult.wire) times symmetry_factor, 2 for every "
-                "symmetry plane that cuts the monitor plane (NUMERICS 20.8)")
+                "symmetry plane that cuts the monitor plane")
             views[name] = whole
         return views[name]
 
     def _flux_symmetry_factor(self, name: str, sim) -> float:
-        """2^k for the k §20 symmetry planes whose normal lies in the plane of
+        """2^k for the k symmetry planes whose normal lies in the plane of
         flux monitor ``name`` and which its window reaches. A full plane
         reaches every one. On a domain fitted with ``domain=`` a window
         reaches a plane when the fold clipped it there, from a window
@@ -798,7 +798,7 @@ class RunResult:
         on the mirror (the engine's cell-centre membership,
         ``flux_window_range``). A window that stops short of the mirror reads
         its own region and gets no factor, like a port off the plane. Without
-        the simulation, or on a §4 ``pmc`` wall (not a fold), 1. Raises for a
+        the simulation, or on a ``pmc`` wall (not a fold), 1. Raises for a
         fitted window on the kept side of an even plane whose edge lies inside
         the first cell of the grid the run used (a copy re-meshed after the
         fit, which refuses it, can bring one back): that flux has no
@@ -830,7 +830,7 @@ class RunResult:
                     if lo > 1e-6:
                         dq = first_cell() if sym[b] == 1 else 0.0
                         if sym[b] == 1 and lo <= 0.5 * dq + 1e-9 * dq:
-                            # the fit refuses this window (§20.8); a copy re-meshed
+                            # the fit refuses this window; a copy re-meshed
                             # afterwards can bring it back: refuse the reading
                             raise ValueError(
                                 f"monitor {name!r}: its window starts {lo:.6g} um from the even (PMC) "
@@ -854,14 +854,14 @@ class RunResult:
         the engine wrote (the simulated half of a folded domain): what the
         analysis readers that place a monitor window on a plane work on. A
         flux here is the modeled part's power, without the whole-device
-        factor ``data[name]`` carries (NUMERICS §20.8)."""
+        factor ``data[name]`` carries."""
         from .components import frame as _frame
         return _frame.to_wire_frame(self._raw(name), self._known_simulation())
 
     def __repr__(self) -> str:
         return f"RunResult({str(self.output_dir)!r}, monitors={self.monitor_names})"
 
-    # -- visualization (photonhub.viz; docs/viz-layer-design.md) ------------
+    # -- visualization (photonhub.viz) ---------------------------------------
 
     @property
     def simulation(self):
@@ -938,7 +938,7 @@ class RunResult:
     @property
     def norm_amplitude(self) -> Optional[float]:
         """``A0``, the amplitude of the first wire-order source: the
-        engine's section-12 normalization amplitude, which this reader
+        engine's normalization amplitude, which this reader
         multiplies back into every frequency-domain array (``A0`` on
         ``field_dft`` phasors, ``A0^2`` on flux). None when the simulation is
         not known, in which case the arrays keep the engine's unit-amplitude
@@ -1006,8 +1006,7 @@ class RunResult:
         power of a port instead, ``data.simulation.port_monitors[name]
         .mode_power(data)`` (flux-commensurate with a
         :class:`~photonhub.PowerMonitor`; on a folded domain both, and the
-        beam's ``power_watts``, are the whole device's power, NUMERICS
-        §20.8), and normalize it against a
+        beam's ``power_watts``, are the whole device's power), and normalize it against a
         reference run of your own, for example the same beam launched into
         the bare background with a :class:`~photonhub.PowerMonitor` across
         its path."""
@@ -1023,7 +1022,7 @@ class RunResult:
         if port not in monitors:
             fold = getattr(sim, "_fold", None)
             if fold is not None and port in fold.mirrored_ports:
-                # a port in the mirrored half of the fold: its image's reading (§4.5)
+                # a port in the mirrored half of the fold: its image's reading
                 image = fold.mirrored_ports[port]
                 t = self.transmission(image, **kwargs)
                 t = t.copy()
@@ -1100,7 +1099,7 @@ class RunResult:
         ``field`` is Ex..Hz or a derived 'E'/'intensity'/'H'; ``freq=`` is
         required for a multi-frequency DFT monitor; ``val`` selects
         real/imag/abs/phase for complex data. ``unfold`` (the default) mirrors
-        a NUMERICS §20 half domain back into the whole device, with each
+        a symmetry-reduced half domain back into the whole device, with each
         component's parity about the plane; it needs ``simulation=``. Returns
         a matplotlib ``Axes``."""
         from .viz import plot_field as _plot_field
@@ -1132,9 +1131,8 @@ class RunResult:
     def _axis_coord_um(self, axis: str, origin: int, n: int,
                        stride: int = 1) -> np.ndarray:
         """Yee-node base coordinates (microns) for `n` recorded cells starting at
-        cell `origin` along `axis`, sampled every `stride` cells (NUMERICS.md
-        section 12 interval_space; stride 1 = every cell). Graded runs (section
-        15.10) carry the per-axis 'coords_um' arrays in the manifest; uniform
+        cell `origin` along `axis`, sampled every `stride` cells (the
+        monitor's interval_space; stride 1 = every cell). Graded runs carry the per-axis 'coords_um' arrays in the manifest; uniform
         runs fall back to the i * dl_um rule."""
         coords = self.manifest.get("grid", {}).get("coords_um")
         if coords is not None and axis in coords:
@@ -1143,7 +1141,7 @@ class RunResult:
         else:
             base = (float(origin) + np.arange(n, dtype=np.float64) * stride) \
                 * self._grid_dl_um()
-        # A simulation fitted around its device (design spec §4.4) was built in
+        # A simulation fitted around its device was built in
         # the user's frame and records the wire corner in origin_um; report the
         # coordinates in that frame. A document loaded from the wire has (0,0,0).
         return base + self._frame_origin(axis)
@@ -1159,7 +1157,7 @@ class RunResult:
         dtype = entry.get("dtype", "float32")
         if dtype != "float32":
             raise ValueError(f"monitor {name!r}: unsupported dtype {dtype!r}")
-        # Exactly the keys output.cpp emits — no aliases for never-shipped
+        # Exactly the keys the engine emits — no aliases for never-shipped
         # draft manifests.
         kind = entry.get("type")
         if kind in ("field_time", "field_snapshot"):
@@ -1255,8 +1253,7 @@ class RunResult:
             kind, dims = "snapshot", _SNAPSHOT_DIMS
         manifest_dims = entry.get("dims")
         if manifest_dims is not None:
-            # The engine names the leading dim "sample" (NUMERICS.md section
-            # 6); the xarray dim is "t" with coordinates in seconds.
+            # The engine names the leading dim "sample"; the xarray dim is "t" with coordinates in seconds.
             normalized = ("t",) + tuple(manifest_dims[1:])
             if tuple(manifest_dims[:1]) != ("sample",) or normalized != dims:
                 raise ValueError(
@@ -1290,17 +1287,17 @@ class RunResult:
         return xr.DataArray(data, dims=dims, coords=coords, attrs=attrs, name=name)
 
     def _load_field_dft(self, entry: dict) -> xr.DataArray:
-        """NUMERICS.md section 12 field_dft: float32 [re, im] pairs in binary
+        """A field_dft monitor: float32 [re, im] pairs in binary
         order [freq][component][k][j][i][re,im], reconstructed as complex64
         with dims ('f', 'component', 'z', 'y', 'x'). Spatial coordinates are
         Yee cell base coordinates (index * dl_um, offset by the optional
-        'origin_cells' region corner). The section-12 snapping rule makes
+        'origin_cells' region corner). The per-component snapping rule makes
         origin_cells EXACT for every listed component (the validator rejects
         specs whose per-component snaps disagree).
 
         .. warning:: The coordinates are BASE-NODE positions for EVERY
-           component: the per-component Yee half-cell offsets (NUMERICS.md
-           section 1.1, E and H components live at staggered points, H also
+           component: the per-component Yee half-cell offsets (E and H
+           components live at staggered points, H also
            half a step earlier in time) are NOT applied here, as for
            snapshots. Combining raw components by hand, in particular an
            E x H* Poynting flux from a field_dft plane, without first
@@ -1324,10 +1321,10 @@ class RunResult:
             )
         manifest_dims = entry.get("dims")
         if manifest_dims is not None:
-            # Exactly the dim names output.cpp emits — no aliases. The
+            # Exactly the dim names the engine emits — no aliases. The
             # engine names the leading dim "freq"; the xarray dim is "f"
             # with coordinates in Hz. The trailing [re, im] pair dim (named
-            # "complex" by the engine's output.cpp) is consumed by the
+            # "complex" by the engine) is consumed by the
             # complex64 reconstruction.
             normalized = ("f",) + tuple(manifest_dims[1:-1])
             if (tuple(manifest_dims[:1]) != ("freq",)
@@ -1354,7 +1351,7 @@ class RunResult:
                 f"monitor {name!r}: origin_cells {origin} must be the region "
                 "low corner as [i0, j0, k0] (x, y, z cell indices)"
             )
-        # §12 interval_space: per-axis spatial stride (x, y, z). Absent => every
+        # interval_space: per-axis spatial stride (x, y, z). Absent => every
         # cell (stride 1). Strides the reconstructed coordinates so a decimated
         # plane reads back at the right physical positions.
         stride = entry.get("interval_space", (1, 1, 1))
@@ -1382,7 +1379,7 @@ class RunResult:
                             name=name)
 
     def _load_flux(self, entry: dict) -> xr.DataArray:
-        """NUMERICS.md section 12 flux: one float32 power per frequency
+        """A flux monitor: one float32 power per frequency
         (fp64-accumulated in the engine), dims ('f',), positive toward
         +axis. The engine's shared 1/|A0*S(f)|^2 normalization is undone
         here (``A0^2`` multiplied back in) so the value is watts for the
@@ -1397,7 +1394,7 @@ class RunResult:
             )
         manifest_dims = entry.get("dims")
         if manifest_dims is not None and tuple(manifest_dims) != ("freq",):
-            # Exactly the dim name output.cpp emits — no aliases.
+            # Exactly the dim name the engine emits — no aliases.
             raise ValueError(
                 f"monitor {name!r}: manifest dims {manifest_dims} != "
                 "expected ['freq']"
@@ -1413,13 +1410,13 @@ class RunResult:
         attrs = self._common_attrs(name, "flux")
         attrs["freqs_hz"] = [float(f) for f in freqs]
         data = self._restore_amplitude(data, attrs, power=True)
-        # output.cpp emits "axis" unconditionally for flux entries (it throws
+        # The engine emits "axis" unconditionally for flux entries (it throws
         # on a spec lookup miss): without it the sign convention of the
         # reported power is unrecoverable from the artifact.
         if "axis" not in entry:
             raise ValueError(
                 f"monitor {name!r}: flux manifest entry has no 'axis' (the "
-                "plane normal; required — output.h manifest contract)"
+                "plane normal; required by the manifest contract)"
             )
         attrs["axis"] = entry["axis"]
         coords = {"f": ("f", freqs, {"units": "Hz"}),

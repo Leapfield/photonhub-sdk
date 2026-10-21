@@ -10,11 +10,11 @@ complex phase, so it drops straight into
 :func:`~photonhub.analysis.eq_current_source.equivalence_current_source` and
 launches one-sided (forward only) exactly like a solved waveguide mode does.
 
-Why the Huygens source plane and not a §18 :class:`~photonhub.components.sources.ModeSource`:
+Why the Huygens source plane and not a :class:`~photonhub.components.sources.ModeSource`:
 a Gaussian beam is only *real* (flat-phase) at its waist and at normal incidence.
 Move the waist off the injection plane, or tilt the beam, and the transverse
 profile picks up the wavefront-curvature, Gouy and transverse-k phases, which
-the §18 wire (real signed ``profile``) cannot carry. The eq-current source plane stamps
+the wire (real signed ``profile``) cannot carry. The eq-current source plane stamps
 one :class:`~photonhub.components.sources.PointDipole` per cell per component with
 its own amplitude AND phase, so an arbitrary complex profile is exact on the
 existing wire and engine, no schema change, CPU and GPU alike.
@@ -288,7 +288,7 @@ def _spot_on_plane(w0: float, lam_um: float, n: float, d: float) -> float:
 
 def _default_center(sim, letter: str) -> float:
     """The default transverse centre of a launch on axis ``letter``: the domain
-    centre, or ``0`` on a §20-folded axis, whose mirror plane sits on the
+    centre, or ``0`` on a folded axis, whose mirror plane sits on the
     domain's min face and is the device's centre."""
     a = _AXES.index(letter)
     sym = getattr(sim, "symmetry", None)
@@ -299,8 +299,8 @@ def _default_center(sim, letter: str) -> float:
 
 def _modeled_watts(sim, axis: str, h_c: float, v_c: float, power_watts):
     """The power a sheet launch centred at ``(h_c, v_c)`` puts into the part
-    the simulation models: ``power_watts`` is the whole, unfolded device's
-    (NUMERICS §20.8), so a launch centred on k §20 symmetry planes carries
+    the simulation models: ``power_watts`` is the whole, unfolded device's,
+    so a launch centred on k symmetry planes carries
     ``power_watts / 2^k`` here, the same rule as a port launch."""
     if power_watts is None:
         return None
@@ -333,7 +333,7 @@ def _resolve_window(sim, axis, center_um, half_w_um, half_v_um, *, w0h, w0v,
         half_v_um = (window_sigmas * stretch
                      * _spot_on_plane(w0v, lam_um, n, waist_distance_um))
     # Clip to the domain: the largest half-extent that still lands inside
-    # [0, size] on the far side of the beam centre (a §20-folded axis has its
+    # [0, size] on the far side of the beam centre (a folded axis has its
     # centre at 0, so the clip is the whole modelled half).
     def _clip(half, c, letter):
         L = float(size[_AXES.index(letter)])
@@ -352,7 +352,7 @@ def _plane_grids(sim, axis, *, h_center, v_center, half_w, half_v, dl):
     Registration comes from :func:`~photonhub.analysis.yee_mode.window_nodes`, the
     SAME ladder the eigensolve and the equivalence-current sheet use, so the
     analytic beam lands on exactly the cells the sheet stamps (and is clipped at
-    a §20 symmetry plane the same way). The engine's in-plane Yee offsets for a
+    a symmetry plane the same way). The engine's in-plane Yee offsets for a
     cut normal to ``axis`` are
 
         E_h, H_v  at (h+½, v)      E_v, H_h  at (h, v+½)
@@ -421,7 +421,7 @@ def gaussian_beam(
     Parameters
     ----------
     sim:
-        The simulation whose grid, size, and §20 symmetry the beam is sampled
+        The simulation whose grid, size, and symmetry the beam is sampled
         on. A cheap placeholder geometry-only simulation (same grid/size/symmetry) is fine.
     axis:
         Propagation axis, ``"x"``/``"y"``/``"z"``, the injection plane's normal.
@@ -439,7 +439,7 @@ def gaussian_beam(
         incidence, the Gaussian's SHAPE is wavelength-independent.
     center_um:
         Transverse beam centre as ``(h, v)`` in the in-plane-axis order above.
-        Default: the domain centre. Under a §20 symmetry plane the folded axis'
+        Default: the domain centre. Under a symmetry plane the folded axis'
         centre is ``0`` (the plane sits on the domain min face).
     n:
         Refractive index of the medium the beam propagates in. Default:
@@ -495,7 +495,7 @@ def gaussian_beam(
     :func:`~photonhub.analysis.eq_current_source.equivalence_current_source`
     directly (a per-frequency mode mapping, say), pass ``conjugate_fields(beam)``
     (``from photonhub.analysis.gaussian_beam import conjugate_fields``): the
-    source plane stamps ``e^{+iωt}`` phasors. The §18 aux-line path
+    source plane stamps ``e^{+iωt}`` phasors. The aux-line path
     (:func:`~photonhub.analysis.mode_devices.mode_source`) keeps only the real part
     and would silently mis-launch anything but an at-waist, normal-incidence beam.
     """
@@ -747,10 +747,9 @@ def gaussian_beam_source(
     normalized on the engine's own discrete Poynting quadrature over the
     dipoles actually stamped, so a full-plane ``PowerMonitor`` below the
     source plane reads it back in watts and a
-    transmission monitor reads an absolute fraction of the launch. Under §20
-    symmetry planes it is the power of the whole, unfolded device. A beam
+    transmission monitor reads an absolute fraction of the launch. Under symmetry planes it is the power of the whole, unfolded device. A beam
     centered on k planes puts ``power_watts / 2^k`` into the modeled part.
-    A full-plane ``PowerMonitor`` reports ``power_watts`` (NUMERICS §20.8).
+    A full-plane ``PowerMonitor`` reports ``power_watts``.
     On a one-cell periodic
     (quasi-2-D) axis it is the power through that one cell's width;
     transmission ratios are normalization-invariant either way.
@@ -774,8 +773,10 @@ def gaussian_beam_source(
         source planes buy nothing. ``None`` (default) or a single entry launches the
         single band-centre beam.
     amplitude_threshold:
-        Drop dipoles below this fraction of the peak (default 1e-6).
-        This removes the Gaussian's far tail from the source plane.
+        Finite fraction in [0, 1), relative to each field's own peak (default
+        1e-6). At each sample, keep the electric and magnetic currents together
+        when either field reaches the threshold. Power is normalized on the
+        kept samples.
     """
     if not power_watts > 0.0:
         raise ValueError(f"power_watts must be > 0, got {power_watts}")
@@ -830,4 +831,7 @@ def gaussian_beam_source(
         h_center_um=h_c, v_center_um=v_c, half_w_um=half_w, half_v_um=half_v,
         power_watts=_modeled_watts(sim, axis, h_c, v_c, power_watts),
         amplitude_threshold=float(amplitude_threshold),
-        modes_by_freq=bank)
+        modes_by_freq=bank,
+        # a default window stops at the boundary layers, where a source would
+        # refuse the run; an explicit one is the caller's
+        _clip_to_interior=(half_w_um is None, half_v_um is None))

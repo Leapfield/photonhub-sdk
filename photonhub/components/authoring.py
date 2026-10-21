@@ -44,8 +44,7 @@ class Port:
     beyond the distance at which the mode's intensity is 30 dB below its peak,
     at the longest wavelength the port reads, from the mode's effective index
     and the highest cladding index at the core's faces (the rule of
-    :func:`photonhub.mode_window_um`, refined by the port's own mode solve;
-    NUMERICS §18.8). ``window_um`` gives the two half-extents explicitly. ``mode`` is a family and an index in
+    :func:`photonhub.mode_window_um`, refined by the port's own mode solve). ``window_um`` gives the two half-extents explicitly. ``mode`` is a family and an index in
     one string (``"TE0"``, ``"TM1"``). ``out_direction`` is the side of the
     plane that faces the domain wall, ``"+"`` or ``"-"``; ``None`` lets the
     simulation infer it from where the port sits relative to the device.
@@ -54,8 +53,8 @@ class Port:
     wavelength in the background: what the launch injects that is not the
     guide's discrete mode interferes with it at this port's plane, at a phase
     set by the distance in microns, so a standoff counted in cells would move
-    that phase with the mesh and this port's reading would drift with it
-    (NUMERICS §18.6). ``medium``
+    that phase with the mesh and this port's reading would drift with it.
+    ``medium``
     is the port waveguide's material, used to extend the guide
     through the wall. ``dl_um``, ``supersample`` and ``num_modes`` are the
     mode-solve frame controls.
@@ -183,10 +182,13 @@ class GaussianBeam:
     on an axis with a symmetry plane the symmetry plane. ``power_watts`` is the
     beam power through its plane in watts, as a :class:`~photonhub.PowerMonitor`
     reads it; with symmetry planes it is the whole device's power, like a port
-    launch (NUMERICS §20.8). Exactly
+    launch. Exactly
     one of ``waist_um`` (1/e field radius) or ``mfd_um`` (1/e² intensity
     diameter) sizes the spot, each a number or an (h, v) pair. Angles are in
-    radians.
+    radians. ``amplitude_threshold``, a finite fraction in [0, 1) (default
+    1e-6), compares each field with its own peak. At each sample, electric and
+    magnetic currents are kept or dropped together, and power is normalized on
+    the kept samples. It is ignored when ``paraxial=True``.
     """
 
     axis: str

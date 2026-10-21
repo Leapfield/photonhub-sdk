@@ -1,9 +1,9 @@
 """Default human-readable renderer for phsolver progress events.
 
-``run_local`` streams JSON-lines events (NUMERICS.md section 7) from phsolver;
+``run_local`` streams JSON-lines events from phsolver;
 this module turns them into a one-line, TTY-aware status display on stderr. The
-line format mirrors the engine CLI's renderer
-(``engine/include/phcore/status_line.h``) — keep the two in sync.
+line formats mirror the engine CLI's own renderer, for stepping and for setup;
+keep them in sync.
 
 ``run_local`` passes ``--progress none`` to the child so phsolver stays silent
 on its own stderr and Python owns the human surface (it knows the real terminal
@@ -86,6 +86,23 @@ def format_progress(e: dict) -> str:
     return "  ".join(parts)
 
 
+def format_setup_progress(e: dict) -> str:
+    """Build the one-line status body for a ``setup_progress`` event: the
+    engine's host setup (the material raster) before the first step, e.g.
+    ``setup  42% [####------] materials 5355/12750 rows  1m12s  ETA 1m39s``."""
+    done = int(e.get("done_units", 0))
+    total = int(e.get("total_units", 0))
+    pct = int(100 * done / total) if total else 0
+    line = (
+        f"setup {pct:3d}% {_bar(pct)} {e.get('stage', '?')} {done}/{total} "
+        f"{e.get('unit', '')}  {_dur(e.get('elapsed_s'))}"
+    )
+    eta = e.get("eta_s")
+    if eta is not None and float(eta) >= 0:
+        line += f"  ETA {_dur(eta)}"
+    return line
+
+
 class TerminalRenderer:
     """Stateful renderer: feed it every event dict and it draws to ``stream``.
 
@@ -106,6 +123,8 @@ class TerminalRenderer:
             self._start(event)
         elif kind == "progress":
             self._progress(event)
+        elif kind == "setup_progress":
+            self._setup(event)
         elif kind == "done":
             self._done(event)
         elif kind == "error":
@@ -136,6 +155,11 @@ class TerminalRenderer:
     def _progress(self, e: dict) -> None:
         self.last = e
         line = format_progress(e)
+        self._w("\r\033[K" + line if self.tty else line + "\n")
+        self.started = True
+
+    def _setup(self, e: dict) -> None:
+        line = format_setup_progress(e)
         self._w("\r\033[K" + line if self.tty else line + "\n")
         self.started = True
 

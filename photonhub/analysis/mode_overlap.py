@@ -120,8 +120,8 @@ ModeBank = Union[Mapping[float, Mapping[int, Any]], Mapping[int, Any]]
 _QUANTITIES = ("transmission", "power", "amplitude")
 
 # One µm² in m². The overlap quadrature integrates over the plane's µm
-# coordinates (dA in µm²), while the engine's PowerMonitor forms its §12
-# Poynting sum with the SI grid spacing (dA in m²; NUMERICS.md — internal
+# coordinates (dA in µm²), while the engine's PowerMonitor forms its
+# Poynting sum with the SI grid spacing (dA in m²; the engine's internal
 # units are SI). The "power" readout multiplies by this ONCE, as the last
 # operation, so the returned modal power is FLUX-COMMENSURATE: mode_power /
 # PowerMonitor on the same plane is the modal power fraction (O(1), ~the modal
@@ -210,7 +210,7 @@ def _colocate_to_node(a: np.ndarray, axis: int) -> np.ndarray:
     ~0 at the transverse boundary).
 
     The engine's DFT monitor emits each component at its own Yee node in
-    *cell-index* space (``grid.h`` ``yee_offset``: E_t1 is +½ in t1, E_t2 +½ in
+    *cell-index* space (E_t1 is +½ in t1, E_t2 +½ in
     t2, H_t1 +½ in t2, H_t2 +½ in t1), so the recorded E and H tangential
     components are physically staggered by half a cell. Combining them in the
     overlap cross-products without first interpolating each to a COMMON point is a
@@ -236,8 +236,7 @@ def resample_profile(
     1-D grids ``src_x``/``src_y``) onto the destination coordinates
     ``dst_x``/``dst_y``, zero-filled outside the source window.
 
-    Generalizes ``validation/suites/waveguide/run_waveguide.py:_resample``, numpy-only
-    (two passes of :func:`numpy.interp`, x then y). Returns a ``(dst_y.size,
+    Numpy-only resampling (two passes of :func:`numpy.interp`, x then y). Returns a ``(dst_y.size,
     dst_x.size)`` array indexed ``[iy, ix]``."""
     field = np.asarray(field, dtype=np.float64)
     src_x = np.asarray(src_x, dtype=np.float64)
@@ -528,7 +527,7 @@ def vector_modal_fields(
     # its eps raster truly was instead of assuming a centered array (the snap
     # displaces the window by up to ~a cell).
     # A GRADED-window mode carries its true node ladders (x_coords_um /
-    # y_coords_um, centre-relative — §15 nonuniform solves); prefer them over
+    # y_coords_um, centre-relative — nonuniform solves); prefer them over
     # reconstructing a uniform ladder from the scalar pitch, which would
     # misplace every node of a nonuniform raster.
     mode_xc = getattr(mode, "x_coords_um", None)
@@ -625,7 +624,7 @@ def _plane_component(
             else da.isel(f=0)
     # Drop the (singleton) normal axis and any other length-1 dims, keeping
     # t1/t2 -- INCLUDING a transverse axis that is itself length 1. On a
-    # quasi-2-D run (a 1-cell plain-periodic axis, NUMERICS.md section 1) the
+    # quasi-2-D run (a 1-cell plain-periodic axis) the
     # recorded plane is genuinely 1-D: squeezing that axis away left dims like
     # ('y',) and the readout refused the plane, which locked every modal
     # workflow out of 2-D scenes -- the same degenerate-axis family as the
@@ -669,21 +668,20 @@ def _overlap_terms(
     (``|c|² = |a_pm|²/P_mode²``) and the power readout (``|a_pm|²/P_mode``).
     ``a_pm`` is the unnormalized complex coefficient, ``P_mode`` the mode's own
     power on the plane: with the longitudinal de-stagger on, the power a unit
-    mode carries through the Yee plane, ``P_mode * cos(phi)`` (NUMERICS §18.7).
+    mode carries through the Yee plane, ``P_mode * cos(phi)``.
     See :func:`mode_transmission` for the argument schema.
 
     ``destagger_dl`` (the grid spacing along the propagation/normal axis, microns)
     enables the **longitudinal Yee de-stagger**, see :func:`mode_transmission`.
 
-    ``fold_low`` = (t1 folded, t2 folded): the in-plane axis' MIN face is a §20
-    symmetry plane (PMC/PEC fold) the plane's coordinate ladder starts ON. The
+    ``fold_low`` = (t1 folded, t2 folded): the in-plane axis' MIN face is a symmetry plane (PMC/PEC fold) the plane's coordinate ladder starts ON. The
     half-domain quadrature then weights an ON-PLANE (node-registered) sample row
     by half a cell, its cell covers only ``[0, dl/2]`` of the modeled half ,
     where :func:`_cell_widths`' end rule would extend it ``dl/2`` into the
     MIRROR half and over-count fold-antinode modes (an even mode's ~+dl/(2 w_eff)
     power inflation; a fold-node mode is untouched, the parity-asymmetric bias
     that under-read T on folded readings). Products whose components sit ½-cell
-    off the fold axis (grid.h Yee offsets) have no on-plane row and keep full
+    off the fold axis (the engine's Yee offsets) have no on-plane row and keep full
     weights, so the halving is applied per product term. Default (False, False)
     keeps every unfolded reading on the exact historical code path."""
     if axis not in _TRANSVERSE:
@@ -737,10 +735,10 @@ def _overlap_terms(
         yee_mode = getattr(use_mode, "yee_staggered", False)
 
         if colocate and not yee_mode:
-            # Yee co-location (§ _colocate_to_node): shift each staggered sim
+            # Yee co-location (see _colocate_to_node): shift each staggered sim
             # component to the cell node so the two-term overlap is 2nd-order.
             # Arrays are [i_t2, i_t1] (t1 = last axis, t2 = axis 0); offsets from
-            # grid.h yee_offset: E_t1 +½t1, E_t2 +½t2, H_t1 +½t2, H_t2 +½t1.
+            # the engine's Yee offsets: E_t1 +½t1, E_t2 +½t2, H_t1 +½t2, H_t2 +½t1.
             Es1 = _colocate_to_node(Es1, -1)
             Es2 = _colocate_to_node(Es2, 0)
             Hs1 = _colocate_to_node(Hs1, 0)
@@ -751,7 +749,7 @@ def _overlap_terms(
         # the mode rather than the line-monitor width of 1.0.
         w1 = _widths_with_grid(c1, use_mode, t1, t1, t2)   # along t1
         w2 = _widths_with_grid(c2, use_mode, t2, t1, t2)   # along t2
-        # §20 folded-domain quadrature (see the docstring): halve the first
+        # folded-domain quadrature (see the docstring): halve the first
         # sample's weight on a folded in-plane axis whose ladder starts ON the
         # symmetry plane — for NODE-registered products only. Guard on the
         # ladder actually reaching the plane (a shrunk/offset window whose
@@ -771,7 +769,7 @@ def _overlap_terms(
             # readout.
             dA_1 = dA_2 = np.outer(w2, w1)   # [i_t2, i_t1], matches field arrays
         elif yee_mode:
-            # Native Yee registration (grid.h yee_offset): the E_t1·H_t2-type
+            # Native Yee registration (the engine's Yee offsets): the E_t1·H_t2-type
             # products sit +½ ALONG t1 / node along t2 (no sample on a t1 fold);
             # the E_t2·H_t1-type products sit node along t1 / +½ along t2.
             dA_1 = np.outer(w2n, w1)         # E_t1 x H_t2 products
@@ -793,7 +791,7 @@ def _overlap_terms(
             # Full-vector mode: project with the mode's TRUE transverse H, not the
             # scalar-limit (n_eff/eta0)·(z_hat x e). This is the grid-consistent
             # "smooth readout" path.
-            # (issue #34). n_eff is intrinsic to the vector mode, so use_neff is
+            # n_eff is intrinsic to the vector mode, so use_neff is
             # not applicable here.
             m = vector_modal_fields(use_mode, c1, c2, axis=axis,
                                     direction=direction, center_um=cen,
@@ -872,13 +870,13 @@ def _overlap_terms(
             # P_mode. The Yee scheme conserves the staggered product
             # 1/2 Re sum E_k x H*_{k+1/2} dA exactly along a lossless guide
             # on ANY graded ladder (the discrete Poynting theorem; it is also
-            # what the §12 flux monitor reads), and with E and H expanded as
+            # what the flux monitor reads), and with E and H expanded as
             # above that product is (|a|^2 - |b|^2) * P_mode * cos(phi). The
             # de-staggered |a|^2 * P_mode therefore over-reads the conserved
             # flux by sec(phi) ~ 1 + (beta*dl)^2/8, a factor set by the LOCAL
             # cell: two ports in cells of different widths (any graded
             # propagation axis) read a lossless straight guide as lossy or
-            # gainy (NUMERICS §18.7). Folding cos(phi) into P_mode leaves the
+            # gainy. Folding cos(phi) into P_mode leaves the
             # normalised amplitude c = a_pm/P_mode (and |c|^2, the self-overlap
             # 1) unchanged and corrects every POWER readout: |a_pm|^2/|P_mode|
             # here and the S-matrix's c*sqrt(|P_mode|).
@@ -985,7 +983,7 @@ def mode_transmission(
     ``direction="-"`` reading, whose signed flux through the +n_hat plane is
     negative, is still a power). The ``1e-12`` converts the µm² area element of
     the overlap quadrature to m², making the value **flux-commensurate**: it
-    carries the same §12 source-spectrum normalization AND the same SI area
+    carries the same source-spectrum normalization AND the same SI area
     element as a ``PowerMonitor``, so ``mode_power / flux`` on one plane is the
     modal power fraction (~1 for a clean guide). (Before 2026-08 the µm² element
     was returned unconverted, a ~1e12 unit mismatch against flux.) Use
@@ -1054,8 +1052,7 @@ def mode_transmission(
         conserves along a lossless guide, which the de-staggered ``|c|^2 *
         P_mode`` over-read by ``sec(phi)``. So ``power=True`` readings of two
         planes in cells of different widths (a graded propagation axis) or in
-        modes of different ``n_eff`` ratio to the conserved power (NUMERICS
-        §18.7); ``T`` (``|c|^2``) is unchanged. ``None`` (default) = off, so
+        modes of different ``n_eff`` ratio to the conserved power; ``T`` (``|c|^2``) is unchanged. ``None`` (default) = off, so
         synthetic already-co-located fields and the legacy readout are
         unchanged. Pass the plane's own cell width along the normal (a
         :class:`~photonhub.analysis.mode_devices.ModeMonitor` carries it as

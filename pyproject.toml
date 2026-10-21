@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "photonhub"
-version = "0.1.5"
+version = "0.1.6"
 description = "Python client for the PhotonHub GPU FDTD photonics solver"
 readme = "README.md"
 # 3.11 floor: the floor CI exercises is 3.12, and on 3.10 the resolver falls
@@ -41,6 +41,7 @@ Repository = "https://github.com/Leapfield/photonhub-sdk"
 [project.optional-dependencies]
 test = [
     "pytest",
+    "pytest-xdist>=3.2",  # the local gate runs with -n auto --dist worksteal (3.2 added worksteal)
     "ruff>=0.16,<0.17",   # the gallery format gate runs ruff format; a new style release would restyle
     "fastapi",
     "uvicorn",
@@ -62,6 +63,7 @@ replicate = ["pyyaml"]                       # PaperSpec.from_yaml parses the YA
 gds = ["gdstk"]                              # import/export GDSII
 hdf5 = ["h5py"]                              # RunResult HDF5 export
 notebook = ["nbformat"]                       # paper-replication tutorials
+gdsfactory = ["gdsfactory>=9,<10"]           # photonhub.integrations.gdsfactory: layout Component in, S-matrix out
 
 [project.scripts]
 photonhub = "photonhub._cli:main"
@@ -90,3 +92,4 @@ testpaths = ["tests"]
 "tests/test_gpu_jobs_hotaisle.py" = ["F811"]
 "tests/test_gpu_jobs_heartbeat.py" = ["F811"]
 "tests/test_gpu_jobs_devcloud.py" = ["F811"]
+"tests/test_gpu_jobs_gpu_model.py" = ["F811"]

@@ -51,13 +51,15 @@ What's not handled (deferred, matching :mod:`.smatrix`)
 from __future__ import annotations
 
 import math
+import re
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import (Any, Callable, Dict, List, Mapping, Optional, Sequence,
+from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Sequence,
                     Tuple, Union)
 
 import numpy as np
+import xarray as xr
 
 from ..viz import _geometry as _geom
 from ..components.source_time import GaussianPulse, SourceTimeType
@@ -69,11 +71,15 @@ from .yee_mode import solve_yee_mode_bank
 from ._constants import C0 as _C0
 from .._compat import caller_stacklevel
 
+if TYPE_CHECKING:
+    from .compact_model import SMatrixModel
+
 __all__ = [
     "SMatrixPort",
     "SMatrixPlan",
     "SMatrixResult",
     "plan_smatrix",
+    "read_touchstone",
     "run_smatrix",
     "write_touchstone",
 ]
@@ -119,8 +125,7 @@ class SMatrixPort:
     source_offset_um:
         Distance from the port plane to the drive's launch plane, measured
         toward the wall (``out_direction``). ``None`` = a third of a
-        wavelength in the background, the standoff the declarative ports take
-        (NUMERICS §18.6).
+        wavelength in the background, the standoff the declarative ports take.
     supersample / num_modes:
         Forwarded to the Yee mode solve (eigensolver frame controls).
     """
@@ -231,6 +236,7 @@ class SMatrixResult:
     data: Mapping[str, Any]
     errors: Mapping[str, Exception]
     simulations: Mapping[str, Any]
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def sij(self, port_out: str, port_in: str):
         """``S_ij(f)`` as a 1-D complex xarray slice."""
@@ -259,9 +265,23 @@ class SMatrixResult:
         return is_passive(self.S, atol=atol)
 
     def to_touchstone(self, path, **kwargs) -> Path:
-        """Write the matrix as a Touchstone v1 ``.sNp`` file, see
+        """Write the matrix as a Touchstone file, see
         :func:`write_touchstone`."""
-        return write_touchstone(self.S, path, **kwargs)
+        options = dict(kwargs)
+        options["metadata"] = {**self.metadata, **(options.get("metadata") or {})}
+        return write_touchstone(self.S, path, **options)
+
+    def to_model(self, **kwargs) -> SMatrixModel:
+        """Build a checked wavelength-interpolated S-matrix model."""
+        from .compact_model import smatrix_model
+
+        options = dict(kwargs)
+        options["metadata"] = {**self.metadata, **(options.get("metadata") or {})}
+        return smatrix_model(self.S, **options)
+
+    def to_json(self, path, **kwargs) -> Path:
+        """Write the S-matrix as a JSON compact model."""
+        return self.to_model(**kwargs).to_json(path)
 
     def summary(self) -> str:
         """Human-readable per-frequency |S|^2 table + the two checks."""
@@ -323,7 +343,7 @@ class SMatrixPlan:
             :class:`~photonhub.runners.batch.Batch` (``path_dir`` /
             ``max_workers`` / ``solver_path`` / ``timeout`` / ``progress``
             forwarded); ``"cloud"`` (or the deprecated ``"web"``) submits via ``ph.cloud.Batch``
-            (``max_workers`` and extra kwargs such as ``device=`` forwarded;
+            (``max_workers`` and extra kwargs such as ``device=`` and ``solver=`` forwarded;
             ``path_dir`` is not a web concept and must be None). Any other
             callable is invoked as ``runner(simulations_dict)`` and must
             return a mapping ``driven-port name -> RunResult`` (or any
@@ -396,7 +416,7 @@ def _as_smatrix_port(port, simulation, freqs_hz, source_time) -> SMatrixPort:
     wlen0_um = _C0 / f_c * 1e6
     out_dir = _decl.infer_out_direction(simulation, port)
     n_bg = math.sqrt(float(simulation.background.permittivity))
-    # the port-window rule at the longest wavelength read (NUMERICS §18.8),
+    # the port-window rule at the longest wavelength read,
     # from the effective-index estimate: no mode solve here
     half_w, half_v = _decl.default_window(port, wlen0_um, n_bg, shell=simulation,
                                           wlen_max_um=_C0 / min(freqs) * 1e6)
@@ -520,7 +540,7 @@ def plan_smatrix(
     extra = tuple(simulation.monitors) if keep_monitors else ()
 
     # --- one driven simulation per port -------------------------------------
-    # The launch standoff is a LENGTH, never a cell count (NUMERICS 18.6): the
+    # The launch standoff is a LENGTH, never a cell count: the
     # same wavelength-derived default the declarative ports take.
     from ..components import declarative as _decl
 
@@ -600,8 +620,13 @@ def write_touchstone(
     *,
     z0: float = 50.0,
     comments: Sequence[str] = (),
+    version: int = 1,
+    metadata: Optional[Mapping[str, Any]] = None,
+    strict: bool = False,
+    passivity_atol: float = 1e-3,
+    reciprocity_atol: float = 1e-3,
 ) -> Path:
-    """Write an assembled S-matrix as a Touchstone v1 ``.sNp`` file.
+    """Write an assembled S-matrix as a Touchstone file.
 
     ``S`` is the :class:`xarray.DataArray` from
     :func:`~photonhub.analysis.smatrix.assemble_smatrix` /
@@ -612,64 +637,86 @@ def write_touchstone(
     these modal wave amplitudes, power waves are already normalized so
     ``|S_ij|^2`` is a power ratio).
 
-    Layout follows the v1 spec: 1-port and 3+-port matrices in row-major
+    Version 1 layout follows the v1 spec: 1-port and 3+-port matrices in row-major
     (``port_out``-major) order with at most four S-pairs per line and each
     matrix row starting a new line; the 2-port special column-major order
     ``S11 S21 S12 S22`` on one line. NaN entries (an unassembled partial
     matrix) are rejected.
 
-    The file extension is forced to the port count: ``device`` or
-    ``device.s3p`` for a 3-port; a MISMATCHED explicit suffix raises (readers
-    key the port count on it).
+    Version 1's file extension is forced to the port count: ``device`` or
+    ``device.s3p`` for a 3-port; a mismatched suffix raises. Version 2 uses
+    ``.ts`` by default and records port count in its header. Failed checks
+    warn and are recorded, or raise before writing when ``strict=True``.
+    Port labels, comments and metadata must contain ASCII text.
     """
-    Sd = S.transpose("port_out", "port_in", "f")
-    out_labels = [str(v) for v in Sd.coords["port_out"].values]
-    in_labels = [str(v) for v in Sd.coords["port_in"].values]
-    if out_labels != in_labels:
-        raise ValueError(
-            "port_out and port_in labels differ — assemble with a common "
-            f"port_order (got {out_labels} vs {in_labels})")
-    n = len(out_labels)
-    if n == 0:
-        raise ValueError("S carries no ports")
+    from .compact_model import PROVENANCE_NOTE, _prepare_smatrix, _writer_checks
+    from photonhub import __version__
 
-    freqs = np.asarray(Sd.coords["f"].values, dtype=np.float64)
-    order = np.argsort(freqs)
-    freqs = freqs[order]
-    arr = np.asarray(Sd.values)[:, :, order]
-    if not np.all(np.isfinite(arr)):
-        bad = int(np.size(arr) - np.count_nonzero(np.isfinite(arr)))
-        raise ValueError(
-            f"S contains {bad} non-finite entries (undriven ports / failed "
-            "drives?) — Touchstone needs the complete matrix")
+    if version not in (1, 2):
+        raise ValueError("Touchstone version must be 1 or 2")
+    out_labels, freqs, arr = _prepare_smatrix(S)
+    n = len(out_labels)
     if not (z0 > 0.0 and math.isfinite(z0)):
         raise ValueError(f"z0 must be a positive finite resistance, got {z0}")
 
     path = Path(path)
     expected = f".s{n}p"
     if path.suffix == "":
-        path = path.with_suffix(expected)
-    elif path.suffix.lower() != expected:
+        path = path.with_suffix(expected if version == 1 else ".ts")
+    elif (path.suffix.lower() != expected if version == 1
+          else path.suffix.lower() not in (expected, ".ts")):
         raise ValueError(
             f"{path.name!r} does not match the {n}-port Touchstone extension "
-            f"{expected!r} (readers key the port count on it); drop the "
-            "suffix or use the matching one")
+            f"{expected!r} or the version 2 extension '.ts'")
+
+    checks = _writer_checks(arr.transpose(2, 0, 1), strict=strict,
+                            passivity_atol=passivity_atol,
+                            reciprocity_atol=reciprocity_atol)
+    if any(not isinstance(key, str) for key in (metadata or {})):
+        raise ValueError("metadata keys must be strings")
+
+    def ascii_text(value: str, source: str) -> str:
+        try:
+            value.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError(f"Touchstone {source} must contain only ASCII text") from exc
+        return value
 
     def pair(v: complex) -> str:
         return f"{v.real:.12e} {v.imag:.12e}"
 
     lines: List[str] = []
     lines.append(f"! {n}-port S-parameters (PhotonHub photonic modal ports)")
+    lines.append(f"! photonhub_version: {__version__}")
+    lines.append(f"! checks: {checks.summary()}")
+    lines.append(f"! note: {PROVENANCE_NOTE}")
     for k, label in enumerate(out_labels, start=1):
-        lines.append(f"! port {k} = {label}")
+        lines.append(f"! port {k} = {ascii_text(label, f'port label {label!r}')}")
+    for key, value in sorted((metadata or {}).items()):
+        ascii_text(key, f"metadata entry {key!r}")
+        value_text = ascii_text(str(value), f"metadata entry {key!r}")
+        for piece in value_text.splitlines() or [""]:
+            lines.append(f"! {key}: {piece}")
     for c in comments:
-        for piece in str(c).splitlines():
+        for piece in ascii_text(str(c), f"comment {c!r}").splitlines():
             lines.append(f"! {piece}")
+    if version == 2:
+        lines.append("[Version] 2.0")
     lines.append(f"# Hz S RI R {z0:g}")
+    if version == 2:
+        lines.append(f"[Number of Ports] {n}")
+        if n == 2:
+            lines.append("[Two-Port Data Order] 12_21")
+        lines.extend((f"[Number of Frequencies] {len(freqs)}",
+                      "[Matrix Format] Full", "[Network Data]"))
 
     for kf, f in enumerate(freqs):
         Sf = arr[:, :, kf]
-        if n == 1:
+        if version == 2:
+            for i in range(n):
+                row = " ".join(pair(Sf[i, j]) for j in range(n))
+                lines.append((f"{f:.12e} " if i == 0 else "  ") + row)
+        elif n == 1:
             lines.append(f"{f:.12e} {pair(Sf[0, 0])}")
         elif n == 2:
             # v1 2-port special order: S11 S21 S12 S22 on one line.
@@ -687,6 +734,163 @@ def write_touchstone(
                     else:
                         lines.append(f"  {chunk}")
 
+    if version == 2:
+        lines.append("[End]")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="ascii")
     return path
+
+
+def read_touchstone(path) -> xr.DataArray:
+    """Read a Touchstone v1 or v2 S-parameter file.
+
+    Parameters
+    ----------
+    path:
+        Touchstone ``.sNp`` or ``.ts`` file. RI, MA and DB data and Hz, kHz,
+        MHz and GHz frequencies are accepted. Version 2 noise data is ignored.
+
+    Returns
+    -------
+    xarray.DataArray
+        Complex matrix with dimensions ``(port_out, port_in, f)`` and frequency
+        coordinates in Hz.
+    """
+    path = Path(path)
+    raw = path.read_text(encoding="utf-8").splitlines()
+    comments: List[str] = []
+    labels: Dict[int, str] = {}
+    keywords: Dict[str, str] = {}
+    tokens: List[str] = []
+    option = None
+    in_data = False
+    network_data_seen = False
+    version = 1
+    for line in raw:
+        body, sep, comment = line.partition("!")
+        if sep:
+            comment = comment.lstrip()
+            comments.append(comment)
+            match = re.fullmatch(r"port\s+(\d+)\s*=\s*(.*)", comment)
+            if match:
+                labels.setdefault(int(match.group(1)), match.group(2))
+        body = body.strip()
+        if not body:
+            continue
+        if body.startswith("#"):
+            option = body[1:].split()
+            continue
+        keyword = re.fullmatch(r"\[([^]]+)\]\s*(.*)", body)
+        if keyword:
+            key = keyword.group(1).lower()
+            value = keyword.group(2).strip()
+            keywords[key] = value
+            if key == "version":
+                if value != "2.0":
+                    raise ValueError(f"unsupported Touchstone version {value}")
+                version = 2
+            if key == "network data" and not network_data_seen:
+                in_data = True
+                network_data_seen = True
+            elif network_data_seen:
+                in_data = False
+            continue
+        if version == 1 or in_data:
+            tokens.extend(body.split())
+
+    unit, parameter, fmt, z0 = "GHZ", "S", "MA", 50.0
+    if option:
+        remaining = [v.upper() for v in option]
+        if "R" in remaining:
+            idx = remaining.index("R")
+            if idx + 1 >= len(option):
+                raise ValueError("Touchstone R option lacks z0")
+            if idx + 2 != len(option):
+                raise ValueError(f"unsupported Touchstone option after R z0: {option[idx + 2]}")
+            z0 = float(option[idx + 1])
+            remaining = remaining[:idx]
+        if remaining and remaining[0] in ("HZ", "KHZ", "MHZ", "GHZ"):
+            unit = remaining.pop(0)
+        if remaining and remaining[0] in ("S", "Y", "Z", "H", "G"):
+            parameter = remaining.pop(0)
+        if remaining and remaining[0] in ("RI", "MA", "DB"):
+            fmt = remaining.pop(0)
+        if remaining:
+            raise ValueError(f"unsupported Touchstone option {remaining[0]}")
+    if parameter != "S":
+        raise ValueError(f"Touchstone parameter {parameter} is not S")
+    scale = {"HZ": 1.0, "KHZ": 1e3, "MHZ": 1e6, "GHZ": 1e9}.get(unit)
+    if scale is None:
+        raise ValueError(f"unsupported Touchstone frequency unit {unit}")
+    if fmt not in ("RI", "MA", "DB"):
+        raise ValueError(f"unsupported Touchstone data format {fmt}")
+    if version == 2:
+        try:
+            n = int(keywords["number of ports"])
+        except (KeyError, ValueError) as exc:
+            raise ValueError("Touchstone 2.0 needs [Number of Ports]") from exc
+        matrix_format = keywords.get("matrix format", "Full")
+        if matrix_format.lower() != "full":
+            raise ValueError(f"unsupported [Matrix Format] {matrix_format}")
+        two_port_order = keywords.get("two-port data order", "21_12")
+        if n == 2 and two_port_order not in ("12_21", "21_12"):
+            raise ValueError(f"unsupported [Two-Port Data Order] {two_port_order}")
+    else:
+        suffix = re.fullmatch(r"\.s(\d+)p", path.suffix.lower())
+        if suffix is None:
+            raise ValueError("Touchstone v1 needs a .sNp extension")
+        n = int(suffix.group(1))
+        two_port_order = "21_12"
+    if n <= 0:
+        raise ValueError("Touchstone port count must be positive")
+    stride = 1 + 2 * n * n
+    if len(tokens) % stride:
+        raise ValueError("Touchstone network data has incomplete frequency records")
+    nf = len(tokens) // stride
+    if version == 2 and "number of frequencies" in keywords:
+        if nf != int(keywords["number of frequencies"]):
+            raise ValueError("[Number of Frequencies] differs from network data")
+    freqs = np.empty(nf, dtype=np.float64)
+    arr = np.empty((n, n, nf), dtype=np.complex128)
+    for k in range(nf):
+        offset = k * stride
+        freqs[k] = float(tokens[offset]) * scale
+        pairs = []
+        for p in range(n * n):
+            a = float(tokens[offset + 1 + 2 * p])
+            b = float(tokens[offset + 2 + 2 * p])
+            if fmt == "RI":
+                value = complex(a, b)
+            else:
+                magnitude = a if fmt == "MA" else 10 ** (a / 20)
+                value = magnitude * np.exp(1j * np.deg2rad(b))
+            pairs.append(value)
+        if n == 2 and two_port_order == "21_12":
+            arr[:, :, k] = np.array(pairs)[[0, 2, 1, 3]].reshape(2, 2)
+        else:
+            arr[:, :, k] = np.array(pairs).reshape(n, n)
+    port_names = ([labels[k] for k in range(1, n + 1)]
+                  if all(k in labels for k in range(1, n + 1))
+                  else [str(k) for k in range(1, n + 1)])
+    attrs: Dict[str, Any] = {"version": version, "z0": z0,
+                             "comments": comments}
+    check_line = next((c[len("checks: "):] for c in comments
+                       if c.startswith("checks: ")), None)
+    if check_line is not None:
+        pattern = (r"passivity_violation=([+\-\d.eE]+) \(atol ([+\-\d.eE]+), "
+                   r"(pass|FAIL)\); reciprocity_error=([+\-\d.eE]+) "
+                   r"\(atol ([+\-\d.eE]+), (pass|FAIL)\)")
+        match = re.fullmatch(pattern, check_line)
+        if match:
+            attrs["checks"] = {
+                "passivity_violation": float(match.group(1)),
+                "passivity_atol": float(match.group(2)),
+                "passive": match.group(3) == "pass",
+                "reciprocity_error": float(match.group(4)),
+                "reciprocity_atol": float(match.group(5)),
+                "reciprocal": match.group(6) == "pass",
+                "num_freqs": nf,
+            }
+    return xr.DataArray(arr, dims=("port_out", "port_in", "f"),
+                        coords={"port_out": port_names, "port_in": port_names,
+                                "f": freqs}, attrs=attrs)

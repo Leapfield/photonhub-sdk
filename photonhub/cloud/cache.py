@@ -10,7 +10,7 @@ Beside those result directories the client also keeps the wire spec it
 submitted under each job id (:func:`store_spec`). ``ph.cloud.resume`` is handed
 an id and nothing else, so without it the reader cannot know the simulation and
 leaves every frequency-domain array on the engine's per-unit-amplitude
-normalization (NUMERICS.md section 12) while the submitting call returns
+normalization while the submitting call returns
 absolute watts and V/m for the same paid job.
 """
 

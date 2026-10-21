@@ -1,5 +1,4 @@
-"""Advisory monitor checks (spec: docs/superpowers/specs/
-2026-07-29-results-viz-monitor-checks-design.md).
+"""Advisory monitor checks.
 
 Two pure entry points, both returning ``{"findings": [...], "counts": ...}``:
 

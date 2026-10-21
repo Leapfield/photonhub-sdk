@@ -1,8 +1,8 @@
 """Shared physical constants (and the Yee tangential-component table) for the
 plugin stack.
 
-The ENGINE is the source of truth: the values here match
-``engine/include/phcore/types.h`` (``kC0`` exact SI, ``kMu0`` CODATA 2018,
+The ENGINE is the source of truth: the values here match the
+solver's own constants (``kC0`` exact SI, ``kMu0`` CODATA 2018,
 ``kEps0 = 1/(kMu0 kC0^2)``). Every plugin imports from this module instead of
 re-declaring its own copies, so the constants cannot drift between plugins (or
 against the engine) again — ``yee_mode`` once carried the pre-2019
@@ -23,13 +23,13 @@ C0: float = c0
 def engine_dt_s(dl_um: float, courant: float = 0.99,
                 active_axes: int = 3) -> float:
     """The engine's timestep (seconds): ``dt = courant * dl /
-    (C0 * sqrt(active_axes))`` — the Courant formula of
-    ``engine/src/core/resolve.cpp`` (NUMERICS §2). ``courant`` is
+    (C0 * sqrt(active_axes))`` — the solver's Courant
+    formula. ``courant`` is
     ``RunSpec.courant`` (user-settable, default 0.99); client code that phases
     anything against the engine clock must call THIS with the simulation's
     actual courant rather than re-deriving the formula, or a non-default
     courant silently de-tunes it. ``active_axes`` is the number of axes with
-    more than one cell (NUMERICS §2): a quasi-2D run — one 1-cell plain
+    more than one cell: a quasi-2D run — one 1-cell plain
     periodic axis — steps at ``sqrt(2)``, so shape-aware callers must pass 2
     there or the phase (and any ``omega*dt`` stability estimate) is off by
     ``sqrt(3/2)``."""

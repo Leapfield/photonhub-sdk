@@ -1,6 +1,5 @@
 """Optical material library, literature dispersion models that emit
-:class:`~photonhub.Medium` objects (NUMERICS.md §19; the "material library"
-deferred there).
+:class:`~photonhub.Medium` objects with Lorentz and Drude poles.
 
 Each :class:`Material` bundles a refractive-index model taken verbatim from
 the published literature (Sellmeier / polynomial coefficients or tabulated
@@ -11,9 +10,9 @@ converts it to what the engine can run:
   one wavelength: ``permittivity = n^2 - k^2`` and any absorption mapped to
   the Ohmic conductivity (exact at that frequency).
 - ``mat.medium(band_um=(1.5, 1.6))``, a dispersive ``Medium`` carrying the
-  engine's SINGLE scalar Lorentz pole (§19), least-squares fitted to the
+  engine's SINGLE scalar Lorentz pole, least-squares fitted to the
   literature curve over the band. The fit follows the Courant-safe recipe
-  proven for c-Si in ``validation/suites/gds`` (PR #55/#57): the pole is placed near
+  proven for c-Si in the GDS benchmark suite: the pole is placed near
   the band, NOT at the material's physical UV resonance, so ``eps_inf``
   stays well above 1 (a near-UV pole drives ``eps_inf -> 1``, which sits on
   the Courant edge and diverges). Use :meth:`Material.lorentz_fit` for the
@@ -50,8 +49,7 @@ reproduced verbatim and the original papers are cited on each entry.
 Accuracy note (dispersive media): a dispersive structure makes ``Simulation``
 default subpixel smoothing OFF, and correctly so, subpixel smoothing x the
 Lorentz-ADE update is a LIVE late-time instability at fine grids
-(engine/docs/subpixel-dispersion-instability.md; reconfirmed 2026-07-02 on a
-current build: a 25 c/lambda dispersive-Si scene diverges with Volume
+(reconfirmed 2026-07-02 on a current build: a 25 c/lambda dispersive-Si scene diverges with Volume
 smoothing, and reducing the Courant number does not reliably cure it). So the
 way to sharpen a dispersive interface is grid alignment / a finer uniform grid
 (which resolves the geometry without smoothing), NOT ``subpixel=True``. Turning
@@ -117,8 +115,8 @@ def _freq_hz(wavelength_um: np.ndarray) -> np.ndarray:
 
 def _ade_nyquist_eps(eps_inf: float, lorentz: Sequence[Tuple[float, float]],
                      drude_hz: Sequence[float], dt: float) -> float:
-    """The lossless discrete permittivity at the time-step Nyquist
-    (NUMERICS.md §19.4): ``eps_inf - sum_L delta_eps*x/(1-x) -
+    """The lossless discrete permittivity at the time-step Nyquist:
+    ``eps_inf - sum_L delta_eps*x/(1-x) -
     sum_D (wp*dt/2)^2`` with ``x = (omega0*dt/2)^2``. ``lorentz`` holds
     ``(resonance_frequency_hz, delta_eps)`` pairs, ``drude_hz`` plasma
     frequencies. ``-inf`` once a pole reaches ``omega0*dt >= 2``."""
@@ -136,7 +134,7 @@ def _ade_nyquist_eps(eps_inf: float, lorentz: Sequence[Tuple[float, float]],
 def _ade_max_dl_um(eps_inf: float, lorentz: Sequence[Tuple[float, float]],
                    drude_hz: Sequence[float], courant: float,
                    active_axes: int = 3) -> float:
-    """The coarsest uniform spacing (µm) meeting the §19.4 discrete-Nyquist
+    """The coarsest uniform spacing (µm) meeting the discrete-Nyquist
     bound ``eps_nyq(dt) >= courant^2`` at the engine timestep ``dt =
     courant*dl / (c0*sqrt(active_axes))`` (``active_axes`` 2 for a quasi-2-D
     run with one 1-cell periodic axis). ``eps_nyq`` falls monotonically with
@@ -350,10 +348,9 @@ class LorentzFit:
         ``dl_um`` (µm) with the engine's 3-D Courant timestep
         ``dt = courant * dl / (c0 * sqrt(3))``. ``omega0 * dt < 2`` is only
         the pole's own bound; the binding ADE rule is the discrete-Nyquist
-        inequality of NUMERICS.md §19.4 (``eps_inf - delta_eps*x/(1-x) >=
+        inequality (``eps_inf - delta_eps*x/(1-x) >=
         courant^2``, ``x = (omega0*dt/2)^2``), which :meth:`max_dl_um`
-        applies. NB: a quasi-2D run (one 1-cell plain periodic axis,
-        NUMERICS §1/§2) steps sqrt(3/2) LARGER than this 3-D estimate:
+        applies. NB: a quasi-2D run (one 1-cell plain periodic axis) steps sqrt(3/2) LARGER than this 3-D estimate:
         ``validate()`` remains authoritative there."""
         if self.resonance_frequency_hz is None:
             return 0.0
@@ -365,8 +362,7 @@ class LorentzFit:
             * engine_dt_s(dl_um, courant)
 
     def max_dl_um(self, courant: float = 0.99, active_axes: int = 3) -> float:
-        """The coarsest uniform grid spacing (µm) that meets the §19.4
-        discrete-Nyquist ADE bound ``eps_inf - delta_eps*x/(1-x) >=
+        """The coarsest uniform grid spacing (µm) that meets the discrete-Nyquist ADE bound ``eps_inf - delta_eps*x/(1-x) >=
         courant^2`` (``x = (omega0*dt/2)^2``), which implies
         ``omega0 * dt < 2``. ``active_axes`` is the number of axes with more
         than one cell (2 for quasi-2-D, whose timestep is sqrt(3/2) larger).
@@ -422,7 +418,7 @@ class PoleFit:
     def omega0_dt(self, dl_um: float, courant: float = 0.99) -> float:
         """The largest ``omega0 * dt`` over the fitted Lorentz poles at grid
         spacing ``dl_um``. ``omega0 * dt < 2`` is only each pole's own bound;
-        the binding ADE rule is the §19.4 discrete-Nyquist inequality over
+        the binding ADE rule is the discrete-Nyquist inequality over
         ALL poles, Drude included, which :meth:`max_dl_um` applies. Uses the
         3-D Courant dt; a quasi-2D run steps sqrt(3/2) larger
         (``validate()`` is authoritative)."""
@@ -433,8 +429,7 @@ class PoleFit:
         return 2.0 * math.pi * f_max * dt
 
     def max_dl_um(self, courant: float = 0.99, active_axes: int = 3) -> float:
-        """The coarsest uniform grid spacing (µm) that meets the §19.4
-        discrete-Nyquist ADE bound ``eps_inf - sum_L delta_eps*x/(1-x) -
+        """The coarsest uniform grid spacing (µm) that meets the discrete-Nyquist ADE bound ``eps_inf - sum_L delta_eps*x/(1-x) -
         sum_D (wp*dt/2)^2 >= courant^2`` (``x = (omega0*dt/2)^2``).
         ``active_axes`` is the number of axes with more than one cell (2 for
         quasi-2-D, whose timestep is sqrt(3/2) larger). A fit with
@@ -586,7 +581,7 @@ class Material:
         is scanned on both sides of the band (a pole INSIDE the band is a
         singularity) and the best feasible fit wins, with near-ties broken
         toward the longest pole wavelength (lowest ``omega0``, the largest
-        ADE stability margin, §19.4). Feasibility enforces the wire bound
+        ADE stability margin). Feasibility enforces the wire bound
         ``eps_inf >= 1``, passivity ``delta_eps >= 0``, and
         ``n_inf >= min_n_inf_ratio * min(n_band)``, the Courant-edge guard
         learned from the c-Si benchmark work (an unconstrained near-UV pole
@@ -752,7 +747,7 @@ class Material:
         Where :meth:`lorentz_fit` fits ``Re eps`` with ONE lossless pole and
         moves absorption into a band-centre Ohmic sigma, this fits real AND
         imaginary parts together with damped poles (passivity enforced through
-        the §19.1 bounds: ``delta_eps >= 0``, ``gamma >= 0``, ``wp > 0``).
+        the bounds: ``delta_eps >= 0``, ``gamma >= 0``, ``wp > 0``).
         Deterministic multi-start least squares (log-spaced pole ladders on
         both sides of the band; no RNG). Raises when the request exceeds the
         engine's pole budget or scipy is unavailable.
@@ -769,7 +764,7 @@ class Material:
         if n_total > MAX_ADE_POLES:
             raise ValueError(
                 f"{n_total} poles exceed the engine budget of "
-                f"{MAX_ADE_POLES} (NUMERICS.md §19)")
+                f"{MAX_ADE_POLES}")
         lo, hi = float(band_um[0]), float(band_um[1])
         if not (0.0 < lo < hi):
             raise ValueError(f"invalid band_um {band_um}")
@@ -933,7 +928,7 @@ Vacuum = Material(
     comments="n = 1; dry air differs by ~3e-4 (use vacuum for air cladding)",
 )
 
-# H. H. Li, J. Phys. Chem. Ref. Data 9, 561-658 (1993 review), 293 K —
+# H. H. Li, J. Phys. Chem. Ref. Data 9, 561-658 (1980), 293 K:
 # tabulated n, transparent range (the same source the gds benchmark's
 # dispersive-Si pole is anchored to).
 Si = Material(
@@ -955,7 +950,7 @@ Si = Material(
     ),
     valid_range_um=(1.2, 14.0),
     reference=(
-        "H. H. Li, J. Phys. Chem. Ref. Data 9, 561-658 (1993), 293 K, "
+        "H. H. Li, J. Phys. Chem. Ref. Data 9, 561-658 (1980), 293 K, "
         "doi:10.1063/1.555624"
     ),
     comments="crystalline silicon, transparent range (tabulated n, k ~ 0)",

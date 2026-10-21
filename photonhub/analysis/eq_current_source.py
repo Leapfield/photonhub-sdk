@@ -1,6 +1,6 @@
 """source-current (Huygens) mode source, per-cell phased-dipole source planes.
 
-Replaces the §18 single-scalar-aux-carrier mode launch with the textbook
+Replaces the single-scalar-aux-carrier mode launch with the textbook
 source-current pair built from the engine's own discrete Yee eigenmode
 (:func:`~photonhub.analysis.yee_mode.solve_yee_mode`):
 
@@ -13,18 +13,17 @@ Every dipole carries the mode's per-cell **complex** field value: amplitude from
 cannot represent, the half-cell spatial phase e^{iβ·dl/2} between the E and H
 planes, and the half-step temporal phase e^{iω·dt/2} (the engine samples both
 dipole types at (s+½)·dt while the J source plane acts at the E time level). This is the
-per-cell discrete Huygens construction proven clean in
-``docs/investigations/2026-06-30-launch-fidelity/slab3d_fdtd.py`` (shed vanishing with resolution),
-translated onto engine dipole conventions (NUMERICS §§ dipoles: E −= (dt/ε)·A·g,
+per-cell discrete Huygens construction, whose shed field vanishes with
+resolution, translated onto the engine's dipole conventions (dipoles: E −= (dt/ε)·A·g,
 H −= (dt/μ0)·A·g, g = env·cos(2πf0(t−t0)+phase)).
 
-Measured vs the §18 aux-line launch (straight Si strip, GPU):
-flux loss 0.44→0.09 % @20 nm (and FALLING with resolution where §18 floors),
+Measured vs the aux-line launch (straight Si strip, GPU):
+flux loss 0.44→0.09 % @20 nm (and FALLING with resolution where the aux-line launch floors),
 backward 0.20→0.003 %, near-source p_in placement wobble 0.24→0.11 %.
 
 The trade: a cloud of ~10–40 k point dipoles instead of one ModeSource (linear
 per-step cost, negligible next to the curl updates) and a frozen single-frequency
-profile (like a single-frequency mode source; the §18 broadband carriers remain the
+profile (like a single-frequency mode source; the broadband carriers remain the
 tool for wide-band launches).
 """
 from __future__ import annotations
@@ -35,6 +34,8 @@ from typing import List, Mapping, Optional, Tuple
 import numpy as np
 
 from ..components import PointDipole
+# the band test of Simulation.check_runnable: the clip must keep what it keeps
+from ..components.simulation import _BAND_EDGE_TOL_UM
 from ..viz import _geometry as _geom
 from ._constants import C0 as _C0, engine_dt_s
 
@@ -59,7 +60,7 @@ def _launched_power(mode, dl_um: float, wh_um=None, wv_um=None,
     ``None`` or all-true masks keep every historical expression bit-identically.
 
     ``fold_low`` = (h folded, v folded): the window's MIN face on that in-plane
-    axis sits ON a §20 symmetry plane (``window_nodes``' ``h_bc``/``v_bc`` is
+    axis sits ON a symmetry plane (``window_nodes``' ``h_bc``/``v_bc`` is
     ``"pec"``/``"pmc"``; a ``"periodic"`` window is the whole period, never
     folded).
     The half-domain power integral then weights an ON-PLANE node row by half a
@@ -110,15 +111,16 @@ def _launched_power(mode, dl_um: float, wh_um=None, wv_um=None,
 
 
 # Largest fraction of a sheet's peak amplitude allowed to sit inside a
-# PML/absorber band on a TRANSVERSE axis. Every practical window truncates some
-# exponential tail against the domain wall — a 3-sigma Gaussian window edge is
-# ~1e-4 of peak, and the committed benchmark frames (edge-coupler uniform,
-# practical case 1) reach ~2e-2 where the window is clipped to the domain —
-# all physically negligible. The failure this rejects is a WINDOW SIZED INTO
-# the absorber (the 08-14 edge-coupler auto15 frame put 30 % of the beam's
-# peak amplitude inside the transverse PML, sized for 20*dl instead of 20
-# LOCAL cells): the run completes and reports silently wrong power/profile.
+# PML/absorber band on a TRANSVERSE axis when the sheet is BUILT. It only
+# decides which windows fail here, at build time, with a window-specific
+# message: a sheet with any dipole in the band is still refused when it is
+# run (Simulation.check_runnable) unless the caller opts in
+# with allow_sources_in_boundary=True. The failure this rejects at once is a
+# WINDOW SIZED INTO the absorber (the 08-14 edge-coupler auto15 frame put 30 %
+# of the beam's peak amplitude inside the transverse PML, sized for 20*dl
+# instead of 20 LOCAL cells).
 _ABSORBER_AMPLITUDE_TOL = 0.05
+
 
 
 def _absorbing_interval(sim, axis_index: int):
@@ -180,7 +182,7 @@ def _reject_absorber_overlap(sim, dips, *, a: int, ih_ax: int, iv_ax: int,
         lo, hi, boundary = span
         worst, count = 0.0, 0
         for d in dips:
-            # In-band means STRICTLY beyond an interval edge: a §20-folded
+            # In-band means STRICTLY beyond an interval edge: a symmetry-folded
             # axis has lo = 0.0 with no lower band at all, and its on-plane
             # dipole row sits exactly AT 0.0 (it can carry the beam's peak);
             # a window edge exactly ON the first absorber node is likewise
@@ -202,9 +204,10 @@ def _reject_absorber_overlap(sim, dips, *, a: int, ih_ax: int, iv_ax: int,
             "with significant amplitude — the launch would be silently wrong "
             "(the band is carved from realized LOCAL cells, so on a graded "
             "axis it is thicker than layers*dl): " + "; ".join(problems) +
-            f". Tails at or below {_ABSORBER_AMPLITUDE_TOL:.0%} of peak are "
-            "accepted, so shrink the window (half_w_um / half_v_um / "
-            "window_sigmas), enlarge the domain, or re-center the beam.")
+            ". Shrink the window (half_w_um / half_v_um / window_sigmas), "
+            "enlarge the domain, or re-center the beam. A smaller tail in the "
+            "band builds, but the run is refused until every dipole clears "
+            "the layers.")
 
 
 def equivalence_current_source(
@@ -224,6 +227,7 @@ def equivalence_current_source(
     extra_j_phase: float = 0.0,
     _window_origin: Optional[Tuple[float, float]] = None,
     modes_by_freq: Optional[Mapping[float, object]] = None,
+    _clip_to_interior: Tuple[bool, bool] = (False, False),
 ) -> List[PointDipole]:
     """Build the phased-dipole Huygens source planes launching ``mode`` along ``axis``.
 
@@ -241,23 +245,25 @@ def equivalence_current_source(
     window is the whole period and every column is stamped, the single
     column of a one-cell (quasi-2-D) axis included. The normalization is the
     power the Yee scheme carries through the planes downstream, the continuum
-    integral times ``cos(beta*dl/2)`` of the source plane's own cell (NUMERICS §18.7),
+    integral times ``cos(beta*dl/2)`` of the source plane's own cell,
     so without symmetry a ``PowerMonitor`` or a port's ``mode_power`` downstream
-    reads ``power_watts`` back in watts. Under §20 symmetry planes this builder is
+    reads ``power_watts`` back in watts. Under symmetry planes this builder is
     the primitive: ``power_watts`` is the power into the modeled part, so a
     source plane centered on k planes launches ``2^k * power_watts`` into the whole
     device, which is what the ``PowerMonitor`` and the port report. The
     launches built on it (``mode_launch``, ``gaussian_beam_source``,
     ``import_source``, ``thin_lens_source``) take the whole device's power
-    and pass ``power_watts / 2^k`` here (NUMERICS §20.8). Dipoles with relative
-    amplitude below ``amplitude_threshold`` (or falling outside the domain)
-    are dropped.
+    and pass ``power_watts / 2^k`` here. ``amplitude_threshold`` compares
+    each field with its own peak; a sample is kept when either field reaches
+    that fraction, and its electric and magnetic currents are kept or dropped
+    together. Power is normalized on the kept samples. Entries outside the
+    domain are dropped.
 
     Returns the list of :class:`PointDipole` (electric + magnetic) to put in
     ``Simulation.sources``. Single-frequency profile (band-centre), like a
     single-frequency (``num_freqs=1``) mode source.
 
-    **Broadband (``num_freqs`` analogue, NUMERICS.md §5/§18.3).** Pass
+    **Broadband (``num_freqs`` analogue).** Pass
     ``modes_by_freq`` (``{freq_hz: Yee mode}``, N >= 2, each solved AT that
     frequency with the SAME window arguments) to launch a BROADBAND mode: this
     builds one dipole source plane per frequency, source plane k stamped from the mode at
@@ -266,14 +272,14 @@ def equivalence_current_source(
     frequency (``source_time`` copied with ``band_freqs_hz=sorted_freqs``,
     ``carrier_index=k``). Because the windows sum to 1, the source planes reconstruct
     the full source pulse while the per-frequency mode dominates near its own
-    sample, the eq-current twin of the §18 broadband ModeSource, now on the
+    sample, the eq-current twin of the broadband ModeSource, now on the
     graded grid too. Each source plane is normalized to the full ``power_watts`` (the
-    window, not an amplitude split, apportions the band, exactly like §18). The
+    window, not an amplitude split, apportions the band, exactly like the broadband ModeSource). The
     concatenation of all N source planes is returned. ``modes_by_freq`` None or with a
     single entry falls through to the single-frequency path (``mode`` is used),
     bit-identical to the pre-broadband build.
 
-    §20 symmetry planes (half-domain sims) are honored automatically, matching
+    Symmetry planes (half-domain sims) are honored automatically, matching
     :func:`solve_yee_mode`'s window rule: the source plane is clipped at the plane,
     ON-plane dipoles are kept at 1x amplitude (they are self-mirror, the
     boundary supplies the image; the engine's own half==full tests use
@@ -291,7 +297,7 @@ def equivalence_current_source(
             # Sheet k: the mode solved AT freqs[k] drives the geometric/temporal
             # phases (its own n_eff/frequency); the shared pulse is windowed to
             # this carrier (band = sorted freqs, index = k). The windows sum to
-            # 1, so the N sheets reconstruct the source pulse (§5/§18.3).
+            # 1, so the N sheets reconstruct the source pulse.
             st_k = source_time.model_copy(
                 update={"band_freqs_hz": tuple(freqs), "carrier_index": k})
             dips.extend(_build_sheet(
@@ -301,14 +307,15 @@ def equivalence_current_source(
                 half_v_um=half_v_um, power_watts=power_watts,
                 amplitude_threshold=amplitude_threshold,
                 extra_j_phase=extra_j_phase, _window_origin=_window_origin,
-                sheet_freq_hz=fk))
+                sheet_freq_hz=fk, _clip_to_interior=_clip_to_interior))
         return dips
     return _build_sheet(
         sim, mode, axis=axis, position_um=position_um, source_time=source_time,
         direction=direction, h_center_um=h_center_um, v_center_um=v_center_um,
         half_w_um=half_w_um, half_v_um=half_v_um, power_watts=power_watts,
         amplitude_threshold=amplitude_threshold, extra_j_phase=extra_j_phase,
-        _window_origin=_window_origin, sheet_freq_hz=None)
+        _window_origin=_window_origin, sheet_freq_hz=None,
+        _clip_to_interior=_clip_to_interior)
 
 
 def _build_sheet(
@@ -328,15 +335,22 @@ def _build_sheet(
     extra_j_phase: float = 0.0,
     _window_origin: Optional[Tuple[float, float]] = None,
     sheet_freq_hz: Optional[float] = None,
+    _clip_to_interior: Tuple[bool, bool] = (False, False),
 ) -> List[PointDipole]:
     """One phased-dipole Huygens sheet (the single-frequency build). The
     geometric (beta), half-cell and half-step temporal phases use
     ``sheet_freq_hz``, the frequency this sheet's ``mode`` was solved at ,
     defaulting to ``source_time.freq0_hz`` (the plain single-frequency case,
     bit-identical). ``source_time`` is stamped on every dipole (broadband sheets
-    pass a copy carrying ``band_freqs_hz``/``carrier_index``)."""
+    pass a copy carrying ``band_freqs_hz``/``carrier_index``).
+    ``amplitude_threshold`` compares each field with its own peak, keeps or
+    drops paired currents together, and normalizes power on the kept pairs."""
     if direction not in ("+", "-"):
         raise ValueError(f"direction must be '+' or '-', got {direction!r}")
+    if not math.isfinite(amplitude_threshold) or not 0.0 <= amplitude_threshold < 1.0:
+        raise ValueError(
+            "amplitude_threshold must be finite and in [0, 1); "
+            f"got {amplitude_threshold!r}")
     # The frequency this sheet's geometry/phase is tuned to (the mode's own
     # solve frequency for a broadband sheet; the pulse centre otherwise).
     sheet_freq_hz = (float(source_time.freq0_hz) if sheet_freq_hz is None
@@ -377,7 +391,7 @@ def _build_sheet(
     # this is computed with a hardcoded 0.99 while the run uses another value.
     # Deliberately a HARD attribute access — a sim-like object without a run
     # spec must fail loudly here, not launch with a silently guessed phase.
-    # Graded grids use the engine's §15.5 generalized Courant over the
+    # Graded grids use the engine's generalized Courant over the
     # per-axis MINIMUM spacings; uniform keeps the legacy formula verbatim.
     if not graded_any:
         dt = engine_dt_s(dl, float(sim.run.courant))
@@ -425,7 +439,7 @@ def _build_sheet(
     # Window registration — the SHARED snap+symmetry-clip rule (bit-identical
     # to the Yee mode solve's, or the dipoles would carry a mode solved on a
     # shifted grid). window_nodes returns the sim's OWN node ladders (graded
-    # axes carry their true nonuniform coordinates). With a §20 symmetry plane
+    # axes carry their true nonuniform coordinates). With a symmetry plane
     # on an in-plane min face the window starts ON the plane.
     #   _window_origin (mode_launch, uniform-only) overrides the floor-snap
     #   with the origin the mode RECORDED (center_offset_um) — exact grid
@@ -456,10 +470,9 @@ def _build_sheet(
         h_mid = h_node + 0.5 * (h_dq if h_dq is not None else dl)
         v_mid = v_node + 0.5 * (v_dq if v_dq is not None else dl)
     dom = sim.size_um
-    # A §20 symmetry min face is NOT an interior-margin face: on-plane dipoles
+    # A symmetry min face is NOT an interior-margin face: on-plane dipoles
     # are SELF-MIRROR at 1x amplitude (the engine's own half==full tests drive
-    # a single on-plane dipole at unchanged amplitude — no half-weights,
-    # NUMERICS §20.6), and odd-parity components carry a mode value of exactly
+    # a single on-plane dipole at unchanged amplitude — no half-weights), and odd-parity components carry a mode value of exactly
     # 0 there (the parity BC pins them), so keeping the on-plane row is both
     # required (even components peak there) and safe. min_lo[i] therefore
     # admits coordinate 0 on symmetry axes only. Margins are LOCAL cell widths
@@ -492,6 +505,22 @@ def _build_sheet(
                 _, dq_i = ladders[i_ax]
                 hi_w = float(dq_i[-1]) if dq_i is not None else float(dl)
                 max_hi[i_ax] = float(sim._realized_um()[i_ax]) - 0.25 * hi_w
+    # A window the SDK sized itself (a Gaussian beam's default window) is
+    # clipped to the absorber-free interior of each flagged in-plane axis: its
+    # tail entries inside the PML/absorber layers stamp no dipole, as the
+    # domain wall's do, so the run is not refused for them and the
+    # normalization counts only the placed dipoles. An explicit window is the
+    # caller's and is never clipped here. The clip may drop only a tail: an
+    # entry it drops above the build-time tolerance is refused below, as an
+    # unclipped window with that amplitude in the band would be.
+    domain_lo, domain_hi = list(min_lo), list(max_hi)
+    clipped = []
+    for flag, i_ax in zip(_clip_to_interior, (ih_ax, iv_ax)):
+        span = _absorbing_interval(sim, i_ax) if flag else None
+        if span is not None:
+            min_lo[i_ax] = max(min_lo[i_ax], span[0] - _BAND_EDGE_TOL_UM)
+            max_hi[i_ax] = min(max_hi[i_ax], span[1] + _BAND_EDGE_TOL_UM)
+            clipped.append((i_ax, span))
     # The in-plane Yee points of every window entry, with the SAME float
     # arithmetic the stamping loop below uses, and which of them pass the
     # interior-margin test. A window the domain clips (the far wall row) stamps
@@ -515,8 +544,53 @@ def _build_sheet(
     in_v_node, in_v_mid = _inside(v_pts, iv_ax), _inside(v_mid_pts, iv_ax)
     keep = (in_v_node[:, None] & in_h_mid[None, :],    # ex·hy*: E_h/H_v at (h+½, v)
             in_v_mid[:, None] & in_h_node[None, :])    # ey·hx*: E_v/H_h at (h, v+½)
+    # E and H have different units. Compare each to its own peak, then retain
+    # the paired currents together at their shared Yee position.
+    e_peak = max(float(np.abs(ex).max()), float(np.abs(ey).max()))
+    h_peak = max(float(np.abs(hx).max()), float(np.abs(hy).max()))
+    if e_peak == 0.0 and h_peak == 0.0:
+        raise ValueError("cannot launch a sheet where both E and H are zero everywhere")
+    if e_peak == 0.0 or h_peak == 0.0:
+        raise ValueError("a one-sided launch needs both fields: E and H must each be nonzero")
+    envelope = (
+        np.maximum(np.abs(ex) / e_peak, np.abs(hy) / h_peak),
+        np.maximum(np.abs(ey) / e_peak, np.abs(hx) / h_peak),
+    )
+    cutoff_masks = tuple(weight >= amplitude_threshold for weight in envelope)
+    keep = tuple(placed & retained for placed, retained in zip(keep, cutoff_masks))
+    if clipped:
+        def _in_domain(pts, i_ax):
+            return (domain_lo[i_ax] < pts) & (pts < domain_hi[i_ax])
+        placed = (_in_domain(v_pts, iv_ax)[:, None] & _in_domain(h_mid_pts, ih_ax)[None, :],
+                  _in_domain(v_mid_pts, iv_ax)[:, None] & _in_domain(h_pts, ih_ax)[None, :])
+        # per clipped axis, the entries only that axis' clip drops
+        pts_of = {ih_ax: (h_mid_pts[None, :], h_pts[None, :]),
+                  iv_ax: (v_pts[:, None], v_mid_pts[:, None])}
+        origin = tuple(getattr(sim, "origin_um", (0.0, 0.0, 0.0)))
+        faults = []
+        for i_ax, (lo, hi, boundary) in clipped:
+            worst = 0.0
+            for field, dom_mask, pts in zip((ex, ey), placed, pts_of[i_ax]):
+                amp = np.abs(field)
+                peak = float(amp[dom_mask].max()) if dom_mask.any() else 0.0
+                dropped = dom_mask & np.broadcast_to(
+                    (pts <= lo - _BAND_EDGE_TOL_UM) | (pts >= hi + _BAND_EDGE_TOL_UM), dom_mask.shape)
+                if peak > 0.0 and dropped.any():
+                    worst = max(worst, float(amp[dropped].max()) / peak)
+            if worst > _ABSORBER_AMPLITUDE_TOL:
+                faults.append(
+                    f"axis '{_AXES[i_ax]}': {worst:.1%} of the peak amplitude lies in the "
+                    f"{boundary} layers outside ({lo + origin[i_ax]:.6g}, "
+                    f"{hi + origin[i_ax]:.6g}) um")
+        if faults:
+            raise ValueError(
+                "the default window reaches into absorbing boundary cells with "
+                "significant amplitude, " + "; ".join(faults) + ": clipping it to "
+                "the interior would cut the launch itself, not a tail. Enlarge the "
+                "domain, re-center the beam, or set half_w_um / half_v_um to a "
+                "window that fits.")
     if power_watts is not None:
-        # §20 fold-aware half-domain power (see _launched_power): a window
+        # fold-aware half-domain power (see _launched_power): a window
         # whose min face sits ON a symmetry plane (h_bc/v_bc from the shared
         # window rule) half-weights the on-plane node row, so power_watts is
         # the mode's exact power through the MODELED (half) domain.
@@ -535,7 +609,7 @@ def _build_sheet(
         # stamps E on the J plane and H half a local cell away, so it launches
         # the wave at amplitude s in its OWN cell, and the power the Yee scheme
         # carries through every plane downstream is s^2 * p0 * cos(beta*half)
-        # (the conserved staggered flux, NUMERICS §18.7). Normalizing on that
+        # (the conserved staggered flux). Normalizing on that
         # product makes power_watts the watts a PowerMonitor and the port's
         # modal readout report, whatever cell either sits in; on p0 alone they
         # read cos(beta*half) * power_watts (0.96 W at 8 cells per wavelength).
@@ -543,13 +617,11 @@ def _build_sheet(
         p0 *= math.cos(beta * half)
         s = math.sqrt(float(power_watts) / abs(p0)) if p0 else 1.0
         ex, ey, hx, hy = ex * s, ey * s, hx * s, hy * s
-    peak = max(np.abs(f).max() for f in (ex, ey, hx, hy))
-    thr = amplitude_threshold * peak
     dips: List[PointDipole] = []
 
     def add(comp_letter: str, kind: str, hpos: float, vpos: float, apos: float,
-            val: complex, phi_extra: float, w_um: float):
-        if abs(val) < thr:
+            val: complex, phi_extra: float, w_um: float, retained: bool):
+        if not retained or val == 0:
             return
         c = [0.0, 0.0, 0.0]
         c[a], c[ih_ax], c[iv_ax] = apos, hpos, vpos
@@ -575,13 +647,15 @@ def _build_sheet(
             # the frame-handedness sign `hand` (see above; +1 on x/z, −1 on y):
             #   M_h (H_h dipole at (h, v+1/2)) carries  +hand·E_v = ey
             #   M_v (H_v dipole at (h+1/2, v)) carries  -hand·E_h = ex, phase pi
-            add(h_letter, "H", hh, vm, aM, hand * ey[iv, ih], 0.0, wM)
-            add(v_letter, "H", hm, vv, aM, hand * ex[iv, ih], math.pi, wM)
+            pair1 = bool(cutoff_masks[0][iv, ih])
+            pair2 = bool(cutoff_masks[1][iv, ih])
+            add(h_letter, "H", hh, vm, aM, hand * ey[iv, ih], 0.0, wM, pair2)
+            add(v_letter, "H", hm, vv, aM, hand * ex[iv, ih], math.pi, wM, pair1)
             # J sheet at the E Yee points of plane k0:
             #   J_h (E_h dipole at (h+1/2, v)) carries  -H_v = hy, phase pi (+ph_j)
             #   J_v (E_v dipole at (h, v+1/2)) carries  +H_h = hx        (+ph_j)
-            add(h_letter, "E", hm, vv, aJ, hy[iv, ih], math.pi + ph_j, wJ)
-            add(v_letter, "E", hh, vm, aJ, hx[iv, ih], ph_j, wJ)
+            add(h_letter, "E", hm, vv, aJ, hy[iv, ih], math.pi + ph_j, wJ, pair1)
+            add(v_letter, "E", hh, vm, aJ, hx[iv, ih], ph_j, wJ, pair2)
     _reject_absorber_overlap(sim, dips, a=a, ih_ax=ih_ax, iv_ax=iv_ax,
                              aJ=aJ, aM=aM)
     return dips

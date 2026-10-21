@@ -1,7 +1,7 @@
 """Workbench notebook kernel — scriptable setup, run, and analysis.
 
-One persistent Python namespace executes user cells sequentially on a dedicated
-worker thread.  The ``wb`` bridge object connects scripts to the same
+One persistent Python namespace executes user cells sequentially in a spawned
+worker process. The ``wb`` bridge object connects scripts to the same
 authoritative workspace and run machinery the GUI uses: ``wb.apply(spec)``
 publishes through the ordinary workspace sequence (so the 3D preview refreshes),
 and ``wb.run()`` produces the same sealed, ledger-backed result as the Run
@@ -19,25 +19,30 @@ from __future__ import annotations
 import ast
 import base64
 import copy
-import ctypes
 import io
 import json
+import math
 import os
+import queue
 import re
+import signal
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import traceback
 import uuid
-import warnings
-from contextlib import redirect_stderr, redirect_stdout
+import atexit
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+from .notebook_channel import ChannelError, read_frame, write_frame, worker_environment
 
 _NOTEBOOK_DOC_VERSION = 1
 _STREAM_LIMIT = 200_000       # chars kept per stream output
 _REPR_LIMIT = 20_000          # chars kept for a result repr
+_LIVE_OUTPUT_LIMIT = 30_000_000  # total rich-output bytes retained in a cell
 
 _WELCOME_CODE = """\
 # PhotonHub notebook — the live workspace is available as `wb`.
@@ -165,6 +170,20 @@ class Workbench:
         dialog. The run is recorded in the durable ledger; interrupting the
         cell cancels the solver.
         """
+        if spec is not None and not isinstance(spec, dict):
+            raise TypeError("wb.run expects the simulation spec as a dict")
+        from ..runners.phsolver import device_args
+        device = str(device or "cpu").strip()
+        device_args(device)
+        if timeout_s in (None, "", 0):
+            timeout_s = None
+        else:
+            try:
+                timeout_s = float(timeout_s)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("timeout_s must be a positive number") from exc
+            if not math.isfinite(timeout_s) or timeout_s <= 0:
+                raise ValueError("timeout_s must be a positive number")
         try:
             data, session = self._kernel._hooks.run_local(
                 spec=copy.deepcopy(spec) if spec is not None else None,
@@ -226,7 +245,22 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + f"\n… [truncated {len(text) - limit} characters]"
 
 
-def _figure_output(value: Any) -> Optional[dict]:
+def _safe_hook_message(message: str) -> str:
+    """Do not let a hook exception return the sidecar's private cloud key."""
+    try:
+        from ..cloud import config
+        secrets = [getattr(config._CONFIG, "api_key", None)]
+        secrets.extend(value for name, value in os.environ.items()
+                       if name.upper().endswith(("_KEY", "_SECRET", "_TOKEN", "_CREDENTIAL")))
+        for value in secrets:
+            if isinstance(value, str) and len(value) >= 8:
+                message = message.replace(value, "[redacted]")
+    except Exception:
+        return "Workbench operation failed"
+    return message
+
+
+def _figure_output(value: Any, *, raise_errors: bool = False) -> Optional[dict]:
     """Convert a user object into a figure/image output dict, or ``None``."""
     candidate = value
     to_plotly = getattr(candidate, "to_plotly_json", None)
@@ -234,11 +268,17 @@ def _figure_output(value: Any) -> Optional[dict]:
         try:
             candidate = to_plotly()
         except Exception:
+            if raise_errors:
+                raise
             return None
     if isinstance(candidate, dict) and isinstance(candidate.get("data"), list):
         try:  # keep the wire JSON-clean (numpy arrays -> lists)
             cleaned = json.loads(json.dumps(candidate, default=_json_fallback))
-        except (TypeError, ValueError):
+        except Exception:
+            # A plain container can resemble a figure but still have keys or
+            # cycles that JSON cannot represent. Its last value is its repr.
+            if raise_errors and callable(to_plotly):
+                raise
             return None
         return {"type": "figure", "figure": {
             "data": cleaned.get("data", []),
@@ -250,6 +290,8 @@ def _figure_output(value: Any) -> Optional[dict]:
         try:
             savefig(buffer, format="png", dpi=110, bbox_inches="tight")
         except Exception:
+            if raise_errors:
+                raise
             return None
         return {"type": "image", "mime": "image/png",
                 "data": base64.b64encode(buffer.getvalue()).decode("ascii")}
@@ -346,7 +388,7 @@ def _parse_cell(code: str, filename: str) -> tuple[ast.Module, list[str]]:
         return ast.parse(rewritten, filename=filename), [t for _, t in ignored]
 
 
-def _capture_pyplot_figures() -> list[dict]:
+def _capture_pyplot_figures(limit: int = 1000) -> list[dict]:
     """Collect and close any figures pyplot accumulated during the cell."""
     plt = sys.modules.get("matplotlib.pyplot")
     if plt is None:
@@ -354,6 +396,8 @@ def _capture_pyplot_figures() -> list[dict]:
     outputs = []
     try:
         for num in list(plt.get_fignums()):
+            if len(outputs) >= limit:
+                break
             output = _figure_output(plt.figure(num))
             if output is not None:
                 outputs.append(output)
@@ -366,32 +410,15 @@ def _capture_pyplot_figures() -> list[dict]:
 class NotebookKernel:
     """Sequential cell executor with a persistent namespace.
 
-    Thread model: HTTP threads mutate the document and queue under ``_lock``;
-    one daemon worker executes cells.  ``restart`` abandons a stuck worker
-    (threads cannot be killed) — the generation counter keeps an abandoned
-    worker from publishing into the new session.
+    HTTP threads mutate the document and queue under ``_lock``. One daemon
+    scheduler serializes execution through a lazily spawned interpreter.
     """
 
     def __init__(self, hooks: WorkbenchHooks,
-                 persist_path: Optional[Path] = None):
-        # A GUI-less matplotlib backend: cells run on server threads where a
-        # macOS/Windows native-window backend would be unusable or unsafe.
-        os.environ.setdefault("MPLBACKEND", "Agg")
-        try:
-            import matplotlib
-            matplotlib.use("Agg", force=True)
-            # `plt.show()` ends nearly every plotting cell people paste in
-            # (every notebook in examples/notebooks does). On Agg it warns
-            # "FigureCanvasAgg is non-interactive, and thus cannot be shown"
-            # — which is both noise and a lie here: _capture_pyplot_figures
-            # collects the figure and the panel renders it inline. Silence
-            # only that message, so genuine matplotlib warnings still show.
-            warnings.filterwarnings(
-                "ignore", message="FigureCanvasAgg is non-interactive",
-                category=UserWarning)
-        except Exception:
-            pass
+                 persist_path: Optional[Path] = None,
+                 execution_available: bool = True):
         self._hooks = hooks
+        self.execution_available = execution_available
         self._persist_path = Path(persist_path) if persist_path else None
         self._lock = threading.RLock()
         self._wake = threading.Condition(self._lock)
@@ -401,13 +428,27 @@ class NotebookKernel:
         self._workspace_rev = 0
         self._generation = 0
         self._running_cell: Optional[str] = None
+        self._interrupted_cell: Optional[str] = None
+        self._interrupt_sequence = 0
+        self._execute_sent = False
+        self._code_running = False
+        self._interrupt_timer: Optional[threading.Event] = None
         self._live: Optional[dict] = None   # live capture for the running cell
-        self._namespace = self._fresh_namespace()
+        self._process: Optional[subprocess.Popen] = None
+        self._start_lock = threading.Lock()
+        self._active_run_process: Optional[subprocess.Popen] = None
+        self._forced_restart_count: Optional[int] = None
+        self._hook_slot = threading.Lock()
+        self._hook_pending = 0
+        self._hook_pending_process: Optional[subprocess.Popen] = None
+        self._channel_write_lock = threading.Lock()
+        self._stopping = False
         if not self._restore():
             self._cells = [self._new_cell(_WELCOME_CODE),
                            self._new_cell(_TOUR_APPLY_CODE),
                            self._new_cell(_TOUR_RUN_CODE)]
         self._worker = self._spawn_worker()
+        atexit.register(self.close)
 
     # ------------------------------------------------------------- document
     def _new_cell(self, code: str = "") -> dict:
@@ -430,6 +471,7 @@ class NotebookKernel:
                 cells.append(view)
             return {
                 "cells": cells,
+                "execution_available": self.execution_available,
                 "kernel": {
                     "status": "busy" if (self._running_cell or self._queue) else "idle",
                     "running_cell": self._running_cell,
@@ -489,6 +531,8 @@ class NotebookKernel:
 
     # ------------------------------------------------------------ execution
     def run_cell(self, cell_id: str, code: Optional[str] = None) -> dict:
+        if not self.execution_available:
+            raise PermissionError("notebook execution is disabled")
         with self._lock:
             cell = self._cell(cell_id)
             if code is not None:
@@ -501,6 +545,8 @@ class NotebookKernel:
             return self.snapshot()
 
     def run_all(self) -> dict:
+        if not self.execution_available:
+            raise PermissionError("notebook worker is unavailable; cell execution is disabled")
         with self._lock:
             for cell in self._cells:
                 if cell["id"] != self._running_cell and cell["id"] not in self._queue:
@@ -517,22 +563,77 @@ class NotebookKernel:
                 except LookupError:
                     pass
             self._queue.clear()
-            worker = self._worker
-            running = self._running_cell is not None
-        if running and worker.is_alive():
-            _async_raise(worker.ident, KeyboardInterrupt)
+            cell_id = self._running_cell
+            process = self._process
+            generation = self._generation
+            sent = self._execute_sent
+            count = self._execution_count
+            code_running = self._code_running
+            if cell_id is not None:
+                self._interrupted_cell = cell_id
+                self._interrupt_sequence += 1
+        if cell_id is not None and process is not None:
+            self._cancel_notebook_run(process)
+            try:
+                if sent and code_running:
+                    self._signal_interrupt(process)
+            except (OSError, ValueError):
+                with self._lock:
+                    current = (self._generation == generation
+                               and self._running_cell == cell_id
+                               and self._execution_count == count
+                               and self._code_running
+                               and self._process is process)
+                    if current:
+                        self._forced_restart_count = count
+                if current:
+                    self._kill_process(expected=process)
+            else:
+                if not sent or not code_running:
+                    return self.snapshot()
+                with self._lock:
+                    if (self._interrupt_timer is not None
+                            or self._execution_count != count):
+                        return self.snapshot()
+                    done = threading.Event()
+                    self._interrupt_timer = done
+                def fallback():
+                    if done.wait(2):
+                        return
+                    with self._lock:
+                        stuck = (self._generation == generation
+                                 and self._running_cell == cell_id
+                                 and self._execution_count == count
+                                 and self._code_running
+                                 and self._interrupt_timer is done
+                                 and self._process is process)
+                        if stuck:
+                            self._forced_restart_count = count
+                    if stuck:
+                        self._kill_process(expected=process)
+                threading.Thread(target=fallback, name="notebook-interrupt-bound",
+                                 daemon=True).start()
         return self.snapshot()
+
+    @staticmethod
+    def _signal_interrupt(process: subprocess.Popen) -> None:
+        if os.name == "nt":
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            os.killpg(process.pid, signal.SIGINT)
 
     def restart(self, *, clear_outputs: bool = False) -> dict:
         with self._lock:
+            self._cancel_interrupt_timer()
             self._generation += 1
+            self._forced_restart_count = None
+            self._wake.notify_all()
             for cell_id in self._queue:
                 try:
                     self._cell(cell_id)["status"] = "idle"
                 except LookupError:
                     pass
             self._queue.clear()
-            abandoned = self._worker if self._running_cell is not None else None
             if self._running_cell is not None:
                 cell = self._cell(self._running_cell)
                 cell["status"] = "error"
@@ -542,19 +643,21 @@ class NotebookKernel:
                     "traceback": "The kernel restarted while this cell was running.",
                 }]
             self._running_cell = None
+            self._execute_sent = False
+            self._code_running = False
             self._live = None
-            self._namespace = self._fresh_namespace()
             if clear_outputs:
                 for cell in self._cells:
                     cell.update(status="idle", execution_count=None,
                                 outputs=[], elapsed_s=None)
-            self._worker = self._spawn_worker()
             self._persist()
             snap = self.snapshot()
-        if abandoned is not None and abandoned.is_alive():
-            # Best effort: a compute-bound abandoned cell honors the async
-            # KeyboardInterrupt at its next bytecode boundary.
-            _async_raise(abandoned.ident, KeyboardInterrupt)
+        with self._lock:
+            old_process = self._process
+        self._cancel_notebook_run(old_process)
+        self._kill_process(expected=old_process)
+        with self._lock:
+            self._worker = self._spawn_worker()
         return snap
 
     def bump_workspace_rev(self) -> None:
@@ -564,33 +667,24 @@ class NotebookKernel:
     def emit_output(self, output: dict) -> None:
         with self._lock:
             live = self._live
-            if live is not None:
-                live["outputs"].append(output)
+            if live is None or live["rich_truncated"]:
+                return
+            size = len(json.dumps(output, ensure_ascii=False).encode("utf-8"))
+            if (len(live["outputs"]) >= 999
+                    or live["rich_bytes"] + size > _LIVE_OUTPUT_LIMIT):
+                live["rich_truncated"] = True
+                live["outputs"].append({"type": "stream", "name": "stderr",
+                                        "text": "… [truncated notebook outputs]"})
+                return
+            live["rich_bytes"] += size
+            live["outputs"].append(output)
 
-    def print_progress_line(self, text: str) -> None:
-        """Rate-limited progress line for long ``wb.run`` calls."""
-        now = time.monotonic()
-        live = self._live
-        if live is None:
-            return
-        if text == live.get("last_progress") and now - live.get("last_progress_at", 0.0) < 5.0:
-            return
-        if now - live.get("last_progress_at", 0.0) < 1.0:
-            return
-        live["last_progress"] = text
-        live["last_progress_at"] = now
-        print(text)
+    def _cancel_interrupt_timer(self) -> None:
+        if self._interrupt_timer is not None:
+            self._interrupt_timer.set()
+            self._interrupt_timer = None
 
     # ---------------------------------------------------------------- worker
-    def _fresh_namespace(self) -> dict:
-        namespace: dict[str, Any] = {"__name__": "__workbench__", "wb": Workbench(self)}
-        try:
-            import numpy
-            namespace["np"] = numpy
-        except Exception:
-            pass
-        return namespace
-
     def _spawn_worker(self) -> threading.Thread:
         worker = threading.Thread(
             target=self._worker_loop, args=(self._generation,),
@@ -617,30 +711,63 @@ class NotebookKernel:
                         continue
                     self._execution_count += 1
                     count = self._execution_count
+                    self._forced_restart_count = None
                     cell["status"] = "running"
                     cell["execution_count"] = count
                     cell["outputs"] = []
                     cell["elapsed_s"] = None
                     self._running_cell = cell_id
+                    self._execute_sent = False
+                    self._code_running = False
+                    self._cancel_interrupt_timer()
                     self._live = {"cell_id": cell_id, "outputs": [],
                                   "stdout": io.StringIO(), "stderr": io.StringIO(),
+                                  "rich_bytes": 0, "rich_truncated": False,
                                   "last_progress": None, "last_progress_at": 0.0}
                     code = cell["code"]
-                    namespace = self._namespace
-                    live = self._live
                 try:
-                    outputs, error, elapsed = self._execute(
-                        code, count, namespace, live)
+                    outputs, error, elapsed = self._execute_remote(code, count, generation)
                 except KeyboardInterrupt:
                     outputs, error, elapsed = [{
                         "type": "error", "ename": "KeyboardInterrupt",
                         "evalue": "interrupted",
                         "traceback": "KeyboardInterrupt",
                     }], True, 0.0
+                except (ChannelError, OSError, ValueError, TypeError,
+                        subprocess.SubprocessError) as exc:
+                    with self._lock:
+                        forced = self._forced_restart_count == count
+                        interrupted = self._interrupted_cell == cell_id
+                        self._forced_restart_count = None
+                        self._interrupted_cell = None
+                    label = "KernelRestart" if forced or interrupted else "KernelUnavailable"
+                    message = ("Notebook restarted after interrupt; Python variables were lost."
+                               if forced or interrupted else str(exc))
+                    outputs, error, elapsed = [{
+                        "type": "error", "ename": label,
+                        "evalue": message, "traceback": label,
+                    }], True, 0.0
+                    with self._lock:
+                        current = generation == self._generation
+                        failed_process = self._process if current else None
+                    if current:
+                        self._cancel_notebook_run(failed_process)
+                        self._kill_process(expected=failed_process)
                 with self._lock:
                     if generation != self._generation:
                         return
+                    if self._forced_restart_count == count:
+                        message = "Notebook restarted after interrupt; Python variables were lost."
+                        outputs = [{"type": "error", "ename": "KernelRestart",
+                                    "evalue": message, "traceback": "KernelRestart"}]
+                        error = True
+                        elapsed = 0.0
+                        self._forced_restart_count = None
+                    self._interrupted_cell = None
+                    self._cancel_interrupt_timer()
                     self._running_cell = None
+                    self._execute_sent = False
+                    self._code_running = False
                     self._live = None
                     try:
                         cell = self._cell(cell_id)
@@ -653,54 +780,388 @@ class NotebookKernel:
             except KeyboardInterrupt:
                 continue
 
-    def _execute(self, code: str, count: int, namespace: dict,
-                 live: dict) -> tuple[list, bool, float]:
-        outputs: list[dict] = []
-        error = False
-        started = time.monotonic()
-        stdout, stderr = live["stdout"], live["stderr"]
-        try:
-            with redirect_stdout(stdout), redirect_stderr(stderr):
+    def _start_process(self) -> subprocess.Popen:
+        # The start lock serializes spawns, but HTTP snapshots and interrupts
+        # can still acquire the kernel lock during a cold frozen start.
+        with self._start_lock:
+            with self._lock:
+                if self._process is not None and self._process.poll() is None:
+                    return self._process
+                if self._stopping:
+                    raise ChannelError("notebook kernel is shutting down")
+                generation = self._generation
+            frozen = getattr(sys, "frozen", False)
+            command = ([sys.executable, "--notebook-worker"] if frozen
+                       else [sys.executable, "-P", "-m", "photonhub._viz_cli", "--notebook-worker"])
+            environment = worker_environment(os.environ)
+            if not frozen:
+                environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+            try:
+                process = subprocess.Popen(
+                    command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, env=environment,
+                    close_fds=True, start_new_session=(os.name != "nt"),
+                    creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
+                )
+            except OSError:
+                raise ChannelError("notebook worker could not start; retry the cell") from None
+            with self._lock:
+                stale = self._stopping or generation != self._generation
+                if not stale:
+                    self._process = process
+            if stale:
+                self._terminate_process(process)
+                raise ChannelError("notebook worker start was interrupted; retry the cell")
+            ready: queue.Queue = queue.Queue(maxsize=1)
+            def read_ready():
                 try:
-                    tree, ignored_magics = _parse_cell(
-                        code, filename=f"<cell {count}>")
-                    for magic in ignored_magics:
-                        print(f"ignored IPython magic: {magic}",
-                              file=sys.stderr)
-                    trailing = None
-                    if tree.body and isinstance(tree.body[-1], ast.Expr):
-                        trailing = ast.Expression(tree.body[-1].value)
-                        tree.body = tree.body[:-1]
-                    if tree.body:
-                        exec(compile(tree, f"<cell {count}>", "exec"), namespace)  # noqa: S102 — the notebook exists to run user code locally
-                    value = None
-                    if trailing is not None:
-                        value = eval(compile(trailing, f"<cell {count}>", "eval"),  # noqa: S307
-                                     namespace)
-                    if value is not None:
-                        namespace["_"] = value
-                        figure = _figure_output(value)
-                        if figure is not None:
-                            live["outputs"].append(figure)
-                            _release_pyplot_figure(value)
-                        else:
-                            live["outputs"].append({
-                                "type": "result",
-                                "text": _truncate(repr(value), _REPR_LIMIT)})
-                except BaseException as exc:  # noqa: BLE001 — every user error becomes a cell error output
-                    error = True
-                    live["outputs"].append(_error_output(exc, count))
-                live["outputs"].extend(_capture_pyplot_figures())
+                    ready.put(read_frame(process.stdout))
+                except BaseException as exc:
+                    ready.put(exc)
+            threading.Thread(target=read_ready, name="notebook-worker-startup",
+                             daemon=True).start()
+            try:
+                greeting = ready.get(timeout=60)
+            except queue.Empty:
+                self._kill_process(expected=process)
+                raise ChannelError("notebook worker did not become ready; retry the cell") from None
+            if greeting != {"type": "ready"}:
+                self._kill_process(expected=process)
+                raise ChannelError("notebook worker mode is unavailable; retry the cell")
+            with self._lock:
+                if self._process is not process or self._stopping:
+                    raise ChannelError("notebook worker start was interrupted; retry the cell")
+            return process
+
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen) -> None:
+        try:
+            if process.poll() is None:
+                if os.name == "nt":
+                    import ctypes
+                    directory = ctypes.create_unicode_buffer(32768)
+                    if not ctypes.windll.kernel32.GetSystemDirectoryW(directory, len(directory)):
+                        raise OSError("Windows system directory is unavailable")
+                    tool = os.path.join(directory.value, "taskkill.exe")
+                    subprocess.run([tool, "/PID", str(process.pid), "/T", "/F"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   env=worker_environment(os.environ), timeout=2, check=False)
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.kill()
+                process.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         finally:
-            elapsed = time.monotonic() - started
-        for name, buffer in (("stdout", stdout), ("stderr", stderr)):
-            text = buffer.getvalue()
-            if text:
-                outputs.append({"type": "stream", "name": name,
-                                "text": _truncate(text, _STREAM_LIMIT)})
-        outputs.extend(live["outputs"])
-        # streams first, then rich outputs/errors — stable, readable order
-        return outputs, error, elapsed
+            # The worker is reaped before closing streams; detached cell
+            # children cannot retain the private channel descriptors.
+            for stream in (process.stdin, process.stdout):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
+
+    def _kill_process(self, *, expected=None) -> None:
+        with self._lock:
+            process = self._process
+            if process is None or (expected is not None and process is not expected):
+                return
+            self._process = None
+        self._terminate_process(process)
+
+    def _cancel_notebook_run(self, process) -> None:
+        with self._lock:
+            owned = process is not None and self._active_run_process is process
+        if owned:
+            try:
+                self._hooks.cancel_active_run()
+            except Exception:
+                # Interrupt, restart, and shutdown must still reap the worker.
+                pass
+
+    def close(self) -> None:
+        with self._lock:
+            self._stopping = True
+            self._cancel_interrupt_timer()
+            self._generation += 1
+            self._queue.clear()
+            self._wake.notify_all()
+            process = self._process
+        self._cancel_notebook_run(process)
+        self._kill_process(expected=process)
+
+    def _execute_remote(self, code: str, count: int,
+                        generation: Optional[int] = None) -> tuple[list, bool, float]:
+        with self._lock:
+            if generation is not None and generation != self._generation:
+                raise ChannelError("notebook execution was restarted")
+        if len(code) > 1_000_000 or len(code.encode("utf-8")) > 30_000_000:
+            message = "notebook cell source is too large"
+            return ([{"type": "error", "ename": "NotebookSourceLimit",
+                      "evalue": message, "traceback": message}], True, 0.0)
+        process = self._start_process()
+        if process.stdin is None or process.stdout is None:
+            raise ChannelError("notebook worker has no private channel")
+        with self._lock:
+            if generation is not None and generation != self._generation:
+                raise ChannelError("notebook execution was restarted")
+            if (self._interrupted_cell is not None
+                    and self._running_cell == self._interrupted_cell):
+                return ([{"type": "error", "ename": "KeyboardInterrupt",
+                          "evalue": "interrupted", "traceback": "KeyboardInterrupt"}], True, 0.0)
+        with self._channel_write_lock:
+            write_frame(process.stdin, {"type": "execute", "code": code, "count": count})
+        with self._lock:
+            current = (self._process is process and
+                       (generation is None or generation == self._generation))
+            if current:
+                self._execute_sent = True
+                self._code_running = True
+            pending_interrupt = current and self._interrupted_cell == self._running_cell
+        if pending_interrupt:
+            self._signal_interrupt(process)
+        while True:
+            message = read_frame(process.stdout)
+            kind = message.get("type")
+            if kind == "code_done":
+                if set(message) != {"type", "count"} or message["count"] != count:
+                    raise ChannelError("invalid notebook code completion")
+                with self._lock:
+                    self._code_running = False
+                    self._cancel_interrupt_timer()
+                continue
+            if kind == "live":
+                if (set(message) != {"type", "name", "text"}
+                        or message["name"] not in {"stdout", "stderr"}
+                        or not isinstance(message["text"], str)
+                        or len(message["text"]) > 8192):
+                    raise ChannelError("invalid notebook live output")
+                with self._lock:
+                    if self._live is not None:
+                        buffer = self._live[message["name"]]
+                        if buffer.tell() < _STREAM_LIMIT:
+                            buffer.write(message["text"][:_STREAM_LIMIT - buffer.tell()])
+                continue
+            if kind == "output":
+                if set(message) != {"type", "output"} or not self._valid_output(message["output"]):
+                    raise ChannelError("invalid notebook rich output")
+                self.emit_output(message["output"])
+                continue
+            if kind == "call":
+                self._handle_worker_call(process, message, count=count)
+                continue
+            if (kind != "result" or set(message) != {"type", "count", "outputs", "error", "elapsed_s"}
+                    or type(message["count"]) is not int
+                    or message["count"] != count):
+                raise ChannelError("unknown notebook worker message")
+            outputs = message["outputs"]
+            if (not isinstance(outputs, list) or len(outputs) > 1000
+                    or not all(self._valid_output(item) for item in outputs)
+                    or type(message["error"]) is not bool
+                    or type(message["elapsed_s"]) not in {int, float}
+                    or not 0 <= message["elapsed_s"] < 1_000_000):
+                raise ChannelError("invalid notebook worker result")
+            return outputs, message["error"], message["elapsed_s"]
+
+    @staticmethod
+    def _valid_output(item: object) -> bool:
+        if not isinstance(item, dict) or not isinstance(item.get("type"), str):
+            return False
+        kind = item["type"]
+        if kind == "stream":
+            return (set(item) == {"type", "name", "text"}
+                    and item["name"] in {"stdout", "stderr"}
+                    and isinstance(item["text"], str) and len(item["text"]) <= 220_000)
+        if kind == "result":
+            return (set(item) == {"type", "text"} and isinstance(item["text"], str)
+                    and len(item["text"]) <= 22_000)
+        if kind == "error":
+            return (set(item) == {"type", "ename", "evalue", "traceback"}
+                    and all(isinstance(item[k], str) for k in ("ename", "evalue", "traceback"))
+                    and len(item["ename"]) <= 100 and len(item["evalue"]) <= 22_000
+                    and len(item["traceback"]) <= 220_000)
+        if kind == "figure":
+            return (set(item) == {"type", "figure"} and isinstance(item["figure"], dict)
+                    and isinstance(item["figure"].get("data"), list)
+                    and isinstance(item["figure"].get("layout"), dict))
+        if kind == "image":
+            if (set(item) != {"type", "mime", "data"} or item["mime"] != "image/png"
+                    or not isinstance(item["data"], str) or len(item["data"]) > 31_000_000):
+                return False
+            try:
+                return base64.b64decode(item["data"], validate=True).startswith(b"\x89PNG\r\n\x1a\n")
+            except (ValueError, base64.binascii.Error):
+                return False
+        return False
+
+    def _handle_worker_call(self, process: subprocess.Popen, message: dict,
+                            *, count: Optional[int] = None) -> None:
+        with self._lock:
+            arrival_interrupt_sequence = self._interrupt_sequence
+        name, args = message.get("name"), message.get("args")
+        call_id = message.get("id")
+        schemas = {"get_spec": set(), "apply_spec": {"spec"},
+                   "run_local": {"spec", "device", "timeout_s"},
+                   "cancel_run": set(), "get_result": set()}
+        if (set(message) != {"type", "id", "name", "args"}
+                or type(call_id) is not int or not 0 < call_id < 1_000_000_000
+                or name not in schemas
+                or not isinstance(args, dict) or set(args) != schemas[name]):
+            raise ChannelError("invalid notebook worker call")
+        if name == "apply_spec" and not isinstance(args["spec"], dict):
+            raise ChannelError("invalid notebook spec")
+        if name == "run_local":
+            from ..runners.phsolver import SolverRunError, device_args
+            try:
+                if args["spec"] is not None and not isinstance(args["spec"], dict):
+                    raise ValueError
+                if not isinstance(args["device"], str) or len(args["device"]) > 80:
+                    raise ValueError
+                device_args(args["device"])
+                timeout = args["timeout_s"]
+                if timeout is not None and (type(timeout) not in {int, float}
+                                            or not math.isfinite(timeout)
+                                            or timeout < 0):
+                    raise ValueError
+            except (TypeError, ValueError, SolverRunError):
+                raise ChannelError("invalid local run request") from None
+        def send(value):
+            with self._channel_write_lock:
+                write_frame(process.stdin, value)
+
+        def call_is_live():
+            # Called with _lock held. A later interrupt abandons a queued call,
+            # while a call issued by still-running cleanup after an interrupt lives.
+            return (count is None or
+                    (self._process is process
+                     and self._running_cell is not None
+                     and self._execution_count == count
+                     and self._code_running
+                     and self._interrupt_sequence == arrival_interrupt_sequence))
+
+        def interrupted_reply():
+            return {"type": "reply", "id": call_id, "ok": False,
+                    "error_type": "KeyboardInterrupt", "message": "interrupted"}
+
+        def handle():
+            with self._lock:
+                live = call_is_live()
+                if live and name == "run_local":
+                    self._active_run_process = process
+            if not live:
+                try:
+                    send(interrupted_reply())
+                except (OSError, ValueError, ChannelError):
+                    pass
+                return
+            try:
+                if name == "get_spec":
+                    value = self._hooks.get_spec()
+                elif name == "apply_spec":
+                    value = self._hooks.apply_spec(args["spec"])
+                    self.bump_workspace_rev()
+                elif name == "run_local":
+                    def progress(value, status):
+                        if process.poll() is not None:
+                            self._cancel_notebook_run(process)
+                            raise ChannelError("notebook worker stopped during the local run")
+                        if (value is None or isinstance(value, dict)) and isinstance(status, str):
+                            send({"type": "progress", "id": call_id,
+                                  "value": value, "status": status[:100]})
+                            with self._lock:
+                                live = self._live
+                                if live is not None:
+                                    now = time.monotonic()
+                                    if (now - live["last_progress_at"] >= 1.0
+                                            and live["stdout"].tell() < _STREAM_LIMIT):
+                                        live["last_progress_at"] = now
+                                        remaining = _STREAM_LIMIT - live["stdout"].tell()
+                                        live["stdout"].write((_progress_text(value, status) + "\n")[:remaining])
+                    data, session = self._hooks.run_local(
+                        spec=args["spec"], device=args["device"],
+                        timeout_s=args["timeout_s"], on_progress=progress)
+                    value = {"output_dir": str(data.output_dir), "session": session}
+                elif name == "cancel_run":
+                    value = self._hooks.cancel_active_run()
+                else:
+                    loaded = self._hooks.get_result()
+                    value = ({"output_dir": str(loaded[0].output_dir), "session": loaded[1]}
+                             if loaded is not None else None)
+                reply = {"type": "reply", "id": call_id, "ok": True, "value": value}
+            except (LookupError, ValueError, TypeError, RuntimeError) as exc:
+                reply = {"type": "reply", "id": call_id,
+                         "ok": False, "error_type": type(exc).__name__,
+                         "message": _safe_hook_message(str(exc))[:20000]}
+            except Exception:
+                if name == "run_local":
+                    self._cancel_notebook_run(process)
+                reply = {"type": "reply", "id": call_id,
+                         "ok": False, "error_type": "RuntimeError",
+                         "message": "Workbench operation failed"}
+            finally:
+                if name == "run_local":
+                    with self._lock:
+                        if self._active_run_process is process:
+                            self._active_run_process = None
+            try:
+                send(reply)
+            except ChannelError:
+                try:
+                    send({"type": "reply", "id": call_id, "ok": False,
+                          "error_type": "ValueError",
+                          "message": "Workbench response is too large for a notebook cell"})
+                except (OSError, ValueError, ChannelError):
+                    self._kill_process(expected=process)
+            except (OSError, ValueError):
+                self._kill_process(expected=process)
+
+        with self._lock:
+            if self._hook_pending_process is not process:
+                self._hook_pending_process = process
+                self._hook_pending = 0
+            if self._hook_pending >= 4:
+                raise ChannelError("too many notebook hook calls")
+            self._hook_pending += 1
+        def bounded_handle():
+            try:
+                with self._lock:
+                    cancel_owned_run = (name == "cancel_run"
+                                        and self._active_run_process is process)
+                if cancel_owned_run:
+                    # Cancellation must reach the idempotent hook while the
+                    # run hook still owns the regular call slot.
+                    handle()
+                elif self._hook_slot.acquire(timeout=2):
+                    try:
+                        handle()
+                    finally:
+                        self._hook_slot.release()
+                else:
+                    try:
+                        with self._lock:
+                            live = call_is_live()
+                        send(({"type": "reply", "id": call_id, "ok": False,
+                               "error_type": "RuntimeError",
+                               "message": "Previous Workbench call is still finishing; try again."}
+                              if live else interrupted_reply()))
+                    except (OSError, ValueError, ChannelError):
+                        self._kill_process(expected=process)
+            finally:
+                with self._lock:
+                    if self._hook_pending_process is process:
+                        self._hook_pending -= 1
+        try:
+            threading.Thread(target=bounded_handle, name=f"notebook-hook-{name}", daemon=True).start()
+        except RuntimeError:
+            with self._lock:
+                if self._hook_pending_process is process:
+                    self._hook_pending -= 1
+            send({"type": "reply", "id": call_id, "ok": False,
+                  "error_type": "RuntimeError", "message": "Workbench operation could not start"})
 
     # ----------------------------------------------------------- persistence
     def _persist(self) -> None:
@@ -763,23 +1224,19 @@ def _error_output(exc: BaseException, count: int) -> dict:
                   if frame.filename.startswith("<cell")), 0)
     rendered = "".join(traceback.format_list(frames[start:]))
     header = f"Traceback (cell {count}, most recent call last):\n" if rendered else ""
-    body = "".join(traceback.format_exception_only(type(exc), exc))
+    try:
+        message = str(exc)
+    except BaseException:  # noqa: BLE001 — even exception formatting is user code
+        message = "<exception message could not be formatted>"
+        body = f"{type(exc).__name__}: {message}\n"
+    else:
+        try:
+            body = "".join(traceback.format_exception_only(type(exc), exc))
+        except BaseException:  # noqa: BLE001 — custom exception metadata can also fail
+            body = f"{type(exc).__name__}: {message}\n"
     return {
         "type": "error",
         "ename": type(exc).__name__,
-        "evalue": _truncate(str(exc), _REPR_LIMIT),
+        "evalue": _truncate(message, _REPR_LIMIT),
         "traceback": _truncate(header + rendered + body, _STREAM_LIMIT),
     }
-
-
-def _async_raise(thread_ident: Optional[int], exc_type: type) -> None:
-    """Raise ``exc_type`` asynchronously in another thread (CPython only).
-
-    This is the standard interpreter facility behind notebook interrupts; it
-    lands at the next bytecode boundary, so C extensions finish their current
-    call first.
-    """
-    if thread_ident is None:
-        return
-    ctypes.pythonapi.PyThreadState_SetAsyncExc(
-        ctypes.c_long(thread_ident), ctypes.py_object(exc_type))

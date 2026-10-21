@@ -9,11 +9,11 @@ The calculation unit is one **Tcell-step** = 1e12 cell-updates =
 $0.40/Tcell-step and is overridable.
 
 The cell count, ``dt`` and step count are computed to match the engine's
-``resolve.cpp`` exactly, the round-half-away-from-zero cell rule
-(:func:`photonhub.components.grid.realized_cells`), the §2 uniform Courant
-limit and the §15.5 graded (per-axis minimum spacing) limit, so the dollar
+exactly, the round-half-away-from-zero cell rule
+(:func:`photonhub.components.grid.realized_cells`), the uniform Courant
+limit and the graded (per-axis minimum spacing) limit, so the dollar
 figure never drifts from what ``phsolver`` actually runs. It is exact for a
-full-duration run; auto-shutoff (NUMERICS.md §7) can only make a run *cheaper*.
+full-duration run; auto-shutoff can only make a run *cheaper*.
 
 Memory and output byte counts are faithful but approximate and each carries a
 documented model: resident device memory is dominated by the six fp32 field
@@ -32,7 +32,7 @@ from .constants import c0
 if TYPE_CHECKING:  # avoid a runtime import cycle (cost <- simulation <- cost)
     from .components.simulation import Simulation
 
-# Speed of light, identical to the engine's kC0 (engine/include/phcore/types.h)
+# Speed of light, identical to the engine's kC0
 # so the resolved dt matches bit-for-bit-comparable inputs.
 _C0 = c0  # m/s, exact
 
@@ -50,15 +50,14 @@ DEFAULT_THROUGHPUT_GCELLS_PER_S = 20.0
 
 # Resident device memory model (per cell, fp32 words): the six Yee field
 # arrays (Ex..Hz) plus per-component Ca and Cb coefficient arrays — the
-# reference solver's bulk allocation (engine/src/cpu_ref/reference_solver.cpp:
-# ca[3]/cb[3] + the six fields). 6 + 6 = 12 words = 48 B/cell. This is the
+# reference solver's bulk allocation (ca[3]/cb[3] + the six fields). 6 + 6 = 12 words = 48 B/cell. This is the
 # general-media upper bound; a tuned vacuum kernel folds scalar coefficients
 # and uses less. CPML psi (boundary slabs only) is a small term and excluded.
 _RESIDENT_FP32_WORDS_PER_CELL = 12
 
-# z-ghost planes carried by every field array (NUMERICS.md §1.2, halo_z = 1).
+# z-ghost planes carried by every field array (halo_z = 1).
 _HALO_Z = 1
-# Pitched x-rows: pitch_x = round_up(nx, 32) (fields.h round_up, 128-B rows).
+# Pitched x-rows: pitch_x = round_up(nx, 32) (128-B rows).
 _PITCH = 32
 
 
@@ -71,7 +70,7 @@ class CostEstimate:
     """Pre-run estimate for one :class:`Simulation`. Returned by
     :meth:`Simulation.cost_estimate`; ``str(estimate)`` is a human summary."""
 
-    # Geometry and time — engine-faithful (resolve.cpp).
+    # Geometry and time — engine-faithful.
     cells_per_axis: Tuple[int, int, int]
     num_cells: int
     num_steps: int
@@ -122,9 +121,9 @@ def _axis_coords_um(grid, axis_index: int) -> Optional[Tuple[float, ...]]:
 
 def _cells_and_min_spacing_um(sim: "Simulation"):
     """Per-axis (cell count, minimum primary spacing in microns), matching the
-    engine: a graded axis has ``len(coords)`` cells (the §15.1 replicate-last
+    engine: a graded axis has ``len(coords)`` cells (the replicate-last
     closing node derives the final cell), a uniform axis has the round-half-away
-    cell count and constant spacing ``dl`` (with the boundary-aware §1 floor ,
+    cell count and constant spacing ``dl`` (with the boundary-aware floor ,
     a plain periodic axis may be a single cell)."""
     dl = sim.grid.dl_um
     counts = list(
@@ -141,12 +140,12 @@ def _cells_and_min_spacing_um(sim: "Simulation"):
 
 
 def _dt_seconds(sim: "Simulation", counts, min_spacing_um) -> float:
-    """dt exactly as resolve.cpp computes it: the §2 uniform limit
+    """dt exactly as the engine computes it: the uniform limit
     ``C*dl/(c0*sqrt(D))`` over the D ACTIVE axes (n > 1; a 1-cell plain
     periodic axis carries no curl term and leaves the Courant sum) for a
-    UniformMesh, else the §15.5 graded limit over the active axes' minimum
-    spacings (a graded grid whose axes happen to be uniform reduces to the §2
-    form, as the engine's graded_courant_dt does)."""
+    UniformMesh, else the graded limit over the active axes' minimum
+    spacings (a graded grid whose axes happen to be uniform reduces to the uniform
+    form, as the engine's graded Courant limit does)."""
     courant = sim.run.courant
     is_graded = getattr(sim.grid, "coords", None) is not None
     if not is_graded:
@@ -164,7 +163,7 @@ def _dt_seconds(sim: "Simulation", counts, min_spacing_um) -> float:
 
 
 def _num_steps(sim: "Simulation", dt_s: float) -> int:
-    """resolve.cpp: an explicit n_steps wins; otherwise ceil(run_time / dt)."""
+    """As the engine resolves it: an explicit n_steps wins; otherwise ceil(run_time / dt)."""
     if sim.run.n_steps is not None:
         return int(sim.run.n_steps)
     return int(ceil(sim.run.run_time_s / dt_s))
@@ -174,9 +173,9 @@ def _region_cells(size_um: Tuple[float, float, float], dl_um: float,
                   cells_per_axis, interval_space=None) -> int:
     """Approximate cell count of a DFT box: ``max(1, round(size/dl))`` per axis
     (1 for a 0-size plane/line/point axis), capped at the domain. Uniform-dl
-    approximation; exact snapping is the engine's (NUMERICS.md §12).
-    ``interval_space`` (§12 spatial decimation) reduces each axis to
-    ``ceil(n/stride)``, mirroring reference_solver.cpp's strided extents."""
+    approximation; exact snapping is the engine's.
+    ``interval_space`` (spatial decimation) reduces each axis to
+    ``ceil(n/stride)``, mirroring the engine's strided extents."""
     strides = interval_space or (1, 1, 1)
     out = 1
     for a in range(3):

@@ -5,7 +5,7 @@ Consumes the ``xarray.DataArray`` that ``RunResult[monitor]`` returns
 (already in µm coordinates). Supports the raw components Ex..Hz plus derived
 ``"E"`` (vector magnitude), ``"intensity"`` (|E|²) and ``"H"``; ``freq=`` is
 required for a multi-frequency DFT monitor; ``val`` in real/imag/abs/phase
-selects what to show for complex data. Colormap/normalization follow §7 and a
+selects what to show for complex data. Colormap/normalization follow the field kind and a
 colorbar is labeled from the DataArray's attrs. ``structures=True`` overlays
 the MATERIAL BOUNDARY on the cut plane, a contour of the same ε sample
 ``plot_index`` draws, so several bodies of one material read as one silhouette, WHITE on a soft dark halo (:func:`_style.field_outline_style`) so it reads
@@ -86,7 +86,7 @@ def _component_array(da, field: str, freq, val: str, time=None):
         raise ValueError(
             f"val must be one of 'real', 'imag', 'abs', 'phase'; got {val!r}"
         )
-    # Real (time-domain) field: val is ignored (design §9).
+    # Real (time-domain) field: val is ignored.
     return comp, "real"
 
 
@@ -97,8 +97,8 @@ def _phase(comp):
 
 def _select_sample(da, freq, time=None):
     """Collapse the frequency ('f') or time ('t') dim to a single slice.
-    Multi-frequency DFT with no ``freq=`` -> ValueError listing the freqs
-    (design §9); a single value selects implicitly. ``time=`` (seconds) picks a
+    Multi-frequency DFT with no ``freq=`` -> ValueError listing the freqs;
+    a single value selects implicitly. ``time=`` (seconds) picks a
     recorded sample on time data, nearest; without it, time data defaults to the
     last frame (the snapshot use)."""
     if "f" in da.dims:
@@ -169,7 +169,7 @@ def _reduce_to_plane(values, x, y, z):
 
 def _orient(remaining):
     """(horizontal, vertical) order for the two surviving spatial dims, from
-    the §5 in-plane axis convention, so it follows a
+    the in-plane axis convention, so it follows a
     :func:`~photonhub.viz._geometry.displayed_transposed` block the way every
     other helper does."""
     s = set(remaining)
@@ -189,7 +189,7 @@ def plot_field(data, monitor, field="Ex", x=None, y=None, z=None, *,
     ``data`` is a :class:`RunResult`; ``monitor`` is its key. ``freq=``
     picks a frequency on a DFT monitor; ``time=`` (seconds) picks a recorded
     sample on a time/snapshot monitor (default: the last frame). See the module
-    docstring and design §3 for the rest.
+    docstring for the rest.
 
     ``scale`` sets the colour scale. ``"max"`` (the default) divides by the
     slice's own maximum, so the colorbar runs 0 to 1 (or -1 to 1 for a signed
@@ -201,7 +201,7 @@ def plot_field(data, monitor, field="Ex", x=None, y=None, z=None, *,
     ``val="abs"``). ``"raw"`` keeps the recorded values.
 
     ``unfold`` (the default) mirrors the recorded half back across each
-    in-plane §20 symmetry plane, with the component's own parity about that
+    in-plane symmetry plane, with the component's own parity about that
     plane, so the picture is the whole device's field. It needs a
     ``simulation`` to know the symmetry, the same object the structure
     outlines need. ``unfold=False`` shows only the half that was stepped.
@@ -211,7 +211,7 @@ def plot_field(data, monitor, field="Ex", x=None, y=None, z=None, *,
     values, used_val = _component_array(da, field, freq, val, time)
     h_coord, v_coord, _, _ = _reduce_to_plane(values, x, y, z)
     # Which way round the recorded plane reads best, from its own extent, and
-    # then true of every helper below (design §5). Reducing again inside the
+    # then true of every helper below. Reducing again inside the
     # block is a relabelled view of the same array, not a second slice.
     transposed = _style.prefer_long_axis_horizontal(
         float(np.ptp(h_coord)), float(np.ptp(v_coord)))
@@ -249,7 +249,7 @@ def _plot_field_on(ax, data, da, monitor, field, x, y, z, values, used_val,
     mirror_h, mirror_v = (False, False)
     if sim is not None and unfold and slice_axis is not None:
         mirror_h, mirror_v = _style.unfold_in_plane(sim, slice_axis, unfold)
-    # A simulation that folded a declared symmetry plane (design spec §4.5)
+    # A simulation that folded a declared symmetry plane
     # hands out the plane already whole through its RunResult: the outlines
     # and the mirror marks still unfold, the recorded data must not.
     fold = getattr(sim, "_fold", None) if sim is not None else None
@@ -271,9 +271,9 @@ def _plot_field_on(ax, data, da, monitor, field, x, y, z, values, used_val,
     cbar = ax.figure.colorbar(mesh, ax=ax)
     cbar.set_label(cb_label)
 
-    # Structure outlines (design §3): reuse the §5 geometry; need a Simulation.
+    # Structure outlines: reuse the geometry; need a Simulation.
     # The field's coordinates are the user's; the scene is sampled in the
-    # corner frame and its outlines moved into the field's frame (spec §4.4).
+    # corner frame and its outlines moved into the field's frame.
     before = set(ax.get_children())
     origin = geom.frame_origin(sim) if sim is not None else (0.0, 0.0, 0.0)
     drew_structure = False
@@ -393,8 +393,7 @@ def _apply_scale(arr, field: str, used_val: str, scale: str, db_floor: float,
 
 
 def component_parity(component: str, symmetry_axis: str, symmetry: int) -> int:
-    """Parity (+1 even, -1 odd) of one field component about a NUMERICS §20
-    mirror plane normal to ``symmetry_axis``.
+    """Parity (+1 even, -1 odd) of one field component about a symmetry mirror plane normal to ``symmetry_axis``.
 
     An odd (``-1``, PEC) plane pins tangential E to zero on the plane, so
     tangential E is odd and normal E even; H is the dual, normal odd and
@@ -413,7 +412,7 @@ def component_parity(component: str, symmetry_axis: str, symmetry: int) -> int:
 
 
 def _mirror_sign(field, used_val, letter, sim):
-    """How the displayed quantity transforms across the §20 plane normal to
+    """How the displayed quantity transforms across the plane normal to
     ``letter``: ``+1`` keep, ``-1`` negate, ``"phase"`` shift by pi.
 
     A magnitude is even by construction. A signed component carries its own
@@ -514,7 +513,7 @@ def _draw_outlines(ax, sim, axis, value, mirror_h=False,
     if not (0.0 <= value <= realized[geom.axis_index(axis)]):
         return False
 
-    # Follow what the run rasterizes: on a smoothed scene the §16 average
+    # Follow what the run rasterizes: on a smoothed scene the average
     # places the boundary inside the cell that straddles it, so the contour
     # stops following the staircase the hard sample would show.
     h_nodes, v_nodes, eps = sample_eps_plane(sim, axis, value,
@@ -554,7 +553,7 @@ def _material_levels(sim):
 def _sim_from_manifest(data) -> Optional[object]:
     """Reconstruct a Simulation from the output manifest if it carries the
     input structures. Today's manifest (data.py) does not persist the structure
-    list, so this returns None, the §12 forward-compat seam for self-describing
+    list, so this returns None, the forward-compat seam for self-describing
     results. Kept as a single lookup point so persisting structures later only
     needs a change here."""
     manifest = getattr(data, "manifest", {}) or {}

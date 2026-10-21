@@ -8,8 +8,8 @@ the bound puts the window edge
 
     ln(1000) / (2 * gamma)
 
-beyond each core face. The default pad is 1.2 times that bound (decision
-0017). With the mode's solved ``n_eff`` the truncation then
+beyond each core face. The default pad is 1.2 times that bound. With the
+mode's solved ``n_eff`` the truncation then
 costs a transmission reading under 0.001 dB per port and the edges sit 42 to
 51 dB below the peak (silicon TE0 and TM0, silicon nitride TE0, 1550 nm).
 With the effective-index estimate a TM mode's ``n_eff`` comes out about 3 %

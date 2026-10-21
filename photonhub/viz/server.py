@@ -23,6 +23,7 @@ import json
 import math
 import os
 import re
+import socket
 import stat
 import subprocess
 import tempfile
@@ -34,8 +35,15 @@ import webbrowser
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlsplit
+try:
+    from starlette.requests import Request as StarletteRequest
+except ImportError:
+    # Importing this module remains possible without the optional app extra.
+    # create_app() still requires FastAPI, which supplies Starlette.
+    StarletteRequest = None
 
 from . import checks, figures, service
+from ..cloud import config as cloud_config
 from .ledger import LedgerError, LedgerNotFound, RunLedger
 from .notebook import NotebookKernel, WorkbenchHooks
 
@@ -47,20 +55,26 @@ _MAX_CLOUD_SPEC_BYTES = 16 * 1024 * 1024
 _PINNED_CLOUD_SOLVER = re.compile(r"[0-9a-f]{12,64}\Z")
 _DESKTOP_CAPABILITY_HEADER = b"x-photonhub-launch-capability"
 _DESKTOP_CAPABILITY_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+_DESKTOP_HEALTH_PROOF_PATH = "/api/health/proof"
+_DESKTOP_HEALTH_PROOF_PURPOSE = b"photonhub-sidecar-ownership-v1\0"
+_DESKTOP_PAID_SUBMIT_PROOF_HEADER = "x-photonhub-paid-submit-proof"
+_DESKTOP_PAID_SUBMIT_PROOF_PURPOSE = b"photonhub-paid-submit-v1\0"
 
 
 class _DesktopCapabilityMiddleware:
-    """Authenticate every desktop-owned API request before route dispatch.
+    """Authenticate desktop API requests before route dispatch.
 
     Static UI assets intentionally remain public on loopback so Chromium can
     bootstrap the renderer.  Once Electron supplies a launch capability,
-    however, every HTTP *and* WebSocket path under ``/api`` fails closed.  The
-    dedicated header is attached only by Electron's main-process proxy; it is
+    however, every HTTP and WebSocket path under ``/api`` requires the
+    capability except GET ``/api/health/proof``. That route returns a
+    connection-bound challenge response before the capability is sent. The
+    dedicated header is attached by the desktop's trusted launchers; it is
     never placed in a page, URL, response, command line, or child environment.
     """
 
     def __init__(self, app, launch_capability: Optional[str] = None,
-                 notebook_enabled: bool = True):
+                 notebook_enabled: bool = False):
         self.app = app
         self.launch_capability = launch_capability
         self.notebook_enabled = notebook_enabled
@@ -69,17 +83,25 @@ class _DesktopCapabilityMiddleware:
         scope_type = scope.get("type")
         path = scope.get("path", "")
         protected = path == "/api" or path.startswith("/api/")
+        if (self.launch_capability is not None and scope_type == "http"
+                and scope.get("method") == "GET"
+                and path == _DESKTOP_HEALTH_PROOF_PATH):
+            # Only this GET route is public so Electron can verify the listener
+            # before it sends the capability on a new connection.
+            await self.app(scope, receive, send)
+            return
         if self.launch_capability is None:
             # No desktop capability means an unauthenticated loopback
             # listener (the `photonhub-serve-viz` CLI). Loopback is shared by
             # every OS user on the host, so notebook cells — arbitrary code
-            # executed in this process — stay disabled unless the operator
+            # executed by a child process — stay disabled unless the operator
             # opted in explicitly (``--enable-notebook``).
             if (scope_type == "http" and not self.notebook_enabled
                     and path.startswith("/api/notebook")):
                 payload = (b'{"detail":"notebook execution is disabled in '
                            b'photonhub-serve-viz; restart with '
-                           b'--enable-notebook on a single-user machine"}')
+                           b'--enable-notebook (CLI) or notebook_enabled=True '
+                           b'(Python) on a single-user machine"}')
                 await send({
                     "type": "http.response.start",
                     "status": 403,
@@ -228,7 +250,7 @@ def create_app(result_dir: Optional[str | Path] = None,
                launch_token: Optional[str] = None,
                shutdown_callback: Optional[Callable[[], None]] = None,
                release_identity: Optional[dict] = None,
-               notebook_enabled: bool = True):
+               notebook_enabled: bool = False):
     """Build the FastAPI app. The loaded bundle lives in a mutable holder so the UI
     can open a different result dir without restarting; ``result_dir`` is optional —
     the app launches empty (Open a bundle or use Preview). If ``ui_dir`` is given the
@@ -437,6 +459,7 @@ def create_app(result_dir: Optional[str | Path] = None,
     @asynccontextmanager
     async def lifespan(_app):
         yield
+        notebook_kernel.close()
         # Uvicorn SIGTERM/Ctrl-C and Electron's parent-watch path all converge
         # here. Ask the shared process layer to terminate/kill phsolver, then
         # keep the sidecar alive long enough for that worker to reap its child.
@@ -776,11 +799,28 @@ def create_app(result_dir: Optional[str | Path] = None,
 
     @app.get("/api/health")
     def health():
-        # An authenticated 200 is itself the desktop ownership proof. Never
-        # echo the capability (or filesystem ownership details) in health.
-        return {"ok": True, "release_build_id": (
+        return {"ok": True, "cloud_configured": bool(getattr(cloud_config._CONFIG, "api_key", None)),
+                "release_build_id": (
                     release_identity.get("build", {}).get("build_id")
                     if release_identity is not None else None)}
+
+    @app.get(_DESKTOP_HEALTH_PROOF_PATH)
+    def health_proof(nonce: str, request: StarletteRequest):
+        from fastapi import HTTPException
+
+        if launch_token is None:
+            raise HTTPException(404)
+        if _DESKTOP_CAPABILITY_PATTERN.fullmatch(nonce) is None:
+            raise HTTPException(400, "invalid health challenge")
+        peer = request.client
+        if peer is None:
+            raise HTTPException(400, "client address unavailable")
+        message = (_DESKTOP_HEALTH_PROOF_PURPOSE + nonce.encode("ascii")
+                   + b"\0" + peer.host.encode("ascii") + b"\0"
+                   + str(peer.port).encode("ascii"))
+        return {"ok": True, "proof": hmac.new(
+            launch_token.encode("ascii"), message, hashlib.sha256,
+        ).hexdigest()}
 
     @app.get("/api/release")
     def desktop_release():
@@ -1317,10 +1357,11 @@ def create_app(result_dir: Optional[str | Path] = None,
             except (binascii.Error, ValueError) as exc:
                 raise HTTPException(
                     422, "content_base64 is not valid base64") from exc
-            handle = stack.enter_context(tempfile.NamedTemporaryFile(
-                prefix="workbench-import-", suffix=".gds"))
-            handle.write(raw)
-            handle.flush()
+            with tempfile.NamedTemporaryFile(
+                    prefix="workbench-import-", suffix=".gds",
+                    delete=False) as handle:
+                stack.callback(Path(handle.name).unlink, missing_ok=True)
+                handle.write(raw)
             return handle.name
         if not isinstance(path, str) or not path.strip():
             raise HTTPException(
@@ -1538,6 +1579,12 @@ def create_app(result_dir: Optional[str | Path] = None,
             _validation_error(exc)
         _assert_no_stale_mode_sources(sim)
         _assert_modal_ports_ready(sim)
+        # The SDK's run rules first (a source in the boundary layers, which
+        # the engine would run): the same refusal Run would meet.
+        try:
+            sim.check_runnable()
+        except ValueError as exc:
+            raise HTTPException(422, {"message": str(exc), "engine": None})
         try:
             from ..runners.phsolver import _solver_subprocess_env, find_solver
             solver = find_solver()
@@ -1840,6 +1887,8 @@ def create_app(result_dir: Optional[str | Path] = None,
             raise RuntimeError(_hook_detail(exc)) from exc
         return messages
 
+    notebook_owned_job = {"id": None}
+
     def _notebook_run_local(*, spec, device, timeout_s, on_progress):
         payload = {"device": device, "timeout_s": timeout_s}
         if spec is not None:
@@ -1850,33 +1899,41 @@ def create_app(result_dir: Optional[str | Path] = None,
         except HTTPException as exc:
             raise RuntimeError(_hook_detail(exc)) from exc
         job_id = job["id"]
-        while True:
+        with job_lock:
+            notebook_owned_job["id"] = job_id
+        try:
+            while True:
+                with job_lock:
+                    current = state["job"]
+                    if current is None or current.get("id") != job_id:
+                        raise RuntimeError(
+                            "the run was superseded by another job")
+                    status = current["status"]
+                    progress = current.get("progress")
+                    error = current.get("error")
+                    session = current.get("session")
+                if on_progress is not None:
+                    on_progress(progress, status)
+                if status in {"completed", "failed", "cancelled"}:
+                    break
+                time.sleep(0.25)
+            if status != "completed" or session is None:
+                raise RuntimeError(error or f"simulation run {status}")
+            data, result_id, run_id = state["result"]
+            if data is None or result_id != session.get("result_id"):
+                raise RuntimeError(
+                    "the completed result is no longer the open result")
+            return data, session
+        finally:
             with job_lock:
-                current = state["job"]
-                if current is None or current.get("id") != job_id:
-                    raise RuntimeError(
-                        "the run was superseded by another job")
-                status = current["status"]
-                progress = current.get("progress")
-                error = current.get("error")
-                session = current.get("session")
-            if on_progress is not None:
-                on_progress(progress, status)
-            if status in {"completed", "failed", "cancelled"}:
-                break
-            time.sleep(0.25)
-        if status != "completed" or session is None:
-            raise RuntimeError(error or f"simulation run {status}")
-        data, result_id, run_id = state["result"]
-        if data is None or result_id != session.get("result_id"):
-            raise RuntimeError(
-                "the completed result is no longer the open result")
-        return data, session
+                if notebook_owned_job["id"] == job_id:
+                    notebook_owned_job["id"] = None
 
     def _notebook_cancel_active_run() -> None:
         with job_lock:
             job = state["job"]
-            if job is not None and job["status"] in {"queued", "running"}:
+            if (job is not None and job["id"] == notebook_owned_job["id"]
+                    and job["status"] in {"queued", "running"}):
                 job["cancel_event"].set()
 
     def _notebook_get_result():
@@ -1894,6 +1951,7 @@ def create_app(result_dir: Optional[str | Path] = None,
             get_result=_notebook_get_result,
         ),
         persist_path=ledger.root / "workbench-notebook.json",
+        execution_available=True,
     )
 
     def _notebook_op(operation):
@@ -1901,6 +1959,8 @@ def create_app(result_dir: Optional[str | Path] = None,
             return operation()
         except LookupError as exc:
             raise HTTPException(404, str(exc))
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc))
 
     @app.get("/api/notebook")
     def notebook_state():
@@ -1945,7 +2005,7 @@ def create_app(result_dir: Optional[str | Path] = None,
 
     @app.post("/api/notebook/run-all")
     def notebook_run_all():
-        return notebook_kernel.run_all()
+        return _notebook_op(notebook_kernel.run_all)
 
     @app.post("/api/notebook/interrupt")
     def notebook_interrupt():
@@ -2174,10 +2234,11 @@ def create_app(result_dir: Optional[str | Path] = None,
             # or changes this optional display field.
             return False
 
-    def _public_cloud_preflight(token: str, accepted) -> dict:
+    def _public_cloud_preflight(token: str, accepted, canonical_sha: str) -> dict:
         quote = getattr(accepted, "quote", {})
         out = {
             "token": token,
+            "canonical_sha": canonical_sha,
             "device": accepted.device,
             "max_usd": accepted.max_usd,
             "quote_usd": accepted.quote_usd,
@@ -2648,10 +2709,25 @@ def create_app(result_dir: Optional[str | Path] = None,
                 "accepted": accepted, "canonical_sha": canonical_sha,
                 "consumed": False, "created_at": time.time(),
             }
-        return _public_cloud_preflight(token, accepted)
+        return _public_cloud_preflight(token, accepted, canonical_sha)
 
     @app.post("/api/cloud/run")
-    def start_cloud_run(payload: dict = Body(...)):
+    def start_cloud_run(request: StarletteRequest, payload: dict = Body(...)):
+        if launch_token is not None:
+            token = payload.get("preflight_token")
+            supplied = request.headers.getlist(_DESKTOP_PAID_SUBMIT_PROOF_HEADER)
+            if (not isinstance(token, str) or len(supplied) != 1
+                    or not re.fullmatch(r"[0-9a-f]{64}", supplied[0])):
+                raise HTTPException(403, "Native confirmation is required before a paid cloud run.")
+            try:
+                token_bytes = token.encode("utf-8")
+            except UnicodeEncodeError:
+                raise HTTPException(403, "Native confirmation is required before a paid cloud run.") from None
+            expected = hmac.new(launch_token.encode("ascii"),
+                                _DESKTOP_PAID_SUBMIT_PROOF_PURPOSE + token_bytes,
+                                hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(supplied[0], expected):
+                raise HTTPException(403, "Native confirmation is required before a paid cloud run.")
         # Serialize the paid POST through durable service-id publication. The
         # lock also closes the local-vs-cloud simultaneous-start race.
         with execution_lock:
@@ -3512,8 +3588,9 @@ def create_app(result_dir: Optional[str | Path] = None,
             return _INDEX
 
     # Add this last so it is the outermost application middleware. In an
-    # Electron-owned launch, no API route (including health, cloud endpoints,
-    # future streaming responses, or future WebSockets) can run first.
+    # Electron-owned launch, only GET /api/health/proof bypasses the capability
+    # so the listener can prove ownership before Electron sends it. Every other
+    # API route, including future streams and WebSockets, stays protected.
     app.add_middleware(
         _DesktopCapabilityMiddleware, launch_capability=launch_token,
         notebook_enabled=notebook_enabled,
@@ -3557,6 +3634,35 @@ def _read_desktop_launch_capability() -> str:
     return capability
 
 
+def _read_desktop_cloud_config() -> None:
+    """Accept one optional bounded cloud configuration over the launch pipe."""
+    import sys
+
+    cloud_config.reset()
+    cloud_config.set_private_delivery_mode()
+    raw = sys.stdin.readline(8194)
+    if not raw or not raw.endswith("\n") or len(raw) > 8193:
+        print("[photonhub] cloud access unavailable: private delivery failed",
+              file=sys.stderr)
+        return
+    try:
+        value = json.loads(raw)
+        if value is None:
+            return
+        if (not isinstance(value, dict) or set(value) != {"api_key", "url"}
+                or not isinstance(value["api_key"], str)
+                or not 1 <= len(value["api_key"]) <= 4096
+                or not isinstance(value["url"], str)
+                or not 1 <= len(value["url"]) <= 2048):
+            raise ValueError("invalid cloud configuration")
+        cloud_config.configure(api_key=value["api_key"], url=value["url"])
+    except (ValueError, TypeError, cloud_config.CloudError):
+        cloud_config.reset()
+        cloud_config.set_private_delivery_mode()
+        print("[photonhub] cloud access unavailable: private delivery invalid",
+              file=sys.stderr)
+
+
 def _persistent_run_root(run_root: Optional[str | Path] = None) -> Path:
     """Resolve the CLI/desktop archive; direct ``create_app`` stays isolated."""
     configured = run_root or os.environ.get("PHOTONHUB_RUN_ROOT")
@@ -3573,13 +3679,29 @@ def _load_desktop_release(path: str | Path) -> dict:
     return load_release_manifest(manifest_path, artifact_root=manifest_path.parent)
 
 
+def _create_listening_socket(port: int, *, windows: bool = os.name == "nt") -> socket.socket:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if windows:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", port))
+        listener.listen(2048)
+        listener.setblocking(False)
+        return listener
+    except BaseException:
+        listener.close()
+        raise
+
+
 def serve_viz(result_dir: Optional[str | Path] = None, *, port: int = 8765,
               open_browser: bool = True, ui_dir: Optional[str | Path] = None,
               watch_parent: bool = False,
               run_root: Optional[str | Path] = None,
               launch_token: Optional[str] = None,
               release_manifest: Optional[str | Path] = None,
-              notebook_enabled: bool = True) -> None:
+              notebook_enabled: bool = False) -> None:
     """Start the local viz server on 127.0.0.1 and (optionally) open a browser."""
     import uvicorn
 
@@ -3599,7 +3721,8 @@ def serve_viz(result_dir: Optional[str | Path] = None, *, port: int = 8765,
         launch_token=launch_token, shutdown_callback=request_shutdown,
         release_identity=release_identity)
     config = uvicorn.Config(
-        app, host="127.0.0.1", port=port, log_level="warning")
+        app, host="127.0.0.1", port=port, log_level="warning",
+        proxy_headers=False)
     server = uvicorn.Server(config)
     server_ref["server"] = server
     if watch_parent:
@@ -3607,8 +3730,21 @@ def serve_viz(result_dir: Optional[str | Path] = None, *, port: int = 8765,
     url = f"http://127.0.0.1:{port}/"
     if open_browser:
         webbrowser.open(url)
-    print(f"[photonhub] viz server → {url}  (Ctrl-C to stop)")
-    server.run()
+    try:
+        listener = _create_listening_socket(port)
+    except OSError as exc:
+        print(
+            f"[photonhub] cannot listen on 127.0.0.1:{port} ({exc}); "
+            "choose a free port with --port",
+            file=__import__("sys").stderr,
+        )
+        raise SystemExit(3) from None
+    try:
+        print(f"[photonhub] viz server → {url}  (Ctrl-C to stop)")
+        server.run(sockets=[listener])
+    finally:
+        listener.close()
+        cloud_config.reset()
 
 
 def _main(argv=None) -> int:
@@ -3620,9 +3756,9 @@ def _main(argv=None) -> int:
     ap.add_argument("--no-open", action="store_true", help="don't open a browser")
     ap.add_argument(
         "--enable-notebook", action="store_true",
-        help="allow notebook code cells (arbitrary Python in this process). "
+        help="allow notebook code cells (arbitrary Python in a child process). "
              "The listener is unauthenticated on loopback, which every OS "
-             "user on the host shares — enable only on a single-user machine.",
+             "user on the host shares; enable only on a single-user machine.",
     )
     ap.add_argument("--ui-dir", default=None, help="serve a built web UI at / (packaged app)")
     ap.add_argument(
@@ -3636,6 +3772,9 @@ def _main(argv=None) -> int:
         "--launch-capability-stdin", action="store_true", help=argparse.SUPPRESS,
     )
     ap.add_argument(
+        "--cloud-config-stdin", action="store_true", help=argparse.SUPPRESS,
+    )
+    ap.add_argument(
         "--release-manifest", default=None,
         help="validate and report an installed Workbench release.json",
     )
@@ -3645,6 +3784,12 @@ def _main(argv=None) -> int:
             _read_desktop_launch_capability()
             if a.launch_capability_stdin else None
         )
+        if a.cloud_config_stdin:
+            if not a.launch_capability_stdin:
+                raise ValueError("cloud configuration requires private launch pipe")
+            os.environ.pop("PHOTONHUB_API_KEY", None)
+            os.environ.pop("PHOTONHUB_URL", None)
+            _read_desktop_cloud_config()
         serve_viz(
             a.result_dir, port=a.port, open_browser=not a.no_open,
             ui_dir=a.ui_dir, watch_parent=a.watch_parent,

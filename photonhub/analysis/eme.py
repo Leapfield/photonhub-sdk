@@ -108,6 +108,8 @@ class InterfaceDiagnostics:
     older diagnostics deceptively modest. ``max_guided_input_residual`` filters
     the continuity residual to incident guided channels on either side, so a
     poor continuum test channel cannot hide the accuracy of the physical ports.
+    ``method`` records the interface model that built the S-matrix; ``rank``,
+    ``condition_number`` and ``equations`` describe that model's own system.
     """
 
     n_left: int
@@ -128,6 +130,7 @@ class InterfaceDiagnostics:
     left_reaction_orthogonality_error: float = 0.0
     right_reaction_orthogonality_error: float = 0.0
     max_guided_input_residual: float = 0.0
+    method: str = "galerkin"
 
 
 @dataclass
@@ -154,6 +157,7 @@ class EMEResult:
     left_power_metric: Optional[np.ndarray] = None
     right_power_metric: Optional[np.ndarray] = None
     interface_diagnostics: Tuple[InterfaceDiagnostics, ...] = ()
+    interface: str = "galerkin"
 
     def __post_init__(self) -> None:
         if self.n_left_modes == 0:
@@ -399,6 +403,10 @@ def eme_convergence_report(
     """
     if len(results) < 2:
         raise ValueError("convergence reporting needs at least two EME results")
+    if len({getattr(r, "interface", "galerkin") for r in results}) > 1:
+        raise ValueError(
+            "convergence reporting compares results built with one interface "
+            "model; these mix galerkin and projection interfaces")
     if port_left < 1 or port_right < 1:
         raise ValueError("port_left and port_right must be >= 1")
     if tolerance <= 0.0:
@@ -939,6 +947,7 @@ def interface_smatrix(
     rcond: float = 1e-10,
     enforce_passivity: bool = False,
     return_diagnostics: bool = False,
+    method: str = "galerkin",
 ) -> Union[SMatrix, Tuple[SMatrix, InterfaceDiagnostics]]:
     """Generalized two-sided Petrov-Galerkin match at a waveguide step.
 
@@ -951,6 +960,29 @@ def interface_smatrix(
     A rank-revealing SVD exposes truncation through continuity residuals; it
     never fabricates exact unitarity.
 
+    ``method`` chooses how the scattering matrix is built from those
+    projections:
+
+    * ``"galerkin"`` (default) solves the tall continuity system in the
+      least-squares sense.  With a complete basis this is the exact interface.
+      With a truncated basis it cannot place power in channels the basis lacks,
+      so it returns that power to the represented modes: a guided-only basis
+      reports almost no loss at a junction whose modes are offset or reshaped.
+    * ``"projection"`` matches each incidence only on the far side's modes:
+      from the left, the E- and H-continuity equations tested with the right
+      modes, solved for the transmitted and reflected amplitudes together (for
+      one mode per side, t = 2cb / (c + b) and r = (b - c) / (b + c), with c
+      and b the E and H projections); from the right, the same with the left
+      modes. With a complete basis this is the exact interface, like the
+      default. With a truncated basis, power that the far basis cannot
+      represent is lost from the cascade, as radiation leaves an open device:
+      a guided-only basis then keeps the mode-overlap loss of a lateral offset
+      or a straight-to-bend junction. It drops radiation that would return to
+      the guide further on, so it reads low wherever that matters, such as a
+      sharp curvature reversal, a closed box or a very short abrupt step; there
+      a complete basis is needed. Identical bases give the identity in both
+      methods.
+
     ``enforce_passivity=True`` clips any gain of an ordinary real guided
     interface (singular values of the power-normalized S-matrix above 1).
     It is off by default: the guided traces are not exactly orthogonal, so
@@ -962,6 +994,9 @@ def interface_smatrix(
     finer cross-section mesh), while the raw cascade stays lossless to 3e-4. The
     raw violation is always reported in the diagnostics.
     """
+    if method not in ("galerkin", "projection"):
+        raise ValueError(
+            f"method must be 'galerkin' or 'projection', got {method!r}")
     n_left = len(left_modes)
     n_right = len(right_modes)
     if n_left < 1 or n_right < 1:
@@ -1048,7 +1083,7 @@ def interface_smatrix(
     ):
         raise ValueError(
             "interface sections use different PML/complex-coordinate contours; "
-            "cross-contour mode matching is not implemented"
+            "give both sections the same absorbing layers and layer strength"
         )
     dA = dl_x_um * dl_y_um
 
@@ -1097,8 +1132,37 @@ def interface_smatrix(
     )
     kout_eq = k_out / row_scale[:, None]
     kin_eq = k_in / row_scale[:, None]
-    pinv, rank, condition, _ = _svd_pinv(kout_eq, rcond)
-    raw_scattering = pinv @ kin_eq
+    if method == "galerkin":
+        pinv, rank, condition, _ = _svd_pinv(kout_eq, rcond)
+        raw_scattering = pinv @ kin_eq
+        equations = k_out.shape[0]
+    else:
+        # Each incidence is matched only on the far side's modes, so field the
+        # far basis cannot represent is lost (radiated) instead of being
+        # returned to the represented modes. c_rl / b_rl hold the right-mode
+        # coefficients of each left E / H field, a_lr / d_lr the left-mode
+        # coefficients of each right E / H field. From the left,
+        # (a + r) e_L = t e_R and (a - r) h_L = t h_R tested on the right modes
+        # give c_rl (a + r) = t and b_rl (a - r) = t; eliminating r exactly
+        # (least squares over the 2 n_right equations) gives one mode's
+        # t = 2cb / (c + b), r = (b - c) / (b + c), the exact Fresnel pair
+        # when the right basis spans the field. From the right, with H
+        # reversed, r' = a_lr (rho + b) and r' = d_lr (b - rho).
+        eye_r = np.eye(n_right, dtype=complex)
+        eye_l = np.eye(n_left, dtype=complex)
+        m_left = np.block([[c_rl, -eye_r], [b_rl, eye_r]])
+        m_right = np.block([[eye_l, -a_lr], [eye_l, d_lr]])
+        pinv_l, rank_l, cond_l, _ = _svd_pinv(m_left, rcond)
+        pinv_r, rank_r, cond_r, _ = _svd_pinv(m_right, rcond)
+        x_left = pinv_l @ np.vstack((-c_rl, b_rl))      # [r; t] per left input
+        x_right = pinv_r @ np.vstack((a_lr, d_lr))      # [r'; rho] per right input
+        raw_scattering = np.block([
+            [x_left[:n_left], x_right[:n_left]],
+            [x_left[n_left:], x_right[n_left:]],
+        ])
+        rank = rank_l + rank_r
+        condition = max(cond_l, cond_r)
+        equations = m_left.shape[0] + m_right.shape[0]
     raw_residual = np.linalg.norm(
         k_out @ raw_scattering - k_in, axis=0
     ) / np.maximum(np.linalg.norm(k_in, axis=0), 1e-300)
@@ -1159,7 +1223,7 @@ def interface_smatrix(
         n_left=n_left,
         n_right=n_right,
         rank=rank,
-        equations=k_out.shape[0],
+        equations=equations,
         condition_number=condition,
         raw_residual_by_input=raw_residual,
         residual_by_input=residual,
@@ -1178,6 +1242,7 @@ def interface_smatrix(
             right.reaction_orthogonality_error
         ),
         max_guided_input_residual=max_guided_input_residual,
+        method=method,
     )
     return (smatrix, diagnostics) if return_diagnostics else smatrix
 
@@ -1208,6 +1273,10 @@ def propagation_smatrix(modes: Sequence[VectorMode], length_um: float) -> SMatri
     k0 = 2.0 * np.pi / lam_um  # 1/µm
     n_eff = np.array([m.n_eff for m in modes], dtype=float)
     k_eff = np.array([m.k_eff for m in modes], dtype=float)
+    if not np.all(np.isfinite(k_eff)):
+        raise ValueError(
+            "mode attenuation is unavailable; solve with absorbing layers "
+            "and a wider window before EME propagation")
     phi = np.exp(-1j * k0 * n_eff * length_um - k0 * k_eff * length_um)
     phase = np.diag(phi).astype(complex)
     zero = np.zeros((n, n), dtype=complex)
@@ -1270,6 +1339,7 @@ def run_eme(
     *,
     interface_rcond: float = 1e-10,
     enforce_passivity: bool = False,
+    interface: str = "galerkin",
 ) -> EMEResult:
     """Cascade a sequence of :class:`Section`s into one device S-matrix.
 
@@ -1292,11 +1362,23 @@ def run_eme(
         guided ports whose ``energy_balance(0)`` exceeds 1 by more than 1e-3
         warns: that gain is a basis that has not converged.
 
+    interface:
+        ``"galerkin"`` (default) or ``"projection"``, the interface model of
+        :func:`interface_smatrix`. Use ``"projection"`` for an open device
+        modelled with a truncated (for example guided-only) basis, where power
+        that a section's modes cannot represent radiates away: gentle bends,
+        lateral offsets and other junctions whose scattered field does not
+        return to the guide. Keep ``"galerkin"`` with a complete basis; the two
+        agree once the basis is complete, which is a useful check.
+
     Returns
     -------
     EMEResult
         The device scattering matrix and convenience power ratios.
     """
+    if interface not in ("galerkin", "projection"):
+        raise ValueError(
+            f"interface must be 'galerkin' or 'projection', got {interface!r}")
     if len(sections) < 2:
         raise ValueError("run_eme needs at least two sections (in and out ports)")
     for k, section in enumerate(sections):
@@ -1371,6 +1453,7 @@ def run_eme(
                 rcond=interface_rcond,
                 enforce_passivity=enforce_passivity,
                 return_diagnostics=True,
+                method=interface,
             )
             segments.append(matched)
             diagnostics.append(diag)
@@ -1398,6 +1481,7 @@ def run_eme(
         left_power_metric=left_trace.power_metric,
         right_power_metric=right_trace.power_metric,
         interface_diagnostics=tuple(diagnostics),
+        interface=interface,
     )
     if not enforce_passivity:
         _warn_if_active(result, bases)
@@ -1552,16 +1636,14 @@ def waveguide_section(
 #
 # This is the CPU "expose the batch" prerequisite for any GPU port: once the F×Z
 # eigensolves are collected as one independent set, the same set is what a batched
-# GPU eigensolver would consume. See
-# ``docs/eme-gpu-acceleration-design.md``.
+# GPU eigensolver would consume.
 #
 # Multiprocessing note: on macOS/Windows the default start method is *spawn*,
 # which re-imports the caller's ``__main__`` — so a script that calls
 # ``run_eme_band(..., backend="process")`` MUST guard its entry with
 # ``if __name__ == "__main__":``. The *thread* backend has no such constraint and
 # skips result pickling; which backend wins depends on how much of the eigensolve
-# releases the GIL and on the process-startup cost relative to the workload (see
-# ``validation/suites/eme/eme_band_speedup.py`` for measured numbers).
+# releases the GIL and on the process-startup cost relative to the workload.
 
 #: Per-section base solvers, stashed in a module global so a pool task ships only
 #: ``(section, wavelength)`` indices rather than re-pickling a solver per task.
@@ -1667,6 +1749,7 @@ def run_eme_band(
     workers: Optional[int] = None,
     backend: str = "auto",
     enforce_passivity: bool = False,
+    interface: str = "galerkin",
 ) -> Dict[float, EMEResult]:
     """Cascade a staircased device across a band of wavelengths, solving the
     independent per-(wavelength × section) FDE eigenmodes **in parallel**.
@@ -1711,6 +1794,8 @@ def run_eme_band(
         for a large spawn-platform sweep, or ``"serial"`` to disable parallelism.
     enforce_passivity:
         Forwarded to :func:`run_eme` (off by default).
+    interface:
+        Forwarded to :func:`run_eme` (``"galerkin"`` by default).
 
     Returns
     -------
@@ -1719,6 +1804,9 @@ def run_eme_band(
         wavelength, identical to a per-wavelength :func:`run_eme` cascade.
     """
     global _BAND_SOLVERS
+    if interface not in ("galerkin", "projection"):
+        raise ValueError(
+            f"interface must be 'galerkin' or 'projection', got {interface!r}")
     if len(base_sections) < 2:
         raise ValueError("run_eme_band needs at least two sections (in/out ports)")
     wls = [float(w) for w in wlens_um]
@@ -1815,5 +1903,6 @@ def run_eme_band(
                 )
             sections.append(Section(modes=modes, length_um=lengths[si]))
         results[wl] = run_eme(sections, n_modes=n_modes,
-                              enforce_passivity=enforce_passivity)
+                              enforce_passivity=enforce_passivity,
+                              interface=interface)
     return results

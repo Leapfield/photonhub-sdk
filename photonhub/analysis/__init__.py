@@ -47,6 +47,7 @@ spectrum to convergence. Point-probe spectra only in v1; CPU only. See
 :mod:`photonhub.analysis.spectral_completion`.
 """
 
+from .compact_model import SMatrixChecks, SMatrixModel, smatrix_checks, smatrix_model
 from .cvcs import cvcs_sections, interpolate_mode, interpolate_plane
 from .diffraction import DiffractionOrders, diffraction_orders
 from .eme import (
@@ -135,6 +136,7 @@ from .smatrix_driver import (
     SMatrixPort,
     SMatrixResult,
     plan_smatrix,
+    read_touchstone,
     run_smatrix,
     write_touchstone,
 )
@@ -155,6 +157,8 @@ __all__ = [
     "ModeOverlap",
     "ModeSolver",
     "ResonanceAnalysis",
+    "SMatrixChecks",
+    "SMatrixModel",
     "SMatrixPlan",
     "SMatrixPort",
     "SMatrixResult",
@@ -205,6 +209,7 @@ __all__ = [
     "plan_smatrix",
     "propagate_plane",
     "propagation_smatrix",
+    "read_touchstone",
     "reciprocity_error",
     "rectangular_base_section",
     "rectangular_waveguide",
@@ -216,6 +221,8 @@ __all__ = [
     "sample_staggered_eps",
     "select_resonances",
     "smatrix",
+    "smatrix_checks",
+    "smatrix_model",
     "solve_mode_bank",
     "solve_mode_on_cross_section",
     "solve_modes_by_freq",

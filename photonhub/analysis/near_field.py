@@ -331,7 +331,7 @@ def equivalent_currents(
     H2, _, _, _ = _plane_component_3d(plane_fields[h2n], h2n, freq_hz, t1, t2, axis)
 
     if colocate:
-        # Same offsets as mode_overlap._overlap_terms (grid.h yee_offset):
+        # Same offsets as mode_overlap._overlap_terms (the engine's Yee offsets):
         # arrays are [i_t2, i_t1]; E_t1 is +1/2 in t1 (last axis), E_t2 +1/2 in
         # t2 (axis 0), H_t1 +1/2 in t2, H_t2 +1/2 in t1.
         E1 = _colocate_to_node(E1, -1)
@@ -464,11 +464,11 @@ def _project_one_face(
 
 
 
-# --- NUMERICS §20 symmetry: unfolding a reduced domain's plane ----------------
+# --- Symmetry planes: unfolding a reduced domain's plane -------------------
 
 def _mirror_parity(component: str, axis: str, symmetry: int) -> int:
     """Sign a field component picks up on reflection through a symmetry plane
-    normal to ``axis`` (NUMERICS.md §20).
+    normal to ``axis``.
 
     A PEC plane (``symmetry = -1``) pins the tangential E and passes the normal
     component; a PMC plane (``+1``) does the opposite. H is a pseudovector, so
@@ -482,7 +482,7 @@ def _mirror_parity(component: str, axis: str, symmetry: int) -> int:
 
 def _half_offset(component: str, axis: str) -> bool:
     """Whether ``component`` sits half a cell past the primary node along
-    ``axis`` (the §1.1 Yee stagger): ``E_c`` is offset along ``c``, ``H_c``
+    ``axis`` (the Yee stagger): ``E_c`` is offset along ``c``, ``H_c``
     along the two axes that are not ``c``."""
     if component[0] == "E":
         return component[1] == axis
@@ -633,7 +633,7 @@ def far_field(
         if ax not in _TRANSVERSE:
             raise ValueError(f"axis must be one of x/y/z, got {ax!r}")
 
-    # §20: a symmetry-reduced run recorded only its fraction of the plane. Mirror
+    # A symmetry-reduced run recorded only its fraction of the plane. Mirror
     # it back before integrating; that step co-locates, so it takes over from
     # `colocate` (applying both would average the same half cell twice).
     if simulation is not None and any(

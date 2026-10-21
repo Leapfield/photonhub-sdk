@@ -1,4 +1,4 @@
-"""Cut-plane geometry shared by every 2D view and the 3D builder (design §5).
+"""Cut-plane geometry shared by every 2D view and the 3D builder.
 
 Given a constant-coordinate cut plane ``axis=a, value=v0`` (a in {x, y, z}),
 project the scene's analytic geometry onto the two in-plane axes:
@@ -42,7 +42,7 @@ _AXES = "xyz"
 def frame_origin(sim) -> Tuple[float, float, float]:
     """The user-frame position of the wire's corner (``Simulation.origin_um``),
     ``(0, 0, 0)`` for a hand-built or ingested scene. The plotters sample and
-    check in the corner frame and draw in the user's frame (design spec §4.4)."""
+    check in the corner frame and draw in the user's frame."""
     from ..components.frame import frame_origin as _origin
     return _origin(sim)
 
@@ -65,19 +65,24 @@ def axis_index(axis: str) -> int:
 _DISPLAY_SWAP = False
 
 
+def physical_in_plane_axes(axis: str) -> Tuple[str, str]:
+    """The fixed transverse (u, v) axis order used by stored geometry."""
+    a = axis_index(axis)
+    rest = [i for i in range(3) if i != a]
+    return _AXES[rest[0]], _AXES[rest[1]]
+
+
 def in_plane_axes(axis: str) -> Tuple[str, str]:
     """The two axis letters that remain in the cut plane, in (horizontal,
-    vertical) order: the natural pair for a constant-``axis`` slice. For a
-    z-cut this is ('x', 'y'); for x it is ('y', 'z'); for y it is ('x', 'z').
+    vertical) display order. The natural pair is ('x', 'y') for a z-cut,
+    ('y', 'z') for x, and ('x', 'z') for y.
 
     Inside :func:`displayed_transposed` the pair comes back swapped, so a view
     that opts in draws the same plane with its other axis horizontal. That is
     a presentation choice only: the ascending pair above is the convention
     every caller outside such a block sees, the wire and the Workbench
     included."""
-    a = axis_index(axis)
-    rest = [i for i in range(3) if i != a]
-    h, v = _AXES[rest[0]], _AXES[rest[1]]
+    h, v = physical_in_plane_axes(axis)
     return (v, h) if _DISPLAY_SWAP else (h, v)
 
 
@@ -102,7 +107,7 @@ def displayed_transposed(swap: bool = True):
 
 def select_plane(x, y, z) -> Tuple[str, float]:
     """Resolve exactly one of x/y/z (microns) to ``(axis, value)``; not
-    exactly one set -> ValueError (design §9)."""
+    exactly one set -> ValueError."""
     given = [(ax, v) for ax, v in (("x", x), ("y", y), ("z", z)) if v is not None]
     if len(given) != 1:
         raise ValueError(
@@ -127,7 +132,7 @@ def box_rectangle(
     the in-plane axes' order, or ``None`` if the plane does not intersect.
 
     Intersects iff ``|value - center[axis]| <= size[axis]/2 + tol`` (closed,
-    matching the §9 closed-containment mesh sampling rule). ``tol`` defaults to
+    matching the closed-containment mesh sampling rule). ``tol`` defaults to
     0 — exact containment, what structure mesh sampling means. Overlay glyphs
     pass half a cell for a box that is FLAT on the cut axis: a monitor plane
     carries no thickness to intersect, and the quarter-cell auto-snap moves it
@@ -152,7 +157,7 @@ def sphere_circle(
     in-plane axes' order, or ``None`` if the plane does not intersect.
 
     Intersects iff ``d = |value - center[axis]| < radius``; the cut radius is
-    ``sqrt(radius**2 - d**2)`` (design §5)."""
+    ``sqrt(radius**2 - d**2)``."""
     a = axis_index(axis)
     d = abs(value - center_um[a])
     if d >= radius_um:
@@ -183,8 +188,8 @@ def polyslab_section(
       ``slab_lo <= value <= slab_hi``): the exact cross-section is the reference
       polygon ``vertices_um`` mapped into the two in-plane axes ->
       ``("polygon", ((h, v), ...))``. The vertices are stored in ``(u, v)`` =
-      (lower-indexed, higher-indexed) transverse order, which already matches
-      the ``(h, v)`` in-plane order this module uses, so no swap is needed.
+      (lower-indexed, higher-indexed) transverse order. The returned outline
+      follows the selected display order.
       ``sidewall_angle`` is NOT applied — the reference polygon is drawn as-is
       (the slanted-wall taper to the cut height is deferred; see the caveat in
       :class:`~photonhub.components.structures.Polygon`).
@@ -198,12 +203,14 @@ def polyslab_section(
     Returns ``None`` when the plane misses the slab."""
     lo, hi = _slab_extent(slab_bounds_um)
     verts = [(float(u), float(v)) for u, v in vertices_um]
-    u_ax, v_ax = in_plane_axes(geom_axis)  # the two transverse axes (u, v order)
+    u_ax, v_ax = physical_in_plane_axes(geom_axis)
 
     if cut_axis == geom_axis:
         # Perpendicular cut: exact polygon when within the axial extent.
         if not (lo <= value <= hi):
             return None
+        if in_plane_axes(cut_axis)[0] != u_ax:
+            verts = [(v, u) for u, v in verts]
         return ("polygon", tuple(verts))
 
     # Parallel cut: exact crossing intervals of the reference polygon along
@@ -293,7 +300,7 @@ def cylinder_section(
     half = length_um / 2.0
     axial_lo = center_um[a] - half
     axial_hi = center_um[a] + half
-    u_ax, v_ax = in_plane_axes(geom_axis)
+    u_ax, v_ax = physical_in_plane_axes(geom_axis)
     u_i, v_i = _AXES.index(u_ax), _AXES.index(v_ax)
     cu, cv = center_um[u_i], center_um[v_i]
 
@@ -302,13 +309,15 @@ def cylinder_section(
             return None
         sweep = angle_stop_rad - angle_start_rad
         is_full = sweep >= 2.0 * math.pi - full_sweep_tol
+        swapped = in_plane_axes(cut_axis)[0] != u_ax
+        h_center, v_center = (cv, cu) if swapped else (cu, cv)
         if is_full and inner_radius_um <= 0.0:
-            return ("circle", (cu, cv, radius_um))
+            return ("circle", (h_center, v_center, radius_um))
         if is_full:
-            return ("annulus", (cu, cv, radius_um, inner_radius_um))
-        return ("polygon",
-                _arc_polygon(cu, cv, radius_um, inner_radius_um,
-                             angle_start_rad, angle_stop_rad))
+            return ("annulus", (h_center, v_center, radius_um, inner_radius_um))
+        verts = _arc_polygon(cu, cv, radius_um, inner_radius_um,
+                             angle_start_rad, angle_stop_rad)
+        return ("polygon", tuple((v, u) for u, v in verts) if swapped else verts)
 
     # Parallel cut: exact chord of the outer circle at the cut offset (the
     # annular hole / partial sweep are still ignored — see the docstring).
@@ -332,7 +341,7 @@ def reflect_spec(kind, params, sign_h: int, sign_v: int):
     """The same cut-plane patch spec reflected about ``h = 0`` and/or ``v = 0``
     (``sign_* = -1`` reflects that in-plane axis, ``+1`` leaves it).
 
-    A NUMERICS §20 symmetry plane sits on an axis MINIMUM face, i.e. at
+    A symmetry plane sits on an axis MINIMUM face, i.e. at
     coordinate 0, so unfolding the half domain is exactly this negation. The
     spec kinds are the tagged union this module returns, so a new geometry
     kind gets its mirror here and nowhere else."""
@@ -417,8 +426,7 @@ def axis_line_in_plane(
     cut only when ``feature_axis`` lies in the cut plane — i.e. is one of the
     two in-plane axes. Returns ``(orientation_axis, position)`` where
     ``orientation_axis`` is the in-plane axis the line is constant along, or
-    ``None`` when the feature's plane is parallel to the cut (out of plane,
-    design §5/§9)."""
+    ``None`` when the feature's plane is parallel to the cut (out of plane)."""
     if feature_axis == cut_axis:
         return None
     return (feature_axis, position_um)

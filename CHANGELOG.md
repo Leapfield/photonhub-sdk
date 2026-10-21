@@ -5,6 +5,711 @@ The desktop application and the solver engine share this version number.
 
 ## Unreleased
 
+## 0.1.6 (2026-10-21)
+
+This release adds broadband and modal inverse design with checked gradients,
+shape optimization of guide widths and polygon vertices, an opt-in mode solve
+on the Yee lattice, design studies, gdsfactory import, compact-model export,
+index maps from temperature or carrier density, more local MCP tools and the
+GDS layout reader in the packaged Workbench build. Setup is much faster on
+scenes with many structures. It also moves numbers, among them bend and
+rotated ring ports, port modes on custom media, modes solved with absorbing
+layers, TF/SF box spectra and Bloch magnetic launches. Re-run anything you
+compare against a 0.1.5 result.
+Entries marked **numbers move** change a reading; several under Breaking do
+too. Breaking entries need a change in your code: `optimize` defaults to
+L-BFGS-B, a source inside the boundary layers is refused and fourteen names
+deprecated in 0.1.2 are removed, among others. The wire schema moves to
+`1.22.0-alpha.1`.
+
+### Added
+
+- Inverse design adds `BroadbandModeTransmission`: modal transmission
+  `T_k` at several frequencies read from one forward run, with port modes
+  re-solved at each frequency and the input port's reading in the same run
+  as the incident amplitude, or fixed incident amplitudes read from one
+  design-free broadband run (`reference_incident_amplitudes`), reduced to
+  one figure of merit (the mean, a weighted sum, a smooth minimum or a
+  callable returning the value and its slopes). `value_and_gradient`,
+  `parametric_value_and_gradient`, `finite_difference_check`, `optimize`
+  and `optimize_parametric` take it at one forward and one adjoint solve
+  per evaluation whatever the number of frequencies, and return
+  `BroadbandGradientResult`. The adjoint run drives each port sample with
+  delayed copies of the forward pulse whose amplitudes make the summed
+  current, at every frequency, exactly the single-frequency adjoint current
+  scaled by `dF/dT_k`; it runs longer than the forward run by the span of
+  those delays, about `1/df` for the smallest frequency spacing `df`. No
+  solver or file-format change. `DesignRegion.monitor` takes a sequence of
+  frequencies, and a `simulation` for quasi-2D runs (one periodic cell),
+  where it records the quarter-cell plane. On a quasi-2D CPU taper (21
+  wavelengths from 1.35 to 1.85 um, 0.025 um uniform mesh, 8000 fixed
+  steps) and a 3D CPU strip guide (5 wavelengths from 1.45 to 1.65 um, 0.04
+  um uniform mesh, 3000 fixed steps), both subpixel off, non-dispersive, PML
+  on every open axis and shutoff 0, the broadband gradient of the mean
+  matched the sum of the single-frequency gradients to 3.1e-7 and 3.0e-7
+  relative L2 and central differences of real solves to 1.6e-3 and 1.5e-4
+  (8.8e-5 and 3.3e-6 against their Richardson extrapolation). Launch each
+  frequency's own mode (`mode_launch(..., modes_by_freq=...)`) when `T_k`
+  should match one run per wavelength: on the quasi-2D taper it did to
+  5.2e-4, against 1.3% with the 1.55 um mode launched at every wavelength.
+- Inverse design now offers `ModeTransmission`, the same-run S-matrix
+  element `|S_out,in|^2` of two modal ports whose four-field monitors are
+  cropped clear of transverse PML. Its exact discrete gradient uses one
+  forward and one adjoint solve, including ports on different axes or with
+  different modes. The incident reading picks up part of a design's
+  reflection when the reference mode differs from the solver's discrete
+  mode, with an error that changes with the input plane and does not fade
+  with distance from the source: on two reflective 3D CPU tests (0.05 and
+  0.04 um uniform mesh, subpixel off, non-dispersive Si in SiO2, six PML
+  layers on every axis, 3000 fixed steps, shutoff 0, eight and nine input
+  planes) the incident power differed from a design-free run by up to 5.7%
+  with scalar modes, 0.42% and 1.0% with Yee-staggered modes solved on the
+  smoothed cross-section (the `supersample=8` default) and 0.16% and 0.24%
+  with Yee-staggered modes solved with `supersample=1`, and the reported
+  transmission moved by 6.4% and 12.4%, 1.7% and 1.4%, and 0.11% and 0.16%
+  across the planes. Constructing the objective warns when a port mode is
+  not Yee-staggered or was solved on a smoothed cross-section, and building
+  its ports warns when more than 1e-3 of a mode's power lies outside the
+  crop. An optional `incident_amplitude`, read with
+  `reference_incident_amplitude` from a design-free run, holds the
+  denominator fixed and drops the input term, the reflection seen through
+  the incident reading, from the gradient; it does not remove the
+  plane-dependent error of a scalar or smoothed mode. `GradientResult` includes the forward and adjoint
+  simulations; `build_adjoint_simulation` returns the runnable adjoint and
+  its coefficient after the same checks as `value_and_gradient`;
+  `finite_difference_check` compares the gradient with central differences
+  of real solves and records every value and solve length. `optimize` and
+  `optimize_parametric` accept the objective. `ModePower` remains a relative
+  modal-power objective.
+- Shape optimization has a checked gradient. `parametric_value_and_gradient`
+  returns the objective, `dJ/dp` for a few shape parameters, the Jacobian
+  `drho/dp` it was chained through and the underlying density gradient with
+  its forward and adjoint simulations; it still costs one forward and one
+  adjoint solve. `parametric_finite_difference_check` compares it with
+  central differences of real solves, re-rendering the shape for every
+  perturbed solve.
+  `WidthProfile` renders a guide's widths along one axis with a soft edge and
+  gives the exact Jacobian, which `optimize_parametric(jacobian=...)` now
+  accepts; `ParametricResult.grads` records every `dJ/dp`. The edge defaults
+  to the larger of two cells and the pixel pitch across the width. With an
+  edge of one pitch a width's gradient is exactly zero whenever the edge lies
+  on a pixel face and swings from 0 to about 1.9 times its mean across each
+  pitch; two pitches hold it within 0.94 to 1.05 of the mean. An `edge_um`
+  below the pitch, which leaves a width dead over part of its range, warns,
+  and so does a width clipped by the region boundary. Without a Jacobian,
+  `optimize_parametric` keeps the central difference of `expand`, which is
+  wrong for any density within `fd_step` of a kink of `expand` (`np.clip`,
+  `np.maximum`): there it returns a blend of the two one-sided slopes. Both
+  paths now check `expand` before any solve: a kink within `fd_step` of the
+  parameters warns, and so does a supplied Jacobian that disagrees with
+  differences of `expand`. The checks render one parameter at a time, so
+  their memory stays within a few times the Jacobian's; `optimize_parametric`
+  runs them on its first evaluation only, and `check_jacobian=False` skips
+  them.
+- Shape optimization can move the vertices of a polygon. `PolygonProfile`
+  renders a polygon, optionally mirrored about an axis, onto a
+  `DesignRegion` as the exact fraction of each pixel it covers, the
+  continuous material averaging of Michaels and Yablonovitch (Opt. Express
+  26, 31717, 2018), so the permittivity moves continuously with every
+  vertex; its parameters are vertex displacements in microns, and
+  `jacobian` returns the exact derivative as a sparse matrix. The polygon
+  must stay simple: `density` and `jacobian` raise, naming the edges, when
+  two non-adjacent edges touch or cross, and `check_simple=False` skips
+  that test.
+  `parametric_value_and_gradient` and `optimize_parametric` chain a sparse
+  Jacobian without densifying it, and their no-solve Jacobian check runs
+  one column at a time for it. `curvature_penalty` is that paper's logistic
+  radius-of-curvature penalty with its exact gradient. Its radius assumes
+  the two neighbours of a vertex are roughly equally far away, so a sharp
+  corner next to a distant fixed vertex reads as a gentle bend;
+  `PolygonProfile.pad_ends` adds fixed vertices along the end edges of a
+  mirrored chain at a given spacing, so the penalty sees the corners where
+  a taper meets its fixed guides;
+  `optimize_parametric(penalty=...)` subtracts a penalty from the objective
+  (adds it when minimizing) and records it per evaluation in
+  `ParametricResult.penalty_history`. `DesignRegion(merge_boxes=True)` emits
+  the same pixel model as a few merged boxes: the engine checks every
+  structure at every sample, and on a quasi-2D CPU test (0.025 um cells)
+  a 720 x 360 pixel region took 483 s to set up as one box per pixel.
+  `DesignRegion.monitor(simulation=...)` places the design monitor on a
+  quasi-2D run's single periodic cell, which the adjoint run now does too,
+  so quasi-2D gradients run; 3D specifications are unchanged. On that
+  paper's 2D taper (quasi-2D CPU run, 0.025 um uniform mesh, subpixel off,
+  non-dispersive, PML on x and y, 12000 fixed steps, shutoff 0, 400 vertex
+  displacements) the chained gradient matches central differences of real
+  solves on 20 interior displacements, chosen where the render is smooth
+  over the stencil, at relative L2 6.1e-4, limited by the differences
+  themselves at 2.0e-3. An independent check on 16 further displacements,
+  including vertices next to both ends, gives 1.1e-3.
+- `VectorModeSolver(..., method="yee")` and
+  `VectorModeSolver.from_rectangular_core(..., method="yee")` add an opt-in
+  straight cross-section solve on the staggered Yee lattice that the FDTD
+  engine steps (Z. Zhu and T. G. Brown, Opt. Express 10, 853 (2002)). Each
+  field component sees its own permittivity sample: `from_rectangular_core`
+  averages the exact rectangle over a cell centred on each component, and
+  `yee_eps_tensor` accepts samples at those positions. The default
+  `method="flm"` is unchanged and its results are identical. On a Si 500 x
+  220 nm strip (index 3.4757) in oxide (1.444) at 1.55 µm, with a 2.5 x 2.4 µm
+  window, electric walls, subpixel tensor sampling, no dispersion and half
+  windows, the Yee method at 4 nm cells reads TE0 +1.2e-4 and TM0 -7.6e-5
+  from an independent reference solver whose own error bars are ±1.9e-4 and
+  ±1.4e-4, where the default method reads +1.9e-3 and +4.5e-3. Its TE0
+  converges at second order in the cell size, its TM0 at an observed order of
+  1.2 to 1.9 depending on where the core faces fall. A half-window solve
+  (`x_min_symmetry`) reproduces the full window's index to 1e-14. The
+  returned fields are co-located on the cell centres, like the default
+  method's (`yee_staggered=False`), so mode readouts, mode sources and the
+  adjoint treat them as they treat default-method modes, and the source
+  launch reserved for modes solved on the simulation's own mesh refuses them.
+  The co-location leaves `n_eff` and `n_group` unchanged and moves
+  `te_fraction` at first order (2.1e-4 for that strip's TE0 at 5 nm cells). A
+  half-window mode sets the new `VectorMode.x_min_plane_on_node`; its
+  `te_fraction` then equals the full window's and its `modal_power` is half
+  of it. `yee_eps_outer` passes the permittivity of the two low-edge faces
+  that are no cell's +x or +y face. Bends, absorbing x layers and
+  `solve_eme_basis` raise `NotImplementedError` with `method="yee"`; they are
+  planned.
+- EME adds an interface model for truncated bases:
+  `run_eme(..., interface="projection")`, also on `run_eme_band` and as
+  `interface_smatrix(..., method="projection")`. Each incidence is matched
+  only on the far side's modes, so power the far basis cannot hold is lost as
+  radiation instead of being returned to the represented modes. On a
+  0.5 x 0.22 um strip (n 3.5 in 1.444) moved sideways by 0.15 um at 1.31 um,
+  one guided mode per side on a 0.05 um mesh in a 2.0 x 1.3 um window, the
+  default interface reads T = 0.938 and the projection 0.604, the squared
+  mode overlap (0.6045). With a complete basis both models give the exact
+  interface. The projection drops radiation that would return to the guide
+  later, so it reads low at a sharp curvature reversal; use a complete basis
+  there. `EMEResult.interface` and `InterfaceDiagnostics.method` record the
+  model, and `eme_convergence_report` refuses to compare results built with
+  different models. The default is unchanged.
+- **Schema 1.22.0-alpha.1** (was 1.21.0-alpha.1). Index change from an
+  imported temperature or carrier-density map, CPU solver only. New
+  `ph.SpatialMap` (a scalar map on a rectilinear grid in the user's frame;
+  an axis given one coordinate is invariant) and `ph.perturbed_medium(base,
+  temperature=..., dn_dT=..., electrons_cm3=..., holes_cm3=...)`, which
+  returns a custom medium on the map's nodes: thermo-optic
+  `n0 + dn/dT (T - T_ref)`, and silicon carrier plasma dispersion and
+  absorption at 1550 nm from Nedeljkovic, Soref and Mashanovich (2011,
+  default; eqs. (4) and (5), Table 1, 1.55 um row) or the commonly quoted
+  1.55 um expressions for Soref and Bennett (1987), with the absorption
+  carried as a per-node conductivity. Carrier maps need `wavelength_um`, the
+  run's wavelength, within 1.50 to 1.60 um; the run's own band is not
+  checked. The wire gains two optional keys on
+  `permittivity_data`: `coords_um` places the nodes by their own
+  coordinates on any geometry (the edge value holds beyond the outermost
+  node), and `conductivity_s_per_m` gives a per-node conductivity. Absent,
+  the 1.18 box-spanning grid is unchanged; every SDK wire carries the new
+  version string. GPU solvers refuse custom media; subpixel smoothing stays
+  off with them. A port may sit inside a heated region (see "Port modes on
+  custom media" under Changed). A new guide, "Temperature and carrier
+  maps", covers the workflow and its limits. No heat or charge solver.
+- `ph.study` adds design studies with parameters, grid, explicit points,
+  corners, Monte Carlo and Latin hypercube samplers, local and cloud execution
+  through existing batches, deterministic job names, spec-hash deduplication,
+  resume, cloud per-job and study spend ceilings, an xarray results table with
+  save and load, and a yield helper that reports its sample counts.
+  `ph.spec_sha256` returns the digest of a canonical wire document.
+  `ph.Batch.run(on_complete=...)` and
+  `ph.cloud.Batch.run(max_usd_total=..., on_submit=..., on_complete=...)` add
+  completion, spend and submission hooks.
+- Cloud batches accept `solver=` on `ph.cloud.Batch.run` and
+  `ph.study.run(cloud=True)`, forwarding the selected build on every quote
+  and submission, including through `SMatrixPlan` and the layout helper.
+- Cloud studies record the selected solver and refuse resume with a different
+  solver, so one study directory cannot silently mix builds.
+- New optional extra `photonhub[gdsfactory]` (gdsfactory 9.x) and module
+  `photonhub.integrations.gdsfactory`. `import_component` turns a gdsfactory
+  `Component` and its layer stack, or a list of `GDSLayer`, into extruded
+  structures, ports and a background, with a material override map.
+  `ImportedComponent.simulation` fits a scene around it and `plot` previews
+  it. `plan_component_smatrix` and `run_component_smatrix` plan and run its
+  S-matrix study, locally by default. The module imports without gdsfactory.
+- Compact-model export. `write_touchstone` writes Touchstone 2.0 with
+  `version=2`, and `read_touchstone` reads versions 1 and 2. `smatrix_model`
+  builds an `SMatrixModel`: a callable that interpolates the S-matrix in
+  wavelength and returns the port-pair dictionary a SAX circuit takes, saved
+  and loaded as JSON. `SMatrixResult` gains `metadata`, `to_model` and
+  `to_json`. Polar interpolation is the default; an interval switches to
+  whole-matrix complex interpolation only when polar interpolation gains more
+  than `passivity_atol` above the largest gain at any sample in the model,
+  plus a roundoff margin; the sample reference is at least zero.
+  Noisy or uniformly gained samples keep polar unless polar interpolation
+  still exceeds that threshold, as it can near a zero; gain below it is kept
+  and reported by the checks, whose tolerance is unchanged. One bad
+  sample raises the threshold for the whole model, so reported interior gain
+  can reach the largest sample gain plus the tolerance. Models check samples and
+  15 interior points per interval, then
+  recheck the selected interpolant. Non-strict mode warns on failed checks;
+  `strict=True` refuses non-passive or non-reciprocal samples or intervals.
+  Every switch warns once per model with the interval count, worst interval
+  index and bounds, and worst significant midpoint amplitude drop in dB
+  relative to polar; entries below 10% of their row or column maximum do not
+  judge sag. The pi/2 coarse-sampling warning is never suppressed.
+  Stored choices avoid repeated selection during calls. Model files use
+  format version 2; a version-1 file from a pre-release build loads with
+  polar evaluation everywhere. Rebuilding metadata refreshes the SDK version
+  and provenance note and replaces stale generated diagnostics. Denser sampling
+  helps resolve rapid phase changes but cannot remove zero-crossing phase
+  jumps or certify behavior between finite probes. The checks test
+  consistency, not accuracy: exported S-parameters inherit the convergence of
+  the run and the mesh behind them.
+- The local MCP server adds `get_schema`, `capabilities`, `validate_spec`,
+  `estimate`, `result_summary`, and `convergence_report`, plus four resources
+  for the schema, capabilities, stable issue codes, and agent skill.
+  `photonhub.error_codes` holds the issue-code registry, and
+  `photonhub.agent_tools` exposes the same checks without the MCP extra.
+  `photonhub-mcp --print-skill` prints the packaged skill. The MCP guide and
+  `llms.txt` explain the workflow. No MCP tool submits a cloud job or spends
+  money. Failures from the six existing MCP tools now return a JSON payload
+  with a stable id, severity, message, and fix; the original message text is
+  retained inside the payload.
+- A long engine setup now reports progress on CPU and single-GPU runs (not
+  yet on multi-GPU runs). Once setup has run 15 s, the solver
+  writes `setup_progress` events (stage, units done and total, percent,
+  estimated time left) to its event stream and `--log-file`, and `run_local`
+  draws a setup status line. Readers that switch on `"event"` skip the new kind.
+- **The packaged Workbench build includes the GDS layout reader.** Import
+  GDS needs the reader to list a file's cells and layers and to turn the
+  layers you pick into editable structures; without it, both steps stop with
+  a missing-reader error. The desktop build now bundles the reader and stops
+  if the packaged app lacks it. This has not been checked on a packaged
+  build. Workbench imports keep to the size and nesting limits of
+  `import_gds` (see "`import_gds` limits flattened layouts" under Breaking)
+  and report a structured error above them. Only polygons become structures:
+  a waveguide drawn as a GDS path is not imported.
+
+### Changed
+
+- Engine setup is much faster on scenes with many structures. Each material
+  sample now checks only the structures near it, so setup grows with the
+  structure count instead of its square. The material grid is bit for bit the
+  same. On a laptop, a metasurface lens with 890 structures set up in 9.5 s
+  instead of 538 s, and 7,201 pixel boxes with subpixel off in 0.04 s instead
+  of 50 s.
+- `optimize` and `optimize_parametric` with L-BFGS-B no longer spend two
+  evaluations (four solves) before the optimizer starts. A one-step probe
+  used to rescale the gradient, and SciPy then evaluated the start again.
+  The adjoint gradient is the exact derivative of the evaluated objective,
+  so SciPy now receives `J` and `dJ/dx` divided by `|J|` at the start,
+  which is SciPy's own first evaluation. `history` starts there and holds
+  only evaluations SciPy asked for, including its line-search trials. The
+  path an optimization takes changes with the scale, so a re-run of an
+  earlier L-BFGS-B design ends at a different point.
+- **Numbers move: bend port readings.** `library.bend` keeps each port at the
+  same arc endpoint, but its mode plane now crosses the guide end. Before, each
+  plane cut along the guide. Mode launches and results read from these ports
+  therefore change. With a slab normal of `x` (both ports) or `y` (the
+  `x`-normal port), a port's thickness lies on the first of its plane's two
+  axes in x, y, z order, so its mode family is still named in the port
+  plane's frame and `TE0` there is not the slab's `TE0`; this separate known
+  defect remains.
+- **Numbers move: rotated ring port readings.** For `library.ring` with a slab
+  normal of `x` or `y`, both bus ports now use that normal for their mode
+  windows and guide extensions. Before, they used `z`; results read from those
+  ports can change. The default `z` orientation is unchanged. On a slab normal
+  other than `z`, the port's mode family is still named in the port plane's
+  frame, so `TE0` there is not the slab's `TE0`; this separate known defect
+  remains.
+- **Port modes on custom media: numbers move.** Port modes are solved on
+  the node values of every custom medium (`permittivity_data`: perturbed
+  media, `Medium.from_eps_array` grids and trilinear design regions alike),
+  where they used the medium's scalar `permittivity`, so the port modes,
+  and the readings normalized by them, of an existing scene with a
+  `Medium.from_eps_array` grid or a design region at a port move. Ordinary
+  media are unchanged. Inside a doped region the port mode is that of the
+  index-shifted core and stays lossless; a transmission read at such a port
+  is not yet checked against a reference run.
+- **An `eps_of_medium` key that matches no medium now warns.** Every
+  `photonhub.analysis` function that takes `eps_of_medium`
+  (`solve_mode_on_cross_section`, `mode_bank_on_cross_section`,
+  `solve_yee_eme_basis` and the others) ignored such a key without a word;
+  each now issues a `UserWarning` that counts the unmatched keys. A key on
+  `ph.materials.Si` itself is the common case. A key on a structure outside
+  the mode window stays silent. Results do not change.
+- Desktop Workbench notebook cells now execute in a separate local process
+  without the Workbench cloud key or launch credential, including in sessions
+  with Cloud GPU access. A cloud call in a cell needs a key supplied explicitly
+  by the user; Workbench Cloud GPU runs remain in the Run dialog. A programmatic
+  visualization server still requires `notebook_enabled=True` for cells. Its
+  cells also move to the separate worker and no longer inherit the server
+  process's `PHOTONHUB_API_KEY`. Cells can access the same user's files and
+  may inspect the app's local server process where the operating system permits it.
+  Output from programs a cell starts and raw writes to standard streams are
+  not shown in the notebook. `input()` is unavailable. A direct SDK local run
+  from a cell in the installed app points to `wb.run()` for local execution.
+  Long cell output is truncated with a note, while the cell keeps the status
+  its code produced.
+- Desktop Workbench now requires a native confirmation showing the actual
+  quote, device, chosen maximum spend, cell and step counts, and short
+  simulation ID before each paid Cloud GPU submission. Declining the
+  confirmation sends no run request and requires a new quote.
+- The one-call waveguide size error now reports its grid and resolved `dl_um`
+  spacing, and names only window settings that can reduce that grid.
+- **Message wording changes; no numbers move.** Solver validation errors and
+  warnings, and the SDK's docstrings, errors and warnings, no longer cite
+  internal documents or engine source files. Each message states its rule
+  directly. Code that matches on message text may need updating: for example,
+  the ADE stability error now reads "ADE stability" where it cited a section
+  number. The `section` of each entry in `photonhub.capabilities.CPU_ONLY_FEATURES`
+  is now a plain feature name, such as "Bloch boundaries".
+
+### Breaking
+
+- **`optimize` defaults to L-BFGS-B.** Topology optimization now uses
+  `method="lbfgs"` by default, as `optimize_parametric` already did, so
+  callers that relied on the default get L-BFGS-B instead of Adam. Pass
+  `method="adam"` to keep the old behaviour. `step` applies only to Adam: a
+  call that sets `step` without `method` now ignores it. An L-BFGS-B run of
+  `n_iters` iterations can take more than `n_iters` evaluations, two solves
+  each, because a line search may try several points (at most
+  `2 * n_iters + 10`). In an optimizer comparison with the exact gradient
+  (3D CPU runs, one run per optimizer and problem on one mesh each), L-BFGS-B's
+  best transmission led Adam's at equal evaluations from the 6th evaluation on for a 64-pixel
+  topology crossing and from the 8th for an 8-width shape crossing. The
+  shipped topology examples (`inverse_design_crossing.py`,
+  `inverse_design_focusing.py` and `inverse_design_waveguide.py`) pin
+  `method="adam"`, the optimizer their recorded results used.
+- **A source inside the boundary layers is refused before the run.** A point
+  dipole inside the PML or absorber layers ran with a warning, once per
+  dipole, although the boundary absorbs the part of the source inside it, so
+  the launch is not the one asked for and the recorded spectra cannot be
+  trusted. `Simulation.check_runnable()` now refuses such a run, so
+  `run_local`, the cloud quote, run, submit and batch entry points, the cloud
+  worker and the Workbench's engine preflight all stop it (that preflight now
+  applies every `check_runnable()` rule before the solver's own check, as Run
+  already did). The error is one
+  line per logical source: the thousands of dipoles of one mode launch, port
+  or Gaussian beam are one entry naming its index range and plane, each face
+  it reaches, how deep, and the move that clears it (positions in your frame,
+  also for a domain fitted with `domain=`). Construction still accepts the
+  scene, and a symmetry plane is a mirror, not a layer. Graded axes are now
+  checked too, their layers counted in realized cells. Every sample counts,
+  also a window tail far below the peak: a mode window that reaches the
+  layers must shrink (`ph.mode_window_um`) or the domain must grow.
+  `run_local(..., allow_sources_in_boundary=True)` runs such a scene anyway
+  and warns once per source instead: the spectra are physically meaningless,
+  so it is for boundary diagnostics only. The keyword is not on the wire, so
+  the cloud refuses these runs. New `Simulation.sources_in_boundary_layers()`
+  returns the per-source messages.
+- **A Gaussian beam's default window stops at the boundary layers.** With
+  `half_w_um` or `half_v_um` left unset, `gaussian_beam_source` (and a
+  `GaussianBeam` source) now leaves out the window's tail samples inside the
+  PML or absorber layers, as it already left out those beyond the domain, and
+  normalizes the power over the samples it places. Such a beam was
+  refused by the rule above otherwise. A default window whose samples in the
+  layers carry more than 5 % of the peak amplitude is refused instead, since
+  the clip would cut the beam itself. An explicit window is never clipped.
+  None of the gallery or course beams had samples in the layers, so none of
+  their numbers moves.
+- **Fourteen names deprecated in 0.1.2 are removed.** Each was renamed in the
+  0.1.2 naming pass and has warned since; the 0.1.2 notes planned the removal
+  for 0.2, and it comes earlier. Reading one as an attribute (`ph.PolySlab`)
+  raises `AttributeError` with the current spelling, "photonhub.PolySlab was
+  removed in 0.1.6; use photonhub.Polygon". Python turns that into a plain
+  `ImportError: cannot import name 'PolySlab'` for `from photonhub import
+  PolySlab`; the table below is the guide there. The wire schema, its type
+  names and every keyword argument are unchanged, so saved specs load as
+  before. Replace:
+
+  | Removed | Use |
+  |---|---|
+  | `ph.PolySlab` | `ph.Polygon` |
+  | `ph.FluxMonitor` | `ph.PowerMonitor` |
+  | `ph.FieldTimeMonitor` | `ph.TimeMonitor` |
+  | `ph.FieldDftMonitor` | `ph.ProfileMonitor` |
+  | `ph.FieldSnapshotMonitor` | `ph.SnapshotMonitor` |
+  | `ph.SimulationData` | `ph.RunResult` |
+  | `ph.BatchData` | `ph.BatchResults` |
+  | `ph.PermittivityData` | `ph.PermittivityArray` |
+  | `ph.UniformGridSpec` | `ph.UniformMesh` |
+  | `ph.GradedGridSpec` | `ph.GradedMesh` |
+  | `ph.GradedAxisCoords` | `ph.GradedMeshAxis` |
+  | `ph.auto_grid` | `ph.auto_mesh` |
+  | `ph.run_async`, `ph.cloud.run_async` (and `ph.web.run_async`) | `ph.submit`, `ph.cloud.submit` |
+  | `ph.estimate_cost` | `ph.quote` |
+
+  Still deprecated and still working: the `ph.web` module path (use
+  `ph.cloud`), the `photonhub.plugins` module path (use `photonhub.analysis`),
+  `ph.cloud.run_quoted_async` (use `submit_quoted`),
+  `photonhub.analysis.resonance.ResonanceFinder` (use `ResonanceAnalysis`),
+  `ph.materials.cSi` (use `Si`), and `ph.GdsLayer` and `ph.TfsfBox` (use
+  `GDSLayer` and `TFSFBox`).
+- **Modes solved with absorbing layers now follow the waveguide branch.**
+  `VectorModeSolver.solve(num_pml=...)` and
+  `rectangular_waveguide(bend_radius_um=...)` can return a different mode set,
+  order, phase index, group index and loss. Straight layered modes must have
+  enough field energy outside the layers, stable real index as layer strength
+  halves, and no steadier duplicate field; they are ordered by real index.
+  For a 1.2 × 0.8 µm guide of index 2.0 in 1.444 cladding at 1.55 µm,
+  with a 0.08 µm tensor mesh, 3.2 × 2.0 µm window and seven x layers at
+  strength 20, the first index changes from 1.778446 to 1.801463.
+  A guided mode whose real index depends on the layers can be dropped with
+  one warning that names its index, interior energy share and movement at
+  half strength. Widen the window; thicker layers in the same window do
+  not help. A rib slab pair at 2.107872 with share 0.995 still passes the
+  straight rule on a 5 × 1.6 µm window: 1.55 µm wavelength, 0.02 µm
+  area-fraction mesh, 0.5 × 0.22 µm core on a 0.09 µm slab, indices
+  3.4764/1.444, eight x layers at strength 30. This is a known limit.
+  Bends refuse `|R| < W/2 + dl`, where `W` is the full width including
+  layers and `dl` is one x mesh cell. A bend pair is assigned to at most
+  one selected straight mode in the same window and layers, ranked by
+  interior field overlap times the square root of its interior energy
+  share. Its index, field and per-mode loss come from that one leaky
+  eigenpair. For a 0.7 × 0.4 µm guide of index 2.0 in 1.444 cladding at
+  1.55 µm, with a 0.025 µm tensor mesh, 5 × 3 µm window and 50 x layers
+  at strength 30, the TE index at R=20 µm changes from 1.576325 to
+  1.576060, and the TM mode now reports its own loss instead of zero
+  (about 768 dB/cm on that window, flagged `loss_unresolved`; 545 and
+  593 dB/cm on 7 and 8 µm windows with 60 layers). At R=12 µm, the TE index changes from 1.643338 to
+  1.579983 and its group index from about 1.748 to 1.938; at R=15, 13,
+  11, 9 and 5 µm, the previously recorded TE indices change by about
+  -0.018, -0.046, -0.084, -0.141 and -0.390. Bend loss still requires
+  window and layer convergence checks. Bend indices also still carry a
+  first-order mesh error, present before this change: on a mirror-symmetric
+  guide, +R and -R differ by about n dl/R, and +R sits about n dl/(2R)
+  below their mean (1.576060 against a mean of 1.577023 at R=20 µm on the
+  0.025 µm mesh above). Its cause is not yet settled. Do not cite a bend
+  index until that is resolved. A bend requested without layers
+  now auto-adds them at strength 30 and warns; the
+  `rectangular_waveguide` bend path no longer inherits its strength-1
+  default for those auto-added layers. For straight guides, less than 95%
+  of transverse magnetic-field energy outside the layers sets
+  `window_limited=True`; a bend inherits that flag from its straight
+  partner. The new `loss_unresolved` flag marks bend loss when the radiation
+  caustic is too close to the layers or loss changes by more than 10% when
+  layer strength halves. One warning per solve explains affected modes and
+  any shortage. A recorded microring bend solve, at 1.5688 µm wavelength,
+  R=6.775 µm and 0.035 µm mesh with its default window and layers,
+  requests 16 modes and now returns two with a shortage warning; the mode
+  it selects remains the same. EME refuses a junction between straight and bend
+  sections with different absorbing-layer contours: give both sections the
+  same layers and strength for a common reaction-overlap contour. Its
+  nonfinite-loss guard and the waveguide summary's unavailable-loss label
+  remain defensive for caller-provided modes. Straight solves without
+  absorbing layers are unchanged.
+- **Beam amplitude cutoffs now retain paired source currents.** Gaussian-beam,
+  imported-field and thin-lens launches at every `amplitude_threshold` are
+  affected, as are all mode-port launches: declared ports, S-matrix runs,
+  replicate builds and Workbench builds. Electric source currents were dropped
+  far more readily than magnetic ones, causing backward radiation and less
+  forward power than requested. Each field is now compared with its own peak,
+  paired currents are retained together, and power is normalized over the
+  retained samples. At a 1% cutoff, a 1.55 um vacuum beam on a uniform 0.1 um
+  mesh with four PML cells has its backward/forward power ratio change from
+  1.01 to 0.036. In the recorded edge-coupler launches at a 1e-4 cutoff,
+  coupling changes by at most 0.08 percentage points on uniform 150 nm meshes
+  and up to about 0.17 percentage points for a 12 x 12 um window; those runs use
+  contour subpixel averaging, nondispersive materials and 12 PML cells. At the
+  default 1e-6 cutoff, dipole counts grow and wire bytes and recorded wire
+  hashes move, while added currents carry at most 2.8e-7 of an electric
+  source's squared amplitude. Recorded readings move by at most 3.8e-7 dB on
+  the tightest record and 1.8e-3 dB on a -65 dB crosstalk reading. Invalid
+  cutoffs outside the finite range [0, 1), all-zero fields and launches with
+  only one of the electric or magnetic fields are now refused. Currents with
+  exactly zero amplitude are omitted.
+- **Programmatic visualization servers disable notebook execution by default.**
+  `create_app()` and `serve_viz()` now require `notebook_enabled=True` to run
+  notebook cells because other users on the same computer may reach a local
+  server and run code. Opt in only when everyone with access to that computer
+  is trusted. Desktop Workbench executes cells in the separate worker after
+  local authorization, regardless of Cloud GPU access.
+- **Helpers on a restored result check whether the saved setup can be kept.**
+  `with_auto_boundaries()` and `with_stabilized_pml()` keep the saved coordinates,
+  symmetry and ports when their edits leave the boundary layer thickness
+  unchanged. They now refuse changes to a boundary kind or layer count that
+  need the original domain fit, as does `with_absorber()` when it replaces PML.
+  `with_auto_mesh()`, `with_mesh_overrides()` and `with_oblique_plane_wave()`
+  also refuse edits to a restored result. Rebuild from the original inputs or
+  apply the helper before running.
+- **Explicit GDS layers must match shape sidewalls.** `export_gds` now refuses
+  an explicit stack when a slanted polygon's sidewall angle or reference plane
+  does not match a layer on its slab. A flat or vertical shape offered only a
+  slanted layer is also refused. Such calls could export before but would
+  re-import as different solids. Add a `GDSLayer` with the shape's matching
+  sidewall angle and reference plane, then pass that stack to `import_gds` for
+  the round trip.
+- **`import_gds` limits flattened layouts.** With `flatten=True`, it now
+  refuses a cell exceeding 100,000 polygons or 1,000,000 polygon vertices
+  after reference and array expansion, or a hierarchy deeper than 256 levels.
+  Labels, paths and polygon properties are discarded before counting or
+  flattening because only polygons become structures. For a trusted larger
+  polygon layout, raise `max_flattened_elements=` and
+  `max_flattened_vertices=`. Workbench reports a structured error. Undefined
+  cell references remain skipped.
+- **Replication budgets can refuse the first run.** With a finite budget,
+  `replicate` raises `ValueError` when the first run does not fit or has no
+  usable planning estimate. The convergence loop can return a result with no
+  completed resolutions. A simulation with no cost estimate is refused under
+  a budget. An admitted run counts toward the budget even if it fails or is
+  cancelled; the limit applies to the SDK's estimate, not the provider's bill.
+  A NaN, negative, or non-number budget now raises `ValueError` before any run;
+  the single-run path previously ignored its budget. New result information
+  includes the `estimate_unavailable` stop reason, `budget_detail` and
+  `budget_cause` text, `ReplicationResult.spent_usd`, and the `spent_usd`
+  amount attached to an exception raised after a run starts.
+- **Port medium with a box-spanning grid behind a fitted port: breaking.**
+  With `domain=ph.Domain()`, a Port's own `medium` that is a box-spanning
+  grid (`Medium.from_eps_array`) other than its guide's now raises when the
+  fit extends that port's guide through the wall: the grid has no box of
+  its own to span there. Such a scene built before, with the grid spread
+  over the extension's short box. Give the Port a medium without a grid,
+  drop `medium=` to take the guide's, or place the grid with `coords_um`.
+
+### Fixed
+
+- **TF/SF box spectra: numbers move.** A run with a TF/SF box whose band is
+  above the first source's band, and a frequency-domain field or flux
+  monitor, now samples fast enough to prevent the box's band aliasing into
+  monitored frequencies. In the confirmed case (a 20 THz dipole, a
+  200.86 THz box and a 20 THz monitor in a periodic vacuum cell on a uniform
+  0.1 um mesh, run until both pulses had passed), the sampling interval
+  tightens from 29 steps to 2. The monitored reading was 289 times the
+  correct value and now agrees with an every-step reference to within 3e-6.
+- **Bloch magnetic launches: numbers move.** A run with a Bloch boundary at
+  a nonzero wavevector is affected when it launches magnetic point dipoles,
+  alone, in a Gaussian-beam launch or in a mode launch made of phased point
+  dipoles. The dipoles
+  drove both the requested wave and its mirror image in the wavevector.
+  For a magnetic dipole alone, frequency-domain field amplitudes now double
+  and power quadruples. For a one-way launch with electric and magnetic
+  dipoles, the forward amplitude rises by about a third (measured 1.33
+  times), while the backward wave falls from 0.34 of the forward amplitude
+  to the level of an ordinary non-Bloch run (0.046 in the measured launch). Resonance frequencies
+  and quality factors read from ring-down remain effectively unchanged: in
+  the recorded cases, the differences were at most 2e-7 THz and 0.013 %.
+  Runs at zero wavevector or without magnetic dipoles do not change. GPU
+  runs do not change because these features are not available there.
+- **Domain fit, box-spanning custom media at a port: numbers move.** Fixed:
+  with `domain=ph.Domain()`, the guide extension the fit adds behind a port
+  whose guide carries a box-spanning custom medium
+  (`Medium.from_eps_array`, schema 1.18) spread the whole grid over the
+  extension's own short box, so the port plane read the far end of the
+  profile. The extension now places the host's grid by the host box's node
+  coordinates (schema 1.22 `coords_um`): it reads what the host reads at
+  the port plane and the host's end-face values beyond it, so such a
+  scene's port modes and readings move. Scenes without custom media keep
+  their wire, apart from the version string, and their port modes.
+- **Domain fit, `eps_of_medium` anchors at a port plane: numbers move.**
+  Fixed: with `domain=ph.Domain()`, an `eps_of_medium` anchor keyed on a
+  guide's medium missed the guide extension the fit adds behind a port
+  wherever that extension carried a medium object of its own: a
+  box-spanning grid (see the entry above), or a Port medium given as its
+  own object and equal to the guide's, such as a materials-library entry.
+  The anchor, keyed on the guide's medium as you passed it or as
+  `sim.structures` holds it, now holds on the extensions too, and so at the
+  port plane, also on copies of the simulation. A materials-library entry
+  such as `ph.materials.Si` is not a key: the simulation holds a Medium
+  made from it, so key the Medium `sim.structures` holds. A key on a
+  structure's own medium still wins. Anchored solves at such a port plane
+  move: a 500 x 220 nm strip of library silicon in silica, anchored to
+  n = 3.48 by a key on the Medium `sim.structures` holds, read a TE0 n_eff
+  of 2.447974 at 1.55 um at the plane of a port given
+  `medium=ph.materials.Si` and now reads 2.452536, what the anchored guide
+  reads mid-guide on the same mesh (the fitted mesh at 12 cells per
+  wavelength, a 2.0 x 1.4 um mode window, default smoothing). Port modes
+  and wires do not change.
+- Fixed: the single-frequency adjoint copied the carrier window of a
+  broadband launch built with `modes_by_freq` into its currents, so its
+  gradient at a frequency away from the first carrier was wrong (cosine
+  -0.30 against central differences of real solves on a 3D CPU test, 0.05
+  um uniform mesh, subpixel off, non-dispersive, six PML layers per axis,
+  2200 fixed steps, shutoff 0). Adjoint currents now use the plain pulse;
+  results with a plain-pulse launch are unchanged.
+- Fixed: `VectorModeSolver.solve_eme_basis` could keep one box mode twice
+  when two shift-invert searches found it (the copies 1.8e-6 apart in a
+  0.37 x 0.22 um strip in a 5.15 x 6.22 um closed box, 30 box modes), and
+  every interface with that basis then failed with "rank-deficient reaction
+  Gram". Copies within 1e-4 now merge, keeping the one with the lower
+  residual.
+- Fixed: cloud batches refresh stale quotes before submitting queued jobs
+  and check refreshed prices against the per-job and remaining total spend
+  ceilings. Ambiguous submissions keep their accepted price reserved.
+- `ph.Batch.run` now stops starting queued simulations when the call is
+  interrupted (Ctrl-C) or an error escapes it; simulations already running
+  finish first. Before, the whole queue still ran.
+- A last-value display that raises now reports a cell error and keeps the
+  notebook's variables available for the next cell.
+- Workbench closes uploaded layout files before reading them, so imports can
+  open on Windows, and removes the temporary file after either outcome.
+- `materials.Si` now cites H. H. Li, J. Phys. Chem. Ref. Data 9, 561-658
+  (1980); it gave the year as 1993. The index is unchanged.
+- **Workbench checks its local server before it opens.** A private startup
+  check confirms that the local server belongs to this app launch before
+  Workbench sends it access credentials. Another program listening on the
+  same port cannot receive those credentials through the startup check.
+- **Automatic boundaries keep explicit choices.** `with_auto_boundaries()`
+  leaves PMC and Bloch boundaries in place and changes only open axes.
+- **Graded boundary checks use the cells at each face.** A coarse edge can now
+  trigger the dispersive PML warning at construction and select the absorber
+  with `with_auto_boundaries()`. A fine edge that previously warned can now
+  keep PML without that warning.
+- **GDS export preserves polygon sidewalls on round trip.** Automatic layers
+  carry each slanted polygon's sidewall angle and reference plane, assigning
+  separate layers when those extrusion rules differ. Flat and vertical shapes
+  keep the same layer numbers, returned stack and GDS file as before when
+  exported automatically or against vertical layers.
+- **Tall cuts show Polygon and Cylinder material in the right place.**
+  `plot_index` and the material contours of `plot_field` could place Polygon
+  material or Cylinder wedges on the wrong physical axes when a tall view
+  rotated the display. They now sample the shapes in their physical positions.
+- **3D scenes show the solver's interior.** `plot_3d` and the Workbench 3D
+  view could hide structures beside a symmetry plane and draw a PML layer on
+  that plane. They now show the one-sided PML there and skip shapes that touch
+  the interior only at an edge. On graded grids, both the 2D PML bands and 3D
+  interior now follow the realized mesh cells. Uniform grids without symmetry
+  keep their previous bounds, to rounding.
+- **Workbench Undo keeps later edits.** Undo after deleting a structure,
+  source, port or monitor restores the item without reverting later edits.
+  Undo is withdrawn when later edits make the restore unsafe.
+- **`photonhub-mcp` parses its command line.** `--help` printed nothing and
+  was taken as a result path; it now prints usage and exits 0, also without
+  the `mcp` extra. An unknown option exits 2, and a result directory given on
+  the command line or in `PHOTONHUB_RESULT_DIR` that does not open exits 2
+  with the reason instead of starting the server without it.
+- **A mode launch is one entry in the 3D scene.** `plot_3d`, and the
+  Workbench 3D view built on it, drew each point dipole of a mode launch or a
+  Gaussian beam as its own trace, so one launch added thousands of legend
+  entries. Eight or more consecutive point dipoles lying in one plane (within
+  one grid cell) are now one marker trace named for the range, such as
+  "sources 0-5879 (5880 point dipoles)". A few hand-placed dipoles keep one
+  entry each.
+- **Workbench flux charts state one unit, the right one.** A flux monitor
+  reads power in watts for the sources as declared whenever the result knows
+  its simulation, as `PowerMonitor` documents. The spectrum chart's title said
+  watts while its y-axis, its banner ("not absolute watts") and its CSV header
+  said normalized flux. The spectrum payload (`viz.service.spectrum_values`,
+  the MCP `get_spectrum` tool and the Workbench spectrum figure) now carries
+  `unit`: `"W"`, or `"per unit source amplitude"` for a result without its
+  simulation file. Title, axis, banner and CSV header all follow it, in the
+  single-run and the compare view; the compare view warns when the two runs
+  differ.
+- **An engine preflight clears when the scene is replaced.** A passed
+  preflight stayed green after New, a packaged example, Open or an import
+  swapped in another scene. It now clears whenever the incoming scene differs
+  (key order aside), and an answer that arrives after a replacement counts
+  only for the scene it checked.
+- **GPU runs with the full smoothing methods: a dipole on a structure's
+  boundary injects the right amount. GPU numbers move; the CPU solver is
+  unchanged.** With `subpixel_method="tensor_full"` or `"contour_full"`, an
+  electric point dipole whose node lies in a cell on a tilted or curved
+  boundary, or on the edge or corner of a structure, straight waveguides
+  included, now injects with the same coefficient the field update uses in
+  that cell, on single- and multi-GPU runs, as the CPU solver always did.
+  Before, the GPU used the diagonal smoothed coefficient there, so the source
+  was off by up to several times at a single node, in either direction.
+  Launches built from dipoles were affected on the GPU wherever their plane
+  crosses such a cell, which a launch across a strip or rib waveguide does at
+  its corners: a driven port or `mode_launch` on the dipole path
+  (`launch="eq_current"`, which the default `launch="auto"` picks for a
+  full-vector Yee mode with recorded placement), `gaussian_beam_source`,
+  `import_source`, `thin_lens_source` and `equivalence_current_source`. GPU
+  results of these scenes move toward the CPU's. Only `tensor_full` and
+  `contour_full` were affected: the default `contour` never was, nor were the
+  other diagonal methods. Dipoles away from those cells, magnetic dipoles,
+  plane waves, `mode_source`, `mode_launch(..., launch="aux")` and an `auto`
+  launch that falls back to `ModeSource` keep their GPU results.
+
 ## 0.1.5 (2026-09-28)
 
 This release moves numbers. Inverse-design gradients are now exact and
@@ -29,8 +734,7 @@ schema stays at `1.21.0-alpha.1`.
   finite differences, and its size was off by a scene-dependent factor of about
   1e2 to 4e4. On four 3D CPU scenes (uniform mesh at 0.04 or 0.05 um, subpixel
   off, no dispersion, 6 PML layers per axis, `shutoff=0` with a fixed window)
-  the cosine is 0.99999999 or better and the norm ratio within 2e-4 of 1
-  (`validation/suites/adjoint/README.md`).
+  the cosine is 0.99999999 or better and the norm ratio within 2e-4 of 1.
 - **Numbers move: design pixels move by a quarter cell.** A `DesignRegion`'s
   pixel boxes are shifted by 0.25 mesh cell on each axis by default, so no Yee
   E sample lies on a pixel face and each E component takes its permittivity
@@ -54,7 +758,7 @@ schema stays at `1.21.0-alpha.1`.
   low-level step and takes the coefficient as `beta`; its default of 1 gives
   an unscaled gradient.
 - **Gradient solves keep the caller's run settings,** including the default
-  stop rule (decision 0011). The gradient is exact for the recorded window;
+  stop rule. The gradient is exact for the recorded window;
   against a converged gradient its error follows the truncation of the forward
   results. With the energy-only stop at `shutoff` 1e-5 that was about 0.2 % on
   a measured point-source scene, and more on resonant designs. Local CPU runs
@@ -91,8 +795,7 @@ schema stays at `1.21.0-alpha.1`.
   41,700 with a recorded error of 1.3e-6 of the band peak, 0.013 of the
   tolerance. Other guarded runs can also stop earlier; their recorded spectra
   usually move well within the requested tolerance, but a fast decay into a
-  weak slow tail in one frequency can stop early with a larger error (engine
-  NUMERICS section 7).
+  weak slow tail in one frequency can stop early with a larger error.
 - The cap warning of a guarded run now says how many monitor frequencies were
   still settling and names the furthest one, and it points at your own code
   rather than at the SDK. The manifest's `run.dft_hold` and the solver's
@@ -102,7 +805,7 @@ schema stays at `1.21.0-alpha.1`.
   which has none of the three names, so they resolved only after an explicit
   `import photonhub.web`. `ph.web` now returns that module, with one
   `DeprecationWarning`, and it still answers every other name
-  `photonhub.cloud` has (issue #451).
+  `photonhub.cloud` has.
 - **Warnings point at your own line.** A warning raised inside model
   validation (the `GaussianPulse.for_band` clamp of an octave band, the
   dispersive-in-PML advisory) or reached through another SDK function (the
@@ -113,7 +816,7 @@ schema stays at `1.21.0-alpha.1`.
   reached through a symlink. When no line of yours is on the stack (a
   display hook, a job's background thread), they name the SDK function that
   was called. Deprecation warnings that now name your script's line are
-  shown by Python's default filters where they were hidden before; the §18
+  shown by Python's default filters where they were hidden before; the
   aux-line deprecation warns only when you call `mode_source_vector` or
   `mode_source` with a full-vector mode yourself, not when `mode_launch`
   uses that path.
@@ -199,12 +902,10 @@ schema stays at `1.21.0-alpha.1`.
 - The GPU runner (`scripts/gpu_run.py`) tries three rental providers in a
   fixed order and moves on only when one refuses for capacity and nothing was
   created. `scripts/gpu_promotion_evidence.py` writes the record a stable GPU
-  image tag needs before it moves, under `docs/validation/gpu-promotions/`.
+  image tag needs before it moves.
 - `scripts/package-headless-solver.sh --closed-test` builds a headless
-  archive for a closed test under the draft legal texts (decision 0023),
+  archive for a closed test under the draft legal texts,
   stamped closed test in its name, README, notice and `provenance.json`.
-- The eigenmode expansion suite's 2026-09-08 validation evidence is recorded
-  under `validation/suites/eme/`.
 
 ## 0.1.4 (2026-09-27)
 
@@ -1251,7 +1952,7 @@ open, see
   are no longer drawn as bodies. New `propagate_um=` (and `propagate_extent_um=`) draws the
   recorded plane's field reconstructed that far downstream (`propagate_plane`) as a plane
   floating at that height, a lens's focal spot above the device.
-- `photonhub.viz.export_scene` unfolds a §20 symmetry plane: a half-domain
+- `photonhub.viz.export_scene` unfolds a symmetry plane: a half-domain
   run with a mirror on an in-plane minimum face is exported as the whole
   device: interior and structure outlines mirrored about the face, the
   field's |E| mirrored as-is and the dominant component's phasor with its

@@ -50,42 +50,47 @@ def omit_unsupported_dft_shutoff(wire: dict, target: str) -> dict:
     return wire
 
 # The feature flags the v1 engine advertises via ``phsolver --capabilities``
-# (engine/src/main/phsolver.cpp cmd_capabilities). Pinned here so the drift test
+# (the solver's capability manifest). Pinned here so the drift test
 # fails the build the moment the engine manifest changes without the client
 # being updated in lockstep — in EITHER direction.
 #
 # 2026-07 manifest refresh: the list had frozen at Phase 1a-1 while the engine
 # shipped nine more features; both sides now advertise the full surface. Each
-# name mirrors its wire surface (section = NUMERICS.md). A drift-test failure
+# name mirrors its wire surface. A drift-test failure
 # against an OLDER binary means that binary predates this refresh — rebuild it.
 ENGINE_ADVERTISED_FEATURES = frozenset({
     "uniform_grid", "point_dipole", "gaussian_pulse", "pec", "periodic",
     "field_time", "field_snapshot",
-    # Phase 1a-1 (NUMERICS.md §9-§13)
+    # Phase 1a-1
     "structures", "lossy_media", "pml", "plane_wave", "field_dft", "flux",
     # Shipped since (2026-07 manifest refresh)
-    "graded_grid",      # §15 nonuniform coords (schema 1.2)
-    "subpixel",         # §16 volume/tensor/tensor_full
-    "mode_source",      # §18 incl. broadband modes_by_freq
-    "lorentz_media",
-    "multi_pole_media",  # §19 multi-pole + Drude ADE
-    "pec_media",  # §10.1 PEC structure material    # §19 single-pole ADE dispersion
-    "symmetry",         # §20 PEC/PMC symmetry planes
-    "absorber",         # §21 adiabatic absorber boundary
-    "magnetic_dipole",  # §5 PointDipole polarization Hz
-    "apodization",      # §12 DFT time window
-    "interval_space",   # §12 DFT spatial decimation
-    "mode_port",        # §12 post-processing metadata (schema 1.16)
+    "graded_grid",      # nonuniform coords (schema 1.2)
+    "subpixel",         # volume/tensor/tensor_full
+    "mode_source",      # incl. broadband modes_by_freq
+    "lorentz_media",    # single-pole ADE dispersion
+    "multi_pole_media",  # multi-pole + Drude ADE
+    "pec_media",  # PEC structure material
+    "symmetry",         # PEC/PMC symmetry planes
+    "absorber",         # adiabatic absorber boundary
+    "magnetic_dipole",  # PointDipole polarization Hz
+    "apodization",      # DFT time window
+    "interval_space",   # DFT spatial decimation
+    "mode_port",        # post-processing metadata (schema 1.16)
     # Schema 1.18 (2026-08)
-    "anisotropic_media",   # §10.2 diagonal eps tensor
-    "bloch",               # §22 Bloch boundaries (CPU)
-    "oblique_plane_wave",  # §22 stage C constant-k tilt
-    "tfsf_box",            # §13.5 closed TF/SF box (CPU)
+    "anisotropic_media",   # diagonal eps tensor
+    "bloch",               # Bloch boundaries (CPU)
+    "oblique_plane_wave",  # stage C constant-k tilt
+    "tfsf_box",            # closed TF/SF box (CPU)
     # Schema 1.19 (2026-08)
-    "field_precision_fp16",  # §23 fp16 field storage lane
+    "field_precision_fp16",  # fp16 field storage lane
     # Schema 1.20 (2026-08)
-    "dft_precision_narrow",  # §12.6 narrowed field_dft accumulator lanes
-    "dft_shutoff",  # §7 CPU-only recorded-result decay estimate
+    "dft_precision_narrow",  # narrowed field_dft accumulator lanes
+    "dft_shutoff",  # CPU-only recorded-result decay estimate
+    # Schema 1.22 (2026-10), CPU reference only (the
+    # custom_media_coords_or_conductivity row of CPU_ONLY_FEATURES refuses
+    # them on a GPU)
+    "custom_media_coords",        # permittivity_data.coords_um
+    "custom_media_conductivity",  # permittivity_data.conductivity_s_per_m
 })
 
 _PROBE_TIMEOUT_S = 30.0
@@ -140,9 +145,9 @@ def engine_feature_drift(
 # --- device capability exclusions ----------------------------------------- #
 #
 # ``phsolver --capabilities`` is a flat list with no device dimension, and
-# ``phsolver validate`` takes no ``--device`` (engine/src/main/phsolver.cpp),
+# ``phsolver validate`` takes no ``--device``,
 # so neither can express that a shipped feature is CPU-reference-only.
-# ``GpuSolver::run`` (the GPU solver in engine/src/kernels/) therefore throws
+# ``GpuSolver::run`` (the engine's GPU solver) therefore throws
 # SpecError on these features at the moment the GPU run starts, which on the
 # paid cloud path is after a worker has been provisioned against a bound quote.
 #
@@ -151,9 +156,8 @@ def engine_feature_drift(
 # throws stay as the backstop: this is defence in depth, not a replacement, and
 # the engine remains the authority on its own spec.
 #
-# ``oblique_plane_wave`` (NUMERICS 22.1) needs no row of its own: an oblique
-# wave's transverse phase advance IS a Bloch phase, and engine/src/core/
-# resolve.cpp rejects ``angle_theta != 0`` unless the transverse axis is
+# ``oblique_plane_wave`` needs no row of its own: an oblique wave's
+# transverse phase advance IS a Bloch phase, and the engine's validation rejects ``angle_theta != 0`` unless the transverse axis is
 # ``bloch`` -- so the ``bloch`` row already covers it on both solvers.
 
 
@@ -178,6 +182,21 @@ class CpuOnlyFeature:
         return bool(self.detect(spec))
 
 
+def _has_custom_media_grid_keys(spec: dict) -> bool:
+    # Schema 1.22 keys on ``permittivity_data`` (node coordinates and a
+    # per-node conductivity grid), matching the engine's own loop over
+    # ``spec_.structures`` for them. Kept
+    # apart from the ``permittivity_data`` row, which a GPU port of
+    # box-spanning custom media removes; this one stays until the GPU carries
+    # the coordinates and the conductivity grid.
+    for st in spec.get("structures") or ():
+        pd = ((st or {}).get("medium") or {}).get("permittivity_data") or {}
+        if (pd.get("coords_um") is not None
+                or pd.get("conductivity_s_per_m") is not None):
+            return True
+    return False
+
+
 def _has_boundary(spec: dict, condition: str) -> bool:
     boundaries = spec.get("boundaries") or {}
     return any(boundaries.get(axis) == condition for axis in ("x", "y", "z"))
@@ -190,7 +209,7 @@ def _has_source_type(spec: dict, type_name: str) -> bool:
 
 def _has_cw_source(spec: dict) -> bool:
     # The engine also tests ``norm_pulse.cw``, but norm_pulse is filled from the
-    # first source in wire order (engine/src/io/spec_io.cpp), so scanning every
+    # first source in wire order, so scanning every
     # source covers that arm too -- there is no separate wire field.
     return any(((s or {}).get("source_time") or {}).get("type") == "cw"
                for s in spec.get("sources") or ())
@@ -205,29 +224,41 @@ def _has_permittivity_data(spec: dict) -> bool:
 
 CPU_ONLY_FEATURES = (
     CpuOnlyFeature(
+        name="custom_media_coords_or_conductivity",
+        section="custom media node coordinates and conductivity grid",
+        message=("custom media node coordinates and conductivity grids "
+                 "(permittivity_data coords_um, conductivity_s_per_m) are "
+                 "supported on the CPU reference solver only in this "
+                 "release. A domain fit gives coords_um to the guide "
+                 "extension it adds behind a port whose guide is a "
+                 "box-spanning grid; draw that guide through the domain "
+                 "walls so the fit adds none, or run with --device cpu"),
+        detect=_has_custom_media_grid_keys,
+    ),
+    CpuOnlyFeature(
         name="dft_shutoff",
-        section="NUMERICS 7",
+        section="frequency-domain decay stop",
         message=("dft_shutoff is supported on the CPU reference solver only "
                  "in this release; run with --device cpu"),
         detect=lambda spec: (spec.get("run", {}).get("dft_shutoff") or 0) > 0,
     ),
     CpuOnlyFeature(
         name="bloch",
-        section="NUMERICS 22",
+        section="Bloch boundaries",
         message=("bloch boundaries are supported on the CPU reference solver "
                  "only in this release — run with --device cpu"),
         detect=lambda spec: _has_boundary(spec, "bloch"),
     ),
     CpuOnlyFeature(
         name="tfsf_box",
-        section="NUMERICS 13.5",
+        section="total-field/scattered-field box",
         message=("tfsf_box sources are supported on the CPU reference solver "
                  "only in this release — run with --device cpu"),
         detect=lambda spec: _has_source_type(spec, "tfsf_box"),
     ),
     CpuOnlyFeature(
         name="permittivity_data",
-        section="NUMERICS 10.3",
+        section="custom permittivity data",
         message=("permittivity_data (custom media) is supported on the CPU "
                  "reference solver only in this release — run with "
                  "--device cpu"),
@@ -235,14 +266,14 @@ CPU_ONLY_FEATURES = (
     ),
     CpuOnlyFeature(
         name="pmc",
-        section="NUMERICS 4-PMC",
+        section="PMC boundaries",
         message=("pmc boundaries are supported on the CPU reference solver "
                  "only in this release — run with --device cpu"),
         detect=lambda spec: _has_boundary(spec, "pmc"),
     ),
     CpuOnlyFeature(
         name="cw",
-        section="NUMERICS 5-CW",
+        section="continuous-wave sources",
         message=("cw sources are supported on the CPU reference solver only "
                  "in this release — run with --device cpu"),
         detect=_has_cw_source,

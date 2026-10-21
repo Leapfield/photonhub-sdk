@@ -62,7 +62,7 @@ def field_figure(data, monitor: str, *, field: str = "Ex", val: str = "real",
     # fields (E, H, intensity) ride val="real" but are non-negative — a
     # diverging scale would wash them into uniform gray.
     diverging = val in ("real", "imag") and field not in ("E", "H", "intensity")
-    # Defaults follow the design-§7 constants the CLI matplotlib path uses:
+    # Defaults follow the constants the CLI matplotlib path uses:
     # magma for magnitudes, cyclic twilight for phase, RdBu for signed parts.
     if cmap:
         colorscale = _mpl_colorscale(cmap)
@@ -142,15 +142,21 @@ def _overlay_traces(outlines: Optional[dict], col: str, row: str) -> list:
 
 
 def spectrum_figure(data, monitor: str) -> dict:
-    """A flux monitor's signed value (watts for the declared sources) vs wavelength."""
+    """A flux monitor's signed value vs wavelength: watts for the declared
+    sources when the result knows its simulation, per unit source amplitude
+    when it does not. ``unit`` carries which (see ``spectrum_values``)."""
     s = service.spectrum_values(data, monitor)
+    label = {"W": "signed flux (W)",
+             "per unit source amplitude": "signed flux per unit source amplitude"
+             }.get(s["unit"], "signed value")
     return {
         "data": [{"type": "scatter", "mode": "lines+markers",
                   "x": _json_safe_numbers(s["wavelength_nm"]),
                   "y": _json_safe_numbers(s["value"]), "name": monitor}],
-        "layout": {"title": f"{monitor} · signed flux (W)",
+        "layout": {"title": f"{monitor} · {label}",
                    "xaxis": {"title": "wavelength (nm)"},
-                   "yaxis": {"title": "signed normalized flux"}, "margin": _MARGIN},
+                   "yaxis": {"title": label}, "margin": _MARGIN},
+        "unit": s["unit"],
     }
 
 

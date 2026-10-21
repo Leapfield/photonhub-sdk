@@ -30,8 +30,7 @@ wire format):
 2. **Amplitudes** are re-fit by linear least squares of the *real* recorded
    signal against those poles, a deliberately transparent step, so the model
    the acceptance gate validates is bit-for-bit the model the tail uses.
-3. **The tail is a geometric series, not an integral.** The engine's §12
-   running DFT is a rectangle-rule sum over samples spaced :math:`\\Delta`;
+3. **The tail is a geometric series, not an integral.** The engine's running DFT is a rectangle-rule sum over samples spaced :math:`\\Delta`;
    completing it with the continuous integral would change quadrature mid-
    spectrum. Summing the model over the *same* discrete grid keeps the two
    parts of the answer on one quadrature, so as the record grows the
@@ -81,7 +80,7 @@ After a real run::
     out["spectrum"]                   # completed complex spectrum over 'freq'
 
 The returned spectrum is the raw (un-normalized) DFT integral of the probe
-signal, the same quantity a §12 point monitor accumulates before its
+signal, the same quantity a point monitor accumulates before its
 ``A0·S(f)`` source normalization; divide by your source spectrum if you need
 the engine-normalized form.
 """
@@ -417,7 +416,7 @@ class SpectrumCompleter:
 
 def _rectangle_dft(u: np.ndarray, t: np.ndarray, delta: float,
                    freqs: np.ndarray) -> np.ndarray:
-    """§12-style rectangle-rule DFT over the recorded samples.
+    """Rectangle-rule DFT over the recorded samples.
 
     ``F(f) = delta * sum_n u(t_n) e^{+2 pi i f t_n}``, the e^{+i w t} phasor
     convention of the engine's running DFT, evaluated at the record's own

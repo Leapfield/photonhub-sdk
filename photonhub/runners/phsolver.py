@@ -8,7 +8,7 @@ subprocess + JSON-lines event stream + stderr/timeout/exit-code contract
 byte-identical local vs cloud; output interpretation (load a ``RunResult``
 vs package a result bundle) is the caller's job.
 
-phsolver streams JSON-lines on stdout (NUMERICS.md section 7): ``start`` →
+phsolver streams JSON-lines on stdout: ``start`` →
 repeated ``progress`` → terminal ``done`` or ``error``. Exit codes are the
 contract: 0 ok, 1 spec error, 2 runtime/solver error.
 """
@@ -32,7 +32,7 @@ EventCb = Optional[Callable[[dict], None]]
 
 
 # The Workbench/packaging issuer hands a release solver its one-launch
-# capability through these two variables (docs/desktop-solver-authorization.md).
+# capability through these two variables.
 # They are the solver's OWN credential — the gated binary refuses to start
 # without them — so the generic scrub below must not eat them, even though
 # the secret's name ends in a credential suffix.
@@ -264,8 +264,8 @@ def device_args(device: Union[str, None]) -> list:
     or ``[]`` when unset (the solver then defaults to CPU). Accepts ``"cpu"``,
     ``"gpu"``, ``"gpu:N"`` (N a local device index), ``"gpu:all"`` (every visible
     GPU), or ``"gpu:N,M,..."`` (an explicit multi-GPU set, the engine splits the
-    grid along z across those devices), the engine CLI grammar
-    (engine/src/main/phsolver.cpp). Rejected here so a typo fails fast with a
+    grid along z across those devices), the engine CLI grammar.
+    Rejected here so a typo fails fast with a
     clear message rather than at the solver. Shared by the local runner and the
     cloud executor so the device grammar has one definition.
 

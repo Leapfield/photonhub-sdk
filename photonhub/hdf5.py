@@ -17,7 +17,7 @@ Layout, deliberately "the output directory in one file":
                             :mod:`photonhub.components.frame`)
 
 Everything else (run/grid/provenance metadata, monitor shapes/dims/coords,
-the section-12 complex64 reconstruction and normalization) is carried by the
+the complex64 reconstruction and normalization) is carried by the
 embedded ``manifest_json`` and rebuilt by :class:`photonhub.data.RunResult`
 using the exact same code path as the raw directory, so an HDF5 load is
 bit-identical to a raw-directory load, by construction.

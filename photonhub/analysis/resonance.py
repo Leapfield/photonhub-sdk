@@ -220,7 +220,7 @@ class ResonanceAnalysis:
         ``dt`` is derived from the ``t`` coordinate, which must be uniformly
         spaced -- except for the one short final interval the engine's monitor
         cadence produces when ``n_steps`` is not a multiple of
-        ``interval_steps`` (``engine/NUMERICS.md`` section 6); that extra final
+        ``interval_steps``; that extra final
         sample is dropped with a warning.
 
         If the array has a ``component`` dimension, the electric components are
@@ -266,7 +266,7 @@ class ResonanceAnalysis:
         simulation : Simulation, optional
             The run's simulation. Without ``t_start``, the fit starts at the
             end of its last source (``max source_end_time_s``, the instant
-            ``engine/NUMERICS.md`` section 7 uses). A fit whose first sample
+            auto-shutoff measures from). A fit whose first sample
             precedes that instant warns; the check also uses the simulation a
             ``RunResult`` carries when none is passed.
 
@@ -540,7 +540,7 @@ def _resonance_dataset(
 
 def _last_source_end_s(simulation) -> Optional[float]:
     """The instant the last source stops injecting, ``max (t0 + 8 tau)`` over
-    the sources (``engine/NUMERICS.md`` section 7); ``inf`` when a source never
+    the sources; ``inf`` when a source never
     ends (CW); ``None`` when there is no simulation or no source with a time
     dependence."""
     sources = getattr(simulation, "sources", None) if simulation is not None else None
@@ -611,8 +611,7 @@ def _uniform_dt(t: np.ndarray) -> Tuple[float, int]:
     ``n_usable`` is the number of LEADING samples that share that stride, which
     is every sample except in one case. A monitor with ``interval_steps = K``
     records at steps where ``(s+1) % K == 0`` "plus the final step
-    ``s = n_steps-1`` if not already recorded" (``engine/NUMERICS.md`` section
-    6). When ``n_steps`` is not a multiple of ``K`` that final sample lands
+    ``s = n_steps-1`` if not already recorded". When ``n_steps`` is not a multiple of ``K`` that final sample lands
     fewer than ``K`` steps after its predecessor, so the axis ends on a single
     SHORT interval. That is the engine's normative cadence, not corrupt data,
     so the extra sample is dropped with a warning instead of rejected.
@@ -638,8 +637,8 @@ def _uniform_dt(t: np.ndarray) -> Tuple[float, int]:
         warnings.warn(
             f"time coordinate ends on a short interval ({diffs[-1]:.6g} vs "
             f"{dt:.6g}): the run's n_steps is not a multiple of the monitor's "
-            "interval_steps, so the engine recorded an extra final sample "
-            "(NUMERICS.md section 6). Dropping that one sample to keep the "
+            "interval_steps, so the engine recorded an extra final sample"
+            ". Dropping that one sample to keep the "
             "analysis on a uniform grid.",
             UserWarning,
             stacklevel=caller_stacklevel(),

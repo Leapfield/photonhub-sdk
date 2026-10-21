@@ -1,7 +1,7 @@
 """Physical constants, in SI units, shared by the SDK and the notebooks.
 
-``ph.c0`` and ``ph.eps0`` are the values the solver itself uses
-(``engine/include/phcore/types.h``): the speed of light is exact SI, the
+``ph.c0`` and ``ph.eps0`` are the values the solver itself uses:
+the speed of light is exact SI, the
 vacuum permeability is CODATA 2018, and the vacuum permittivity follows from
 them as ``1 / (mu0 * c0**2)``. Every module of the SDK takes its constants
 from here, so a wavelength converted in a notebook, in the SDK and in the

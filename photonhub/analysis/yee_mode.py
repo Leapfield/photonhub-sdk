@@ -8,10 +8,9 @@ the difference (~2.4% near-source shedding).
 
 This module solves the mode on the **engine's own Yee discretization**:
   * fields on the standard Yee locations (Ex@(i+1/2,j), Ey@(i,j+1/2), Ez@(i,j)),
-  * forward/backward staggered curls matching engine/src/kernels/update_body.h,
+  * forward/backward staggered curls matching the engine's field update,
   * the diagonal KFJ subpixel eps sampled PER-COMPONENT at its own Yee location
-    (eps_xx at Ex, eps_yy at Ey, eps_zz at Ez), exactly as the engine samples on the mesh
-    (engine/src/cpu_ref/reference_solver.cpp sample_voxel comp_axis).
+    (eps_xx at Ex, eps_yy at Ey, eps_zz at Ez), exactly as the engine samples on the mesh.
 
 The eigenproblem is the canonical transverse-E full-vector FDFD (diagonal eps,
 mu=1): ``mat @ [Ex;Ey] = -n_eff^2 [Ex;Ey]`` with the block operator built from the
@@ -49,16 +48,16 @@ from .._compat import caller_stacklevel, legacy_keywords
 
 
 # --------------------------------------------------------------------------- #
-# Yee forward/backward derivative matrices (match engine update_body.h).
+# Yee forward/backward derivative matrices (match the engine's field update).
 # --------------------------------------------------------------------------- #
 def dual_spacings(dq: np.ndarray, periodic: bool = False) -> np.ndarray:
     """Dual-grid steps for the backward (H-curl) derivatives from the primal
-    steps ``dq`` (§15.2): interior dual width = midpoint average of the two
+    steps ``dq``: interior dual width = midpoint average of the two
     adjacent primal cells; the first entry keeps the first primal width (the
     standard convention, ``dl_b[0] = dl_f[0]``, so the
-    §20 face rules read the face row over one whole cell). Uniform input
+    face rules read the face row over one whole cell). Uniform input
     reproduces the constant spacing exactly. ``periodic`` closes the ladder
-    across the seam instead (§15.2: the first dual width straddles the last
+    across the seam instead (the first dual width straddles the last
     and the first primal cell); the engine admits only seam-symmetric graded
     periodic axes (``dq[0] == dq[-1]``), where the two closures coincide."""
     dq = np.asarray(dq, dtype=float)
@@ -77,7 +76,7 @@ def _dmats(nx: int, ny: int, dl: float, h_min_bc=None, v_min_bc=None,
 
     Spacing: with ``dq_h``/``dq_v`` None (uniform), every row is scaled by the
     single ``1/dl``, byte-identical to the historical operator. A GRADED axis
-    passes its PRIMAL spacing vector ``dq`` (length n, §15.1 replicate-last):
+    passes its PRIMAL spacing vector ``dq`` (length n, replicate-last):
     forward rows divide by the primal widths (node i -> i+1 distance), backward
     rows by the DUAL widths (:func:`dual_spacings`), the standard nonuniform
     Yee FDFD (Zhu & Brown; the same construction an open mode solver
@@ -89,15 +88,15 @@ def _dmats(nx: int, ny: int, dl: float, h_min_bc=None, v_min_bc=None,
     implicit ghost, the half-located quantities that ``bwd`` acts on (eps*E_n
     and the tangential H) are taken as 0 half a cell outside, a MAGNETIC (PMC)
     mirror OUTSIDE the window; immaterial when the edge sits in decayed
-    cladding. ``"pmc"`` / ``"pec"`` instead put the engine's §20 symmetry plane
+    cladding. ``"pmc"`` / ``"pec"`` instead put the engine's symmetry plane
     exactly ON the low node line: PMC takes the odd ghost X[-1] = -X[0], so
-    bwd's first row reads 2*X[0]/dl, the engine's §20.4 backward-read rule;
+    bwd's first row reads 2*X[0]/dl, the engine's backward-read rule;
     PEC takes the even ghost, zeroing that row (the caller must ALSO pin the
     on-plane tangential-E DOFs, see :func:`_solve_yee_eig`). The high edge
     stays the implicit node-line PEC in those cases.
 
     ``"periodic"`` closes BOTH edges of that axis across the seam (the k = 0
-    Bloch wrap of a plain periodic axis, NUMERICS §1/§15.2): ``fwd``'s last
+    Bloch wrap of a plain periodic axis): ``fwd``'s last
     row reads node 0 as its neighbour and ``bwd``'s first row reads node
     n-1. On a ONE-cell axis both operators are identically zero, the field
     is its own periodic image, so the transverse derivative along that axis
@@ -135,7 +134,7 @@ def _dmats(nx: int, ny: int, dl: float, h_min_bc=None, v_min_bc=None,
             return sp.diags(1.0 / dual_spacings(dq, periodic=True)) @ m
         d0 = np.ones(n)
         if bc == "pmc":
-            d0[0] = 2.0        # odd ghost: (X[0] - (-X[0]))/dl (§20.4)
+            d0[0] = 2.0        # odd ghost: (X[0] - (-X[0]))/dl
         elif bc == "pec":
             d0[0] = 0.0        # even ghost: (X[0] - X[0])/dl
         m = sp.diags([d0, -np.ones(n - 1)], [0, -1], format="csr")
@@ -152,7 +151,7 @@ def _dmats(nx: int, ny: int, dl: float, h_min_bc=None, v_min_bc=None,
 
 
 def min_face_symmetry_bcs(sim, axis):
-    """The §20 symmetry parity of each in-plane axis' MIN face for a
+    """The symmetry parity of each in-plane axis' MIN face for a
     cross-section normal to ``axis``, as ``(h_bc, v_bc)`` in :func:`_dmats`
     terms: ``"pec"`` (-1, odd/electric), ``"pmc"`` (+1, even/magnetic), or
     ``None``. Read from ``Simulation.symmetry``; objects without the field
@@ -173,7 +172,7 @@ def window_min_face_bcs(sim, axis, *, h_center, half_w, v_center, half_v, dl):
     ``(h_lo, v_lo, h_bc, v_bc)``:
 
     - ``lo`` = the grid-snapped window origin ``floor((center-half)/dl)*dl``,
-      CLIPPED to 0 on any in-plane axis carrying a §20 symmetry plane (the
+      CLIPPED to 0 on any in-plane axis carrying a symmetry plane (the
       plane sits on the domain min face at coordinate 0; the below-plane half
       of a requested window is the mirror image the boundary supplies, it
       must not be solved or stamped).
@@ -195,8 +194,7 @@ def window_min_face_bcs(sim, axis, *, h_center, half_w, v_center, half_v, dl):
 
 def is_plain_periodic_axis(sim, axis_letter: str) -> bool:
     """True when ``sim``'s ``axis_letter`` WRAPS: a ``"periodic"`` boundary
-    with no §20 symmetry plane on it (NUMERICS §1, the axis that may be a
-    single cell). Its two faces are one seam, so a mode window that reaches a
+    with no symmetry plane on it (the axis that may be a single cell). Its two faces are one seam, so a mode window that reaches a
     face has no wall there, see :func:`_periodic_window`. Duck-typed sims
     without ``boundaries`` (viz stubs) are never periodic. ``"bloch"`` is NOT
     plain periodic: its wrap carries a phase the k = 0 closure would fold
@@ -226,7 +224,7 @@ def _periodic_window(sim, axis_letter, dl, q):
     ``arange(n)*dl_axis`` with ``dq=None`` (the legacy scalar fast path) when
     the caller's ``dl`` is that spacing, else the explicit spacing vector so
     every consumer registers on the true grid; on a graded axis the stored
-    coordinates with their §15.1 primal widths (the engine admits only
+    coordinates with their primal widths (the engine admits only
     seam-symmetric graded periodic axes, so the periodic dual closure equals
     the replicate one). On a ONE-cell axis (the quasi-2D reduction) the ladder
     is the single node ``[0]``: the transverse derivative along that axis is
@@ -257,8 +255,7 @@ def _axis_window_nodes(sim, axis_letter, center, half, dl, bc):
     """Window node ladder for ONE in-plane axis: ``(nodes, dq, bc_eff)``.
 
     ``nodes`` are the sim's PRIMARY node coordinates covering
-    ``[center-half, center+half]`` (a node at each cell's low edge; the §15.1
-    replicate-last primal widths in ``dq``), ``bc_eff`` the §20 parity when the
+    ``[center-half, center+half]`` (a node at each cell's low edge; the replicate-last primal widths in ``dq``), ``bc_eff`` the parity when the
     window's first node sits ON the min-face plane, or ``"periodic"`` on a
     plain periodic axis (the ladder is then the whole period whatever the
     requested window, :func:`_periodic_window`). A UNIFORM axis reproduces
@@ -297,8 +294,7 @@ def window_nodes(sim, axis, *, h_center, half_w, v_center, half_v, dl):
     ladders for a cross-section window normal to ``axis``. Returns
     ``(h_nodes, h_dq, h_bc, v_nodes, v_dq, v_bc)`` where ``dq`` is the primal
     spacing vector for a GRADED axis and ``None`` for a uniform one (the
-    legacy-fast-path marker), and ``bc`` is ``"pec"``/``"pmc"`` for a §20
-    fold on the axis' min face, ``"periodic"`` on a plain periodic axis (the
+    legacy-fast-path marker), and ``bc`` is ``"pec"``/``"pmc"`` for a fold on the axis' min face, ``"periodic"`` on a plain periodic axis (the
     ladder is then the whole period, :func:`_periodic_window`; a one-cell
     quasi-2D axis is one node), else ``None``. Every consumer of the window, the eps sampler,
     the eigensolve, and the equivalence-current sheet, must derive its
@@ -412,7 +408,7 @@ def _kfj_at_offset(sim, axis, plane_value_um, h0, v0, nh, nv, dl, off_h, off_v,
 
 class _WindowGeom:
     """The resolved cross-section window: node ladders, primal spacings
-    (``None`` on a uniform axis, the legacy-fast-path marker), §20 BCs, and
+    (``None`` on a uniform axis, the legacy-fast-path marker), BCs, and
     the per-offset Yee point coordinates. ``graded`` is True when either
     in-plane axis actually grades."""
 
@@ -424,7 +420,7 @@ class _WindowGeom:
         self.h_lo, self.v_lo = float(h_nodes[0]), float(v_nodes[0])
         self.graded = h_dq is not None or v_dq is not None
         # The period length of a wrapped ("periodic") axis: its closing node
-        # plus the closing cell (§15.1 replicate-last on a graded ladder);
+        # plus the closing cell (replicate-last on a graded ladder);
         # None on a walled or folded axis.
         self.h_period = self._period(h_nodes, h_dq, h_bc)
         self.v_period = self._period(v_nodes, v_dq, v_bc)
@@ -471,9 +467,9 @@ def staggered_eps_sampler(sim, axis, plane_value_um, *, h_center, v_center,
     ``(sample, geom)`` where ``sample(freq_hz)`` maps material values at that
     frequency onto the cached geometry and returns the flat
     ``(eps_xx, eps_yy, eps_zz)``, and ``geom`` is the :class:`_WindowGeom`
-    (node ladders + spacings + §20 BCs) every downstream consumer must derive
+    (node ladders + spacings + BCs) every downstream consumer must derive
     its registration from. Graded in-plane axes are supported natively: each
-    Yee point's sampling cell is its own primal/dual cell (§15), and the KFJ
+    Yee point's sampling cell is its own primal/dual cell, and the KFJ
     interface normal uses the true point coordinates. Uniform axes keep the
     legacy fine-center path bit-identically.
 
@@ -486,16 +482,17 @@ def staggered_eps_sampler(sim, axis, plane_value_um, *, h_center, v_center,
     (legacy). When no un-overridden dispersive medium is present the first
     result is cached and the (large) geometry samples released, callers just
     call ``sample(f)`` per frequency and the sampler decides what repeats."""
-    from .kfj_smoothing import (_any_dispersive, _default_eps_of, _eps_lut,
-                                _paint_indices)
+    from .kfj_smoothing import (_anchored, _any_dispersive, _custom_overlay, _default_eps_of,
+                                _eps_lut, _paint_indices, _with_overlay)
 
+    eps_of_medium = _anchored(sim, eps_of_medium)
     geom = _WindowGeom(*window_nodes(
         sim, axis, h_center=h_center, half_w=half_w,
         v_center=v_center, half_v=half_v, dl=dl), dl=dl)
     nh, nv = geom.nh, geom.nv
     ss = int(supersample)
     # Geometry paint per Yee offset: Ex at (h+1/2), Ey at (v+1/2), node.
-    idx_maps, grads = [], []
+    idx_maps, grads, overlays = [], [], []
     for off_h, off_v in ((0.5, 0.0), (0.0, 0.5), (0.0, 0.0)):
         if not geom.graded:
             # legacy fine centers — bit-identical on uniform grids
@@ -514,6 +511,9 @@ def staggered_eps_sampler(sim, axis, plane_value_um, *, h_center, v_center,
         if geom.v_period is not None:
             fv = np.mod(fv, geom.v_period)
         idx_maps.append(_paint_indices(sim, axis, plane_value_um, fh, fv))
+        # a custom medium (a perturbed map) paints its own per-point values
+        overlays.append(_custom_overlay(sim, axis, plane_value_um, fh, fv, idx_maps[-1],
+                                        eps_of_medium))
         # gradient coordinates = the Yee point positions (None -> scalar dl)
         grads.append(None if not geom.graded else
                      (geom.pts("h", off_h), geom.pts("v", off_v)))
@@ -530,15 +530,17 @@ def staggered_eps_sampler(sim, axis, plane_value_um, *, h_center, v_center,
         # eps_xx: tensor h-component at Ex; eps_yy: v-component at Ey;
         # eps_zz: eps_par (propagation tangential) at the node.
         periods = (geom.h_period, geom.v_period)
-        _, exx, _ = _kfj_reduce(lut[idx_maps[0] + 1], nh, nv, ss, dl, grads[0], periods)
-        _, _, eyy = _kfj_reduce(lut[idx_maps[1] + 1], nh, nv, ss, dl, grads[1], periods)
-        ezz, _, _ = _kfj_reduce(lut[idx_maps[2] + 1], nh, nv, ss, dl, grads[2], periods)
+        paint = [_with_overlay(lut[m + 1], o) for m, o in zip(idx_maps, overlays)]
+        _, exx, _ = _kfj_reduce(paint[0], nh, nv, ss, dl, grads[0], periods)
+        _, _, eyy = _kfj_reduce(paint[1], nh, nv, ss, dl, grads[1], periods)
+        ezz, _, _ = _kfj_reduce(paint[2], nh, nv, ss, dl, grads[2], periods)
         result = flat(exx), flat(eyy), flat(ezz)
         if frozen:
             # eps is frequency-independent: keep the three flat vectors,
             # release the supersampled geometry rasters.
             state["cached"] = result
             idx_maps.clear()
+            overlays.clear()
         return result
 
     return sample, geom
@@ -573,12 +575,16 @@ def sample_staggered_eps(sim, axis, plane_value_um, *, h_center, v_center,
 def _solve_yee_eig(exx, eyy, ezz, nh, nv, wavelength_um: float, dl_um: float,
                    nmodes: int, center_offset=None, h_min_bc=None,
                    v_min_bc=None, dq_h=None, dq_v=None,
-                   x_coords_um=None, y_coords_um=None, min_neff: float = 1.0):
+                   x_coords_um=None, y_coords_um=None, min_neff: float = 1.0,
+                   n_guess: Optional[float] = None):
     """Solve the discrete-Yee eigenproblem at ``wavelength_um`` for pre-sampled,
     Yee-staggered diagonal permittivity arrays over a window, returning
     :class:`VectorMode`\\ s above ``min_neff`` in descending real ``n_eff``.
     The legacy default ``min_neff=1`` retains guided modes; the experimental
     hard-wall EME caller lowers it to retain propagating box-radiation modes.
+    ``n_guess`` moves the shift-invert target from the largest sampled index
+    (the default, ``None``) to that index; the ``nmodes`` eigenpairs nearest
+    it are computed.
     Pure-imaginary-beta roots remain excluded because reconstruction divides by
     real beta. Each mode carries its ordinary right-eigenpair residual. Factored
     out of :func:`solve_yee_mode`
@@ -591,7 +597,7 @@ def _solve_yee_eig(exx, eyy, ezz, nh, nv, wavelength_um: float, dl_um: float,
 
     ``h_min_bc``/``v_min_bc`` = ``"periodic"`` closes that axis across its
     seam (k = 0 wrap, see :func:`_dmats`; a one-cell axis drops out of the
-    operator entirely). ``"pec"``/``"pmc"`` put an engine §20 symmetry plane
+    operator entirely). ``"pec"``/``"pmc"`` put an engine symmetry plane
     ON the window's low node line (see :func:`_dmats`): the restricted half of the matching-
     parity full-window eigenmode satisfies the half problem EXACTLY on the
     lattice, so a half-window solve reproduces the full mode's n_eff to
@@ -631,7 +637,7 @@ def _solve_yee_eig(exx, eyy, ezz, nh, nv, wavelength_um: float, dl_um: float,
 
     if h_min_bc == "pec" or v_min_bc == "pec":
         # Pin the tangential-E DOFs ON the plane (odd -> identically 0), like
-        # the engine's §4/§20 face pinning: zero their rows AND columns. The
+        # the engine's face pinning: zero their rows AND columns. The
         # decoupled DOFs get eigenvalue 0 == n_eff^2 = 0, far outside the
         # guided shift-invert window, so they never surface as modes.
         mask = np.ones(2 * N)
@@ -662,10 +668,11 @@ def _solve_yee_eig(exx, eyy, ezz, nh, nv, wavelength_um: float, dl_um: float,
             f"trial mode count {nmodes} is too large for a {nh} x {nv} "
             f"cross-section ({2 * N} transverse unknowns); reduce num_modes "
             "or enlarge the solve window")
+    target = n_core if n_guess is None else float(n_guess)
     vals, vecs = spl.eigs(
         mat,
         k=nmodes,
-        sigma=-(n_core ** 2),
+        sigma=-(target ** 2),
         which="LM",
         v0=_deterministic_arpack_start(
             mat.shape[0],
@@ -785,7 +792,7 @@ _WINDOW_EDGE_TOL = 0.05
 def _window_edge_amplitude(mode, h_bc, v_bc) -> float:
     """``max|E|`` on the window's ARTIFICIAL faces over the mode's peak ``|E|``.
 
-    A §20 symmetry face is not artificial, it is the mode's own mirror plane
+    A symmetry face is not artificial, it is the mode's own mirror plane
     and routinely carries the field PEAK (a fold-antinode mode reads 1.0
     there), so a face whose ``bc`` is set is excluded; a ``"periodic"``
     axis has no artificial face at all (both edges are the one seam the
@@ -816,7 +823,7 @@ def _warn_tight_window(mode, geom: "_WindowGeom", axis, plane_value_um):
     wall half a cell out (``_dmats``' ``bwd`` zero ghost) and its high faces an
     implicit ELECTRIC wall one cell out (``fwd``'s), and the two bias n_eff in
     OPPOSITE directions. On an unfolded window the two partially cancel, so a
-    tight window still reads plausibly; a §20 fold replaces the low wall with
+    tight window still reads plausibly; a fold replaces the low wall with
     the exact mirror and removes that cancellation, so the SAME ``half_v_um``
     that looked converged unfolded can be an order of magnitude worse folded.
     Neither case is visible in the returned n_eff, hence the warning."""
@@ -953,6 +960,10 @@ def _reject_lossy_yee_eme_materials(
     sim, eps_of_medium, active_indices
 ) -> None:
     """Reject unsupported media sampled by this real hard-wall window."""
+    from .kfj_smoothing import _anchored
+
+    # the sampler warned of an unmatched key already
+    eps_of_medium = _anchored(sim, eps_of_medium, warn=False)
     active_media_ids = {
         id(sim.structures[index].medium) for index in active_indices
     }
@@ -1051,7 +1062,7 @@ def solve_yee_mode(sim, axis: str, plane_value_um: float, wlen_um: float,
     the eps the engine's ADE realizes there, NOT the eps_inf that bare
     ``permittivity`` carries; ``eps_of_medium`` overrides per medium.
 
-    §20 symmetry planes are honored AUTOMATICALLY: when ``sim.symmetry`` puts a
+    Symmetry planes are honored AUTOMATICALLY: when ``sim.symmetry`` puts a
     plane on an in-plane axis' min face and the window reaches it, the window
     is clipped at the plane and the matching parity BC applied (PEC -1 / PMC
     +1, :func:`window_min_face_bcs`), the half-window mode is the engine's

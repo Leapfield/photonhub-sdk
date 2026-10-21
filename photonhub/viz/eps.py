@@ -4,26 +4,25 @@ as a heatmap.
 Rebuilds the realized grid with the SAME helpers ``cost.py`` uses
 (:func:`photonhub.components.grid.realized_cells` /
 :func:`graded_primary_spacings`), samples ε at cell centers under the
-NUMERICS §9 last-structure-wins rule, and renders with ``pcolormesh`` on the
+engine's last-structure-wins rule, and renders with ``pcolormesh`` on the
 real µm node coordinates so graded meshes are correct (never assumed uniform).
 
 Every supported geometry is sampled on the mesh here so the preview equals what the solver
 samples: ``Box`` and ``Sphere`` are exact on any cut, and the extruded
 ``Cylinder`` (annular sector) and ``Polygon`` (point-in-polygon) reproduce the
 engine's ``cylinder_contains`` / ``polyslab_contains`` predicates
-(``engine/src/cpu_ref/reference_solver.cpp``) per pixel, both on a cut
+per pixel, both on a cut
 PERPENDICULAR to the extrusion axis (the exact in-plane cross-section) and on a
 cut ALONG it (the rectangular bands where the plane crosses the solid).
 
 Subpixel smoothing IS reflected: when ``Simulation.subpixel`` is on, the view
-shows the §16 volume-fraction average the solver samples on the mesh rather than the §9
-hard point sample, so the drawn boundary is the one that runs. It is the
+shows the volume-fraction average the solver samples on the mesh rather than the hard point sample, so the drawn boundary is the one that runs. It is the
 isotropic average, resolved on a sub-sample lattice; the per-component
 harmonic term of the ``tensor``/``contour`` methods cannot be shown as one
 scalar (see :func:`smooth_eps_plane`). Pass ``subpixel=False`` for the hard
 sample. A ``phsolver --mesh`` dump of the engine's own coefficients is still
 the only way to compare byte for byte. The Polygon
-``sidewall_angle`` taper IS applied (§17.6), mirroring the engine: this module
+``sidewall_angle`` taper IS applied, mirroring the engine: this module
 feeds the client mode solver's cross-section, so painting the un-tapered
 reference polygon would solve launch/readout modes on a different guide than the
 engine propagates. (``plot``'s polygon OUTLINE is still the reference polygon, the outline and this ε sample intentionally differ on a tapered slab.)
@@ -46,7 +45,7 @@ _AXES = "xyz"
 
 def axis_nodes_um(sim, axis_index: int) -> np.ndarray:
     """Primary-node coordinates (microns) for an axis of the realized grid:
-    the graded ``coords`` array extended by the §15.1 replicate-last closing
+    the graded ``coords`` array extended by the replicate-last closing
     node, or a uniform ``n*dl`` ladder. Length ``n_cells + 1`` (cell edges)."""
     dl = sim.grid.dl_um
     q = sim._axis_coords_um(axis_index)
@@ -87,8 +86,8 @@ def sample_eps_plane(sim, axis: str, value: float, *, subpixel: bool = False,
     expects).
 
     ``subpixel=False`` (the default, and what every physics caller wants) is
-    the §9 hard point sample: one last-structure-wins material per cell
-    centre. ``subpixel=True`` returns the §16 VOLUME-FRACTION AVERAGE instead,
+    the hard point sample: one last-structure-wins material per cell
+    centre. ``subpixel=True`` returns the VOLUME-FRACTION AVERAGE instead,
     the smoothed ε the solver samples on the mesh when ``Simulation.subpixel`` is on;
     see :func:`smooth_eps_plane` for what that does and does not reproduce."""
     a = geom.axis_index(axis)
@@ -110,13 +109,13 @@ def sample_eps_plane(sim, axis: str, value: float, *, subpixel: bool = False,
 
 
 def eps_at_points(sim, axis: str, HH, VV, WW, structures=None):
-    """§9 last-structure-wins ε at arbitrary points, painted structure by
+    """Last-structure-wins ε at arbitrary points, painted structure by
     structure in list order (closed containment).
 
     ``HH``/``VV`` are the cut's in-plane coordinates and ``WW`` the coordinate
     ALONG the cut axis. ``WW`` is a float for the plane itself and an array,
     shaped like ``HH``, for points spread through a cell's depth, which is
-    what makes the §16 volume fraction computable from a 2D view at all, since
+    what makes the volume fraction computable from a 2D view at all, since
     the smoothing weight is a fraction of the three-dimensional voxel.
 
     ``structures`` restricts the paint to a subset, in the SAME relative order
@@ -130,7 +129,7 @@ def eps_at_points(sim, axis: str, HH, VV, WW, structures=None):
     v_idx = _AXES.index(v_axis_letter)
 
     # Start from the background everywhere, then paint structures in list order
-    # (last containing structure wins, §9 closed containment).
+    # (last containing structure wins, closed containment).
     eps = np.full(HH.shape, float(sim.background.permittivity),
                   dtype=np.float64)
     flat_w = np.isscalar(WW)
@@ -139,6 +138,20 @@ def eps_at_points(sim, axis: str, HH, VV, WW, structures=None):
         g = structure.geometry
         eps_val = float(structure.medium.permittivity)
         gtype = getattr(g, "type", None)
+        pd = getattr(structure.medium, "permittivity_data", None)
+
+        def paint(inside, g=g, pd=pd, eps_val=eps_val):
+            if pd is None:
+                eps[inside] = eps_val
+                return
+            # custom medium: the engine's trilinear node lookup, so previews
+            # show the real profile and downstream homogeneity checks (e.g.
+            # diffraction_orders' n inference) see a non-uniform plane
+            xyz = [None, None, None]
+            xyz[h_idx], xyz[v_idx], xyz[a] = HH, VV, WW
+            value = custom_eps_at(pd, g, *xyz)
+            eps[inside] = np.broadcast_to(value, eps.shape)[inside]
+
         if gtype == "box":
             c, s = g.center_um, g.size_um
             axial = np.abs(WW - c[a]) <= s[a] / 2.0
@@ -154,43 +167,7 @@ def eps_at_points(sim, axis: str, HH, VV, WW, structures=None):
             )
             if axial is not True:
                 inside = inside & axial
-            pd = getattr(structure.medium, "permittivity_data", None)
-            if pd is not None:
-                # §10.3 custom medium: trilinear node grid over the box
-                # extent (mirrors the engine's eps_data_at) — previews show
-                # the real profile, and downstream homogeneity checks (e.g.
-                # diffraction_orders' n inference) correctly see a
-                # non-uniform plane instead of the scalar mean.
-                shape = pd.shape
-                vals = np.asarray(pd.values, dtype=np.float64).reshape(shape)
-
-                def _frac(coord, cd, sd, n):
-                    f = ((np.asarray(coord, dtype=np.float64)
-                          - (cd - sd / 2.0)) / sd) if sd > 0 else 0.0
-                    return np.clip(f, 0.0, 1.0) * (n - 1)
-
-                q = [None, None, None]
-                q[h_idx] = _frac(HH, c[h_idx], s[h_idx], shape[h_idx])
-                q[v_idx] = _frac(VV, c[v_idx], s[v_idx], shape[v_idx])
-                q[a] = _frac(WW, c[a], s[a], shape[a])
-                i0, w = [], []
-                for d in range(3):
-                    qq = np.asarray(q[d], dtype=np.float64)
-                    lo = np.minimum(qq.astype(np.int64), shape[d] - 2)
-                    i0.append(lo)
-                    w.append(qq - lo)
-                acc = np.zeros_like(HH, dtype=np.float64)
-                for bx in (0, 1):
-                    for by in (0, 1):
-                        for bz in (0, 1):
-                            wt = ((w[0] if bx else 1.0 - w[0])
-                                  * (w[1] if by else 1.0 - w[1])
-                                  * (w[2] if bz else 1.0 - w[2]))
-                            acc = acc + wt * vals[i0[0] + bx, i0[1] + by,
-                                                  i0[2] + bz]
-                eps[inside] = np.broadcast_to(acc, eps.shape)[inside]
-            else:
-                eps[inside] = eps_val
+            paint(inside)
         elif gtype == "sphere":
             c, r = g.center_um, g.radius_um
             d_axis = WW - c[a]
@@ -199,17 +176,52 @@ def eps_at_points(sim, axis: str, HH, VV, WW, structures=None):
             dh = HH - c[h_idx]
             dv = VV - c[v_idx]
             inside = (dh * dh + dv * dv + d_axis * d_axis) <= r * r
-            eps[inside] = eps_val
+            paint(inside)
         elif gtype == "cylinder":
             inside = _cylinder_inside(g, axis, WW, HH, VV, h_idx, v_idx)
             if inside is not None:
-                eps[inside] = eps_val
+                paint(inside)
         elif gtype == "polyslab":
             inside = _polyslab_inside(g, axis, WW, HH, VV, h_idx, v_idx)
             if inside is not None:
-                eps[inside] = eps_val
+                paint(inside)
         # Unknown geometry types are skipped (forward-compatible).
     return eps
+
+
+def custom_eps_at(pd, geometry, x, y, z):
+    """The permittivity of a ``PermittivityArray`` at points ``(x, y, z)``
+    (wire-frame microns, broadcastable), mirroring the engine's node lookup
+    (schema 1.18 and 1.22): the box-spanning grid, or the grid placed
+    by ``coords_um`` with constant extrapolation beyond the outermost node,
+    trilinear in either case."""
+    shape = tuple(int(n) for n in pd.shape)
+    vals = np.asarray(pd.values, dtype=np.float64).reshape(shape)
+    pts = np.broadcast_arrays(*(np.asarray(c, dtype=np.float64) for c in (x, y, z)))
+    i0, w = [], []
+    for d in range(3):
+        n = shape[d]
+        if pd.coords_um is not None:
+            c = np.asarray(pd.coords_um[d], dtype=np.float64)
+            lo = np.clip(np.searchsorted(c, pts[d], side="right") - 1, 0, n - 2)
+            q = np.clip((pts[d] - c[lo]) / (c[lo + 1] - c[lo]), 0.0, 1.0)
+        else:
+            cd, sd = geometry.center_um[d], geometry.size_um[d]
+            f = ((pts[d] - (cd - sd / 2.0)) / sd) if sd > 0 else np.zeros_like(pts[d])
+            f = np.clip(f, 0.0, 1.0) * (n - 1)
+            lo = np.minimum(f.astype(np.int64), n - 2)
+            q = f - lo
+        i0.append(lo)
+        w.append(q)
+    acc = np.zeros(pts[0].shape, dtype=np.float64)
+    for bx in (0, 1):
+        for by in (0, 1):
+            for bz in (0, 1):
+                wt = ((w[0] if bx else 1.0 - w[0])
+                      * (w[1] if by else 1.0 - w[1])
+                      * (w[2] if bz else 1.0 - w[2]))
+                acc = acc + wt * vals[i0[0] + bx, i0[1] + by, i0[2] + bz]
+    return acc
 
 
 def geometry_bbox(g):
@@ -233,11 +245,11 @@ def geometry_bbox(g):
         return lo, hi
     if gtype == "polyslab":
         a = geom.axis_index(g.axis)
-        u_i, v_i = (_AXES.index(x) for x in geom.in_plane_axes(g.axis))
+        u_i, v_i = (_AXES.index(x) for x in geom.physical_in_plane_axes(g.axis))
         us = [float(u) for u, _ in g.vertices_um]
         vs = [float(v) for _, v in g.vertices_um]
         slab_lo, slab_hi = g.slab_bounds_um
-        # §17.6: a sidewall taper dilates the reference polygon by at most
+        # A sidewall taper dilates the reference polygon by at most
         # the slab thickness times tan(angle), so the bound must include it.
         angle = float(getattr(g, "sidewall_angle", 0.0) or 0.0)
         pad = abs(math.tan(angle)) * (slab_hi - slab_lo) if angle else 0.0
@@ -283,7 +295,7 @@ def _faces_cross(sim, axis_index_: int, lo: float, hi: float) -> bool:
 # overhead stays amortised.
 _SMOOTH_TILE_CELLS = 48
 
-# Sub-sample budget for the §16 smoothing: the largest per-axis division whose
+# Sub-sample budget for the smoothing: the largest per-axis division whose
 # total point count stays under this. A picture is not a solve, and the
 # polygon predicate costs one pass per vertex per point.
 _SMOOTH_POINT_BUDGET = 400_000
@@ -292,14 +304,12 @@ _SMOOTH_MAX_DIVISIONS = 8
 
 def smooth_eps_plane(sim, axis: str, value: float, h_nodes, v_nodes, hard,
                      *, supersample: Optional[int] = None):
-    """The §16 volume-fraction average of ε over each cell, given the §9 hard
+    """The volume-fraction average of ε over each cell, given the hard
     sample ``hard`` on the same grid.
 
     Each cell's ε becomes the mean of the material over its PRIMARY voxel,
     sampled on an ``supersample``-per-axis lattice through all three axes. For
-    one interface against a homogeneous surround that is exactly the §16.3
-    isotropic average, and it is exactly the tangential entry ε∥ of the §16.8
-    diagonal KFJ tensor, so it is the smoothed permittivity under
+    one interface against a homogeneous surround that is exactly the isotropic average, and it is exactly the tangential entry ε∥ of the diagonal KFJ tensor, so it is the smoothed permittivity under
     ``subpixel_method="volume"`` and the tangential half of the tensor
     methods.
 
@@ -311,8 +321,7 @@ def smooth_eps_plane(sim, axis: str, value: float, h_nodes, v_nodes, hard,
     the sub-sample lattice rather than in closed form.
 
     Only partially filled cells are sampled; a cell whose neighbourhood is one
-    material has fill fraction 1 and keeps its hard value, which is the §16.4
-    bit-identity floor. A cell is taken as partially filled when the material
+    material has fill fraction 1 and keeps its hard value, which is the bit-identity floor. A cell is taken as partially filled when the material
     changes across the plane OR between the cell's own front and back faces
     along the cut axis. A feature smaller than one cell that the hard sample
     misses entirely is missed here too. ``supersample=None`` picks the finest
@@ -417,7 +426,7 @@ def _cell_bounds(nodes, value):
 
 
 def _cylinder_inside(g, cut_axis, value, HH, VV, h_idx, v_idx):
-    """Boolean mask of the §9 hard sample for a ``Cylinder`` on the cut plane,
+    """Boolean mask of the hard sample for a ``Cylinder`` on the cut plane,
     or ``None`` if the plane misses the cylinder entirely. Mirrors the engine's
     ``cylinder_contains`` (annular sector, closed axial extent), evaluated
     per pixel over the ``(HH, VV)`` in-plane meshgrid.
@@ -442,7 +451,7 @@ def _cylinder_inside(g, cut_axis, value, HH, VV, h_idx, v_idx):
 
     # The two transverse axes of the EXTRUSION axis, in (u, v) order — angles
     # are measured atan2(dv, du) exactly as the engine does.
-    u_letter, v_letter = geom.in_plane_axes(g.axis)
+    u_letter, v_letter = geom.physical_in_plane_axes(g.axis)
     u_i = _AXES.index(u_letter)
     v_i = _AXES.index(v_letter)
 
@@ -477,10 +486,10 @@ def _cylinder_inside(g, cut_axis, value, HH, VV, h_idx, v_idx):
 
 
 def _polyslab_inside(g, cut_axis, value, HH, VV, h_idx, v_idx):
-    """Boolean mask of the §9 hard sample for a ``Polygon`` on the cut plane,
+    """Boolean mask of the hard sample for a ``Polygon`` on the cut plane,
     or ``None`` if the plane misses it. Mirrors the engine's
     ``polyslab_contains`` (closed axial extent + even-odd point-in-polygon,
-    plus the §17.6 ``sidewall_angle`` taper).
+    plus the ``sidewall_angle`` taper).
 
     - Cut PERPENDICULAR to the extrusion axis: in-plane point-in-polygon over
       the full ``(HH, VV)`` grid when the plane is within ``slab_bounds_um``.
@@ -489,10 +498,10 @@ def _polyslab_inside(g, cut_axis, value, HH, VV, h_idx, v_idx):
       transverse coordinate plus the fixed ``value`` form the polygon-space
       ``(pu, pv)`` tested against the polygon.
 
-    §17.6 taper: for ``sidewall_angle != 0`` the reference polygon is
+    Taper: for ``sidewall_angle != 0`` the reference polygon is
     eroded/dilated by the signed-distance band ``delta = (r_a - z_ref)*tan(angle)``
     (rounded-corner offset), with ``z_ref`` set by ``reference_plane``. This
-    mirrors ``reference_solver.cpp::polyslab_contains``, without it the client
+    mirrors the engine's ``polyslab_contains``; without it the client
     mode solver painted the UN-tapered polygon while the engine propagated the
     tapered one, so launch/readout reference modes were solved on a different
     guide than the run. At ``sidewall_angle == 0`` this is a bit-exact no-op."""
@@ -501,7 +510,7 @@ def _polyslab_inside(g, cut_axis, value, HH, VV, h_idx, v_idx):
     lo, hi = g.slab_bounds_um
     verts = [(float(u), float(v)) for u, v in g.vertices_um]
 
-    u_letter, v_letter = geom.in_plane_axes(g.axis)
+    u_letter, v_letter = geom.physical_in_plane_axes(g.axis)
     u_i = _AXES.index(u_letter)
     v_i = _AXES.index(v_letter)
 
@@ -524,7 +533,7 @@ def _polyslab_inside(g, cut_axis, value, HH, VV, h_idx, v_idx):
 
     angle = float(getattr(g, "sidewall_angle", 0.0) or 0.0)
     if angle != 0.0:
-        # §17.6, mirroring polyslab_contains: phi = signed distance (<0 inside);
+        # Mirroring the engine's polyslab_contains: phi = signed distance (<0 inside);
         # a point survives iff phi <= -delta.
         ref = str(getattr(g, "reference_plane", "middle") or "middle").lower()
         z_ref = lo if ref == "bottom" else (hi if ref == "top" else (lo + hi) / 2.0)
@@ -541,7 +550,7 @@ def _polyslab_inside(g, cut_axis, value, HH, VV, h_idx, v_idx):
 
 def _dist_to_polygon_boundary_vec(verts, pu, pv):
     """Vectorized UNSIGNED distance from ``(pu, pv)`` to the polygon's edge set ,
-    the §17.6 mirror of the engine's ``dist_to_polygon_boundary`` (min over edges
+    the mirror of the engine's ``dist_to_polygon_boundary`` (min over edges
     of the distance to the closest point on each clamped segment, which is what
     gives the rounded-corner offset)."""
     pu = np.asarray(pu, dtype=np.float64)
@@ -564,7 +573,7 @@ def _dist_to_polygon_boundary_vec(verts, pu, pv):
 
 
 def _point_in_polygon_vec(verts, pu, pv):
-    """Vectorized even-odd point-in-polygon (the engine's §17.5 ``ray_cross``
+    """Vectorized even-odd point-in-polygon (the engine's ``ray_cross``
     rule) over numpy-broadcastable ``pu``/``pv``. ``verts`` is a list of
     ``(u, v)`` tuples. Returns a boolean array broadcast to ``pu/pv``."""
     pu = np.asarray(pu, dtype=np.float64)
@@ -597,12 +606,12 @@ def plot_index(sim, x=None, y=None, z=None, *, ax=None, cmap=None,
     meshes render with correct, non-uniform cell widths. ``grid=True`` overlays
     the realized cell edges, useful to confirm features are well resolved.
     ``unfold`` (the default) mirrors the sampled half back across each in-plane
-    §20 symmetry plane, so the heatmap shows the whole device; ``unfold=False``
+    symmetry plane, so the heatmap shows the whole device; ``unfold=False``
     shows the reduced domain the solver steps.
 
     ``subpixel`` follows ``Simulation.subpixel`` by default, so the view shows
-    what the run samples on the mesh: the §16 volume-fraction average when the run
-    smooths, the §9 hard point sample when it does not. Force either with
+    what the run samples on the mesh: the volume-fraction average when the run
+    smooths, the hard point sample when it does not. Force either with
     ``True``/``False``, and raise ``supersample`` for a finer fill fraction at
     proportional cost (see :func:`smooth_eps_plane` for what the scalar
     average does and does not reproduce)."""
@@ -613,7 +622,7 @@ def plot_index(sim, x=None, y=None, z=None, *, ax=None, cmap=None,
     if ax is None:
         _, ax = plt.subplots()
     # Which way round the plane reads best, decided once from the domain's own
-    # proportions and then true of every helper below (design §5).
+    # proportions and then true of every helper below.
     spans = [sim._realized_um()[_AXES.index(l)] for l in geom.in_plane_axes(axis)]
     with geom.displayed_transposed(_style.prefer_long_axis_horizontal(*spans)):
         return _plot_index_on(ax, sim, axis, value, owns_figure, cmap=cmap,
@@ -628,12 +637,12 @@ def _plot_index_on(ax, sim, axis, value, owns_figure, *, cmap, legend, grid,
     before = set(ax.get_children())
 
     # The cut is given in the user's frame; the scene is sampled, reflected
-    # and drawn in the corner frame, then moved into the user's (spec §4.4).
+    # and drawn in the corner frame, then moved into the user's.
     a = geom.axis_index(axis)
     origin = geom.frame_origin(sim)
     oh, ov = geom.plane_offsets(origin, axis)
     value_c = value - origin[a]
-    # Cut outside the domain -> empty Axes + warning, never raise (design §9).
+    # Cut outside the domain -> empty Axes + warning, never raise.
     realized = sim._realized_um()
     if not (0.0 <= value_c <= realized[a]):
         warnings.warn(

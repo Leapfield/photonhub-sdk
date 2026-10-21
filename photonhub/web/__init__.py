@@ -25,7 +25,8 @@ WebJobTimeout = _cloud.CloudJobTimeout
 
 def __getattr__(name):
     # Everything else ph.web answered when it was photonhub.cloud itself: the
-    # submodules and cloud's own renamed names (run_async, with its warning).
+    # submodules and cloud's own renamed names (run_quoted_async, with its
+    # warning; a removed name fails with cloud's hint).
     return getattr(_cloud, name)
 
 

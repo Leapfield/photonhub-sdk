@@ -1,4 +1,4 @@
-"""Run controls (NUMERICS.md section 2)."""
+"""Run controls."""
 
 from typing import Optional
 
@@ -51,7 +51,7 @@ class RunSpec(FrozenModel):
     model_config = ConfigDict(json_schema_extra=_RUN_ONE_OF)
 
     run_time_s: Optional[float] = Field(default=None, gt=0)
-    # Client-only third way to give the duration (design spec §4.1): the run
+    # Client-only third way to give the duration: the run
     # length in transits of the longest domain axis at the highest structure
     # index. The Simulation resolves it to run_time_s at construction; it never
     # reaches the wire or the schema.
@@ -65,10 +65,10 @@ class RunSpec(FrozenModel):
         default=None, ge=1, le=MAX_INT32,
         validation_alias=AliasChoices("n_steps", "num_steps"))
     courant: float = Field(default=0.99, gt=0, le=0.9999)
-    # NUMERICS.md section 7 auto-shutoff (run-until-field-decay): the run may
+    # Auto-shutoff (run-until-field-decay): the run may
     # finish before run_time_s/n_steps once the field energy decays below this
     # fraction of its peak (after the sources stop). 0 disables; default 1e-5
-    # (standard behavior). The engine's resolve.cpp validate() is authoritative.
+    # (standard behavior). The engine's own validation is authoritative.
     shutoff: float = Field(default=1.0e-5, ge=0, lt=1)
     # Positive values guard frequency-domain results on capable CPU solvers.
     # None is target-aware: local CPU injects 1e-4 when supported; saved specs,

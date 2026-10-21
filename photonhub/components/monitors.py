@@ -1,4 +1,4 @@
-"""Field monitors (NUMERICS.md sections 6 and 12).
+"""Field monitors: time-domain and frequency-domain.
 
 Monitor names must be filename-safe (the engine writes ``<name>.bin``) and, a constraint JSON Schema cannot express across array items, unique within a
 simulation (enforced by ``Simulation``).
@@ -60,7 +60,7 @@ class SnapshotMonitor(FrozenModel):
 
 class Apodization(FrozenModel):
     """Time window applied to a monitor's running DFT (the standard
-    ``ApodizationSpec`` analogue, NUMERICS.md section 12). A Gaussian roll-ON of
+    ``ApodizationSpec`` analogue). A Gaussian roll-ON of
     standard deviation ``width_s`` for t < ``start_s``, flat (== 1) on
     ``[start_s, end_s]``, and a Gaussian roll-OFF for t > ``end_s``, used to
     isolate the late-time steady state of a resonant structure (suppressing the
@@ -241,7 +241,7 @@ class ModePort(FrozenModel):
 
 
 class ProfileMonitor(FrozenModel):
-    """Running-DFT field monitor over a box region (NUMERICS.md section 12):
+    """Running-DFT field monitor over a box region:
     fp64 accumulation every step over the full run, raw Yee-located phasors.
     The engine normalizes them by the first wire-order source's ``A0 * S(f)``
     and :class:`~photonhub.RunResult` multiplies ``A0`` back in, so the
@@ -419,8 +419,7 @@ class ProfileMonitor(FrozenModel):
 
 class PowerMonitor(FrozenModel):
     """Poynting-flux monitor perpendicular to ``axis`` at ``position_um``,
-    snapped to a plane index ``1 <= kp <= n_axis - 1`` (NUMERICS.md
-    section 12). Positive values mean power toward +axis. The value
+    snapped to a plane index ``1 <= kp <= n_axis - 1``. Positive values mean power toward +axis. The value
     :class:`~photonhub.RunResult` returns is the time-averaged power in
     WATTS of a continuous-wave excitation at each frequency by the sources
     as declared: the engine accumulates the flux from phasors normalized by
@@ -436,7 +435,7 @@ class PowerMonitor(FrozenModel):
     components makes this exactly the flux the solver conserves from plane to
     plane on any mesh: the power a port's modal readout reports, and the one
     a port or beam launch built cell by cell (the default) normalizes
-    ``power_watts`` to (NUMERICS §18.7); a paraxial beam and an auxiliary-line
+    ``power_watts`` to; a paraxial beam and an auxiliary-line
     mode source keep the continuum normalization and read ``cos(k*dl/2)`` of
     it. A
     plane wave of field amplitude ``E0`` in an empty domain carries
@@ -463,10 +462,10 @@ class PowerMonitor(FrozenModel):
     omitted from the wire. Not yet supported by the multi-GPU decomposition
     (single GPU / CPU only).
 
-    **With symmetry planes** (``symmetry=``, NUMERICS §20) the value is the
+    **With symmetry planes** (``symmetry=``) the value is the
     power of the whole device through the plane, what the simulation without
     the planes reads, the convention of ports and of every launch's
-    ``power_watts`` (NUMERICS §20.8): the engine integrates the part of the
+    ``power_watts``: the engine integrates the part of the
     plane the simulation models, and the reader multiplies it by 2 for every
     symmetry plane that cuts the monitor plane (one whose normal lies in it,
     reached by the window; the array's ``symmetry_factor`` attr, absent when

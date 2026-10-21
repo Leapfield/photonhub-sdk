@@ -257,7 +257,7 @@ def _stored_simulation(cfg: CloudConfig, job_id: str):
     cache, or None when no usable spec was kept.
 
     The engine normalizes every ``field_dft`` phasor and flux per unit
-    amplitude of the first wire-order source (NUMERICS.md section 12) and the
+    amplitude of the first wire-order source and the
     reader multiplies ``A0`` back in only when it knows the simulation. The
     submitting calls hand theirs over; a resume is given an id alone, so it
     reads the spec the client stored when it submitted that job. Without one
@@ -582,7 +582,7 @@ def resume(job_id: str, *, simulation=None, progress: ProgressCb = None,
     The result reads in the same absolute units and the same frame as the
     call that submitted the job: this client stores the wire spec of every job
     it submits, so the reader knows the simulation and undoes the engine's
-    per-unit-amplitude normalization (NUMERICS.md section 12) here too, and it
+    per-unit-amplitude normalization here too, and it
     stores beside it the client state the spec does not carry (the user-frame
     origin of a fitted domain, the half a symmetry plane dropped, declared
     ports), so coordinates, whole planes and ``transmission()`` agree. Both are stored

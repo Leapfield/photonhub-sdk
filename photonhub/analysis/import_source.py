@@ -155,7 +155,7 @@ def import_field(
     Parameters
     ----------
     sim:
-        The simulation whose grid/size/§20 symmetry the profile is sampled on
+        The simulation whose grid, size and symmetry the profile is sampled on
         (a placeholder geometry-only simulation with the same grid is fine).
     axis:
         The injection plane's normal, ``"x"``/``"y"``/``"z"``.
@@ -179,7 +179,7 @@ def import_field(
         straddle (a beam tilted by theta has ``n cos(theta)``). Default: ``n``.
     center_um:
         Transverse placement of the profile origin as ``(h, v)``; default the
-        domain centre (0 on a §20-folded axis).
+        domain centre (0 on a folded axis).
     half_w_um, half_v_um:
         Half-extents of the sampled window; default the data's own extent,
         clipped to the domain.
@@ -318,9 +318,12 @@ def import_source(
     source plane. ``power_watts`` (default 1 W) normalizes the launched power on the
     engine's discrete Poynting quadrature exactly like the mode and beam
     launches: the whole, unfolded device's power, so a profile centred on k
-    §20 symmetry planes puts ``power_watts / 2^k`` into the modeled part
-    (NUMERICS §20.8); ``None`` keeps the imported amplitude scale. Returns the ``PointDipole`` list for
-    ``Simulation.sources``.
+    symmetry planes puts ``power_watts / 2^k`` into the modeled part;
+    ``None`` keeps the imported amplitude scale. Returns the ``PointDipole`` list for
+    ``Simulation.sources``. ``amplitude_threshold`` compares each field with
+    its own peak (default fraction 1e-6). Electric and magnetic currents at a
+    sample are kept or dropped together, and power is normalized on the kept
+    samples.
     """
     if direction not in ("+", "-"):
         raise ValueError(f"direction must be '+' or '-', got {direction!r}")

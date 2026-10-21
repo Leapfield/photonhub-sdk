@@ -30,6 +30,7 @@ from ..data import (
     validate_monitor_manifest_entry,
     validate_result_manifest_contract,
 )
+from ..spec_hash import _sha256_hex as _sha256_bytes
 
 
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -62,10 +63,6 @@ def _json_text(value: Any) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         allow_nan=False,
     )
-
-
-def _sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
 
 
 def _stat_signature(file_stat: os.stat_result) -> tuple[int, int, int, int, int]:
