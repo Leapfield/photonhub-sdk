@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "photonhub"
-version = "0.1.6"
+version = "0.1.7"
 description = "Python client for the PhotonHub GPU FDTD photonics solver"
 readme = "README.md"
 # 3.11 floor: the floor CI exercises is 3.12, and on 3.10 the resolver falls
-# back to a year-old xarray (2025.6) — claim only what current deps support.
+# back to a year-old xarray (2025.6). Claim only what current deps support.
 requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -41,6 +41,7 @@ Repository = "https://github.com/Leapfield/photonhub-sdk"
 [project.optional-dependencies]
 test = [
     "pytest",
+    "hatchling",  # exercise the actual wheel and sdist contents in the package gate
     "pytest-xdist>=3.2",  # the local gate runs with -n auto --dist worksteal (3.2 added worksteal)
     "ruff>=0.16,<0.17",   # the gallery format gate runs ruff format; a new style release would restyle
     "fastapi",
@@ -72,6 +73,7 @@ photonhub-mcp = "photonhub._mcp_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["photonhub"]
+exclude = ["/photonhub/executor"]
 
 # The published sdist is the installable client, not the development tree.
 # Tests are deliberately excluded: they carry no value for someone installing
@@ -82,14 +84,11 @@ packages = ["photonhub"]
 include = ["photonhub", "LICENSE", "README.md", "pyproject.toml"]
 # Hatchling adds VCS metadata by default; the repo-root .gitignore names
 # private benchmark paths that do not belong in a published artifact.
-exclude = ["/.gitignore"]  # superseded by photonhub/.gitignore; kept as intent
+exclude = ["/.gitignore", "/photonhub/executor"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.ruff.lint.per-file-ignores]
 # These modules import the runner fixtures from test_gpu_jobs; pytest binds them by parameter name.
-"tests/test_gpu_jobs_hotaisle.py" = ["F811"]
-"tests/test_gpu_jobs_heartbeat.py" = ["F811"]
-"tests/test_gpu_jobs_devcloud.py" = ["F811"]
-"tests/test_gpu_jobs_gpu_model.py" = ["F811"]
+"tests/test_gpu_jobs_*.py" = ["F811"]

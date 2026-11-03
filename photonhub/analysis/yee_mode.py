@@ -15,7 +15,10 @@ This module solves the mode on the **engine's own Yee discretization**:
 The eigenproblem is the canonical transverse-E full-vector FDFD (diagonal eps,
 mu=1): ``mat @ [Ex;Ey] = -n_eff^2 [Ex;Ey]`` with the block operator built from the
 forward/backward derivative matrices (standard formulation; here wired to the
-engine's curls + staggered eps). The launched mode is then the FDTD discrete mode,
+engine's curls + staggered eps). The core also takes an optional diagonal mu at
+the H positions, which the cross-section solver's bends and absorbing layers
+use (transformation optics; see :func:`_solve_yee_eig`); the FDTD port paths
+never pass it. The launched mode is then the FDTD discrete mode,
 so a TF/SF injection of it is clean (this is how a mode solve is matched to an FDTD grid).
 
 KNOWN COMPROMISE, real-space field consumers still COLLOCATE the staggered
@@ -570,13 +573,14 @@ def sample_staggered_eps(sim, axis, plane_value_um, *, h_center, v_center,
 
 
 # --------------------------------------------------------------------------- #
-# The eigenproblem (canonical transverse-E FDFD, diagonal eps, mu=1).
+# The eigenproblem (canonical transverse-E FDFD, diagonal eps, optional
+# diagonal mu).
 # --------------------------------------------------------------------------- #
 def _solve_yee_eig(exx, eyy, ezz, nh, nv, wavelength_um: float, dl_um: float,
                    nmodes: int, center_offset=None, h_min_bc=None,
                    v_min_bc=None, dq_h=None, dq_v=None,
                    x_coords_um=None, y_coords_um=None, min_neff: float = 1.0,
-                   n_guess: Optional[float] = None):
+                   n_guess: float | None = None, mu=None):
     """Solve the discrete-Yee eigenproblem at ``wavelength_um`` for pre-sampled,
     Yee-staggered diagonal permittivity arrays over a window, returning
     :class:`VectorMode`\\ s above ``min_neff`` in descending real ``n_eff``.
@@ -613,7 +617,25 @@ def _solve_yee_eig(exx, eyy, ezz, nh, nv, wavelength_um: float, dl_um: float,
     = the node ladders RELATIVE to the requested mode centre, carried on the
     returned :class:`VectorMode` so consumers place a graded-solved mode on
     its true nonuniform mesh (uniform callers may pass ``None``, consumers
-    then reconstruct coords from ``dl_x_um`` as before)."""
+    then reconstruct coords from ``dl_x_um`` as before).
+
+    ``mu`` = ``None`` (default) keeps μ = 1, and the solve is unchanged bit
+    for bit. Otherwise ``(μxx, μyy, μzz)``, flat arrays like ``exx`` sampled
+    at the H positions of the same index: μxx at Hx (the Ey position), μyy at
+    Hy (the Ex position), μzz at Hz (the cell corner, half a step past Ez on
+    both axes). ε and μ may then be complex, as a complex coordinate stretch
+    folded into the tensors makes them. With ``∂z → -iβ`` and ``H̃ = η0 H``
+    the curl equations give ``n E_t = P H_t`` and ``n H_t = Q E_t``; μyy and
+    μxx stand where the identity blocks of ``P`` stand for μ = 1 (Hy in the
+    Ex row, Hx in the Ey row), and ``μzz⁻¹`` enters the elimination of Hz in
+    ``Q`` between its backward and forward differences, as ``εzz⁻¹`` enters
+    the elimination of Ez in ``P``. Fields follow ``H = (i/(ω μ0)) μ⁻¹ ∇×E``
+    with the complex β of the eigenvalue, and ``Ez`` from ``∇·(εE) = 0``.
+    The phasor here is ``exp(+iωt - iβz)``, the returned-field convention
+    of :class:`VectorMode`, so a passive mode has ``Im n < 0`` and carries
+    ``k_eff = -Im n >= 0``. Without ``n_guess`` the shift targets the
+    largest local index, ``sqrt`` of the largest real part of ``εxx μyy``,
+    ``εyy μxx``, ``εzz μxx`` and ``εzz μyy``."""
     import scipy.sparse as sp
     import scipy.sparse.linalg as spl
 
@@ -624,14 +646,25 @@ def _solve_yee_eig(exx, eyy, ezz, nh, nv, wavelength_um: float, dl_um: float,
                dq_h=dq_h, dq_v=dq_v)
     dxf, dxb, dyf, dyb = (m / k0 for m in _dmats(nh, nv, dl, **bcs))
     inv_ezz = sp.spdiags(1.0 / ezz, 0, N, N)
-    I = sp.eye(N)
-    p_mu = sp.bmat([[None, I], [-I, None]], format="csr")
+    if mu is None:
+        I = sp.eye(N)
+        p_mu = sp.bmat([[None, I], [-I, None]], format="csr")
+    else:
+        mxx, myy, mzz = (np.asarray(m) for m in mu)
+        p_mu = sp.bmat([[None, sp.spdiags(myy, 0, N, N)],
+                        [-sp.spdiags(mxx, 0, N, N), None]], format="csr")
     p_partial = sp.bmat([[-dxf @ inv_ezz @ dyb, dxf @ inv_ezz @ dxb],
                          [-dyf @ inv_ezz @ dyb, dyf @ inv_ezz @ dxb]], format="csr")
     q_ep = sp.bmat([[None, sp.spdiags(eyy, 0, N, N)],
                     [-sp.spdiags(exx, 0, N, N), None]], format="csr")
-    q_partial = sp.bmat([[-dxb @ dyf, dxb @ dxf],
-                         [-dyb @ dyf, dyb @ dxf]], format="csr")
+    if mu is None:
+        q_partial = sp.bmat([[-dxb @ dyf, dxb @ dxf],
+                             [-dyb @ dyf, dyb @ dxf]], format="csr")
+    else:
+        inv_mzz = sp.spdiags(1.0 / mzz, 0, N, N)
+        q_partial = sp.bmat([[-dxb @ inv_mzz @ dyf, dxb @ inv_mzz @ dxf],
+                             [-dyb @ inv_mzz @ dyf, dyb @ inv_mzz @ dxf]],
+                            format="csr")
     qmat = q_ep + q_partial
     mat = (p_mu @ qmat + p_partial @ q_ep).tocsc()
 
@@ -654,31 +687,49 @@ def _solve_yee_eig(exx, eyy, ezz, nh, nv, wavelength_um: float, dl_um: float,
     # eyy/ezz retain the full core epsilon.  Shifting from max(exx) alone can
     # target the radiation spectrum and omit every guided root.  The scalar-
     # dielectric upper bound is the maximum over all component samples.
-    n_core = float(
-        np.sqrt(
-            max(
-                np.max(np.asarray(exx).real),
-                np.max(np.asarray(eyy).real),
-                np.max(np.asarray(ezz).real),
+    if mu is None:
+        n_core = float(
+            np.sqrt(
+                max(
+                    np.max(np.asarray(exx).real),
+                    np.max(np.asarray(eyy).real),
+                    np.max(np.asarray(ezz).real),
+                )
             )
         )
-    )
+    else:
+        # A transformed medium's local index is sqrt(ε μ); every ε component
+        # enters, εzz included, for the reason above.
+        ezz_arr = np.asarray(ezz)
+        n_core = float(np.sqrt(max(
+            np.max((np.asarray(exx) * myy).real),
+            np.max((np.asarray(eyy) * mxx).real),
+            np.max((ezz_arr * mxx).real),
+            np.max((ezz_arr * myy).real))))
     if nmodes >= 2 * N - 1:
         raise ValueError(
             f"trial mode count {nmodes} is too large for a {nh} x {nv} "
             f"cross-section ({2 * N} transverse unknowns); reduce num_modes "
             "or enlarge the solve window")
     target = n_core if n_guess is None else float(n_guess)
-    vals, vecs = spl.eigs(
-        mat,
-        k=nmodes,
-        sigma=-(target ** 2),
-        which="LM",
-        v0=_deterministic_arpack_start(
-            mat.shape[0],
-            complex_dtype=np.issubdtype(mat.dtype, np.complexfloating),
-        ),
-    )
+    try:
+        vals, vecs = spl.eigs(
+            mat,
+            k=nmodes,
+            sigma=-(target ** 2),
+            which="LM",
+            v0=_deterministic_arpack_start(
+                mat.shape[0],
+                complex_dtype=np.issubdtype(mat.dtype, np.complexfloating),
+            ),
+        )
+    except spl.ArpackNoConvergence as exc:
+        # A transformed (bend or layered) operator keeps the pairs that did
+        # converge, as the cross-section solver's default method does; the
+        # mu-free paths raise as before.
+        if mu is None:
+            raise
+        vals, vecs = exc.eigenvalues, exc.eigenvectors
     neff = np.sqrt(-vals)                        # eigenvalue = -n_eff^2
     order = np.argsort(-neff.real)
     vals, neff, vecs = vals[order], neff[order], vecs[:, order]
@@ -693,6 +744,8 @@ def _solve_yee_eig(exx, eyy, ezz, nh, nv, wavelength_um: float, dl_um: float,
     inv_e = sp.spdiags(1.0 / ezz, 0, N, N)
     omega = C0 * k0 * 1e6                                     # rad/s (k0 in 1/um)
     pref = 1j / (omega * MU0)                                 # H = (i/(w*mu0)) curl E
+    if mu is not None:
+        inv_mu = tuple(1.0 / np.asarray(m) for m in mu)       # (Hx, Hy, Hz)
     modes = []
     for m in range(len(order)):
         ne = complex(neff[m])
@@ -709,13 +762,16 @@ def _solve_yee_eig(exx, eyy, ezz, nh, nv, wavelength_um: float, dl_um: float,
             / max(float(residual_denominator), 1e-300)
         )
         ex = vecs[:N, m]; ey = vecs[N:, m]
-        beta = ne.real * k0                                  # per um
+        # A complex (absorbing) medium keeps the complex beta in the fields.
+        beta = ne.real * k0 if mu is None else ne * k0       # per um
         beta_m = beta * 1e6                                  # per m
         # Ez from div(eps E)=0:  i*beta*eps_zz*Ez = d/dx(eps_xx Ex)+d/dy(eps_yy Ey)
         ezc = (inv_e @ (Dxb_u @ (diag_exx @ ex) + Dyb_u @ (diag_eyy @ ey))) / (1j * beta)
         hx = pref * (Dyf_m @ ezc + 1j * beta_m * ey)
         hy = pref * (-1j * beta_m * ex - Dxf_m @ ezc)
         hz = pref * (Dxf_m @ ey - Dyf_m @ ex)
+        if mu is not None:
+            hx, hy, hz = hx * inv_mu[0], hy * inv_mu[1], hz * inv_mu[2]
         def grid(v):  # flat [ih*nv+iv] -> [iy=v, ix=h]
             return v.reshape(nh, nv).T
         exg, eyg, ezg = grid(ex), grid(ey), grid(ezc)
@@ -735,7 +791,8 @@ def _solve_yee_eig(exx, eyy, ezz, nh, nv, wavelength_um: float, dl_um: float,
                         ex=exg * g, ey=eyg * g, ez=ezg * g,
                         hx=hxg * g, hy=hyg * g, hz=hzg * g,
                         wavelength_um=wavelength_um, dl_x_um=dl, dl_y_um=dl,
-                        k_eff=ne.imag, center_offset_um=center_offset,
+                        k_eff=ne.imag if mu is None else -ne.imag,
+                        center_offset_um=center_offset,
                         yee_staggered=True,   # solved on the engine's Yee grid
                         x_coords_um=x_coords_um, y_coords_um=y_coords_um,
                         eigen_residual=eigen_residual)

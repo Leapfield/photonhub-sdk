@@ -72,7 +72,9 @@ class RunSpec(FrozenModel):
     shutoff: float = Field(default=1.0e-5, ge=0, lt=1)
     # Positive values guard frequency-domain results on capable CPU solvers.
     # None is target-aware: local CPU injects 1e-4 when supported; saved specs,
-    # GPU and cloud retain the legacy energy-only wire.
+    # GPU and cloud retain the legacy energy-only wire. An explicit 0 leaves the
+    # wire too. Simulation.to_file alone writes it, so from_file keeps it; wire
+    # text and the Workbench do not.
     dft_shutoff: Optional[float] = Field(
         default=None, ge=0, lt=1,
         description=("Relative threshold for an estimate of remaining change "

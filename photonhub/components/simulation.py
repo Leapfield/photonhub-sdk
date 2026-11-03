@@ -2,6 +2,7 @@
 
 import contextlib
 import contextvars
+import functools
 import logging
 import math
 import os
@@ -9,6 +10,7 @@ import stat
 import tempfile
 import warnings
 from collections.abc import Iterator
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, NamedTuple, Optional, Tuple, Union
 
@@ -30,11 +32,13 @@ from .grid import (
     _structure_index,
     auto_mesh,
     axis_min_cells,
+    boundary_layer_depths_um,
     graded_primary_spacings,
     GradedMesh,
     GradedMeshAxis,
     MeshType,
     quarter_snap_dft_face,
+    RATIO_GUARD_WORDS,
     realized_cells,
     resolved_cell_counts,
     snap_mixed_plane,
@@ -44,6 +48,7 @@ from .grid import (
 )
 from .medium import Background, Boundaries
 from .monitors import (
+    FarFieldMonitor,
     ProfileMonitor,
     PowerMonitor,
     TimeMonitor,
@@ -55,7 +60,7 @@ from .sources import ModeSource, PlaneWave, PointDipole, SourceType, TfsfBox
 from . import declarative as _decl
 from . import frame as _frame
 from ._bounds import geometry_bounds_um
-from .authoring import Domain, GaussianBeam, Mesh, Port
+from .authoring import Domain, GaussianBeam, HeldPort, Mesh, Port
 from .source_time import _C0_M_PER_S, CW
 from .structures import Box, MaterialEntry, Medium, Structure, is_material
 from .._compat import caller_stacklevel, legacy_keywords
@@ -182,6 +187,33 @@ _SHEET_MIN_DIPOLES = 8
 # along a one- or two-cell axis (a quasi-2-D scene) every set of dipoles is
 # "thin", and two launch lines would merge.
 _SHEET_MIN_NORMAL_CELLS = 4
+
+# A fitted domain's boundary layers on a graded axis begin at most the box's
+# rounding (a quarter background cell, half on a fold's far face) plus this
+# share of the layers' own depth inside the wall. The mesher's closing rescale
+# and its snap to interfaces stretch a face's cells by a few percent: 3.9 to
+# 4.5 % on a plain air face opposite a substrate, 14 % for silicon that begins
+# just past a fold's far wall. A face the realized mesh leaves shorter is
+# regrown, at most _LAYER_REGROWS times; a regrown box that does not build
+# leaves the last one that did, with a warning.
+_LAYER_STRETCH = 0.03
+_LAYER_REGROWS = 4
+# Two periods closer than this share of the period are the same period: the
+# floating-point noise of n * dl and of a spacing printed to twelve digits,
+# which holds 5e-12 at worst.
+_PERIOD_TOL = 1e-9
+# The largest whole number either side of a ratio of two Bloch periods.
+_COMMON_CELL_RATIO = 10000
+# The finest cell two Bloch axes are told to share, as a share of the coarsest
+# they could have: half of it already costs about 16 times the cells and steps.
+_COMMON_CELL_FLOOR = 0.5
+# Cells from which the advice says a coordinate ladder can miss the solver's
+# periodic seam by rounding alone. The solver draws no such line: a miss is
+# chance, and it grows with the axis. Of exact ladders 0.01 % miss at 2,500 to
+# 2,999 cells, 0.13 % at 3,000 to 3,499, about 1.8 % at 4,000 to 4,999 and 5.4 %
+# at 5,000 to 5,999. The lowest ladders found that miss both as rounded and as
+# exact nodes have 2,490 and 2,527 cells.
+_LONG_LADDER = 2500
 # The constructor's declaration aliases (Simulation.size_um / .grid), mapped to
 # their field names so with_changes() takes the spelling a simulation is written in.
 _FIELD_ALIASES = {"domain": "size_um", "mesh": "grid"}
@@ -197,6 +229,16 @@ _RESOLVED_FIELDS = ("size_um", "grid", "run", "structures", "sources", "monitors
 # domain= fit moves that frame off the user's, so an edit of one of them on
 # such a simulation cannot be read as the user wrote it.
 _FRAME_FIELDS = frozenset({"size_um", "grid", "structures", "sources", "monitors", "origin_um"})
+
+
+# The edits a loaded result's far-field recipe survives (an edit of a
+# simulation loaded from the wire): nothing its medium, crossing and layer
+# checks read, and not the grid its faces were placed on. A monitors edit
+# keeps the recipes whose faces it keeps (frame.carry_far_field).
+_FAR_FIELD_SAFE_EDITS = frozenset({
+    "run", "sources", "monitors", "subpixel", "subpixel_method", "field_precision",
+    "dft_precision", "pml_m", "pml_kappa_max", "pml_alpha_max", "pml_sigma_max",
+    "absorber_m"})
 
 
 # The fields the declarative resolution reads from the scene it solves the
@@ -231,6 +273,23 @@ def _editing(original):
         yield
     finally:
         _EDITING.reset(token)
+
+
+# Set while an edit constructs a copy whose ports it resolves again
+# afterwards: the far-field build warnings wait for those final sources
+# (_edited_copy gives them once, after _apply_declarative), so the copy's
+# construction does not give them first from the caller's sources alone.
+_FAR_FIELD_ADVICE_DEFERRED: contextvars.ContextVar = contextvars.ContextVar(
+    "photonhub_far_field_advice_deferred", default=False)
+
+
+@contextlib.contextmanager
+def _far_field_advice_deferred(defer: bool):
+    token = _FAR_FIELD_ADVICE_DEFERRED.set(bool(defer))
+    try:
+        yield
+    finally:
+        _FAR_FIELD_ADVICE_DEFERRED.reset(token)
 
 
 def _advised_before(advice: str, found) -> bool:
@@ -428,6 +487,179 @@ def _extension_media(inputs, moved, extensions):
         return out, None
     held = tuple(w.medium for w in moved) + tuple(e.medium for e, _ in out)
     return out, _MediumAliases(held, tuple(entries))
+
+
+def _port_host(port, structures):
+    """``(host, host_index, containing)``: the structure a port sits on, its
+    index in ``structures`` and every structure whose bounds contain the
+    port centre, in list order. Paint order decides the host: the LAST
+    structure containing the centre wins, so the guide under a cladding
+    authored before it is the host, and a guide buried under a cladding
+    authored after it is not (the raster has no guide there to continue).
+    ``(None, None, [])`` off every structure."""
+    containing, host_index = [], None
+    for si, st in enumerate(structures):
+        b = geometry_bounds_um(st.geometry)
+        if all(b[i][0] - 1e-9 <= float(port.center_um[i]) <= b[i][1] + 1e-9 for i in range(3)):
+            containing.append(st)
+            host_index = si
+    return (containing[-1] if containing else None), host_index, containing
+
+
+def _seam_spacings_m(q) -> Tuple[float, float]:
+    """The first and last primary spacings of ``q`` (um) as the engine reads
+    them: in metres, each node scaled by 1e-6. In microns that rounding does not
+    show, and from about 2,500 nodes it can be enough to miss a seam."""
+    first, second, before_last, last = (node * 1e-6 for node in (q[0], q[1], q[-2], q[-1]))
+    return second - first, last - before_last
+
+
+def _seam_spacings_match(q) -> bool:
+    """Whether those spacings agree to the engine's 1e-12 of the spacing, as a
+    periodic axis needs."""
+    dq_first, dq_last = _seam_spacings_m(q)
+    return abs(dq_first - dq_last) <= 1e-12 * max(dq_first, dq_last)
+
+
+def _uniform_at(q, dl) -> bool:
+    """Whether the nodes ``q`` (um, at least two) are uniform at ``dl`` as the
+    engine wants a Bloch axis: each cell in metres, the closing one repeating
+    the last, within 1e-9 of it."""
+    nodes = [node * 1e-6 for node in q]
+    nodes.append(nodes[-1] + (nodes[-1] - nodes[-2]))
+    cell = dl * 1e-6
+    return all(abs((upper - lower) - cell) <= 1e-9 * cell for lower, upper in zip(nodes, nodes[1:]))
+
+
+def _coordinate_ladder(spacing, cells, periodic) -> tuple:
+    """A uniform axis written as coordinates, rounded to 1e-9 um. Those nodes
+    meet a plain periodic seam only by luck, and the solver refuses a miss, so
+    there alone (``periodic``) a miss takes exact nodes: no scene that ran moves."""
+    ladder = tuple(round(i * spacing, 9) for i in range(cells))
+    if periodic and cells > 1 and not _seam_spacings_match(ladder):
+        ladder = tuple(i * spacing for i in range(cells))
+    return ladder
+
+
+def _common_cell(periods, dl) -> Optional[float]:
+    """The largest cell that divides every period, at most ``dl`` and a quarter
+    of the shortest period. ``None`` when no ratio of whole numbers up to
+    ``_COMMON_CELL_RATIO`` fits them within ``_PERIOD_TOL``, and when that cell
+    is finer than ``_COMMON_CELL_FLOOR`` of the most it could be: a period off
+    by a little can always be met by a cell far finer than the scene can pay
+    for, which is no advice."""
+    first = periods[0]
+    if min(periods) <= 0.0:
+        return None
+    whole = 1                                # cells of the first period in the common cell
+    for period in periods[1:]:
+        ratio = Fraction(first / period).limit_denominator(_COMMON_CELL_RATIO)
+        if ratio == 0 or abs(float(ratio) * period - first) > _PERIOD_TOL * first:
+            return None
+        whole = math.lcm(whole, ratio.numerator)
+    coarsest = min(dl, min(periods) / 4.0)
+    cell = first / whole
+    cell /= max(1, math.ceil(cell / coarsest - 1e-9))
+    return cell if cell >= _COMMON_CELL_FLOOR * coarsest else None
+
+
+def _period_advice(axis, kind, asked, cells, dl, lattice) -> str:
+    """How to keep a period the cell missed, as a spacing that can be pasted.
+
+    ``lattice`` holds ``(axis, kind, period, cells)`` for each periodic or Bloch
+    axis. Twelve digits, because nine are only good to 5e-9 near a leading 1,
+    which is past ``_PERIOD_TOL``, so a spacing printed to nine digits drew the
+    same warning again. At least four cells, the fewest a coordinate ladder
+    takes: a shorter axis works only as the mesh's base cell. One cell stays
+    one cell where it can take that cell, a one-cell axis being the point of
+    it.
+
+    A mesh has one base cell, and three kinds of axis cannot do without it: a
+    Bloch axis, an axis under four cells, and an axis too long for a ladder. So
+    two Bloch axes need a cell that divides both, a short axis beside one of the
+    others needs four cells to keep its period, and a long axis beside a Bloch
+    axis or another long one can be refused, which only saying so can help."""
+    others = [row for row in lattice if row[0] != axis]
+    bloch_periods = [period for _, other, period, _ in lattice if other == "bloch"]
+    short = [(letter, period) for letter, other, period, n in others if other == "periodic" and n < 4]
+    long_beside = any(other == "periodic" and n >= _LONG_LADDER for _, other, _, n in others)
+    if kind == "bloch" and len(bloch_periods) > 1:
+        cell = _common_cell(bloch_periods, dl)
+        if cell is None:
+            return ("No cell near this size divides every Bloch period, and those axes share one cell, so change "
+                    "a period to keep them")
+        whole = cells
+        advice = (f"To keep it, give the Bloch axes one cell that divides each period, such as {cell:.12g} um: they "
+                  "cannot take spacings of their own")
+    else:
+        alone = kind == "periodic" and cells == 1 and not (bloch_periods or short or long_beside)
+        whole = 1 if alone else max(cells, 4)
+        advice = (f"To keep it, give this axis a spacing that divides it, such as {asked / whole:.12g} um: Mesh.dl_um "
+                  "takes one per axis (None for a graded axis), but a TF/SF box or a full-tensor subpixel method "
+                  "needs one spacing on every axis")
+    if short and (kind == "bloch" or whole >= _LONG_LADDER):
+        wanted = " and ".join(f"the {letter} axis, such as {period / 4:.12g} um" for letter, period in short)
+        advice += (f". An axis under four cells holds the mesh's base cell, which this axis needs, so give four "
+                   f"cells as well to {wanted}")
+    if kind == "periodic" and whole >= _LONG_LADDER and (bloch_periods or long_beside):
+        advice += (f". From about {_LONG_LADDER:,} cells a coordinate ladder can fail the solver's seam check, more "
+                   "often the longer it is, so this axis needs the mesh's base cell, and another axis needs it too: "
+                   "if the build refuses this spacing, give both axes one spacing")
+    return advice
+
+
+def _warn_periodic_cell(axis, kind, asked, given, dl, cells, low, box, structures, spans, lattice=()) -> None:
+    """Warn about the two ways a fitted periodic or Bloch cell can differ from
+    the cell the scene describes, in the user's frame.
+
+    ``asked`` is the period (``given`` when it is ``period_um``, else the
+    structures' bounding box ``box``), ``cells`` the whole cells of ``dl`` the
+    axis realizes and ``low`` the cell's lower wall. ``spans`` holds each
+    structure's extent along the axis and ``lattice`` every periodic or Bloch
+    axis (:func:`_period_advice`).
+
+    A period off whole cells keeps its rounded size rather than a cell
+    stretched to fit: that would move the grid, the input hash and the numbers
+    of every scene that rounds today (gallery notebook 36 asks 60 um and has
+    59.986). A period rounded by more than a cell's floating-point noise is
+    worth saying whatever its size, so there is no larger tolerance.
+
+    The cell is centred on the bounding box, so a shape drawn off centre moves
+    the walls. A shape that crosses a wall loses the part past it: a wall cuts
+    and does not wrap. That is a warning, not an error, because a cell drawn
+    with a copy of the shape one period away is right as it stands."""
+    realized = cells * dl
+    if asked > 0.0 and abs(realized - asked) > _PERIOD_TOL * asked:
+        source = "the period_um given" if given else "the structures' bounding box"
+        off = abs(realized - asked) / asked
+        how_far = f"{100.0 * off:.3g} % off" if off < 1.0 else f"{realized / asked:.3g} times the period"
+        if kind == "periodic" and cells == 1:
+            # one cell makes the axis invariant: there is no lattice to diffract from
+            matters = ("One cell makes this axis invariant, so the fields do not depend on this length, but a "
+                       "power integrated across the cell does.")
+        else:
+            matters = "A period sets diffraction angles and band positions."
+        warnings.warn(
+            f"{kind} axis {axis!r}: a period of {asked:.6g} um ({source}) is not a whole number of {dl:.6g} um "
+            f"cells, so the cell is {realized:.6g} um, {cells} cell{'' if cells == 1 else 's'}, {how_far}. "
+            f"{matters} {_period_advice(axis, kind, asked, cells, dl, lattice)}",
+            UserWarning, stacklevel=caller_stacklevel())
+    high = low + realized
+    tol = 1e-6 * dl
+    cut = [i for i, (a, b) in enumerate(spans)
+           if not (a >= low - tol and b <= high + tol) and not (a <= low + tol and b >= high - tol)]
+    if cut:
+        first = structures[cut[0]]
+        name = getattr(first, "name", None)
+        label = f"structure {name!r}" if name else f"a {type(first.geometry).__name__}"
+        more = f", and {len(cut) - 1} more," if len(cut) > 1 else ""
+        warnings.warn(
+            f"{kind} axis {axis!r}: the cell runs from {low:.6g} to {high:.6g} um, centred on the structures' "
+            f"bounding box ({box[0]:.6g} to {box[1]:.6g} um), and {label} ({spans[cut[0]][0]:.6g} to "
+            f"{spans[cut[0]][1]:.6g} um){more} neither stays inside the cell nor runs through both walls. A wall "
+            "cuts a shape and does not wrap it, so the part past the wall is gone unless the cell holds its "
+            "copy one period away. Keep the shape inside one period, or run it through both walls",
+            UserWarning, stacklevel=caller_stacklevel())
 
 
 def _warn_port_medium_mismatch(port, containing, wlen0) -> None:
@@ -844,6 +1076,16 @@ class Simulation(FrozenModel):
     # Stored-frame fields a with_* helper replaced on a domain= fit: the
     # inputs no longer describe the simulation, so with_changes refuses.
     _frame_edits: tuple = PrivateAttr(default=())
+    # The far-field surfaces (FarFieldMonitor) compiled into face monitors at
+    # construction: {name: recipe}, the record far_field reads them back
+    # with (faces, outward normals, medium, declared geometry). Client state
+    # like origin_um (client.json); None when there is none.
+    _far_field: Optional[dict] = PrivateAttr(default=None)
+    # The build warnings those surfaces drew, so an edit that draws the same
+    # does not repeat them, and the compiled surfaces they are judged on once
+    # the sources are final (the launches of ports= and source= included).
+    _far_field_advice: tuple = PrivateAttr(default=())
+    _far_field_surfaces: Optional[list] = PrivateAttr(default=None)
     # A domain= fit's record of the media an eps_of_medium anchor may be
     # keyed on in place of a structure's own (a moved coordinate-placed map,
     # a port guide extension: _MediumAliases, _extension_media). Client state
@@ -1109,8 +1351,10 @@ class Simulation(FrozenModel):
         structures = list(self.structures)
         continuations = ()      # (port guide extension, its port's axis), set by the domain fit
         n_max = max([_structure_index(st, wlen0 or 1.55) for st in structures] + [n_bg])
-        # the boundary-layer cell, in closed form before the mesh exists: the
-        # background cell of a graded mesh, the one cell of a uniform mesh
+        # the box's cell, in closed form before the mesh exists: the background
+        # cell of a graded mesh, the one cell of a uniform mesh. A graded
+        # axis's boundary layers take the cells at its faces instead
+        # (``layer_depths`` below)
         if mesh is not None:
             if mesh.dl_um is not None and not isinstance(mesh.dl_um, tuple):
                 dl_bg = float(mesh.dl_um)
@@ -1146,63 +1390,87 @@ class Simulation(FrozenModel):
             # the longest wavelength a port reads sizes its window
             wlen_max = (c0 / min(_decl.band(self.wlens_um, self.wlen0_um)[0]) * 1e6
                         if self.wlens_um is not None else wlen0)
-            size, origin, extensions = self._fit_box(domain, dl_ax, wlen0, n_bg, fold=fold, port_cell=port_cell,
-                                                     bbox=bbox, wlen_max=wlen_max)
-            delta = tuple(-o for o in origin)
-            object.__setattr__(self, "size_um", size)
-            object.__setattr__(self, "origin_um", tuple(float(o) for o in origin))
-            moved = tuple(_frame.translate(structures, delta))
-            extensions, self._medium_aliases = _extension_media(structures, moved, extensions)
-            object.__setattr__(self, "structures", moved + tuple(e for e, _ in extensions))
-            continuations = tuple((e, along) for e, along in extensions if along is not None)
-            object.__setattr__(self, "sources", tuple(_frame.translate(list(self.sources), delta)))
-            object.__setattr__(self, "monitors", tuple(_frame.translate(list(self.monitors), delta)))
-            object.__setattr__(self, "ports", tuple(_frame.translate(list(self.ports), delta)))
-            if isinstance(self.source, (Port, GaussianBeam)):
-                object.__setattr__(self, "source", _frame.translate(self.source, delta))
-        if mesh is not None:
-            periodic = "".join(a for a in _AXES if getattr(self.boundaries, a) in ("periodic", "bloch"))
-            # the refine regions are drawn in the user's frame; the mesh is built in the wire's
-            shift = tuple(-float(o) for o in self.origin_um)
-            refine = tuple(o.model_copy(update={"geometry": _frame.translate(o.geometry, shift)}) for o in mesh.refine)
-            # the port guide extensions refine the mesh but are no interface along
-            # their port's axis (auto_mesh ``continuations``)
-            drawn = {id(e) for e, _ in continuations}
-            meshed = tuple(st for st in self.structures if id(st) not in drawn)
-            if isinstance(mesh.dl_um, tuple):
-                # a lattice-commensurate mesh: each axis with a spacing is a uniform
-                # ladder at it, the others are graded by cells_per_wlen
-                graded_axes = "".join(_AXES[a] for a in range(3) if mesh.spacing(a) is None)
-                coords = {}
-                if graded_axes:
-                    auto = auto_mesh(size_um=self.size_um, wlen_um=wlen0, structures=meshed,
-                                     background_index=n_bg, cells_per_wlen=float(mesh.cells_per_wlen),
-                                     max_grading=mesh.max_grading, dl_min_um=mesh.dl_min_um,
-                                     mesh_overrides=refine, periodic_axes=periodic, axes=graded_axes,
-                                     continuations=continuations)
-                    for letter in graded_axes:
-                        coords[letter] = getattr(auto.coords, letter)
-                given = [mesh.spacing(a) for a in range(3) if mesh.spacing(a) is not None]
-                base = given[0]
-                for a in range(3):
-                    d = mesh.spacing(a)
-                    if d is not None and d != base:
-                        n = realized_cells(self.size_um[a], d, self._axis_min_cells()[a])
-                        coords[_AXES[a]] = tuple(round(i * d, 9) for i in range(n))
-                if coords:
-                    grid = GradedMesh(dl_um=base, coords=GradedMeshAxis(**coords))
-                else:
-                    grid = UniformMesh(dl_um=base)
-            elif mesh.dl_um is not None or mesh.uniform:
-                dl = float(mesh.dl_um) if mesh.dl_um is not None else wlen0 / (n_max * float(mesh.cells_per_wlen))
-                grid = UniformMesh(dl_um=dl)
+
+            def layer_depths(a, walls, layers, faces, structures, spans, rounding, minimum):
+                # an axis auto_mesh grades: the boundary layers are its cells at
+                # each face, not the background cell (None: layers * dl_ax[a])
+                if mesh.spacing(a) is not None:
+                    return None
+                return boundary_layer_depths_um(
+                    axis=a, walls_um=walls, layers=layers, faces=faces, wlen_um=wlen0,
+                    cells_per_wlen=float(mesh.cells_per_wlen), background_index=n_bg,
+                    structures=structures, spans=spans, mesh_overrides=mesh.refine,
+                    dl_min_um=mesh.dl_min_um, rounding_um=rounding, min_depths_um=minimum)
+
+        graded = mesh is not None and mesh.cells_per_wlen is not None and not mesh.uniform
+        # the scene as declared, in the user's frame: a regrown box is fitted
+        # again from it, since each pass moves these fields into the wire's
+        declared = {name: getattr(self, name) for name in (
+            "size_um", "origin_um", "grid", "structures", "sources", "monitors", "ports", "source")}
+        grow, planned, short = {}, None, {}
+        good, failed = None, None      # the last pass that built: its fields and checks; why a later one did not
+        for regrowth in range(_LAYER_REGROWS + 1):
+            if regrowth:
+                for name, value in declared.items():
+                    object.__setattr__(self, name, value)
+            try:
+                if domain is not None:
+                    with warnings.catch_warnings():
+                        if regrowth:
+                            warnings.simplefilter("ignore")      # the first pass gave them
+                        size, origin, extensions, planned = self._fit_box(
+                            domain, dl_ax, wlen0, n_bg, fold=fold, port_cell=port_cell, bbox=bbox,
+                            wlen_max=wlen_max, layer_depths=layer_depths if graded else None, grow=grow)
+                    delta = tuple(-o for o in origin)
+                    object.__setattr__(self, "size_um", size)
+                    object.__setattr__(self, "origin_um", tuple(float(o) for o in origin))
+                    moved = tuple(_frame.translate(structures, delta))
+                    extensions, self._medium_aliases = _extension_media(structures, moved, extensions)
+                    object.__setattr__(self, "structures", moved + tuple(e for e, _ in extensions))
+                    continuations = tuple((e, along) for e, along in extensions if along is not None)
+                    object.__setattr__(self, "sources", tuple(_frame.translate(list(self.sources), delta)))
+                    object.__setattr__(self, "monitors", tuple(_frame.translate(list(self.monitors), delta)))
+                    object.__setattr__(self, "ports", tuple(_frame.translate(list(self.ports), delta)))
+                    if isinstance(self.source, (Port, GaussianBeam)):
+                        object.__setattr__(self, "source", _frame.translate(self.source, delta))
+                if mesh is not None:
+                    object.__setattr__(self, "grid", self._mesh_grid(mesh, wlen0, n_bg, n_max, continuations))
+            except ValueError as exc:
+                if good is None or RATIO_GUARD_WORDS not in str(exc):
+                    raise                    # the scene as declared does not build, or not for the box's size
+                # a regrown box the mesher refuses (its spacing-ratio guard, which a
+                # larger box can trip where the first did not): the last box that
+                # built stands, short faces and all. Any other error is no
+                # matter of the box's size and is raised as it is
+                failed = exc
+                fields, aliases, short = good
+                for name, value in fields.items():
+                    object.__setattr__(self, name, value)
+                if domain is not None:
+                    self._medium_aliases = aliases
+                break
+            short = self._short_boundary_layers(planned, dl_ax) if domain is not None and graded else {}
+            good = ({name: getattr(self, name) for name in declared},
+                    getattr(self, "_medium_aliases", None) if domain is not None else None, short)
+            if not short or regrowth == _LAYER_REGROWS:
+                break
+            for key, (depth, _intrusion, _allowed) in short.items():
+                grow[key] = max(grow.get(key, 0.0), depth)
+        for (a, side), (_depth, intrusion, allowed) in sorted(short.items()):
+            if failed is not None:
+                lines = [ln.strip() for ln in str(failed).splitlines() if ln.strip()] or [type(failed).__name__]
+                reason = next((ln for ln in lines if ln.startswith("Value error, ")), lines[0])
+                reason = reason.removeprefix("Value error, ").split(" [type=")[0]
+                why = f"fitting that face again gave a box that does not build ({reason}), so the last box that built stands"
             else:
-                grid = auto_mesh(size_um=self.size_um, wlen_um=wlen0, structures=meshed,
-                                 background_index=n_bg, cells_per_wlen=float(mesh.cells_per_wlen),
-                                 max_grading=mesh.max_grading, dl_min_um=mesh.dl_min_um,
-                                 mesh_overrides=refine, periodic_axes=periodic,
-                                 continuations=continuations)
-            object.__setattr__(self, "grid", grid)
+                why = f"after {_LAYER_REGROWS} regrowths of the face"
+            layer = "PML" if getattr(self.boundaries, _AXES[a]) == "pml" else "absorber"
+            warnings.warn(
+                f"the {side}{_AXES[a]} boundary layers begin {intrusion:.4g} um inside the wall, so the {layer} "
+                f"covers that much of the interior you asked for, {intrusion - allowed:.4g} um more than the "
+                f"{allowed:.4g} um the fit allows; {why}. Move that wall out (a larger clearance, extent or "
+                "port margin on that side) or keep the finest cells away from that face", UserWarning,
+                stacklevel=caller_stacklevel())
         if transits is not None:
             transit_s = max(self.size_um) * 1e-6 * n_max / _C0_M_PER_S
             kept = {k: getattr(self.run, k) for k in self.run.model_fields_set
@@ -1212,6 +1480,119 @@ class Simulation(FrozenModel):
         self._fold = fold
         if fold is not None:
             self._refuse_flux_windows_in_the_mirror_cell(fold)
+
+    def _mesh_grid(self, mesh: Mesh, wlen0, n_bg: float, n_max: float, continuations):
+        """The grid ``mesh=`` asks for, on the corner-frame scene as it stands
+        (``size_um``, ``origin_um``, ``structures``)."""
+        periodic = "".join(a for a in _AXES if getattr(self.boundaries, a) in ("periodic", "bloch"))
+        # the refine regions are drawn in the user's frame; the mesh is built in the wire's
+        shift = tuple(-float(o) for o in self.origin_um)
+        refine = tuple(o.model_copy(update={"geometry": _frame.translate(o.geometry, shift)}) for o in mesh.refine)
+        # the port guide extensions refine the mesh but are no interface along
+        # their port's axis (auto_mesh ``continuations``)
+        drawn = {id(e) for e, _ in continuations}
+        meshed = tuple(st for st in self.structures if id(st) not in drawn)
+        if isinstance(mesh.dl_um, tuple):
+            # a lattice-commensurate mesh: each axis with a spacing is a uniform
+            # ladder at it, the others are graded by cells_per_wlen
+            graded_axes = "".join(_AXES[a] for a in range(3) if mesh.spacing(a) is None)
+            coords = {}
+            if graded_axes:
+                auto = auto_mesh(size_um=self.size_um, wlen_um=wlen0, structures=meshed,
+                                 background_index=n_bg, cells_per_wlen=float(mesh.cells_per_wlen),
+                                 max_grading=mesh.max_grading, dl_min_um=mesh.dl_min_um,
+                                 mesh_overrides=refine, periodic_axes=periodic, axes=graded_axes,
+                                 continuations=continuations)
+                for letter in graded_axes:
+                    coords[letter] = getattr(auto.coords, letter)
+            given = [a for a in range(3) if mesh.spacing(a) is not None]
+            mins = self._axis_min_cells()
+
+            def kind(a):
+                return getattr(self.boundaries, _AXES[a])
+
+            def cells(a):
+                return realized_cells(self.size_um[a], mesh.spacing(a), mins[a])
+
+            @functools.cache
+            def ladder(a):
+                return _coordinate_ladder(mesh.spacing(a), cells(a), kind(a) == "periodic")
+
+            first = mesh.spacing(given[0])
+
+            def need(a):
+                """How far an axis needs the base cell, most first: a Bloch axis
+                (the engine wants it uniform at that cell), one under four cells
+                (a ladder needs four nodes), one too long for a ladder's seam."""
+                if kind(a) == "bloch":
+                    return 0
+                if cells(a) < 4:
+                    return 1
+                return 2 if kind(a) == "periodic" and not _seam_spacings_match(ladder(a)) else 3
+
+            def stands(a):
+                """Whether the solver takes this axis beside a base cell of ``first``."""
+                return (mesh.spacing(a) == first or need(a) == 3
+                        or (need(a) == 0 and _uniform_at(ladder(a), first)))
+
+            # The first spacing is the base cell and every other one a ladder.
+            # Where the solver takes that, it stands: that is every scene that
+            # ran, and none may move. Where it refuses, the scene could not run
+            # for anyone, so moving its wire is the fix: an axis that needs the
+            # base cell takes it. That reads the rounded ladder and not the two
+            # spacings, since rounding can make them equal to the engine.
+            base = first if all(stands(a) for a in given) else mesh.spacing(min(given, key=need))
+            for a in given:
+                if mesh.spacing(a) != base:
+                    coords[_AXES[a]] = ladder(a)
+            if coords:
+                return GradedMesh(dl_um=base, coords=GradedMeshAxis(**coords))
+            return UniformMesh(dl_um=base)
+        if mesh.dl_um is not None or mesh.uniform:
+            dl = float(mesh.dl_um) if mesh.dl_um is not None else wlen0 / (n_max * float(mesh.cells_per_wlen))
+            return UniformMesh(dl_um=dl)
+        return auto_mesh(size_um=self.size_um, wlen_um=wlen0, structures=meshed,
+                         background_index=n_bg, cells_per_wlen=float(mesh.cells_per_wlen),
+                         max_grading=mesh.max_grading, dl_min_um=mesh.dl_min_um,
+                         mesh_overrides=refine, periodic_axes=periodic,
+                         continuations=continuations)
+
+    def _short_boundary_layers(self, planned, dl_ax) -> dict:
+        """The faces of a fitted graded mesh whose boundary layers begin
+        further inside the wall than the fit allows: ``{(axis, side): (depth,
+        intrusion, allowed)}``, ``depth`` the depth beyond the wall to fit that
+        face to next time (um), ``intrusion`` how far inside the wall the
+        layers' inner edge now lies and ``allowed`` how far it may. The layers
+        are the outer ``layers`` cells of the realized mesh; the allowance is
+        the box's rounding (a quarter background cell, half on a fold's far
+        face) and ``_LAYER_STRETCH`` of the layers' own depth. The next depth
+        is the realized one, grown by the excess and once more by the
+        rounding, so the rounding cannot take the growth back."""
+        short = {}
+        for a, plan in enumerate(planned):
+            if plan is None:
+                continue
+            layers, wall_lo, wall_hi, folded = plan
+            coords = getattr(getattr(self.grid, "coords", None), _AXES[a], None)
+            if layers <= 0 or coords is None:
+                continue                                 # a uniform axis: layers * dl, as fitted
+            q = [float(c) for c in coords] + [float(self.size_um[a])]
+            n = len(q) - 1
+            if n <= (1 if folded else 2) * layers:
+                continue                                 # the layers fill the axis: no wall to measure from
+            o = float(self.origin_um[a])
+            rounding = (0.5 if folded else 0.25) * dl_ax[a]
+            for side in ("+",) if folded else ("-", "+"):
+                if side == "-":
+                    wall = wall_lo - o
+                    intrusion, depth, reach = q[layers] - wall, q[layers] - q[0], wall - q[0]
+                else:
+                    wall = wall_hi - o
+                    intrusion, depth, reach = wall - q[n - layers], q[n] - q[n - layers], q[n] - wall
+                allowed = rounding + _LAYER_STRETCH * depth
+                if intrusion > allowed + 1e-9:
+                    short[(a, side)] = (reach + (intrusion - allowed) + rounding, intrusion, allowed)
+        return short
 
     def _refuse_flux_windows_in_the_mirror_cell(self, fold) -> None:
         """Refuse a PowerMonitor window, on the kept side of an even (PMC)
@@ -1384,22 +1765,34 @@ class Simulation(FrozenModel):
         return _decl.Fold(planes=planes, mirrored_ports=mirrored, unfolded_monitors=tuple(dict.fromkeys(unfolded)))
 
     def _fit_box(self, domain: Domain, dl_ax, wlen0, n_bg: float, fold=None, port_cell=None, bbox=None,
-                 wlen_max=None):
+                 wlen_max=None, layer_depths=None, grow=None):
         """The fitted box in the user's frame: ``(size_um, origin_um,
-        extensions)``, where ``extensions`` holds for each port
+        extensions, walls)``, where ``extensions`` holds for each port
         guide extension (already in the corner frame) ``(structure, along,
         host, given)``: the port's axis, the axis along which it continues its
         guide, or ``None`` when it is not its host's medium (no continuation);
         the index in ``self.structures`` of the host it continues (``None``
         with no continuation); and the medium it was built from (the Port's
-        or the host's, as given), for :func:`_extension_media`."""
+        or the host's, as given), for :func:`_extension_media`. ``walls``
+        holds each axis's ``(layers, wall_lo, wall_hi, folded)`` in the user's
+        frame, ``None`` on a periodic axis.
+
+        ``layer_depths(axis, walls, layers, faces, structures, spans,
+        rounding, minimum)`` gives the boundary layers' depth beyond each wall
+        of an axis the mesher grades (:func:`boundary_layer_depths_um`;
+        ``rounding`` is how far the box's rounding below may move a face,
+        ``minimum`` a floor on a face's depth), or ``None`` for an axis whose
+        layers are ``layers * dl_ax[axis]`` deep. ``grow`` maps ``(axis,
+        side)`` to such a floor: a face the realized mesh left short
+        (:meth:`_short_boundary_layers`)."""
+        grow = grow or {}
         structures = list(self.structures)
         if not structures:
             raise ValueError("domain= needs structures (or a device) to fit the box around")
         lo = [math.inf] * 3
         hi = [-math.inf] * 3
-        for st in structures:
-            b = geometry_bounds_um(st.geometry)
+        bounds = [geometry_bounds_um(st.geometry) for st in structures]
+        for b in bounds:
             for a in range(3):
                 lo[a], hi[a] = min(lo[a], b[a][0]), max(hi[a], b[a][1])
         if bbox is not None:                          # the whole device's bounds, before the fold dropped its mirrored half
@@ -1450,18 +1843,43 @@ class Simulation(FrozenModel):
                                      f"{pp.axis}; pass out_direction='+' or '-'")
                 sides[pp.name] = "+" if pp.plane_um > mid else "-"
         size, origin, outer = [0.0] * 3, [0.0] * 3, []
+
+        def period_of(a) -> float:
+            period = domain.period_um[a] if domain.period_um is not None else None
+            return float(period) if period is not None else hi[a] - lo[a]
+
+        def whole_cells(a) -> int:
+            return max(1, int(round(period_of(a) / dl_ax[a])))
+
+        lattice = tuple((axis, getattr(self.boundaries, axis), period_of(a), whole_cells(a))
+                        for a, axis in enumerate(_AXES) if getattr(self.boundaries, axis) in ("periodic", "bloch"))
+        # the walls of each axis first, ``(layers, wall_lo, wall_hi, folded)``
+        # (None on a periodic axis), then the layers beyond them, whose depth
+        # on a graded axis sees the port guides through every face
+        planned = []
         for a, axis in enumerate(_AXES):
             dl_bg = dl_ax[a]
             kind = getattr(self.boundaries, axis)
             if kind in ("periodic", "bloch"):
                 period = domain.period_um[a] if domain.period_um is not None else None
-                extent = float(period) if period is not None else hi[a] - lo[a]
-                n = max(1, int(round(extent / dl_bg)))
+                extent = period_of(a)
+                if domain.extent(a) is not None:
+                    raise ValueError(
+                        f"{kind} axis {axis!r}: extent_um has no effect here, so the cell would be {extent:.6g} um "
+                        f"({'the period_um given' if period is not None else 'the bounding box of the structures'}), "
+                        f"not {domain.extent(a):.6g} um. Give the cell as period_um and leave extent_um None on "
+                        "this axis")
+                n = whole_cells(a)
                 size[a], origin[a] = n * dl_bg, 0.5 * (lo[a] + hi[a]) - 0.5 * n * dl_bg   # centred on the device
-                outer.append((None, None))
+                # the cell the solver has: a uniform axis takes its floor of whole
+                # cells, where a graded one fits smaller cells into this length
+                graded_axis = isinstance(self.grid, Mesh) and self.grid.spacing(a) is None and not self.grid.uniform
+                realized = n if graded_axis else max(n, self._axis_min_cells()[a])
+                _warn_periodic_cell(axis, kind, extent, period is not None, dl_bg, realized, origin[a], (lo[a], hi[a]),
+                                    structures, [b[a] for b in bounds], lattice)
+                planned.append(None)
                 continue
             layers = self.pml_num_layers if kind == "pml" else (self.absorber_num_layers if kind == "absorber" else 0)
-            pml = layers * dl_bg
             walls = {}
             for pp in ports:
                 if pp.axis != axis:
@@ -1492,29 +1910,89 @@ class Simulation(FrozenModel):
             own = domain.walls(a) is None and given_extent is None
             if own and a in need_hi:
                 wall_hi = max(wall_hi, need_hi[a])
-            if fold is not None and a in fold.planes:
+            folded = fold is not None and a in fold.planes
+            if folded:
+                wall_lo = fold.planes[a]
+            else:
+                wall_lo = walls["-"] if "-" in walls else lo[a] - clearance
+                if own and a in need_lo:
+                    wall_lo = min(wall_lo, need_lo[a])
+            planned.append((layers, wall_lo, wall_hi, folded))
+        # each port's guide as the extension below will draw it, from one cell
+        # inside the guide out through the wall in the port's cross-section:
+        # a medium that crosses the face, which the layers' depth must see
+        # before the box (and so the extension) exists
+        guide_spans = ([], [], [])
+        for pp in ports if layer_depths is not None else ():
+            a = _AXES.index(pp.axis)
+            if pp.thickness_um is None or planned[a] is None:
+                continue
+            host = _port_host(pp, structures)[0]
+            if pp.medium is not None:
+                n = _structure_index(Structure(geometry=Box(center_um=(0.0, 0.0, 0.0), size_um=(1.0, 1.0, 1.0)),
+                                               medium=pp.medium), wlen0)
+                if host is not None:
+                    hb = geometry_bounds_um(host.geometry)[a]
+                    if (hb[1] > planned[a][2]) if sides[pp.name] == "+" else (hb[0] < planned[a][1]):
+                        # the host runs on past the wall, so the face sees its
+                        # medium unless it stops more than a cell short of the
+                        # face, where the extension's takes over (a Port medium
+                        # that differs from the host's is warned about below):
+                        # the coarser of the two is the one the layers can count
+                        n = min(n, _structure_index(host, wlen0))
+            elif host is not None:
+                n = _structure_index(host, wlen0)
+            else:
+                continue                       # nothing to extend (the extension refuses it if it must)
+            if sides[pp.name] == "+":
+                guide_spans[a].append((pp.plane_um - dl_ax[a], math.inf, n))
+            else:
+                guide_spans[a].append((-math.inf, pp.plane_um + dl_ax[a], n))
+            w, t = _decl._port_axes(pp)
+            for i, half in ((w, 0.5 * float(pp.width_um)), (t, 0.5 * float(pp.thickness_um))):
+                guide_spans[i].append((float(pp.center_um[i]) - half, float(pp.center_um[i]) + half, n))
+        face_cell = ({}, {}, {})     # per axis and side: the mean cell of a graded axis's layers
+        for a, axis in enumerate(_AXES):
+            if planned[a] is None:
+                outer.append((None, None))
+                continue
+            layers, wall_lo, wall_hi, folded = planned[a]
+            dl_bg = dl_ax[a]
+            pml = layers * dl_bg
+            # the boundary layers' depth beyond each wall: layers * dl_bg, or on
+            # a graded axis the cells the mesher puts at that face, those of
+            # the finest medium crossing it (a substrate, a cladding, a port
+            # guide), so the layers begin at the wall. The rounding below moves
+            # each face by up to a quarter cell (the fold's far face by half),
+            # which the depth must allow for where a medium ends near the face
+            pml_lo = pml_hi = pml
+            depths = (layer_depths(a, (wall_lo, wall_hi), layers, "+" if folded else "-+", structures,
+                                   guide_spans[a], (0.5 if folded else 0.25) * dl_bg,
+                                   {side: d for (ax, side), d in grow.items() if ax == a})
+                      if layer_depths is not None and layers > 0 and wall_hi > wall_lo else None)
+            if depths is not None:
+                pml_hi = depths["+"]
+                pml_lo = depths.get("-", pml)
+                face_cell[a].update({side: d / layers for side, d in depths.items()})
+            if folded:
                 # the mirror is the low face: no margin, no boundary layers there,
                 # and the rounding excess goes to the far side
-                wall_lo = fold.planes[a]
-                extent = (wall_hi + pml) - wall_lo
+                extent = (wall_hi + pml_hi) - wall_lo
                 n = int(round(extent / dl_bg))
                 if n < 4 or not (wall_hi > wall_lo):
                     raise ValueError(f"axis {axis!r}: the folded domain has no interior ({extent:.4g} um for "
                                      f"{layers} boundary layers on the far face)")
                 size[a], origin[a] = n * dl_bg, wall_lo
-                outer.append((wall_lo, wall_hi + pml))
+                outer.append((wall_lo, wall_hi + pml_hi))
                 continue
-            wall_lo = walls["-"] if "-" in walls else lo[a] - clearance
-            if own and a in need_lo:
-                wall_lo = min(wall_lo, need_lo[a])
-            extent = (wall_hi + pml) - (wall_lo - pml)
+            extent = (wall_hi + pml_hi) - (wall_lo - pml_lo)
             n = int(round(extent / dl_bg))
             if n < 4 or not (wall_hi > wall_lo):
                 raise ValueError(f"axis {axis!r}: the fitted domain has no interior ({extent:.4g} um for {layers} "
                                  "boundary layers each face)")
             size[a] = n * dl_bg
-            origin[a] = (wall_lo - pml) - 0.5 * (size[a] - extent)
-            outer.append((wall_lo - pml, wall_hi + pml))
+            origin[a] = (wall_lo - pml_lo) - 0.5 * (size[a] - extent)
+            outer.append((wall_lo - pml_lo, wall_hi + pml_hi))
         # port guide extensions, to one cell past the REALIZED outer face (the
         # rounding may have widened the box by up to half a cell each side)
         extensions = []
@@ -1526,19 +2004,9 @@ class Simulation(FrozenModel):
             if outer[a][0] is None:
                 continue
             face = origin[a] + size[a] if side == "+" else origin[a]
-            # the structure the port sits on: its medium, and how
-            # far it already reaches toward the wall. Paint order decides which one
-            # that is: the LAST structure in list order containing the port centre
-            # wins, so the guide under a cladding authored before it
-            # is the host, and a guide buried under a cladding authored after it is
-            # not (the raster has no guide there to continue).
-            containing, host_index = [], None
-            for si, st in enumerate(structures):
-                b = geometry_bounds_um(st.geometry)
-                if all(b[i][0] - 1e-9 <= float(pp.center_um[i]) <= b[i][1] + 1e-9 for i in range(3)):
-                    containing.append(st)
-                    host_index = si
-            host = containing[-1] if containing else None
+            # the structure the port sits on: its medium, and how far it
+            # already reaches toward the wall (_port_host: paint order decides)
+            host, host_index, containing = _port_host(pp, structures)
             if host is not None and pp.medium is not None:
                 _warn_port_medium_mismatch(pp, containing, wlen0)
             if host is not None:
@@ -1546,7 +2014,9 @@ class Simulation(FrozenModel):
                 reach = hb[1] if side == "+" else hb[0]
             else:
                 reach = pp.plane_um
-            if (face - reach if side == "+" else reach - face) <= dl_bg:
+            # within one cell of the face: the background cell, or the cell of
+            # a graded axis's layers on that face
+            if (face - reach if side == "+" else reach - face) <= face_cell[a].get(side, dl_bg):
                 continue                       # the guide already runs through the PML
             medium = pp.medium if pp.medium is not None else (host.medium if host is not None else None)
             if pp.thickness_um is None or medium is None:
@@ -1584,7 +2054,7 @@ class Simulation(FrozenModel):
                 medium = _placed_on_box(medium, host.geometry)
             extensions.append((_frame.translate(Structure(geometry=box, medium=medium), delta), along,
                                host_index if continues else None, given))
-        return tuple(size), tuple(origin), extensions
+        return tuple(size), tuple(origin), extensions, tuple(planned)
 
     def model_post_init(self, __context) -> None:
         """Fit the domain, mesh and run length, then resolve ``ports`` /
@@ -1611,13 +2081,56 @@ class Simulation(FrozenModel):
         self._resolve_materials()
         self._fit_domain_mesh_run()
         self._user_monitors = tuple(self.monitors)
+        if any(isinstance(m, FarFieldMonitor) for m in self.monitors):
+            self._compile_far_field()
         if declared:
             self._apply_declarative(user_sources=tuple(self.sources),
                                     user_monitors=tuple(self.monitors))
+        self._warn_far_field()
         if fitted or declared:
             type(self).model_validate(
                 self.model_dump(mode="python", exclude=set(_decl.DECLARATIVE_FIELDS) | {"origin_um"}),
                 context={"wire_ingest": True})
+
+    def _compile_far_field(self) -> None:
+        """Replace each :class:`FarFieldMonitor` by the face monitors it
+        records and keep its recipe (``_far_field``)
+        (:func:`~photonhub.components.far_field_monitor.compile_far_field_monitors`),
+        on the final grid and in the corner frame. Its build warnings wait
+        for the final sources (:meth:`_warn_far_field`)."""
+        from .far_field_monitor import compile_far_field_monitors
+
+        monitors, recipes, surfaces = compile_far_field_monitors(self)
+        object.__setattr__(self, "monitors", monitors)
+        self._far_field = recipes
+        self._far_field_surfaces = surfaces
+
+    def _warn_far_field(self) -> None:
+        """Give the build warnings of the compiled far-field surfaces, judged
+        against every source the simulation runs (the launches of ``ports=``
+        and ``source=`` included). An edit that draws the same warnings as the
+        simulation it copies does not repeat them. Inside an edit that
+        resolves the copy's ports again afterwards nothing is given here: the
+        edit calls this once more, with the final sources."""
+        if not self._far_field_surfaces or _FAR_FIELD_ADVICE_DEFERRED.get():
+            return
+        from .far_field_monitor import far_field_advice
+
+        advice = far_field_advice(self, self._far_field_surfaces)
+        self._far_field_advice = advice
+        original = _EDITING.get()
+        given = set(getattr(original, "_far_field_advice", ()) or ()) if original is not None else set()
+        for message in advice:
+            if message not in given:
+                warnings.warn(message, UserWarning, stacklevel=caller_stacklevel())
+
+    @property
+    def far_field_monitors(self) -> dict:
+        """``{name: faces}`` of the :class:`FarFieldMonitor` surfaces this
+        simulation records, each face as ``(monitor name, axis, outward
+        sign)``: what ``far_field(data, name)`` projects."""
+        return {name: tuple((f[0], f[1], float(f[2])) for f in rec["faces"])
+                for name, rec in (self._far_field or {}).items()}
 
     def _apply_declarative(self, *, user_sources, user_monitors) -> None:
         """Solve the ports on ``self`` and set the resolved sources and monitors
@@ -1630,6 +2143,8 @@ class Simulation(FrozenModel):
         object.__setattr__(self, "sources", tuple(sources))
         object.__setattr__(self, "monitors", tuple(snapped))
         object.__setattr__(self, "ports", tuple(resolved.ports))
+        if isinstance(self.source, Port):
+            object.__setattr__(self, "source", HeldPort.of(self.source))
         self._declarative = resolved
 
     def __deepcopy__(self, memo=None):
@@ -1870,6 +2385,21 @@ class Simulation(FrozenModel):
                 "run" not in self.model_fields_set
                 or (self.run.run_time_s is None and self.run.n_steps is None)):
             raise ValueError("run is required on the wire (run_time_s or n_steps)")
+        return self
+
+    @model_validator(mode="after")
+    def _far_field_monitors_compiled(self, info) -> "Simulation":
+        """A :class:`FarFieldMonitor` is a declaration the constructor
+        compiles into face monitors (model_post_init); one still here came
+        through a path that does not construct: a document parsed from the
+        wire, or an edit of one."""
+        left = [m.name for m in self.monitors if isinstance(m, FarFieldMonitor)]
+        if left:
+            raise ValueError(
+                f"the far-field monitors {left} are declarations only the constructor "
+                "compiles into face monitors, and a document loaded from the wire is "
+                "edited as the document it is (a wire document never holds one). Build "
+                "the simulation with ph.Simulation(...)")
         return self
 
     @model_validator(mode="after")
@@ -2430,6 +2960,24 @@ class Simulation(FrozenModel):
                 {**kept, **update}, context={"wire_ingest": True, "wire_edit": added, "edit_copy": True})
             if restored:
                 _copy_restored_client_state(self, new)
+            elif self._far_field:
+                # the far-field surfaces of a loaded result: their recipe was
+                # checked against this grid, medium, structures and layers
+                # (and their faces keep their cells only while the grid
+                # does), so it goes with an edit of nothing else
+                moved = sorted(k for k, v in update.items()
+                               if k not in _FAR_FIELD_SAFE_EDITS and v != getattr(self, k, None))
+                if moved:
+                    warnings.warn(
+                        f"the far-field surfaces {sorted(self._far_field)} keep their face monitors "
+                        f"but not their recipe: this edit changes {moved}, which the recipe's "
+                        "medium, crossing and layer checks were made against. far_field(data, "
+                        "name) on the edited simulation's results finds the faces by their names "
+                        "and projects into vacuum unless n_medium says otherwise; build the "
+                        "simulation with ph.Simulation(...) and FarFieldMonitor to check them again",
+                        UserWarning, stacklevel=caller_stacklevel())
+                else:
+                    _frame.carry_far_field(self, new)
             return new
         if self._inputs is not None and not self._frame_edits and not (
                 set(given) & _FRAME_FIELDS and isinstance(self._inputs.get("size_um"), Domain)):
@@ -2469,7 +3017,10 @@ class Simulation(FrozenModel):
             update["sources"] = tuple(update.pop("sources", own))
             update["monitors"] = tuple(m for m in update.pop("monitors", kwargs["monitors"])
                                        if getattr(m, "name", None) not in generated)
-        new = type(self)(**{**kwargs, **update})
+        # the ports resolved again below (rec): the far-field warnings wait for
+        # the launch they add, and are given once, there
+        with _far_field_advice_deferred(rec is not None):
+            new = type(self)(**{**kwargs, **update})
         # the fields set as direct construction with the same fields sets them
         new.__pydantic_fields_set__.clear()
         new.__pydantic_fields_set__.update(
@@ -2492,6 +3043,7 @@ class Simulation(FrozenModel):
             for name in _decl.DECLARATIVE_FIELDS:          # the resolved ports, in the corner frame
                 object.__setattr__(new, name, getattr(self, name))
             new._apply_declarative(user_sources=new.sources, user_monitors=new.monitors)
+            new._warn_far_field()
             # the merged wire-level content, as model_post_init checks it
             type(self).model_validate(
                 new.model_dump(mode="python", exclude=set(_decl.DECLARATIVE_FIELDS) | {"origin_um"}),
@@ -2686,6 +3238,23 @@ class Simulation(FrozenModel):
         physical angle varies with frequency; keep the band narrow when the
         angle matters (``sin theta(f) = f0 sin(theta) / f``). ``position_um``
         is in your coordinates, as the rest of a ``domain=`` fit is written.
+
+        ``amplitude`` is the full field ``E0`` of the wave, so a p-polarized
+        wave's tangential E is ``E0 cos(theta)``. At the pulse centre ``f0``
+        the wave carries ``E0^2 A n cos(theta) / (2 eta0)`` through a plane
+        normal to ``axis``, the same scale as a normal plane wave of that
+        amplitude (:class:`~photonhub.PowerMonitor` states the convention).
+
+        That closed form covers ``f0`` only. Off it, the constant wavevector
+        leaves a forward wave of field ``E0 (1 + r) / 2``, with
+        ``r = cos(theta) / cos(theta(f))``, and a backward leak of
+        ``E0 (1 - r) / 2``, so an absolute reading off ``f0`` does not follow
+        it: at 30 degrees, 160 and 240 THz on a 200 THz pulse read 1.112 and
+        0.953 of it at ``theta(f)``, and at 45 degrees 1.577 (s-polarized)
+        and 0.879. Keep the band clear of the cutoff ``f0 sin(theta)``: near
+        it the reading at ``f0`` itself swings with the run length, by about
+        1 % at 60 degrees with a 20 THz pulse on 200 THz, with a size and
+        sign that depend on where the source and monitor sit.
         """
         from .frame import _UnrecordedInputs
 
@@ -2925,21 +3494,23 @@ class Simulation(FrozenModel):
             q = self._axis_coords_um(a)
             if q is None:  # uniform axis: trivially seam-equal
                 continue
-            dq_first = q[1] - q[0]
-            dq_last = q[-1] - q[-2]
-            if abs(dq_first - dq_last) > 1e-12 * max(dq_first, dq_last):
+            if not _seam_spacings_match(q):
+                dq_first, dq_last = (1e6 * dq for dq in _seam_spacings_m(q))
                 ax = _AXES[a]
                 raise ValueError(
                     f"boundaries.{ax} is periodic but grid.coords.{ax} has "
-                    f"unequal first/last primary spacings ({dq_first:.7g} vs "
-                    f"{dq_last:.7g} um): the engine's replicate dual-spacing "
+                    f"unequal first/last primary spacings ({dq_first:.15g} vs "
+                    f"{dq_last:.15g} um): the engine's replicate dual-spacing "
                     "closure is only correct at a periodic seam when they "
                     "match, and phsolver validate rejects the scene"
                     ". Regenerate the mesh seam-"
                     "symmetrically — auto_mesh(periodic_axes=...); "
                     "with_auto_mesh/with_mesh_overrides pass it from the "
                     "boundaries automatically — or make that axis boundary "
-                    "non-periodic (pml/absorber/pec)."
+                    "non-periodic (pml/absorber/pec). From about "
+                    f"{_LONG_LADDER:,} cells rounding alone can miss this: give "
+                    "that axis the mesh's base cell, one spacing shared with "
+                    "any other axis that needs it."
                 )
         return self
 
@@ -3174,7 +3745,7 @@ class Simulation(FrozenModel):
         """Bloch wrap x low-loss resonance: warn that stability is Courant-
         NON-monotone.
 
-        Measured on the Meep material-dispersion scene (two Lorentz poles, a
+        Measured on a material-dispersion scene (two Lorentz poles, a
         4-cell Bloch axis): k = 1.8 (2 pi/a) is stable at courant 0.99 but
         DIVERGES at 0.7, while k = 2.1 diverges at 0.99 and is stable at 0.7 ,
         a resonance between dt, the undamped pole, and the Bloch phase, not a
@@ -3818,12 +4389,18 @@ class Simulation(FrozenModel):
             raise ValueError(f"simulation spec is not a regular file: {source}")
         return cls.from_wire_json(source.read_text(encoding="utf-8"))
 
-    def _wire_exclude(self):
+    def _wire_exclude(self, *, saved: bool = False):
         # Omit additive-optional fields that were never explicitly set so
         # older documents round-trip byte-identically and stay consumable by
         # earlier-minor parsers that reject unknown keys; the engine applies
         # the same defaults. (subpixel_method is the exception, below.) pml_num_layers entered the wire in schema 1.1.0
         # (default 12); run.shutoff in 1.3.0 (default 1e-5).
+        left = [m.name for m in self.monitors if isinstance(m, FarFieldMonitor)]
+        if left:
+            raise ValueError(
+                f"the far-field monitors {left} were set without construction (model_copy), "
+                "so they were never compiled into the face monitors the solver records; "
+                "use with_changes(monitors=...), which builds them")
         exclude: dict = {}
         for _f in _decl.DECLARATIVE_FIELDS:
             exclude[_f] = True     # client-only setup fields (never on the wire)
@@ -3872,8 +4449,13 @@ class Simulation(FrozenModel):
         if "shutoff" not in self.run.model_fields_set:
             run_exclude.add("shutoff")
         # A zero guard means the legacy energy-only rule and is omitted so
-        # older GPU/cloud parsers receive the same wire as before this key.
-        if not self.run.dft_shutoff:
+        # older GPU/cloud parsers receive the same wire as before this key,
+        # and so the digest of a scene that sets it holds (the record of
+        # notebook 33 stores one). The SDK reads an absent key as its
+        # target-aware default, not as zero, so ``saved`` keeps the zero for
+        # to_file: its from_file reload must not gain the local CPU guard. The
+        # Workbench holds to_wire_dict, so it still loses the zero.
+        if not self.run.dft_shutoff and not (saved and self.run.dft_shutoff == 0.0):
             run_exclude.add("dft_shutoff")
         exclude["run"] = run_exclude
         return exclude or None
@@ -3889,6 +4471,9 @@ class Simulation(FrozenModel):
 
         Use the same aliases and exclusions as :meth:`to_wire_dict`. Client
         authoring state, including declared ports and wavelengths, is omitted.
+        So is an explicit ``dft_shutoff=0``, which a text reloaded with
+        :meth:`from_wire_json` then reads as the default guard on a local CPU
+        run; :meth:`to_file` keeps it.
         This is the solver contract, not a complete authoring-state round trip."""
         return self.model_dump_json(by_alias=True, exclude_none=True,
                                     exclude=self._wire_exclude(), indent=indent)
@@ -3902,6 +4487,14 @@ class Simulation(FrozenModel):
         published with :func:`os.replace`, so readers observe either the old
         complete document or the new complete document.  The model itself is
         unchanged and the saved path is returned for convenient logging.
+
+        The document is :meth:`to_wire_json` with one addition: an explicit
+        ``dft_shutoff=0`` is written, so :meth:`from_file` gives the same stop
+        rule back on a local CPU run.  Runs, digests and the document sent to
+        a GPU or the cloud leave it out, as :meth:`to_wire_json` does.  The
+        Workbench loses it even from a file that holds it: its Run dialog uses
+        the default stop rule and its Save removes the value.  A solver older
+        than schema 1.21 refuses the key if handed the file directly.
         """
 
         target = Path(path).expanduser()
@@ -3928,7 +4521,8 @@ class Simulation(FrozenModel):
                 delete=False,
             ) as handle:
                 temporary = Path(handle.name)
-                handle.write(self.to_wire_json() + "\n")
+                handle.write(self.model_dump_json(by_alias=True, exclude_none=True,
+                                                  exclude=self._wire_exclude(saved=True), indent=2) + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, target)

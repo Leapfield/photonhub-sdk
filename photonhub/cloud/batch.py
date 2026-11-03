@@ -18,11 +18,13 @@ from typing import Mapping, Optional
 
 from .._compat import caller_stacklevel
 from ..components import Simulation
+from ..data import SimulationMismatchError
 from ..runners.batch import BatchResults, _check_batch_name
 from ..runners.local import SolverRunError
 from .actions import _check_quote_grid
 from .client import HttpClient
 from .config import CloudError, get_config
+from ._defaults import resolve as resolve_defaults
 from .run import (
     CloudJobTimeout,
     _check_cloud_device_support,
@@ -181,10 +183,11 @@ class Batch:
         reports a quote's ``cells_per_axis`` and ``dt_s``, that they match the
         grid its simulation realizes locally (a quote that omits them warns
         and is still submitted), and each accepted quote id is bound to its
-        corresponding submission. ``solver`` is forwarded unchanged on every
-        estimate and submission; the closed-test service requires an explicit
-        build and a curated GPU device. ``device`` defaults to ``"gpu"`` as in
-        every cloud call. ``wait_timeout_s`` bounds only how long each entry is
+        corresponding submission. ``device`` and ``solver`` default as in
+        :func:`~photonhub.cloud.run` (the service's only GPU, and on a GPU the
+        commit of the locally installed solver), resolved once for the whole
+        batch and sent unchanged on every estimate, refresh and submission.
+        ``wait_timeout_s`` bounds only how long each entry is
         waited for: an entry past it is reported as a
         :class:`~photonhub.cloud.CloudJobTimeout` and its service job keeps
         running, and billing (``timeout`` is its old name and warns).
@@ -222,6 +225,9 @@ class Batch:
         limits = _spend_limits(max_usd, self.simulations)
         cfg = get_config()
         quote_http = HttpClient(cfg)
+        # Once per batch: every estimate, refresh and submission below names
+        # this one device and solver, so each bound quote stays valid.
+        device, solver = resolve_defaults(quote_http, device, solver)
         quotes = {
             name: _accepted_quote(
                 quote_http, name, sim, limits[name], device, wires[name], solver)
@@ -288,7 +294,7 @@ class Batch:
             try:
                 return name, _finish_cloud_job(http, cfg, job_id,
                                                timeout=timeout, simulation=sim), None
-            except (SolverRunError, CloudJobTimeout, CloudError) as e:
+            except (SolverRunError, CloudJobTimeout, CloudError, SimulationMismatchError) as e:
                 return name, None, e
 
         with ThreadPoolExecutor(max_workers=max(1, max_workers)) as ex:

@@ -254,19 +254,25 @@ def _uniform_spacing(coords: np.ndarray, letter: str,
     return float(d[0])
 
 
-def _plane_media(simulation, axis: str, position_um: float) -> list:
+def _plane_media(simulation, axis: str, position_um: float,
+                 points=None) -> list:
     """The distinct media the hard sample puts on the cut's cell centres,
     ordered by owner: ``None`` for the background, then structure media in
     list order. Painted with each structure's list index in place of its
-    permittivity, so the owner of every cell is exact."""
+    permittivity, so the owner of every cell is exact. ``points``, an
+    ``(HH, VV)`` pair in the ``in_plane_axes(axis)`` order, samples those
+    points instead of the whole cut."""
     from types import SimpleNamespace
 
     from ..viz import _geometry as _geom
     from ..viz.eps import axis_cell_centers_um, axis_nodes_um, eps_at_points
-    h_letter, v_letter = _geom.in_plane_axes(axis)
-    HH, VV = np.meshgrid(
-        axis_cell_centers_um(axis_nodes_um(simulation, _AXIS_IDX[h_letter])),
-        axis_cell_centers_um(axis_nodes_um(simulation, _AXIS_IDX[v_letter])))
+    if points is not None:
+        HH, VV = points
+    else:
+        h_letter, v_letter = _geom.in_plane_axes(axis)
+        HH, VV = np.meshgrid(
+            axis_cell_centers_um(axis_nodes_um(simulation, _AXIS_IDX[h_letter])),
+            axis_cell_centers_um(axis_nodes_um(simulation, _AXIS_IDX[v_letter])))
     tagged = SimpleNamespace(
         background=SimpleNamespace(permittivity=0.0),
         structures=[SimpleNamespace(
@@ -279,8 +285,36 @@ def _plane_media(simulation, axis: str, position_um: float) -> list:
             for o in owners]
 
 
+# The refusals of the medium sampling, worded for each caller: the grating
+# order decomposition (the default, unchanged) and the far-field projection.
+_MEDIUM_WORDING = {
+    "orders": (
+        "the monitor plane at {axis}={pos:.4g} um crosses structures (eps "
+        "spans [{lo:.4g}, {hi:.4g}]) \u2014 grating orders are defined in a "
+        "homogeneous region; move the plane or pass n_medium explicitly",
+        "the monitor plane at {axis}={pos:.4g} um crosses media whose "
+        "dispersive permittivities differ at the recorded frequencies: move "
+        "the plane or pass n_medium explicitly",
+        "the medium at {axis}={pos:.4g} um has Re eps <= 0 at a recorded "
+        "frequency: no propagating plane-wave orders there",
+    ),
+    "far_field": (
+        "the face spans more than one medium there (eps from {lo:.4g} to "
+        "{hi:.4g}), and a far-field projection needs one homogeneous medium "
+        "beyond the surface",
+        "the face spans media whose dispersive permittivities differ at the "
+        "projected frequencies, and a far-field projection needs one "
+        "homogeneous medium beyond the surface",
+        "the medium there has Re eps <= 0 at a projected frequency, so no "
+        "wave in it reaches the far zone",
+    ),
+}
+
+
 def _infer_n_medium(simulation, axis: str, position_um: float,
-                    freqs_hz) -> Tuple[np.ndarray, bool]:
+                    freqs_hz, *, wording: str = "orders",
+                    points=None,
+                    ) -> Tuple[np.ndarray, bool]:
     """``(n per frequency, dispersive)`` of the medium filling the plane.
 
     ``position_um`` is the plane's WIRE-frame coordinate along ``axis`` (the
@@ -288,21 +322,27 @@ def _infer_n_medium(simulation, axis: str, position_um: float,
     region for plane-wave orders to be well-defined, so the analytic eps is
     sampled on the cut and required uniform. For a pole medium the
     ``permittivity`` field is only eps_inf, so a plane in a
-    dispersive medium takes ``Re eps(f)`` at each recorded frequency."""
-    from ..viz.eps import sample_eps_plane
-    _, _, eps2d = sample_eps_plane(simulation, axis, position_um)
+    dispersive medium takes ``Re eps(f)`` at each recorded frequency.
+    The far-field projection shares this sampling: ``wording="far_field"``
+    words the refusals for it (``_MEDIUM_WORDING``), and ``points`` (an
+    ``(HH, VV)`` pair in the ``in_plane_axes(axis)`` order) samples the
+    recorded face's own points instead of the whole cut."""
+    crosses, differ, nonpositive = _MEDIUM_WORDING[wording]
+    if points is None:
+        from ..viz.eps import sample_eps_plane
+        _, _, eps2d = sample_eps_plane(simulation, axis, position_um)
+    else:
+        from ..viz.eps import eps_at_points
+        eps2d = eps_at_points(simulation, axis, points[0], points[1],
+                              float(position_um))
     lo, hi = float(np.min(eps2d)), float(np.max(eps2d))
     if hi - lo > 1e-9 * max(1.0, hi):
-        raise ValueError(
-            f"the monitor plane at {axis}={position_um:.4g} um crosses "
-            f"structures (eps spans [{lo:.4g}, {hi:.4g}]) — grating orders "
-            "are defined in a homogeneous region; move the plane or pass "
-            "n_medium explicitly")
+        raise ValueError(crosses.format(axis=axis, pos=position_um, lo=lo, hi=hi))
     freqs = np.atleast_1d(np.asarray(freqs_hz, dtype=np.float64))
     if not any(getattr(s.medium, "is_dispersive", False)
                for s in simulation.structures):
         return np.full(freqs.shape, math.sqrt(lo)), False
-    media = _plane_media(simulation, axis, position_um)
+    media = _plane_media(simulation, axis, position_um, points)
     if not any(m is not None and m.is_dispersive for m in media):
         return np.full(freqs.shape, math.sqrt(lo)), False
     bg = float(simulation.background.permittivity)
@@ -310,14 +350,9 @@ def _infer_n_medium(simulation, axis: str, position_um: float,
                      for m in media] for f in freqs])        # (nf, n_media)
     lo_f, hi_f = eps.min(axis=1), eps.max(axis=1)
     if np.any(hi_f - lo_f > 1e-9 * np.maximum(1.0, np.abs(hi_f))):
-        raise ValueError(
-            f"the monitor plane at {axis}={position_um:.4g} um crosses media "
-            "whose dispersive permittivities differ at the recorded "
-            "frequencies: move the plane or pass n_medium explicitly")
+        raise ValueError(differ.format(axis=axis, pos=position_um))
     if np.any(lo_f <= 0.0):
-        raise ValueError(
-            f"the medium at {axis}={position_um:.4g} um has Re eps <= 0 at a "
-            "recorded frequency: no propagating plane-wave orders there")
+        raise ValueError(nonpositive.format(axis=axis, pos=position_um))
     return np.sqrt(lo_f), True
 
 

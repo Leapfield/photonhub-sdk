@@ -11,7 +11,7 @@ schema does not know them.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Optional, Tuple, Union
 
 from pydantic import Field, model_validator
@@ -58,6 +58,12 @@ class Port:
     is the port waveguide's material, used to extend the guide
     through the wall. ``dl_um``, ``supersample`` and ``num_modes`` are the
     mode-solve frame controls.
+
+    ``sim.ports`` reads each port back as a ``HeldPort``, a ``Port`` whose
+    ``center_um`` is in that simulation's stored frame, from the fitted box's
+    low corner. ``dataclasses.replace`` and a copy of the object keep it so. A
+    new ``Port`` built from its fields, ``Port(held.name, held.center_um, ...)``
+    or ``Port(**dataclasses.asdict(held))``, is a new port in the user's frame.
     """
 
     name: str
@@ -164,6 +170,34 @@ class Port:
         return replace(self, out_direction=out_direction)
 
 
+class HeldPort(Port):
+    """A :class:`Port` as a :class:`~photonhub.Simulation` holds it, in the
+    wire frame: ``center_um`` starts at the fitted box's low corner, not at the
+    user's origin.
+
+    The class is the mark. ``dataclasses.replace`` rebuilds through the
+    instance's class, so it travels through a rename, an edit of the centre
+    and a copy of the object, which a comparison of values could not follow.
+    It is a class and not a field because a field reaches
+    ``Simulation.model_dump_json``, the scene hash of a study, and the client
+    state written beside a run. So it says nothing about which simulation
+    holds the port, and nothing of an edit: ``out_direction`` stays as stored.
+    """
+
+    def __eq__(self, other):
+        """Equal to any :class:`Port` with the same fields, as before the mark."""
+        if not isinstance(other, Port):
+            return NotImplemented
+        return all(getattr(self, f.name) == getattr(other, f.name) for f in fields(Port))
+
+    __hash__ = Port.__hash__
+
+    @classmethod
+    def of(cls, port: Port) -> "HeldPort":
+        """``port`` marked as held; its coordinates are not touched."""
+        return port if isinstance(port, cls) else cls(**{f.name: getattr(port, f.name) for f in fields(Port)})
+
+
 @dataclass(frozen=True)
 class GaussianBeam:
     """A declared Gaussian-beam excitation on the plane ``axis = position_um``.
@@ -251,19 +285,47 @@ class Domain(FrozenModel):
     windows use.
     On an axis a port exits through, the face sits ``port_margin_um`` beyond
     the outermost port plane on that side (the launch plane on the driven
-    side, the readout plane otherwise); default ten background cells. A
-    periodic axis takes its extent from ``period_um`` (a 3-tuple with ``None``
-    for the other axes) or from the bounding box, with no margin and no PML.
+    side, the readout plane otherwise); default ten of the port's cells: on
+    a graded mesh the cell of the port's medium (of the scene's highest index
+    when the port names none), on a uniform mesh its one cell, with given
+    spacings the finest of them. The boundary layers begin at that face, so
+    the margin is the whole distance from the plane to the PML. A
+    periodic or Bloch axis takes its extent from ``period_um`` (a 3-tuple with
+    ``None`` for the other axes) or from the bounding box, with no margin and
+    no PML. Its cell is a whole number of cells of the mesh, centred on the
+    bounding box, so a shape drawn off centre moves the walls. A period that
+    is not a whole number of cells is rounded to one with a warning that gives
+    the size the cell has and a spacing that keeps the period (``Mesh.dl_um``
+    takes one per axis), and a shape that crosses a wall, which cuts it and
+    does not wrap it, also gets a warning.
     ``extent_um`` (a 3-tuple with ``None`` for the other axes) gives an axis
     its interior extent outright, centred on the structures, in place of the
     bounding box and the clearance: a membrane that runs past every wall, one
     period of a cavity array. An entry may also be a ``(low, high)`` pair, the
     two walls at those coordinates of the user's frame: a substrate that fills
     the domain below a device and air above it, each running into its own
-    boundary layers.
-    The PML thickness is added outside every open face, the extent rounds to
-    the nearest whole background cell (the one cell of a uniform mesh), and
-    the simulation records where the wire's corner landed in ``origin_um``. A
+    boundary layers. An entry on a periodic or Bloch axis is refused: give
+    that axis ``period_um``.
+    The boundary layers are added outside every open face: ``pml_num_layers``
+    (or ``absorber_num_layers``) cells of the mesh there. On a graded mesh
+    those are the cells of the finest medium or refine region that crosses
+    the face (a substrate, a cladding, a port's guide), else the background's,
+    so the layers begin at the face: inside it by at most the rounding below
+    and 3 % of their depth, which the fit checks on the built mesh, fitting a
+    face again where it falls short (a warning names one it cannot fix). A
+    medium or refine region that ends near the outer face is left outside the
+    box or taken in by enough of its cells to keep the mesh's spacing-ratio
+    check in nearly every case, at most 64 and never past its far end (a
+    warning names one whose cells are within about 2 % of that check's limit,
+    where 64 may not keep it and creating the simulation can raise a
+    ValueError; coarser cells, or an end further from the face, avoid it),
+    which can put more cells than the layers between the face and the outer
+    face. The
+    extent rounds
+    to the nearest whole background cell (the one cell of a uniform mesh),
+    which moves each outer face by up to a quarter of that cell (the far face
+    of a symmetry fold by up to half), and the simulation records where the
+    wire's corner landed in ``origin_um``. A
     port whose guide stops short of its wall has the guide continued through
     the boundary layers in the port's width, thickness and medium.
     """
@@ -330,7 +392,13 @@ class Mesh(FrozenModel):
     counted at the band centre ``wlen0_um``) and ``dl_um`` (an explicit cell
     size, uniform), or both when ``dl_um`` is a per-axis 3-tuple: an axis with
     a number is uniform at that spacing (a lattice-commensurate mesh), an axis
-    with ``None`` is graded by ``cells_per_wlen``. ``uniform=True`` with ``cells_per_wlen`` gives a
+    with ``None`` is graded by ``cells_per_wlen``. The mesh has one base cell,
+    the first spacing, and each other spacing is written as coordinates. An
+    axis the solver cannot take that way needs the base cell, and two of them
+    need the same spacing: a Bloch axis, an axis under four cells, or a periodic
+    axis whose coordinates miss the seam, which rounding alone can do from about
+    2,500 cells, more often the longer the axis. ``uniform=True`` with
+    ``cells_per_wlen`` gives a
     :class:`~photonhub.UniformMesh` at ``wlen0_um / (n_max * cells_per_wlen)``,
     ``n_max`` the highest structure index; otherwise :func:`~photonhub.auto_mesh`
     grades the mesh with ``refine`` as its overrides, ``dl_min_um`` as its

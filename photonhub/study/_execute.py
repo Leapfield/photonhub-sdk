@@ -18,7 +18,7 @@ from ..cloud.config import CloudError
 from .._compat import caller_stacklevel
 from ..cloud.run import CloudJobTimeout, DEFAULT_MAX_USD, _check_cloud_device_support
 from ..components import Simulation
-from ..data import RunResult
+from ..data import RunResult, SimulationMismatchError
 from ..runners.batch import Batch, _check_batch_name
 from ..runners.local import SolverRunError
 from ..spec_hash import _sha256_hex, spec_sha256
@@ -202,6 +202,54 @@ def _record(group, status, *, error="", backend="", job_id="", quote_usd=None,
             "updated_at": _now()}
 
 
+def _gpu_study(device) -> bool:
+    """Whether a cloud study's ``device`` (``None`` meaning ``"gpu"``) asks
+    for a GPU."""
+    from ..cloud._defaults import is_gpu_device
+
+    requested = device or "gpu"
+    return is_gpu_device(requested.strip() if isinstance(requested, str) else requested)
+
+
+def _cloud_study_solver(store, solver, device):
+    """The cloud solver build this call submits with and records, checked
+    against the builds the study directory already recorded.
+
+    A study keeps one build. ``solver=None`` on a GPU device takes the build
+    the directory recorded, so collecting jobs, and submitting new ones,
+    needs no local solver, and a later solver upgrade cannot mix builds in
+    one study. With no build recorded, ``None`` is returned and resolved only
+    when a new job is submitted (see :func:`run`), to the locally installed
+    solver's commit as on every cloud call. A record of ``None`` (made
+    before this default existed) is accepted when the caller again passes
+    ``None``. An explicit ``solver`` must match every recorded build.
+    """
+    passed = solver
+    records = [record for record in store.jobs.values()
+               if record.get("backend") == "cloud"]
+    records.extend(store.document["submissions"])
+    if solver is None and _gpu_study(device):
+        recorded = [record.get("solver") for record in records
+                    if record.get("solver") is not None]
+        if recorded:
+            solver = recorded[0]
+    for record in records:
+        recorded_solver = record.get("solver")
+        if recorded_solver == solver or (passed is None and recorded_solver is None):
+            continue
+        guidance = ("resume with solver=None to collect existing jobs; "
+                    "if the service requires an explicit solver for new jobs, "
+                    "use a new study path" if recorded_solver is None else
+                    f"use solver={recorded_solver!r} or a new study path")
+        passed_text = (f"passed solver={passed!r}" if passed is not None or solver is None
+                       else f"passed solver=None, which takes the build {solver!r} "
+                            "this study recorded first")
+        raise ValueError(
+            "cannot resume cloud study with a different solver: "
+            f"recorded solver={recorded_solver!r}, {passed_text}; {guidance}")
+    return solver
+
+
 def _exclusive_run(function):
     @wraps(function)
     def locked(*args, **kwargs):
@@ -232,6 +280,11 @@ def run(samples, build, *, path, measure=None, cloud=False, retry_failed=False,
     ``cloud`` chooses cloud execution; otherwise ``solver_path`` selects the
     local solver. ``solver`` selects the cloud build and is recorded with each
     job and submission; resuming with a different cloud build is refused.
+    On a GPU, ``solver=None`` takes the build the directory recorded, so
+    collecting and adding jobs needs no local solver; a directory with none
+    recorded submits its first jobs with the commit of the locally installed
+    solver, as every cloud call does. ``device=None`` is the service's only
+    GPU.
     ``max_workers``, ``device``, ``timeout`` (local) and
     ``wait_timeout_s`` (cloud) control the runners. ``progress`` receives study
     event dictionaries; ``quiet`` suppresses the one-line stderr job reports.
@@ -263,20 +316,7 @@ def run(samples, build, *, path, measure=None, cloud=False, retry_failed=False,
         _spend_limit(max_usd_total, label="max_usd_total")
     store = StudyStore(path, create=True)
     if cloud:
-        records = [record for record in store.jobs.values()
-                   if record.get("backend") == "cloud"]
-        records.extend(store.document["submissions"])
-        for record in records:
-            recorded_solver = record.get("solver")
-            if recorded_solver != solver:
-                guidance = ("resume with solver=None to collect existing jobs; "
-                            "if the service requires an explicit solver for new jobs, "
-                            "use a new study path" if recorded_solver is None else
-                            f"use solver={recorded_solver!r} or a new study path")
-                raise ValueError(
-                    "cannot resume cloud study with a different solver: "
-                    f"recorded solver={recorded_solver!r}, passed solver={solver!r}; "
-                    f"{guidance}")
+        solver = _cloud_study_solver(store, solver, device)
     store.pin(samples)
     rows, groups = _build_rows(samples, build, cloud=cloud, device=device)
     preview = _make_plan(samples, rows, groups, store, retry_failed)
@@ -348,16 +388,21 @@ def run(samples, build, *, path, measure=None, cloud=False, retry_failed=False,
                 data = cloud_module.resume(old["job_id"], simulation=group["sim"],
                                            wait_timeout_s=wait_timeout_s).result()
                 status, error = "succeeded", ""
-            except (SolverRunError, CloudJobTimeout, CloudError) as exc:
+            except (SolverRunError, CloudJobTimeout, CloudError, SimulationMismatchError) as exc:
                 data = None
                 if isinstance(exc, CloudError) and exc.status_code == 404:
                     status = "failed"
                     error = f"the service no longer knows job {old['job_id']}"
                 else:
+                    # A refusal is about the simulation, not the paid result:
+                    # the job stays collectable, so retry_failed cannot pay again.
                     status = ("timed_out" if isinstance(exc, CloudJobTimeout) else
-                              old["status"] if isinstance(exc, CloudError) else "failed")
+                              old["status"] if isinstance(exc, (CloudError, SimulationMismatchError))
+                              else "failed")
                     error = _error(exc)
-            record = _record(group, status, error=error, backend="cloud", solver=solver,
+            # The build this job was submitted with, not this call's.
+            record = _record(group, status, error=error, backend="cloud",
+                             solver=old.get("solver"),
                              job_id=old["job_id"], quote_usd=old.get("quote_usd"),
                              result=data)
             store.put_job(digest, record)
@@ -368,6 +413,17 @@ def run(samples, build, *, path, measure=None, cloud=False, retry_failed=False,
             raise CloudError(
                 f"study ceiling max_usd_total (${float(max_usd_total):.4f}) "
                 f"is below already submitted quotes (${committed:.4f}); nothing was submitted")
+        if preview.to_run and solver is None and _gpu_study(device):
+            # Only a new submission needs a build, and this directory has
+            # none recorded: read the installed solver's commit here, so the
+            # study records the build its jobs are submitted with. A failure
+            # says why, after the jobs already submitted were collected.
+            from ..cloud._defaults import installed_solver_commit
+
+            solver = installed_solver_commit(closing=(
+                "Nothing new was submitted; the status of the jobs already "
+                "submitted was recorded." if preview.to_collect
+                else "No request was sent."))
         if preview.to_run:
             batch = cloud_module.Batch({job: by_job[job][1]["sim"]
                                         for job in preview.to_run})
@@ -420,7 +476,7 @@ def run(samples, build, *, path, measure=None, cloud=False, retry_failed=False,
                     return
                 status = ("succeeded" if error is None else
                           "timed_out" if isinstance(error, CloudJobTimeout) else
-                          "submitted" if isinstance(error, CloudError)
+                          "submitted" if isinstance(error, (CloudError, SimulationMismatchError))
                           else "failed")
                 record = _record(group, status, error=_error(error) if error else "",
                                  backend="cloud", solver=solver, job_id=new_id or old.get("job_id", ""),

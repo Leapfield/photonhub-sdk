@@ -47,6 +47,7 @@ spectrum to convergence. Point-probe spectra only in v1; CPU only. See
 :mod:`photonhub.analysis.spectral_completion`.
 """
 
+from .colocated import colocated_fields
 from .compact_model import SMatrixChecks, SMatrixModel, smatrix_checks, smatrix_model
 from .cvcs import cvcs_sections, interpolate_mode, interpolate_plane
 from .diffraction import DiffractionOrders, diffraction_orders
@@ -174,6 +175,7 @@ __all__ = [
     "assert_reciprocal",
     "CompletionRejected",
     "cascade",
+    "colocated_fields",
     "cvcs_sections",
     "diffraction_orders",
     "eme_convergence_report",

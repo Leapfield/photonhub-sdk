@@ -18,6 +18,7 @@ from .components import (
     Boundaries,
     Box,
     Cylinder,
+    FarFieldMonitor,
     ProfileMonitor,
     SnapshotMonitor,
     TimeMonitor,
@@ -52,7 +53,7 @@ from . import library
 from . import materials
 from .constants import c0, eps0
 from .cost import CostEstimate, quote
-from .data import RunResult
+from .data import RunResult, SimulationMismatchError
 from .gds import GDSLayer, export_gds, import_gds, read_gds_cell_names
 from .hdf5 import convert_to_hdf5
 from .runners import (
@@ -97,7 +98,7 @@ from .inverse_design import (
     value_and_gradient,
 )
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 __all__ = [
     "study",
@@ -122,6 +123,7 @@ __all__ = [
     "Box",
     "CostEstimate",
     "Cylinder",
+    "FarFieldMonitor",
     "ProfileMonitor",
     "SnapshotMonitor",
     "TimeMonitor",
@@ -152,6 +154,7 @@ __all__ = [
     "Simulation",
     "cloud",
     "RunResult",
+    "SimulationMismatchError",
     "SolverRunError",
     "Sphere",
     "Structure",

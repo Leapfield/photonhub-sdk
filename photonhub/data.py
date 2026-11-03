@@ -55,7 +55,8 @@ power, the modeled part times 2 for every plane that cuts the monitor plane
 modeled part.
 field_dft coordinates are base-node positions with
 NO per-component Yee half-cell destaggering applied, see the warning on
-``_load_field_dft`` before hand-computing E x H* flux from them.
+``_load_field_dft`` before hand-computing E x H* flux from them;
+``photonhub.analysis.colocated_fields`` returns a plane colocated.
 
 Aborted runs (``divergence`` / ``non_finite_energy``)
 still write a complete manifest with truncated monitor data; loading one
@@ -489,6 +490,66 @@ def validate_result_manifest_contract(
     return monitors
 
 
+class SimulationMismatchError(ValueError):
+    """The simulation given to :class:`RunResult` is not the one the result
+    ran. Reading with it would put its grid, ports and amplitudes on another
+    run's fields and give wrong numbers with no sign of it, so the reader
+    refuses and names the difference. ``RunResult(path)`` reads with the saved
+    simulation. The result itself is fine: the cloud client keeps its cached
+    copy when this is raised."""
+
+
+# What a reading does not depend on: the reader takes the time step and the step
+# count from the manifest, and a runner rewrites run.dft_shutoff for its device,
+# so a saved document can differ here from the simulation that asked for it.
+_WIRE_KEYS_NOT_READ = ("schema_version", "run")
+# Rounding, not a difference: a document built on another machine can differ in
+# the last digits of what it computed.
+_WIRE_REL_TOL = 1e-9
+_WIRE_ABS_TOL = 1e-12
+# A launch's amplitudes are solved, and a nearly degenerate port mode (a square
+# core) moves them by 2e-5 between builds of the numerical libraries: the same
+# launch. Their phases stay exact, since a flipped sign is another launch.
+_LAUNCH_REL_TOL = 1e-3
+_WIRE_DIFFERENCES_SHOWN = 6
+
+
+def _comparable_wire(wire: dict) -> dict:
+    return {key: value for key, value in wire.items() if key not in _WIRE_KEYS_NOT_READ}
+
+
+def _wire_differences(saved, given, path: str = "") -> List[str]:
+    """One line for each place the documents ``saved`` and ``given`` differ, in
+    document order, which puts the domain and the grid first."""
+    if isinstance(saved, dict) and isinstance(given, dict):
+        lines: List[str] = []
+        for key in {**given, **saved}:
+            where = f"{path}.{key}" if path else key
+            if key not in saved:
+                lines.append(f"{where}: only in the simulation passed")
+            elif key not in given:
+                lines.append(f"{where}: only in the saved simulation")
+            else:
+                lines += _wire_differences(saved[key], given[key], where)
+        return lines
+    if isinstance(saved, list) and isinstance(given, list):
+        if len(saved) != len(given):
+            return [f"{path}: {len(saved)} entries saved, {len(given)} here"]
+        lines = []
+        for index, (a, b) in enumerate(zip(saved, given)):
+            lines += _wire_differences(a, b, f"{path}[{index}]")
+        return lines
+    numbers = all(isinstance(v, (int, float)) for v in (saved, given))
+    launch = path.startswith("sources[") and path.endswith("].amplitude")
+    try:
+        same = (math.isclose(saved, given, rel_tol=_LAUNCH_REL_TOL if launch else _WIRE_REL_TOL,
+                             abs_tol=_WIRE_ABS_TOL)
+                if numbers else saved == given)
+    except OverflowError:                # an integer too long for a float has no rounding
+        same = saved == given
+    return [] if same else [f"{path}: {repr(saved)[:40]} saved, {repr(given)[:40]} here"]
+
+
 class RunResult:
     """Lazy, dict-like view of one solver output directory.
 
@@ -507,6 +568,19 @@ class RunResult:
     ``client_state=False`` reads the result as the wire document alone
     describes it: coordinates in the corner frame, planes as recorded, no
     declared ports.
+
+    ``simulation=`` is for the simulation that ran. It is compared with the
+    wire document saved with the result (``sim.json`` or the copy in an HDF5
+    bundle), its ``run`` block aside since a reading does not use it and its
+    launch amplitudes to 0.1 %, since a rebuilt launch can move that far. With
+    no document saved, the spec a cloud client stored for the job takes its
+    place when that spec is the input the manifest recorded. With neither, as
+    on a machine without that cache, its grid is compared with the grid the
+    manifest recorded.
+    A difference raises :class:`SimulationMismatchError`, which names it. A
+    script rebuilt on a newer SDK can land here, since the same text can build
+    a different mesh: ``RunResult(path)`` reads such a result correctly from
+    what was saved.
     """
 
     def __init__(self, path: Union[str, Path], *, simulation=None,
@@ -586,6 +660,8 @@ class RunResult:
         self._cache: Dict[str, xr.DataArray] = {}
         self._norm_amplitude_known = False
         self._norm_amplitude: Optional[float] = None
+        if simulation is not None:
+            self._check_simulation(simulation)
 
     @property
     def _source(self) -> Path:
@@ -872,9 +948,12 @@ class RunResult:
         user-frame origin, the symmetry-plane record, and the declared ports
         and wavelengths, whose modes are solved again on first use. A record
         that belongs to another simulation warns and restores nothing, and a
-        simulation restored this way refuses ``with_changes`` (the fields as
-        given are not recorded). None when no simulation is available (a bare
-        output directory)."""
+        simulation restored with a user frame, a symmetry record,
+        wavelengths or declared ports refuses ``with_changes`` (the fields as
+        given are not recorded); one whose record holds only far-field
+        surfaces stays editable, keeping their recipe only through edits of
+        nothing it was checked against. None when no simulation is available
+        (a bare output directory)."""
         if self._simulation is None:
             from .components import Simulation
             from .components import frame as _frame
@@ -914,6 +993,154 @@ class RunResult:
             return beside
         from .cloud.cache import stored_client_state_for_result
         return stored_client_state_for_result(spec.parent)
+
+    def _saved_wire_text(self) -> "tuple[Optional[str], str]":
+        """The wire document this result ran and where it came from: the
+        ``sim.json`` beside it or the copy in an HDF5 bundle. ``(None, "")``
+        when neither is kept or it cannot be read."""
+        if self._h5_path is not None:
+            return self._h5_sim_json(), f"the sim_json in {self._h5_path}"
+        spec = self.output_dir / "sim.json"
+        try:
+            return spec.read_text(encoding="utf-8"), str(spec)
+        except (OSError, ValueError):
+            return None, ""
+
+    def _stored_spec_text(self) -> "tuple[Optional[str], str]":
+        """The spec a cloud client stored for this job, for a bundle with no
+        document of its own. A directory's name alone does not tie it to this
+        result, so it counts only when it is the input the manifest recorded,
+        the viewer's rule. ``(None, "")`` otherwise, as on a machine without
+        that cache, which has only the manifest's grid to compare."""
+        from .cloud.cache import stored_spec_for_result
+        from .spec_hash import spec_sha256
+
+        provenance = self.manifest.get("provenance")
+        recorded = provenance.get("input_sha256") if isinstance(provenance, dict) else None
+        stored = stored_spec_for_result(self.output_dir)
+        if stored is None or not isinstance(recorded, str):
+            return None, ""
+        try:
+            text = stored.read_text(encoding="utf-8")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                if spec_sha256(text) == recorded.lower():
+                    return text, str(stored)
+        except Exception:  # noqa: BLE001, S110 - a spec that does not load proves nothing
+            pass
+        return None, ""
+
+    def _grid_differences(self, simulation, wire: dict) -> List[str]:
+        """Where ``simulation`` differs from the grid this result's manifest
+        recorded: what can be compared when no wire document is kept."""
+        from .components.grid import resolved_cell_counts
+
+        recorded = self.manifest.get("grid")
+        if not isinstance(recorded, dict):
+            return []
+        grid, ran, ours = wire.get("grid", {}), {}, {}
+        if "shape" in recorded:
+            ran["cells"] = list(recorded["shape"])
+            ours["cells"] = list(resolved_cell_counts(
+                simulation.size_um, simulation.grid, simulation._axis_min_cells()))
+        if "dl_um" in recorded and "dl_um" in grid:
+            ran["dl_um"], ours["dl_um"] = recorded["dl_um"], grid["dl_um"]
+        nodes = grid.get("coords") or {}
+        for axis, values in (recorded.get("coords_um") or {}).items():
+            if axis in nodes:
+                ran[f"coords_um.{axis}"], ours[f"coords_um.{axis}"] = values, nodes[axis]
+        return _wire_differences(ran, ours)
+
+    def _check_simulation(self, simulation) -> None:
+        """Raise :class:`SimulationMismatchError` when ``simulation`` is not the
+        one this result ran (see the class docstring). A stand-in without a
+        wire document has nothing to compare."""
+        to_wire = getattr(simulation, "to_wire_dict", None)
+        if to_wire is None:
+            return
+        wire = to_wire()
+        text, where = self._saved_wire_text()
+        from_cache = False
+        if text is None:
+            text, where = self._stored_spec_text()
+            from_cache = text is not None
+        try:
+            saved = None if text is None else json.loads(text.removeprefix("\ufeff"))
+        except ValueError:
+            saved = None
+        if isinstance(saved, dict):
+            ours = _comparable_wire(wire)
+            if _comparable_wire(saved) == ours:
+                return
+            try:
+                # an older document lacks keys this SDK materializes; loading it
+                # adds them, so only a real difference is left
+                from .components import Simulation
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    saved = Simulation.from_wire_json(text).to_wire_dict()
+                loads = True
+            except Exception:  # noqa: BLE001 - only a normalization; a bad document
+                loads = False            # (ValueError, TypeError, OverflowError) stays as written
+            differences = _wire_differences(_comparable_wire(saved), ours)
+            remedy = self._reading_without(simulation, loads, from_cache) if differences else ""
+            if not differences and saved.get("sources"):
+                # Accepted within the launch tolerance, but the engine normalized
+                # by the saved amplitude: restoring another would move every
+                # absolute number by twice the gap.
+                self._norm_amplitude = float(saved["sources"][0].get("amplitude", 1.0))
+                self._norm_amplitude_known = True
+        else:
+            differences = self._grid_differences(simulation, wire)
+            where = f"the grid {self._source} recorded"
+            remedy = f"No simulation was saved with it: use {self._sdk_that_ran()}"
+        if not differences:
+            return
+        shown = "\n".join(f"  {line}" for line in differences[:_WIRE_DIFFERENCES_SHOWN])
+        hidden = len(differences) - _WIRE_DIFFERENCES_SHOWN
+        if hidden > 0:
+            shown += f"\n  and {hidden} more"
+        raise SimulationMismatchError(
+            f"the simulation passed is not the one this result ran. Compared with {where}:\n"
+            f"{shown}\n"
+            "Reading with it would put its grid, ports and amplitudes on another run's fields "
+            f"and give wrong numbers. {remedy}. Or run the simulation you passed. The same script "
+            "can build a different mesh on a newer SDK; the changelog says when.")
+
+    def _sdk_that_ran(self) -> str:
+        """The way to read what this SDK cannot: the same script on the SDK
+        that ran the job builds the simulation that ran, which passes."""
+        solver = self.provenance.get("solver_version")
+        ran = f"the SDK that ran it (solver {solver})" if solver else "the SDK that ran it"
+        return f"{ran}, build the simulation there and pass it as simulation="
+
+    def _keeps_client_record(self) -> bool:
+        """True when a record of the frame and ports was kept with this result,
+        beside it or in the cloud client's cache. A reader without
+        ``simulation=`` gets those back only from it."""
+        if self._h5_path is not None:
+            return self._h5_text("client_json") is not None
+        return self._client_state_path(self.output_dir / "sim.json") is not None
+
+    def _reading_without(self, simulation, loads: bool, from_cache: bool) -> str:
+        """What a read without ``simulation`` gives in its place, said plainly:
+        without a client record the declared ports do not come back, and a
+        document this SDK cannot load gives no simulation at all. A spec from
+        the cloud client's cache is read back by ``ph.cloud.resume``: a bare
+        ``RunResult(path)`` has no document beside the result to load."""
+        read = (f"ph.cloud.resume({self.output_dir.name!r}) without simulation=" if from_cache
+                else "RunResult(path) without simulation=")
+        if not loads:
+            return f"This SDK cannot load the saved simulation: use {self._sdk_that_ran()}"
+        if getattr(simulation, "_declarative", None) is None:
+            return f"{read} reads it with the saved simulation"
+        if self._keeps_client_record():
+            return (f"{read} reads it with the saved simulation; read ports through that "
+                    "result (data.transmission, data.simulation.port_monitors), not through "
+                    "the simulation you passed")
+        return (f"{read} reads its fields with the saved simulation, but its ports do not come "
+                "back: no client record was kept with this result, so data.port_names is empty "
+                f"and data.transmission raises. To read its ports, use {self._sdk_that_ran()}")
 
     def _known_simulation(self):
         """:attr:`simulation`, or None (with one warning) when it cannot be
@@ -1303,12 +1530,14 @@ class RunResult:
            E x H* Poynting flux from a field_dft plane, without first
            colocating/destaggering them gives a systematically wrong answer
            (this exact mistake once mis-diagnosed a mode-launch 'reflection'
-           that modal projection showed was 30x smaller). Use the
-           colocation/destagger handling in ``photonhub.analysis.mode_overlap``
-           (what ``mode_devices``' ``mode_power(..., colocate=True,
-           destagger_dl=dl)`` applies), or a flux monitor, which the engine
-           computes on the staggered grid correctly, before hand-computing
-           power."""
+           that modal projection showed was 30x smaller). Read the plane
+           with ``photonhub.analysis.colocated_fields(data, name)``, which
+           returns every component on the plane's grid nodes at its true
+           coordinates (record the plane one cell thick, so E and H also
+           share one plane along the normal), or use a flux monitor, which
+           the engine computes on the staggered grid correctly, before
+           hand-computing power. Mode overlaps colocate on their own
+           (``mode_power(..., colocate=True, destagger_dl=dl)``)."""
         name = entry["name"]
         shape = tuple(int(n) for n in entry["shape"])
         components = list(entry["components"])

@@ -969,8 +969,9 @@ def run_component_smatrix(
 
     ``runner="local"`` (default) runs on the local solver; ``runner="cloud"``
     submits through ``ph.cloud.Batch``, which quotes each job and holds it to
-    your spending ceiling. Pass ``device`` and ``solver`` through the extra
-    keywords for the cloud service; a callable runner is used as
+    your spending ceiling. ``device`` and ``solver`` pass through the extra
+    keywords; omitted, they take the cloud defaults (the service's only GPU
+    and the installed solver's commit); a callable runner is used as
     :meth:`~photonhub.analysis.SMatrixPlan.run` describes. ``path_dir``,
     ``max_workers``, ``allow_partial`` and any other keyword go to that method.
     ``mesh`` has no default (see :func:`plan_component_smatrix`).

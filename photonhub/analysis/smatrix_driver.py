@@ -36,6 +36,34 @@ port monitor sits on the total-field side of its own source and records
 incident + reflected when driven, exactly the arrangement
 :func:`~photonhub.analysis.smatrix.smatrix` expects for ``S_jj``.
 
+Port frames
+===========
+A simulation fitted with ``domain=`` stores its coordinates in the wire frame,
+from the fitted box's low corner, which sits at ``origin_um`` in the user's
+frame. The mode solve, the monitors and the launch all read the wire frame, so
+:func:`plan_smatrix` moves each port there first:
+
+* a :class:`photonhub.Port` is in the user's frame, the same place as in
+  ``Simulation(ports=...)``, its outward side and mode window included. The one
+  limit is a port in the half a symmetry plane mirrors away, which ``ports=``
+  reads through its image and the plan refuses. A port read back from
+  ``sim.ports`` of the same simulation is in the wire frame already and stands
+  as it is; it stays marked through ``dataclasses.replace`` and a copy of the
+  object, so an edit of its centre is in the wire frame too, and keeps its
+  ``out_direction``. A new ``ph.Port``, whatever its numbers, carries no mark:
+  one built from a held port's fields, or with the origin subtracted by hand,
+  is in the user's frame and moves twice; a solved ``n_eff`` below the
+  background at the port draws a warning.
+* an :class:`SMatrixPort` names its frame in ``frame``. Where ``origin_um`` is
+  not zero an unnamed frame raises, because either reading would be wrong for
+  someone: earlier versions read the values in the wire frame, which callers
+  relied on by subtracting the origin themselves.
+
+The ports on a plan and a result are the ones the plan placed, in the wire
+frame. The monitors and readers need no move of their own: the plan stores
+wire coordinates and the readers take the recorded planes through
+:func:`~photonhub.components.frame.wire_array`.
+
 What's not handled (deferred, matching :mod:`.smatrix`)
 =======================================================
 * **Multimode ports**, one mode channel per port. Decompose a physical plane
@@ -53,7 +81,7 @@ from __future__ import annotations
 import math
 import re
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Sequence,
                     Tuple, Union)
@@ -62,6 +90,7 @@ import numpy as np
 import xarray as xr
 
 from ..viz import _geometry as _geom
+from ..components import frame as _frame
 from ..components.source_time import GaussianPulse, SourceTimeType
 from .mode_devices import ModeMonitor, mode_launch, mode_monitor
 from .mode_overlap import _TRANSVERSE
@@ -87,6 +116,9 @@ __all__ = [
 _AXIS_IDX = {"x": 0, "y": 1, "z": 2}
 _SIGN = {"+": 1.0, "-": -1.0}
 _OPPOSITE = {"+": "-", "-": "+"}
+# How far past a wall a position can sit and still be on it: the tolerance the
+# fold itself keeps a port by (Simulation._fold_symmetry).
+_ON_A_WALL_UM = 1e-9
 
 
 @dataclass(frozen=True)
@@ -103,7 +135,7 @@ class SMatrixPort:
         Propagation axis of the port waveguide ('x' | 'y' | 'z').
     position_um:
         The port plane along ``axis``, where the port monitor sits and where
-        S is referenced.
+        S is referenced, in the frame ``frame`` names.
     out_direction:
         '+' or '-': the direction along ``axis`` that points OUT of the device
         through this port (toward the nearby domain wall). The drive launches
@@ -118,8 +150,8 @@ class SMatrixPort:
     center_um:
         Transverse waveguide location as (horizontal, vertical) in-plane
         coordinates ((y, z) for an x-normal port, (x, z) for y-normal, (x, y)
-        for z-normal); ``None`` = the domain centre. The port's mode is solved,
-        read and launched at this centre.
+        for z-normal), in the frame ``frame`` names; ``None`` = the domain
+        centre. The port's mode is solved, read and launched at this centre.
     dl_um:
         Mode-solve transverse step; ``None`` = the simulation grid's ``dl_um``.
     source_offset_um:
@@ -128,6 +160,16 @@ class SMatrixPort:
         wavelength in the background, the standoff the declarative ports take.
     supersample / num_modes:
         Forwarded to the Yee mode solve (eigensolver frame controls).
+    frame:
+        What ``position_um`` and ``center_um`` are measured from on a
+        simulation fitted with ``domain=``, whose stored coordinates start at
+        ``origin_um``. ``"user"`` is your own frame, the one a
+        :class:`photonhub.Port` reads in; the plan takes ``origin_um`` off.
+        ``"wire"`` is the fitted box's low corner, the frame of
+        ``solve_yee_mode``, ``mode_monitor`` and ``mode_launch``; the values
+        stand. ``None``, the default, is for a simulation at the origin
+        (0, 0, 0), where the two are one place; on any other,
+        :func:`plan_smatrix` raises ``ValueError``.
     """
 
     name: str
@@ -143,6 +185,7 @@ class SMatrixPort:
     source_offset_um: Optional[float] = None
     supersample: int = 8
     num_modes: Optional[int] = None
+    frame: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.name or not all(
@@ -171,6 +214,9 @@ class SMatrixPort:
             raise ValueError(
                 f"port {self.name!r}: source_offset_um must be > 0 (the "
                 "launch sits strictly outside the port plane)")
+        if self.frame not in (None, "user", "wire"):
+            raise ValueError(f"port {self.name!r}: frame must be 'user', "
+                             f"'wire' or None, got {self.frame!r}")
 
     @property
     def in_direction(self) -> str:
@@ -193,12 +239,73 @@ def _grid_dl(sim) -> float:
     return float(dl)
 
 
+def _user_um(sim, axis: str, position_um: float) -> float:
+    """A wire-frame position along ``axis`` in the user's frame, the one a
+    message reports it in."""
+    return position_um + _frame.frame_origin(sim)[_AXIS_IDX[axis]]
+
+
+def _refuse_outside_domain(sim, port_name: str, axis: str, position_um: float,
+                           what: str) -> None:
+    """A port position past the walls would snap onto a wall and read what is
+    there, with nothing to stop it when the port is not driven: the likely sign
+    of a coordinate in the wrong frame, or of a port in the half a symmetry
+    plane mirrors away. A position on a wall stands within rounding: a fold's
+    plane is ``0.5 * (lo + hi)``, so a port kept on it can land just below wire
+    0 (:data:`_ON_A_WALL_UM`)."""
+    a = _AXIS_IDX[axis]
+    length = sim.size_um[a]
+    if -_ON_A_WALL_UM <= position_um <= length + _ON_A_WALL_UM:
+        return
+    low, high = _user_um(sim, axis, 0.0), _user_um(sim, axis, length)
+    where = (f"port {port_name!r}: {what} {axis}={_user_um(sim, axis, position_um):.4g} um "
+             f"lies outside the domain ({low:.4g}, {high:.4g})")
+    if position_um < 0.0 and sim.symmetry[a]:
+        fold = getattr(sim, "_fold", None)
+        advice = ("Simulation(ports=...) reads such a port through its mirror image, but an "
+                  "S-matrix port is solved where it stands: use its image in the kept half, or "
+                  "drop that symmetry" if fold is not None and a in fold.planes
+                  else "This half domain does not hold it: use its image inside the domain")
+        raise ValueError(f"{where}, in the half the symmetry plane {axis}={low:.4g} um mirrors away. {advice}")
+    raise ValueError(f"{where}; move the port inside it")
+
+
+def _warn_if_not_guided(sim, port: SMatrixPort, center_hv: Tuple[float, float],
+                        mode, freq_hz: float) -> None:
+    """Soft check after the solve: a mode below the highest background index
+    at the port is not guided there. The background is read at the corners of
+    the mode window, above and below any slab beside the guide, so a filled
+    cladding or a substrate counts where the simulation's own ``background``
+    would not. A leaky mode can be legitimate, so this warns; it is the one
+    signal for a ``ph.Port`` in the wrong frame, which carries no mark."""
+    from ..components import declarative as _decl
+
+    h_name, v_name = _geom.in_plane_axes(port.axis)
+    painter = _decl._Painter(sim)
+    point = [0.0, 0.0, 0.0]
+    point[_AXIS_IDX[port.axis]] = port.position_um
+    highest = 0.0
+    for h_sign, v_sign in ((-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)):
+        point[_AXIS_IDX[h_name]] = center_hv[0] + h_sign * port.half_w_um
+        point[_AXIS_IDX[v_name]] = center_hv[1] + v_sign * port.half_v_um
+        highest = max(highest, painter.index(point, freq_hz))
+    n_eff = float(np.real(mode.n_eff))
+    if n_eff < highest:
+        warnings.warn(
+            f"port {port.name!r}: its mode solved at n_eff {n_eff:.4g}, below the highest "
+            f"background index at the port, {highest:.4g}, so it is not guided there. A leaky "
+            "mode can do this, but the port's coordinates may be in the wrong frame: a ph.Port "
+            "reads in your frame, so do not subtract origin_um from it",
+            stacklevel=caller_stacklevel())
+
+
 def _warn_if_in_absorbing_layers(sim, axis: str, position_um: float,
                                  what: str) -> None:
     """Soft check: a launch/monitor plane inside the PML/absorber slab is a
-    physics bug the engine cannot always reject. Thickness is estimated with
-    the base ``dl_um`` (approximate on graded axes, hence a warning, not an
-    error)."""
+    physics bug the engine cannot always reject. The slab is the realized
+    outer layer cells on each face (:meth:`Simulation._open_interval_um`): on
+    a graded axis those of the medium at that face, which can be finer than
+    the base ``dl_um``; a symmetry plane's face has none."""
     kind = getattr(sim.boundaries, axis, None)
     layers = 0
     if kind == "pml":
@@ -207,15 +314,16 @@ def _warn_if_in_absorbing_layers(sim, axis: str, position_um: float,
         layers = int(getattr(sim, "absorber_num_layers", 0))
     if layers <= 0:
         return
-    try:
-        slab = layers * _grid_dl(sim)
-    except ValueError:
-        return
     length = sim.size_um[_AXIS_IDX[axis]]
-    if position_um < slab or position_um > length - slab:
+    try:
+        lo, hi = sim._open_interval_um(_AXIS_IDX[axis])
+    except ValueError:
+        lo = hi = 0.5 * length                   # the layers fill the axis
+    if position_um < lo or position_um > hi:
+        slab = lo if position_um < lo else length - hi
         warnings.warn(
-            f"{what} at {axis}={position_um:.4g} um lies inside the "
-            f"~{slab:.4g} um {kind} slab on that wall — move the port plane "
+            f"{what} at {axis}={_user_um(sim, axis, position_um):.4g} um lies inside the "
+            f"~{slab:.4g} um {kind} slab on that wall; move the port plane "
             "or shrink source_offset_um",
             stacklevel=caller_stacklevel())
 
@@ -229,7 +337,11 @@ class SMatrixResult:
     ``(port_out, port_in, f)``, ``|S_ij|^2`` a power ratio. ``data`` maps each
     DRIVEN port name to its run's ``RunResult``; ``errors`` carries
     per-drive failures when ``allow_partial=True`` let the assembly proceed
-    (those columns are NaN)."""
+    (those columns are NaN).
+
+    On a simulation fitted with ``domain=``, ``ports`` are the ports as placed,
+    in the wire frame, from the fitted box's low corner, while the field arrays
+    in ``data`` read in your frame, as any ``RunResult`` does."""
 
     S: Any
     ports: Tuple[SMatrixPort, ...]
@@ -309,7 +421,8 @@ class SMatrixPlan:
     """A fully-prepared S-matrix extraction: the driven simulations, the port
     readers, and the run method. Built by :func:`plan_smatrix`; inspect
     ``simulations`` / ``sports`` (or ``quote()``) before committing
-    compute, then call :meth:`run`."""
+    compute, then call :meth:`run`. ``ports`` are the ports as placed, in the
+    wire frame on a simulation fitted with ``domain=``."""
 
     base: Any
     ports: Tuple[SMatrixPort, ...]
@@ -343,7 +456,9 @@ class SMatrixPlan:
             :class:`~photonhub.runners.batch.Batch` (``path_dir`` /
             ``max_workers`` / ``solver_path`` / ``timeout`` / ``progress``
             forwarded); ``"cloud"`` (or the deprecated ``"web"``) submits via ``ph.cloud.Batch``
-            (``max_workers`` and extra kwargs such as ``device=`` and ``solver=`` forwarded;
+            (``max_workers`` and extra kwargs such as ``device=`` and ``solver=`` forwarded,
+            with the cloud defaults when omitted: the service's only GPU and
+            the installed solver's commit, resolved once for all drives;
             ``path_dir`` is not a web concept and must be None). Any other
             callable is invoked as ``runner(simulations_dict)`` and must
             return a mapping ``driven-port name -> RunResult`` (or any
@@ -400,16 +515,44 @@ class SMatrixPlan:
                              errors=errors, simulations=sims)
 
 
+def _in_wire_frame(port: SMatrixPort, simulation) -> SMatrixPort:
+    """``port`` in the wire frame the mode solve, monitor and launch read: the
+    origin taken off a port in the user's frame (see "Port frames" above)."""
+    origin = _frame.frame_origin(simulation)
+    if not any(origin) or port.frame == "wire":
+        return port
+    if port.frame is None:
+        at = ", ".join(f"{o:.4g}" for o in origin)
+        raise ValueError(
+            f"port {port.name!r}: this simulation's stored coordinates start at "
+            f"origin_um = ({at}), not at your origin, so an SMatrixPort must say "
+            "which it is measured from. Pass frame='user' for your own coordinates, "
+            "the ones a ph.Port takes, or frame='wire' for coordinates with origin_um "
+            "already taken off, the way earlier versions read them")
+    h_name, v_name = _geom.in_plane_axes(port.axis)
+    center = port.center_um
+    if center is not None:
+        center = (float(center[0]) - origin[_AXIS_IDX[h_name]],
+                  float(center[1]) - origin[_AXIS_IDX[v_name]])
+    return replace(port, position_um=float(port.position_um) - origin[_AXIS_IDX[port.axis]],
+                   center_um=center, frame="wire")
+
+
 def _as_smatrix_port(port, simulation, freqs_hz, source_time) -> SMatrixPort:
-    """Accept a :class:`photonhub.Port` beside an :class:`SMatrixPort`: the
-    outward side and the mode window resolve as the Simulation's own port
-    layer resolves them, with the band centre taken from ``source_time`` or
-    the middle of ``freqs_hz``."""
-    from ..components.authoring import Port as _Port
+    """A port as the plan reads it, an :class:`SMatrixPort` in the wire frame.
+    A :class:`photonhub.Port` is taken into that frame before anything reads
+    it, so that its outward side and mode window resolve as the Simulation's
+    own port layer resolves them, with the band centre taken from
+    ``source_time`` or the middle of ``freqs_hz``."""
+    from ..components.authoring import HeldPort, Port as _Port
     from ..components import declarative as _decl
 
     if not isinstance(port, _Port):
-        return port
+        return _in_wire_frame(port, simulation)
+    # A port read back from a simulation is in the wire frame, and the mark
+    # stays on it through an edit, a rename and a copy. Any other is the user's.
+    if not isinstance(port, HeldPort):
+        port = _frame.translate(port, tuple(-o for o in _frame.frame_origin(simulation)))
     freqs = [float(f) for f in freqs_hz]
     f_c = (float(source_time.freq0_hz) if source_time is not None
            else 0.5 * (min(freqs) + max(freqs)))
@@ -425,7 +568,7 @@ def _as_smatrix_port(port, simulation, freqs_hz, source_time) -> SMatrixPort:
         port.monitor_name, port.axis, port.plane_um, out_dir, half_w, half_v,
         polarization=family, mode_index=index, center_um=port.hv_center_um(),
         dl_um=port.dl_um, source_offset_um=port.source_offset_um,
-        supersample=port.supersample, num_modes=port.num_modes)
+        supersample=port.supersample, num_modes=port.num_modes, frame="wire")
 
 
 def plan_smatrix(
@@ -450,9 +593,18 @@ def plan_smatrix(
         placeholders, each driven copy replaces them with that port's mode
         launch, and its ``monitors`` are dropped unless ``keep_monitors``.
     ports:
-        The port declarations (unique names): :class:`SMatrixPort` values, or
-        :class:`photonhub.Port` values, whose outward side and mode window
-        resolve as they do on a :class:`~photonhub.Simulation`.
+        The port declarations (unique names): :class:`photonhub.Port` values,
+        in your frame and at the same place as in ``Simulation(ports=...)``,
+        whose outward side and mode window resolve as they do there; or
+        :class:`SMatrixPort` values, which name their ``frame`` on a simulation
+        fitted with ``domain=``. A port in the half a symmetry plane mirrors
+        away raises ``ValueError``, where ``ports=`` reads it through its
+        image: use the image, or drop the symmetry. A port read from
+        ``sim.ports`` of this same simulation is in the wire frame and stands
+        as it is, also after a rename or an edit of its centre, which is in
+        that frame too. Such an edit keeps the port's ``out_direction``: moved
+        across the device, a port needs ``out_direction=None``. A new
+        :class:`photonhub.Port` built from its fields is in your frame.
     freqs_hz:
         Monitor frequencies for every port, the S-matrix's frequency axis.
     source_time:
@@ -512,6 +664,10 @@ def plan_smatrix(
         h_c, v_c = (p.center_um if p.center_um is not None
                     else _domain_center_hv(simulation, p.axis))
         centers[p.name] = (float(h_c), float(v_c))
+        _refuse_outside_domain(simulation, p.name, p.axis, p.position_um, "plane")
+        for letter, centre in zip(_geom.in_plane_axes(p.axis), centers[p.name]):
+            if getattr(simulation.boundaries, letter) not in ("periodic", "bloch"):   # a period wraps
+                _refuse_outside_domain(simulation, p.name, letter, centre, "centre")
         _warn_if_in_absorbing_layers(simulation, p.axis, p.position_um,
                                      f"port {p.name!r} plane")
         bank = solve_yee_mode_bank(
@@ -521,6 +677,7 @@ def plan_smatrix(
             dl_um=dl, supersample=p.supersample, num_modes=p.num_modes)
         banks[p.name] = bank
         centrals[p.name] = bank[f_central]
+        _warn_if_not_guided(simulation, p, centers[p.name], bank[f_central], f_central)
         # The readout frame (t1, t2) swaps the solve's (h, v) on a y-normal
         # port. Without a centre the monitor reads at the recorded plane's
         # mean coordinate, the domain centre (the bank's modes carry no solve
@@ -556,8 +713,10 @@ def plan_smatrix(
         length = simulation.size_um[_AXIS_IDX[p.axis]]
         if not (0.0 < src_pos < length):
             raise ValueError(
-                f"port {p.name!r}: launch plane {p.axis}={src_pos:.4g} um "
-                f"falls outside the domain (0, {length:.4g}) — reduce "
+                f"port {p.name!r}: launch plane {p.axis}="
+                f"{_user_um(simulation, p.axis, src_pos):.4g} um falls outside the "
+                f"domain ({_user_um(simulation, p.axis, 0.0):.4g}, "
+                f"{_user_um(simulation, p.axis, length):.4g}); reduce "
                 "source_offset_um or move the port plane inward")
         _warn_if_in_absorbing_layers(simulation, p.axis, src_pos,
                                      f"port {p.name!r} launch plane")
@@ -582,7 +741,7 @@ def plan_smatrix(
 
 def run_smatrix(
     simulation,
-    ports: Sequence[SMatrixPort],
+    ports: Sequence[Union[SMatrixPort, Any]],
     *,
     freqs_hz: Sequence[float],
     source_time: Optional[SourceTimeType] = None,

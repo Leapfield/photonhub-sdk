@@ -166,9 +166,10 @@ class BatchResults:
     """Results of a :meth:`Batch.run`. Dict-like over the **successful** runs
     (``batch_data[name]`` / ``items()`` / iteration), with failures captured in
     :attr:`errors`. Local failures are :class:`SolverRunError`; a remote batch
-    may also retain a resumable timeout carrying its service job id. Indexing a
-    failed name re-raises that exception; indexing an unknown name raises
-    ``KeyError``."""
+    may also retain a resumable timeout carrying its service job id, or a
+    :class:`~photonhub.data.SimulationMismatchError` when a job's saved
+    simulation is not the one submitted. Indexing a failed name re-raises that
+    exception; indexing an unknown name raises ``KeyError``."""
 
     def __init__(self, results: Dict[str, RunResult],
                  errors: Dict[str, Exception], path: Path,

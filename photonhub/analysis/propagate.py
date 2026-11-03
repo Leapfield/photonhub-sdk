@@ -21,6 +21,11 @@ homogeneous medium of index ``n`` filling the region swept by ``dz`` (in a
 dispersive medium, ``n(f)`` at each recorded frequency). Yee half-cell
 offsets of the two tangential E components are removed spectrally (exact),
 so the returned fields are node-collocated.
+
+For the field at arbitrary points of a parallel plane, with a zero padding
+that checks itself and falls back to a direct sum when the field does not
+decay inside it, see :func:`~photonhub.analysis.far_field` with
+``exact=True``.
 """
 
 from __future__ import annotations

@@ -87,6 +87,124 @@ Pass `data_checks=False` to `result_summary` to skip checks that read monitor
 data. `convergence_report` reads only `convergence.json` in that result
 directory; save a `ConvergenceReport` object's `to_dict()` there to attach one.
 
+## Far-field surfaces and projection
+
+Declare a `ph.FarFieldMonitor` before running. Keep every recorded face in
+one homogeneous, isotropic, lossless medium and outside the boundary layers.
+For a source enclosed in one medium, prefer a closed box:
+
+```python
+import photonhub as ph
+
+ff = ph.FarFieldMonitor.box(
+    "ff", center_um=(3, 3, 3), size_um=(2, 2, 2), wlens_um=1.55,
+)
+```
+
+For a device above a substrate, record separate planes in air and inside
+the substrate. These example coordinates assume a domain from 0 to 6 um,
+a substrate below z = 2 um and a source near z = 3 um. Include `up` and
+`down` in `ph.Simulation(monitors=[...])`, instead of a box that crosses
+the interface:
+
+```python
+up = ph.FarFieldMonitor.plane(
+    "up", axis="z", position_um=4.0, direction="+", wlens_um=1.55,
+    center_um=(3, 3, 4), size_um=(4, 4, 0), window=(0.2, 0.2),
+)
+down = ph.FarFieldMonitor.plane(
+    "down", axis="z", position_um=1.0, direction="-", wlens_um=1.55,
+    center_um=(3, 3, 1), size_um=(4, 4, 0), window=(0.2, 0.2),
+)
+```
+
+After the run, project the recorded `data`. Angles are radians: theta is
+from +z, phi from +x. `n_medium` is the refractive index, not permittivity;
+the saved recipe infers it when omitted. It does not transmit a field
+through an interface: each plane projects into its own medium.
+
+```python
+import numpy as np
+from photonhub.analysis import far_field
+
+phi = np.linspace(0, 2 * np.pi, 72, endpoint=False)
+theta = np.linspace(0, np.deg2rad(30), 31)
+air = far_field(data, "up", theta_rad=theta, phi_rad=phi, n_medium=1.0)
+sub = far_field(data, "down", theta_rad=np.pi - theta[::-1],
+                phi_rad=phi, n_medium=1.45)
+co_cross = air.polarization("ludwig3", boresight="+z", reference="x")
+sub_co_cross = sub.polarization("ludwig3", boresight="-z", reference="x")
+circular = air.polarization("circular")
+air_cone_w = air.dataset["radiated_power"]
+substrate_cone_w = sub.dataset["radiated_power"]
+```
+
+These grids integrate cones about +z and -z, not total radiated power.
+Use `dataset["intensity"]` (W/sr), `e_theta` and `e_phi` (V); results are
+labelled by `f`, `theta` and `phi`. Ludwig-3 gives `co` and `cross`;
+circular gives `right` and `left` with IEEE handedness for `exp(-i omega t)`.
+On an angle grid, Ludwig-3 defaults to boresight `"+z"` even for a downward
+plane, so it is undefined (`nan`) at theta = pi. Use `boresight="-z"` for
+the downward cone above. In general, Ludwig-3 is undefined opposite the
+chosen boresight.
+Power uses the solid-angle weight, so do not sum intensity samples directly.
+Refine the angular grid when checking a cone integral. Directivity on a
+partial grid is normalized to that grid's power; gain needs measured input
+power via `air.gain(input_power_w=...)`.
+
+An open surface truncates the field. Check plane size, edge window and
+position, especially above a substrate; a higher index has no measured
+accuracy bound here. `n_medium` and `exact=True` do not remove truncation
+or add a layered-medium model. Preserve the full result directory and its
+`client.json` so projection retains the surface recipe and medium.
+See the [far-field guide](https://leapfield.ai/docs/guides/far-field/)
+for the measured errors and their settings.
+
+## Cloud runs
+
+The same simulation, including `FarFieldMonitor` declarations, can run
+through `ph.cloud`; projection and polarization remain local postprocessing.
+No local solver is needed when an approved cloud solver commit is supplied
+explicitly. Configure the account as the
+[cloud guide](https://leapfield.ai/docs/guides/cloud/) describes, select a
+device as `"gpu:" + entry["id"]` from `ph.cloud.gpus()`, and pass it and the approved
+solver commit to `ph.cloud.preflight(sim, device=..., solver=..., max_usd=...)`.
+Preflight quotes without submitting; save its result as `pre`. Show the quote
+and obtain explicit spending approval, then bind the accepted quote:
+
+```python
+data = ph.cloud.run(sim, quote_id=pre.quote_id, device=pre.device,
+                    solver=pre.solver)
+```
+
+Keep `max_usd` on preflight; passing it alongside `quote_id` raises
+`ValueError`. The call returns a `RunResult` for
+the same analysis calls above. A wait timeout leaves the service job running;
+resume it or cancel it explicitly rather than submitting a duplicate.
+
+## Resonances from ring-down
+
+Record a `ph.TimeMonitor`, such as `probe` below, in the simulation before
+running. Fit only after all sources turn off. With the run's `sim`, the
+analysis chooses that start automatically:
+
+```python
+from photonhub.analysis import ResonanceAnalysis, select_resonances
+
+probe = ph.TimeMonitor(name="probe", center_um=(3.2, 3, 3), fields=["Ex"])
+# Include probe in sim.monitors before producing data.
+fit = ResonanceAnalysis(freq_window=(1.8e14, 2.1e14))
+modes = fit.run(data, "probe", fields=["Ex"], simulation=sim)
+selected = select_resonances(modes, freq_window=(1.8e14, 2.1e14))
+```
+
+The result is labelled by `freq` (Hz), with `decay`, `Q`, `amplitude`,
+`phase` and `error`. A fit can include spurious modes. Check a longer
+ring-down, later fit starts (`t_start` in seconds), mesh refinement and
+individual probes; their sum can cancel a mode. Keep monitor sampling
+uniform and its Nyquist frequency above the fit window. A fitted Q alone
+is not convergence evidence.
+
 ## Report numbers with their settings
 
 Report a physics number with:

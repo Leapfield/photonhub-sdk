@@ -21,6 +21,7 @@ from .grid import (
 from .medium import Background, Boundaries
 from .monitors import (
     Apodization,
+    FarFieldMonitor,
     ProfileMonitor,
     SnapshotMonitor,
     TimeMonitor,
@@ -71,6 +72,7 @@ __all__ = [
     "Box",
     "Cylinder",
     "FieldComponentName",
+    "FarFieldMonitor",
     "ProfileMonitor",
     "SnapshotMonitor",
     "TimeMonitor",

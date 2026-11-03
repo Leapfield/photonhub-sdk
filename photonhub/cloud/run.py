@@ -23,7 +23,7 @@ from typing import Callable, Optional
 from .._compat import caller_stacklevel
 from ..bundle import BundleError
 from ..capabilities import check_device_support
-from ..data import RunResult
+from ..data import RunResult, SimulationMismatchError
 from ..runners.batch import Job
 from ..runners.local import SolverRunError
 from . import cache
@@ -327,8 +327,21 @@ def _finish_cloud_job(http: HttpClient, cfg: CloudConfig, job_id: str, *,
     # id, so recover it from the spec stored at submit time. Both then restore
     # the first source's amplitude, and one paid job reads the same absolute
     # numbers whichever way it is collected.
-    if simulation is None:
+    from_stored = simulation is None
+    if from_stored:
         simulation = _stored_simulation(cfg, job_id)
+
+    def read(path) -> RunResult:
+        try:
+            return RunResult(path, simulation=simulation)
+        except SimulationMismatchError:
+            if not from_stored:
+                raise
+            # The caller passed nothing, so nothing of theirs is refused. The
+            # stored spec only stood in for the simulation; the document the
+            # bundle saved is what ran, and it reads the result correctly.
+            return RunResult(path)
+
     # A validated, sealed cache entry is exactly what a successful poll +
     # download would produce, so an already-fetched result loads without the
     # service round-trip. This keeps a paid, downloaded run loadable through
@@ -336,7 +349,9 @@ def _finish_cloud_job(http: HttpClient, cfg: CloudConfig, job_id: str, *,
     cached = cache.completed_result(cfg, job_id)
     if cached is not None:
         try:
-            return RunResult(cached, simulation=simulation)
+            return read(cached)
+        except SimulationMismatchError:
+            raise                        # the paid result is fine; keep it
         except (OSError, ValueError, KeyError, TypeError):
             # Corruption the structural seal cannot see: drop the entry and
             # re-fetch this already-paid job from the service.
@@ -351,7 +366,9 @@ def _finish_cloud_job(http: HttpClient, cfg: CloudConfig, job_id: str, *,
             exc.job_id = job_id
         raise
     try:
-        return RunResult(bundle_dir, simulation=simulation)
+        return read(bundle_dir)
+    except SimulationMismatchError:
+        raise                            # the paid result is fine; keep it
     except (OSError, ValueError, KeyError, TypeError) as exc:
         # Do not preserve a completion marker for outputs the public reader
         # rejects; resume can safely re-fetch this already-paid job.
@@ -363,14 +380,22 @@ def _finish_cloud_job(http: HttpClient, cfg: CloudConfig, job_id: str, *,
 
 def _bind_quote(http: HttpClient, sim, *, device, solver,
                 quote_id: Optional[str], max_usd: Optional[float],
-                preflight_wire: Optional[dict] = None):
+                preflight_wire: Optional[dict] = None,
+                defaults_resolved: bool = False):
     """``(device, solver, quote_id)`` to submit with. A caller's ``quote_id``
     is an accepted quote and is bound as given, and ``max_usd=None`` is the
     explicit unquoted opt-out; otherwise the job is quoted first, on the same
     client it is submitted with, and refused above ``max_usd`` or the
     account's available balance (:func:`~photonhub.cloud.preflight`). Every
-    refusal happens before any request."""
+    local refusal happens before any request.
+
+    A GPU device's defaults (:mod:`photonhub.cloud._defaults`) are resolved
+    here, once, unless the caller already did (``defaults_resolved``): the
+    quote and the submission then carry the same device and solver, and a
+    caller's ``quote_id`` from :func:`~photonhub.cloud.estimate` with the
+    same arguments meets the values it was quoted for."""
     from .actions import _finite_non_negative, _preflight
+    from ._defaults import resolve
 
     if max_usd is not None:
         _finite_non_negative(max_usd, "max_usd")
@@ -381,8 +406,12 @@ def _bind_quote(http: HttpClient, sim, *, device, solver,
                 "given, without quoting again, so no ceiling can be checked "
                 "against it; check its price with ph.cloud.preflight(sim, "
                 "max_usd=...) and pass the quote_id it returns")
+        if not defaults_resolved:
+            device, solver = resolve(http, device, solver)
         return device, solver, quote_id
     if max_usd is None:
+        if not defaults_resolved:
+            device, solver = resolve(http, device, solver)
         return device, solver, None
     if device is None:
         raise ValueError(
@@ -390,13 +419,16 @@ def _bind_quote(http: HttpClient, sim, *, device, solver,
             "'gpu' or name one, or pass max_usd=None to submit unquoted and "
             "let the service choose")
     accepted = _preflight(lambda: http, sim, device=device, solver=solver,
-                          max_usd=max_usd, preflight_wire=preflight_wire)
+                          max_usd=max_usd, preflight_wire=preflight_wire,
+                          resolve_defaults=not defaults_resolved)
     return accepted.device, accepted.solver, accepted.quote_id
 
 
 def _quoted(sim, *, device, solver, max_usd):
     """The accepted quote of :func:`run_quoted` and :func:`submit_quoted`,
-    and the wire document it priced, which is the one they submit."""
+    and the wire document it priced, which is the one they submit. The
+    accepted quote carries the resolved device and solver, which the
+    submission takes as they are."""
     from . import actions
 
     device = _validate_web_device(device)
@@ -429,7 +461,8 @@ def _cloud_run(sim, *, name=None, device=None, solver=None,
                quote_id: Optional[str] = None,
                cfg: Optional[CloudConfig] = None,
                max_usd: Optional[float] = None,
-               preflight_wire: Optional[dict] = None) -> RunResult:
+               preflight_wire: Optional[dict] = None,
+               defaults_resolved: bool = False) -> RunResult:
     device = _validate_web_device(device)
     wire = preflight_wire if preflight_wire is not None else _check_cloud_device_support(sim, device)
     sim.check_runnable()
@@ -439,7 +472,8 @@ def _cloud_run(sim, *, name=None, device=None, solver=None,
     http = HttpClient(cfg)
     device, solver, quote_id = _bind_quote(
         http, sim, device=device, solver=solver, quote_id=quote_id,
-        max_usd=max_usd, preflight_wire=wire)
+        max_usd=max_usd, preflight_wire=wire,
+        defaults_resolved=defaults_resolved)
     resp = http.submit_job(
         wire, name=name, device=device, solver=solver, quote_id=quote_id)
     job_id = _submitted_job_id(resp)
@@ -473,11 +507,16 @@ def run(sim, *, max_usd: Optional[float] = DEFAULT_MAX_USD, name=None,
     and billing**: ask the service to cancel it with
     ``ph.cloud.cancel(job_id)`` or collect it
     with :func:`resume`. ``timeout`` is its old name and warns. ``device``
-    defaults to ``"gpu"`` as in every cloud call; ``"gpu:<id>"`` picks a GPU
-    from :func:`~photonhub.cloud.gpus`. ``solver`` pins a solver version or
-    commit (default: latest). The check covers the quoted grid only: the
-    solver image that runs the job is versioned separately from the service
-    that quotes it."""
+    defaults to ``"gpu"`` as in every cloud call, which becomes the service's
+    GPU when :func:`~photonhub.cloud.gpus` lists exactly one; ``"gpu:<id>"``
+    picks one. On a GPU, ``solver`` defaults to the commit of the locally
+    installed solver (``photonhub which-solver --info``), which must be a
+    release solver reporting its full 40-character commit: a source build's
+    short id is refused before any request. Pass a commit to pin another
+    build. The service runs only builds it has approved for the GPU. The
+    quote and the submission carry the same device and solver. The check
+    covers the quoted grid only: the solver image that runs the job is
+    versioned separately from the service that quotes it."""
     return _cloud_run(sim, name=name, device=device, solver=solver,
                       progress=progress, timeout=wait_timeout_s,
                       quote_id=quote_id, max_usd=max_usd)
@@ -500,12 +539,13 @@ def run_quoted(sim, *, max_usd: float = DEFAULT_MAX_USD, name=None,
     with :class:`CloudError`; the solver image that runs the job is versioned
     separately, so this checks the quote, not the run.  The service remains
     the final authority for quote expiry and concurrent balance changes.
+    ``device`` and ``solver`` default as in :func:`run`.
     """
     accepted, wire = _quoted(sim, device=device, solver=solver, max_usd=max_usd)
     return _cloud_run(
         sim, name=name, device=accepted.device, solver=accepted.solver,
         progress=progress, timeout=wait_timeout_s, quote_id=accepted.quote_id,
-        preflight_wire=wire)
+        preflight_wire=wire, defaults_resolved=True)
 
 
 @_renamed_timeout
@@ -514,7 +554,8 @@ def submit(sim, *, max_usd: Optional[float] = DEFAULT_MAX_USD, name=None,
            progress: ProgressCb = None,
            wait_timeout_s: Optional[float] = None,
            quote_id: Optional[str] = None,
-           _preflighted_wire: Optional[dict] = None) -> Job:
+           _preflighted_wire: Optional[dict] = None,
+           _defaults_resolved: bool = False) -> Job:
     """Submit ``sim`` and return the same :class:`Job` handle type as local
     ``ph.submit`` once the service accepts the job. Polling and download
     continue in the background; collect with ``job.result()``.
@@ -522,7 +563,8 @@ def submit(sim, *, max_usd: Optional[float] = DEFAULT_MAX_USD, name=None,
     Spend-safe by default, exactly as :func:`run`: quoted first and refused
     above ``max_usd`` (default $5) or the available balance; a ``quote_id``
     you already accepted is bound as given; ``max_usd=None`` is the explicit
-    unquoted opt-out. ``job.cancel()`` asks the service to cancel the job and
+    unquoted opt-out. ``device`` and ``solver`` default as in :func:`run`.
+    ``job.cancel()`` asks the service to cancel the job and
     returns its reply; a service that refuses raises ``CloudError``, and the
     job keeps running.
     ``wait_timeout_s`` bounds only how long ``job.result()`` polls: the
@@ -538,7 +580,8 @@ def submit(sim, *, max_usd: Optional[float] = DEFAULT_MAX_USD, name=None,
     http = HttpClient(cfg)
     device, solver, quote_id = _bind_quote(
         http, sim, device=device, solver=solver, quote_id=quote_id,
-        max_usd=max_usd, preflight_wire=wire)
+        max_usd=max_usd, preflight_wire=wire,
+        defaults_resolved=_defaults_resolved)
     # Submit before returning so the handle owns the real service id. Transport
     # and authentication failures therefore surface synchronously, before a
     # background thread can hide them.
@@ -565,7 +608,8 @@ def submit_quoted(sim, *, max_usd: float = DEFAULT_MAX_USD, name=None,
     return submit(
         sim, name=name, device=accepted.device, solver=accepted.solver,
         progress=progress, wait_timeout_s=wait_timeout_s,
-        quote_id=accepted.quote_id, _preflighted_wire=wire)
+        quote_id=accepted.quote_id, _preflighted_wire=wire,
+        _defaults_resolved=True)
 
 
 @_renamed_timeout
@@ -590,7 +634,14 @@ def resume(job_id: str, *, simulation=None, progress: ProgressCb = None,
     machine, through a cache that has since been cleared, or by a submission
     whose response was lost has neither: pass ``simulation=`` then, and
     whenever you still hold the simulation. It takes precedence over the
-    stored spec. With neither, the frequency-domain arrays carry the engine's
+    stored spec, and it must be the simulation that ran: one that differs from
+    the ``sim.json`` in the job's bundle, from the stored spec when the bundle
+    has none and that spec is the input the job recorded, or else from the grid
+    its manifest recorded, raises
+    :class:`~photonhub.data.SimulationMismatchError`, and the cached result
+    stays. Passing nothing is never refused: where the job's
+    saved document differs from the stored spec, the job reads with what it
+    saved. With neither, the frequency-domain arrays carry the engine's
     unit-amplitude values and say so in their ``normalization`` attr, and the
     coordinates are the wire's corner frame."""
     if simulation is not None:

@@ -57,16 +57,16 @@ def coded_errors(fn):
     return wrapped
 
 
-def skill_text() -> str:
-    """Read the packaged skill, or return a short fallback for older builds."""
+def skill_text(name: str = "photonhub") -> str:
+    """Read a packaged skill, or return a short fallback for older builds."""
     try:
-        return read_skill()
+        return read_skill(name)
     except (FileNotFoundError, OSError):
         return "The PhotonHub agent skill file is not packaged in this build.\n"
 
 
 def register(mcp, get_current) -> None:
-    """Attach six structured tools and four read-only resources."""
+    """Attach six structured tools and five read-only resources."""
     from mcp.types import ToolAnnotations
 
     annotations = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
@@ -132,3 +132,8 @@ def register(mcp, get_current) -> None:
     def skill_resource() -> str:
         """The packaged agent skill text."""
         return skill_text()
+
+    @mcp.resource("photonhub://skill/import/SKILL.md", mime_type="text/markdown")
+    def import_skill_resource() -> str:
+        """The packaged skill for rebuilding a simulation from another tool."""
+        return skill_text("photonhub-import")

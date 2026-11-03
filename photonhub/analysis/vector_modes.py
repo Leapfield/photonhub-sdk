@@ -144,8 +144,15 @@ cell's +x face and ``Ey`` on the centre of its +y face, and each component sees
 its own permittivity sample. On a high-contrast rectangular core it converges
 faster under mesh refinement than the default method, which loses accuracy at
 the core's corners. The returned fields are co-located on the cell centres,
-like the default method's. It covers straight solves only; see
-:class:`VectorModeSolver` for its walls, mirror plane and limits.
+like the default method's. A bend is mapped onto a straight guide by
+transformation optics (A. J. Ward and J. B. Pendry, J. Mod. Opt. 43, 773
+(1996)): ``ε`` and ``μ`` are scaled by the radial factor ``q = (R + x)/R``
+at each field component's own lattice position, so no curvature term enters
+the operator, and absorbing x layers are a complex coordinate stretch folded
+into the same tensors. Bends and layers follow the default method's
+arguments, defaults and mode-selection rules; see
+:meth:`VectorModeSolver.solve` and :class:`VectorModeSolver` for its walls,
+mirror plane and limits.
 
 Group index
 ===========
@@ -168,7 +175,7 @@ Public API
   full-vector solve finds every mode; polarization is a property of the result.
   ``bend_radius_um`` switches on the bent/leaky solve.
 * ``method="yee"`` on the constructor and on ``from_rectangular_core`` selects
-  the Yee-lattice operator for straight solves.
+  the Yee-lattice operator, for straight and bent solves.
 * ``VectorModeSolver.solve_eme_basis(num_guided=1, num_radiation=0,
   num_evanescent=0, ...)``, a common-operator EME basis. Continuum requests
   use closed-box spectral seeds followed by four-sided complex-coordinate PML
@@ -264,7 +271,7 @@ SubpixelMethod = Literal["staircase", "volume", "tensor"]
 
 #: Cross-section discretization of :class:`VectorModeSolver`. ``"flm"`` (the
 #: default) is the Fallahkhair-Li-Murphy transverse-H operator; ``"yee"`` is
-#: the transverse-E operator on the staggered Yee lattice, straight solves only.
+#: the transverse-E operator on the staggered Yee lattice.
 ModeMethod = Literal["flm", "yee"]
 
 
@@ -283,6 +290,37 @@ class _YeeLattice(NamedTuple):
     v_bc: str
     lead_x: int
     lead_y: int
+
+
+class _YeeTransform(NamedTuple):
+    """Transformation-optics factors of ``method="yee"`` per lattice column.
+
+    ``s_*`` is the complex x stretch and ``q_*`` the radial factor ``q̃``, at
+    the x faces (``Ex``, ``Hy``, ``Hz``) and at the nodes (``Ey``, ``Ez``,
+    ``Hx``); ``interior_*`` marks the columns outside the absorbing layers,
+    where ``s == 1`` and ``q̃ == q`` exactly."""
+
+    s_face: np.ndarray
+    s_node: np.ndarray
+    q_face: np.ndarray
+    q_node: np.ndarray
+    interior_face: np.ndarray
+    interior_node: np.ndarray
+
+
+class _YeePair(NamedTuple):
+    """One eigenpair of the transformed Yee operator.
+
+    ``index`` is ``n_eff + i*k_eff`` (positive loss), ``mode`` the core's
+    lattice mode, ``vec`` its transverse E in the stretched coordinate
+    (``Ex / s``, ``Ey``), ``inner`` the part of ``vec`` outside the layers
+    and ``share`` that part's energy fraction."""
+
+    index: complex
+    mode: VectorMode
+    vec: np.ndarray
+    inner: np.ndarray
+    share: float
 
 
 #: Physical role of a mode in an EME basis.  ``solve()`` continues to return
@@ -927,10 +965,12 @@ class VectorModeSolver:
         (2.1e-4 for a 500 x 220 nm Si strip's TE0 at 5 nm cells). They carry
         ``yee_staggered=False`` like the default method's, so every consumer
         reads them as node-collocated fields and none mistakes them for modes
-        solved on a simulation's own grid. Limits: straight solves
-        only (``bend_radius_um``, ``num_pml`` and :meth:`solve_eme_basis`
-        raise ``NotImplementedError``; they are planned), square cells
-        (``dl_x_um == dl_y_um``) and ``x_symmetry="none"``. From a
+        solved on a simulation's own grid. Bends and absorbing x layers
+        (``bend_radius_um``, ``num_pml``) work as in the default method, by
+        transformation optics on the same lattice (see :meth:`solve`).
+        Limits: :meth:`solve_eme_basis` raises ``NotImplementedError`` (it
+        is planned), square cells (``dl_x_um == dl_y_um``) and
+        ``x_symmetry="none"``. From a
         cell-centred ``eps`` (or ``eps_tensor``) the staggered values are
         derived from the cells: εzz is the cell's value and εxx at a face the
         harmonic mean of the two cells sharing that x face, εyy likewise across
@@ -953,6 +993,16 @@ class VectorModeSolver:
         faces repeat the sample of the same cell's +x (+y) face, which is
         exact only when the material is uniform across both cells, so pass
         it when geometry touches the window's low x or y edge.
+    yee_periodic:
+        ``(periodic_x, periodic_y)``, default ``(False, False)``: close that
+        axis periodically across the window (k = 0) instead of meeting
+        electric walls, as :meth:`from_rectangular_core` does for a core as
+        wide (tall) as the window. The structure must then be invariant along
+        that axis (a ``ValueError`` names the array that is not); its modes
+        come out uniform along it, both slab polarizations included, so a
+        slab whose two claddings differ can be built from an array. A
+        periodic x axis takes no ``x_min_symmetry``, bend or absorbing x
+        layers. Only with ``method="yee"``.
     """
 
     #: Speed of light in vacuum (m/s), matching :mod:`photonhub.analysis.modes`.
@@ -978,6 +1028,7 @@ class VectorModeSolver:
         yee_eps_tensor: Optional[
             Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
         yee_eps_outer: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+        yee_periodic: tuple[bool, bool] = (False, False),
     ) -> None:
         eps_arr = np.asarray(eps, dtype=float)
         if eps_arr.ndim != 2:
@@ -1038,16 +1089,29 @@ class VectorModeSolver:
         # method="yee": permittivity at the Yee positions of each cell (εxx on
         # its +x face, εyy on its +y face, εzz at its centre), the -x face of
         # column 0 and the -y face of row 0, and which axes close periodically
-        # (a slab spanning the window, set by from_rectangular_core).
+        # (a slab spanning the window).
         self._yee_samples: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
         self._yee_outer: Optional[Tuple[np.ndarray, np.ndarray]] = None
-        self._yee_periodic: Tuple[bool, bool] = (False, False)
+        try:
+            periodic_x, periodic_y = yee_periodic
+        except (TypeError, ValueError):
+            raise ValueError(
+                "yee_periodic must be a pair (periodic_x, periodic_y), got "
+                f"{yee_periodic!r}") from None
+        self._yee_periodic: tuple[bool, bool] = (bool(periodic_x),
+                                                 bool(periodic_y))
         if method == "flm":
-            if yee_eps_tensor is not None or yee_eps_outer is not None:
+            if (yee_eps_tensor is not None or yee_eps_outer is not None
+                    or any(self._yee_periodic)):
                 raise ValueError(
-                    "yee_eps_tensor and yee_eps_outer are used only with "
-                    "method='yee'")
+                    "yee_eps_tensor, yee_eps_outer and yee_periodic are used "
+                    "only with method='yee'")
             return
+        if self._yee_periodic[0] and x_min_symmetry is not None:
+            raise ValueError(
+                "x_min_symmetry needs walls along x; a periodic x axis "
+                "(yee_periodic[0]) is an x-invariant slab, which method='yee' "
+                "solves without a mirror plane")
         if self.dl_x_um != self.dl_y_um:
             raise ValueError(
                 "method='yee' needs square cells (dl_x_um == dl_y_um), got "
@@ -1061,6 +1125,7 @@ class VectorModeSolver:
             if yee_eps_outer is not None:
                 raise ValueError("yee_eps_outer needs yee_eps_tensor")
             self._yee_samples, self._yee_outer = self._yee_samples_from_cells()
+            self._check_yee_periodic_invariance()
             return
         comps = tuple(np.asarray(c, dtype=float) for c in yee_eps_tensor)
         if len(comps) != 3 or any(c.shape != eps_arr.shape for c in comps):
@@ -1072,6 +1137,7 @@ class VectorModeSolver:
         self._yee_samples = comps
         if yee_eps_outer is None:
             self._yee_outer = (comps[0][:, 0].copy(), comps[1][0, :].copy())
+            self._check_yee_periodic_invariance()
             return
         outer = tuple(np.asarray(c, dtype=float) for c in yee_eps_outer)
         if (len(outer) != 2 or outer[0].shape != (eps_arr.shape[0],)
@@ -1083,6 +1149,39 @@ class VectorModeSolver:
         if any(not np.all(np.isfinite(c)) or np.any(c < 1.0) for c in outer):
             raise ValueError("yee_eps_outer samples must be finite and >= 1")
         self._yee_outer = outer
+        self._check_yee_periodic_invariance()
+
+    def _check_yee_periodic_invariance(self) -> None:
+        """Refuse a periodic axis along which the structure varies: ``eps``,
+        the cell tensor and the Yee samples must repeat their first column
+        (periodic x) or row (periodic y), and the low-edge εxx (εyy) sample
+        must be constant along y (x), each to 1e-12 of its largest value."""
+        per_x, per_y = self._yee_periodic
+        if not (per_x or per_y):
+            return
+        arrays = {"eps": self.eps}
+        if self._is_tensor:
+            arrays.update({"eps_tensor εxx": self._exx, "eps_tensor εyy": self._eyy,
+                           "eps_tensor εzz": self._ezz})
+        arrays.update(zip(("yee εxx", "yee εyy", "yee εzz"), self._yee_samples))
+        checks = []
+        if per_x:
+            checks += [(name, a, 1, "x") for name, a in arrays.items()]
+            checks.append(("yee_eps_outer εyy (row 0's -y face)",
+                           self._yee_outer[1], 0, "x"))
+        if per_y:
+            checks += [(name, a, 0, "y") for name, a in arrays.items()]
+            checks.append(("yee_eps_outer εxx (column 0's -x face)",
+                           self._yee_outer[0], 0, "y"))
+        for name, values, axis, along in checks:
+            values = np.asarray(values)
+            spread = float(np.max(np.abs(values - np.take(values, [0], axis=axis))))
+            if spread > 1e-12 * float(np.max(np.abs(values))):
+                index = 0 if along == "x" else 1
+                raise ValueError(
+                    f"yee_periodic[{index}] closes {along} periodically, so the "
+                    f"structure must be invariant along {along}; {name} varies "
+                    f"along it by up to {spread:.3g}")
 
     def _yee_samples_from_cells(self):
         """Yee-position permittivity derived from the cell-centred tensor:
@@ -1117,8 +1216,8 @@ class VectorModeSolver:
                 self.x_symmetry, eps_tensor=eps_tensor,
                 x_min_symmetry=self.x_min_symmetry, method="yee",
                 yee_eps_tensor=self._yee_samples, yee_eps_outer=self._yee_outer,
+                yee_periodic=self._yee_periodic,
             )
-            sibling._yee_periodic = self._yee_periodic
             return sibling
         return VectorModeSolver(
             self.eps, self.dl_x_um, self.dl_y_um, wlen_um,
@@ -1305,11 +1404,10 @@ class VectorModeSolver:
                 eps = eps[:, c0:]
                 samples = tuple(s[:, c0:] for s in samples)
                 outer = (outer[0], outer[1][c0:])
-            solver = cls(eps, dl_um, dl_um, wlen_um,
-                         x_min_symmetry=x_min_symmetry, method="yee",
-                         yee_eps_tensor=samples, yee_eps_outer=outer)
-            solver._yee_periodic = (slab_x, slab_y)
-            return solver
+            return cls(eps, dl_um, dl_um, wlen_um,
+                       x_min_symmetry=x_min_symmetry, method="yee",
+                       yee_eps_tensor=samples, yee_eps_outer=outer,
+                       yee_periodic=(slab_x, slab_y))
 
         if subpixel and subpixel_method == "tensor":
             eps, tensor = cls._kfj_tensor_rect(
@@ -2037,32 +2135,38 @@ class VectorModeSolver:
         like any other. Widen the window and vary layer thickness when
         quantitative loss matters.
 
-        With ``method="yee"`` the solve is the straight transverse-E
-        eigenproblem on the Yee lattice: ``n_guess`` sets its shift
-        (default the largest sampled index), ``group_index`` uses the same
-        central difference with the permittivity samples unchanged, and
-        ``bend_radius_um`` or ``num_pml > 0`` raise ``NotImplementedError``
-        (planned). Modes above the smallest sampled index are returned, with
-        ``k_eff == 0`` and their fields co-located on the cell centres."""
+        With ``method="yee"`` the solve is the transverse-E eigenproblem on
+        the Yee lattice. Without a bend or layers, ``n_guess`` sets its shift
+        (default the largest sampled index), modes above the smallest sampled
+        index are returned with ``k_eff == 0``, and ``group_index`` uses the
+        same central difference with the permittivity samples unchanged.
+
+        A bend or ``num_pml > 0`` keeps every argument's meaning, default,
+        check and the selection rules above, on a transformed operator. The
+        bend becomes a straight guide along ``w = R φ`` with
+        ``ε' = ε diag(q, q, 1/q)`` and ``μ' = diag(q, q, 1/q)`` in
+        ``(x, y, w)``, ``q = (R + x)/R``, each factor taken at its own
+        component's x: the cell's x face for ``Ex``, ``Hy``, ``Hz``, its
+        centre for ``Ey``, ``Ez``, ``Hx``. The layers stretch x by
+        ``s = 1 - i·pml_strength·ξ³`` (``ξ`` the depth into the
+        ``num_pml``-cell layer, 0 on its inner face, 1 on the outer edge of
+        the ε grid), entering as ``diag(1/s, s, s)``. In the outer layer,
+        where the bend radiates, ``q`` is continued to the stretched radius,
+        ``(R + x̃)/R`` with ``x̃ = ∫₀ˣ s dx'``; the inner layer keeps the real
+        ``q``. Outside the layers ``s = 1`` and ``q`` is real, exactly. The
+        returned fields are the physical ones: ``ex``/``hx`` radial and
+        ``ey``/``hy`` vertical as transformed (divided by ``s`` inside a
+        layer), ``ez = E_φ = E'w / q`` and ``hz = H_φ = H'w / q`` with ``q``
+        at the component's own position, all then co-located on the cell
+        centres; they keep the eigenpair's complex β. Without a bend the map
+        is the layers alone (``q = 1``). Interior energy shares use the
+        transverse E of the eigenvector (``Ex / s``, ``Ey``) in place of the
+        transverse H."""
         if num_modes < 1:
             raise ValueError("num_modes must be >= 1")
         if self.method == "yee":
-            if bend_radius_um is not None:
-                raise NotImplementedError(
-                    "method='yee' solves straight cross-sections only; bent "
-                    "solves on the Yee lattice are planned. Use the default "
-                    "method='flm' for a bend.")
-            if num_pml != 0:
-                raise NotImplementedError(
-                    "method='yee' has no absorbing x layers yet (planned); "
-                    "solve with num_pml=0, or use the default method='flm' "
-                    "for a layered straight solve.")
-            modes = self._solve_yee_at(self.wavelength_um, num_modes, n_guess)
-            if not group_index:
-                return modes
-            nm = max(num_modes + 2, len(modes) + 2)
-            return self._with_group_index(
-                modes, lambda wl: self._solve_yee_at(wl, nm, n_guess))
+            return self._solve_yee(num_modes, n_guess, group_index,
+                                   bend_radius_um, num_pml, pml_strength)
         if bend_radius_um is not None and bend_radius_um == 0.0:
             raise ValueError(
                 "bend_radius_um must be nonzero (use None for a straight guide)")
@@ -2113,6 +2217,68 @@ class VectorModeSolver:
             modes, lambda wl: self._solve_at(wl, nm, n_guess, bend_radius_um,
                                              num_pml, pml_strength,
                                              check_bend_loss=False))
+
+    def _solve_yee(
+        self,
+        num_modes: int,
+        n_guess: float | None,
+        group_index: bool,
+        bend_radius_um: float | None,
+        num_pml: int,
+        pml_strength: float,
+    ) -> tuple[VectorMode, ...]:
+        """:meth:`solve` for ``method="yee"``, with the default method's
+        checks, layer defaults and group index. Without a bend or layers it
+        is the straight lattice solve; otherwise :meth:`_solve_yee_leaky_at`
+        maps the cross-section to a straight guide (:meth:`_yee_transform`)."""
+        if bend_radius_um is not None and bend_radius_um == 0.0:
+            raise ValueError(
+                "bend_radius_um must be nonzero (use None for a straight guide)")
+        if num_pml < 0:
+            raise ValueError("num_pml must be >= 0")
+        leaky = bend_radius_um is not None or num_pml > 0
+        if self.x_min_symmetry is not None and leaky:
+            raise ValueError(
+                "x_min_symmetry supports only the straight PML-free solve: a "
+                "bend is not mirror symmetric about the width centre, and the "
+                "x PML would cover the mirror plane")
+        if leaky and self._yee_periodic[0]:
+            raise ValueError(
+                "the x axis closes periodically (yee_periodic[0], or a core as "
+                "wide as the window in from_rectangular_core), so it has no x "
+                "edges for a bend or absorbing x layers; give the cross-section "
+                "electric x walls")
+        nx = self.eps.shape[1]
+        if (bend_radius_um is not None and
+                abs(bend_radius_um) < nx * self.dl_x_um / 2 + self.dl_x_um):
+            raise ValueError(
+                f"bend radius |R|={abs(bend_radius_um):g} um must be at least "
+                f"W/2 + dl={nx * self.dl_x_um / 2 + self.dl_x_um:g} um "
+                f"(W/2={nx * self.dl_x_um / 2:g} um, "
+                f"dl={self.dl_x_um:g} um)")
+        if not leaky:
+            modes = self._solve_yee_at(self.wavelength_um, num_modes, n_guess)
+            if not group_index:
+                return modes
+            nm = max(num_modes + 2, len(modes) + 2)
+            return self._with_group_index(
+                modes, lambda wl: self._solve_yee_at(wl, nm, n_guess))
+        auto_added_layers = bend_radius_um is not None and num_pml == 0
+        if auto_added_layers:
+            num_pml = max(6, nx // 4)
+            pml_strength = 30.0
+        modes = self._solve_yee_leaky_at(
+            self.wavelength_um, num_modes, n_guess, bend_radius_um, num_pml,
+            pml_strength, warn_on_shortage=True,
+            auto_added_layers=auto_added_layers)
+        if not group_index:
+            return modes
+        # The material map is wavelength independent, so the side solves see
+        # the same samples, stretch and radial factors.
+        return self._with_group_index(
+            modes, lambda wl: self._solve_yee_leaky_at(
+                wl, num_modes, n_guess, bend_radius_um, num_pml, pml_strength,
+                check_bend_loss=False))
 
     def _with_group_index(
         self,
@@ -2632,15 +2798,8 @@ class VectorModeSolver:
         lat = self._yee_lattice()
         nv, nh = lat.exx.shape
         n = nh * nv
-        if n > self.MAX_UNKNOWNS:
-            raise ValueError(
-                f"Yee lattice is {nh}x{nv} = {n} nodes (2N = {2 * n} "
-                f"eigenproblem), exceeding MAX_UNKNOWNS={self.MAX_UNKNOWNS}. "
-                "Coarsen the grid or shrink the window.")
-        every = np.concatenate((lat.exx.ravel(), lat.eyy.ravel(),
-                                lat.ezz.ravel()))
-        n_min = float(np.sqrt(every.min()))
-        n_max = float(np.sqrt(every.max()))
+        self._check_yee_size(nh, nv)
+        n_min, n_max = self._yee_index_bounds(lat)
 
         def flat(a: np.ndarray) -> np.ndarray:      # [iv, ih] -> [ih*nv + iv]
             return np.ascontiguousarray(a.T).ravel()
@@ -2722,6 +2881,398 @@ class VectorModeSolver:
             x_min_plane_on_node=self.x_min_symmetry is not None,
             **{name: value * scale for name, value in fields.items()})
 
+    def _check_yee_size(self, nh: int, nv: int) -> None:
+        n = nh * nv
+        if n > self.MAX_UNKNOWNS:
+            raise ValueError(
+                f"Yee lattice is {nh}x{nv} = {n} nodes (2N = {2 * n} "
+                f"eigenproblem), exceeding MAX_UNKNOWNS={self.MAX_UNKNOWNS}. "
+                "Coarsen the grid or shrink the window.")
+
+    @staticmethod
+    def _yee_index_bounds(lat: _YeeLattice) -> tuple[float, float]:
+        """Smallest and largest index of the lattice's permittivity samples."""
+        every = np.concatenate((lat.exx.ravel(), lat.eyy.ravel(),
+                                lat.ezz.ravel()))
+        return float(np.sqrt(every.min())), float(np.sqrt(every.max()))
+
+    # -- method="yee": bends and absorbing x layers by transformation optics
+
+    def _yee_transform(
+        self,
+        lat: _YeeLattice,
+        bend_radius_um: float | None,
+        num_pml: int,
+        pml_strength: float,
+    ) -> _YeeTransform:
+        """Stretch and radial factor at every lattice column.
+
+        A bend of radius ``R`` is the straight guide along ``w = R φ`` with
+        ``ε' = ε diag(q, q, 1/q)`` and ``μ' = diag(q, q, 1/q)`` in
+        ``(x, y, w)``, ``q = (R + x)/R`` (A. J. Ward and J. B. Pendry, J. Mod.
+        Opt. 43, 773 (1996)). The absorbing layers stretch x by
+        ``s = 1 - i·pml_strength·ξ³``, ``ξ`` the depth from 0 on a layer's
+        inner face to 1 on the raster's outer face, ``num_pml`` cells on each
+        x end. That is the default method's thickness, strength and cubic
+        profile, but ``ξ`` here is continuous at each component's x, where
+        the default steps it per cell as ``(k + 1)/num_pml``; the default's
+        integrated stretch is ``(1 + 1/num_pml)²`` times this one's (27%
+        more at 8 cells, 8% at 24), so its half-strength flags can differ.
+        The sign makes outgoing radiation decay in this lattice's
+        ``exp(+iωt - iβz)`` phasor, so a radiating bend has positive loss.
+        Inside the outer layer (``x/R > 0``) the radial factor is analytically
+        continued, ``q̃ = (R + x̃)/R`` with ``x̃ = ∫₀ˣ s dx'`` (F. L. Teixeira
+        and W. C. Chew, IEEE Microwave Guided Wave Lett. 7, 371 (1997)); a
+        real ``q`` there misreads the loss by about 9% on a leaky slab. The
+        inner layer, toward the bend centre, keeps the real ``q``: the field
+        there is evanescent, and with ``q̃`` a layer over 0.5 µm thick on that
+        slab moved most of the pair's energy against the inner wall. Outside
+        the layers ``s = 1`` and ``q̃ = q`` exactly. Each factor is taken at
+        its own component's x: the faces carry ``Ex``, ``Hy`` and ``Hz``, the
+        nodes ``Ey``, ``Ez`` and ``Hx``. Without a bend ``q̃ = 1``. Positions are
+        integer multiples of half a cell from the raster centre, so ``±R``
+        give mirror-image factors to the last bit."""
+        nh = lat.exx.shape[1]
+        nx = self.eps.shape[1]
+        # Half-cell index from the raster centre: node k is the centre of ε
+        # column k - lead_x, face k that column's +x face.
+        m_node = 2.0 * (np.arange(nh) - lat.lead_x) - (nx - 1)
+        m_face = m_node + 1.0
+        layers = min(num_pml, nx // 2)
+        thickness_um = layers * self.dl_x_um
+
+        def factors(m: np.ndarray):
+            if layers > 0:
+                xi = (np.maximum(np.abs(m) - (nx - 2 * layers), 0.0)
+                      / (2 * layers))
+            else:
+                xi = np.zeros_like(m)
+            s = 1.0 - 1j * pml_strength * xi ** 3
+            interior = xi == 0.0
+            if bend_radius_um is None:
+                return s, np.ones(m.shape, dtype=complex), interior
+            radius = float(bend_radius_um)
+            q = (radius + m * (0.5 * self.dl_x_um)) / radius
+            # Im x̃ = ∫ Im(s) dx' from the layer's inner face, -σ·L·ξ⁴/4 on
+            # the +x side, zero outside the layers. Only the outer layer
+            # (x/R > 0), where the bend radiates, continues q: toward the bend
+            # centre the field is evanescent, and a complex radius there lets
+            # the branch that grows toward the wall into the mode.
+            outer = np.sign(m) == np.sign(radius)
+            im_x = np.where(
+                outer, -np.sign(m) * pml_strength * thickness_um * xi ** 4 / 4.0,
+                0.0)
+            return s, q + 1j * (im_x / radius), interior
+
+        s_face, q_face, interior_face = factors(m_face)
+        s_node, q_node, interior_node = factors(m_node)
+        return _YeeTransform(s_face, s_node, q_face, q_node, interior_face,
+                             interior_node)
+
+    @staticmethod
+    def _yee_transformed_media(lat: _YeeLattice, tr: _YeeTransform):
+        """``(ε', μ')`` on the lattice, ``[iv, ih]``: ``ε'xx = εxx q̃/s`` at
+        ``Ex``, ``ε'yy = εyy s q̃`` at ``Ey``, ``ε'zz = εzz s/q̃`` at ``Ez``;
+        ``μ'xx = q̃/s`` at ``Hx``, ``μ'yy = s q̃`` at ``Hy``, ``μ'zz = s/q̃``
+        at ``Hz``. The stretch enters as the uniaxial tensor
+        ``diag(1/s, s, s)`` of an x-stretched coordinate."""
+        def columns(values: np.ndarray) -> np.ndarray:
+            return np.broadcast_to(values[None, :], lat.exx.shape)
+
+        eps = (lat.exx * columns(tr.q_face / tr.s_face),
+               lat.eyy * columns(tr.s_node * tr.q_node),
+               lat.ezz * columns(tr.s_node / tr.q_node))
+        mu = (columns(tr.q_node / tr.s_node),
+              columns(tr.s_face * tr.q_face),
+              columns(tr.s_face / tr.q_face))
+        return eps, mu
+
+    def _yee_eigs(
+        self,
+        wavelength_um: float,
+        nmodes: int,
+        target: float,
+        lat: _YeeLattice,
+        tr: _YeeTransform,
+    ) -> list[_YeePair]:
+        """The ``nmodes`` eigenpairs of the transformed operator nearest
+        ``target`` (shift ``-target²``), each with its interior energy share:
+        the fraction of the stretched-coordinate transverse-E energy
+        (``|Ex/s|² + |Ey|²``) outside the layers. As in the default method,
+        an eigensolve that stops short keeps the pairs that converged, and
+        one that fails returns none."""
+        from .yee_mode import _solve_yee_eig
+
+        nv, nh = lat.exx.shape
+        eps, mu = self._yee_transformed_media(lat, tr)
+
+        def flat(a: np.ndarray) -> np.ndarray:      # [iv, ih] -> [ih*nv + iv]
+            return np.ascontiguousarray(np.asarray(a).T).ravel()
+
+        try:
+            raw = _solve_yee_eig(
+                *(flat(a) for a in eps), nh, nv, wavelength_um,
+                self.dl_x_um, nmodes, h_min_bc=lat.h_bc, v_min_bc=lat.v_bc,
+                min_neff=0.0, n_guess=float(target),
+                mu=tuple(flat(a) for a in mu))
+        except (_spla.ArpackError, RuntimeError):
+            return []
+        pairs = []
+        for mode in raw:
+            ex = np.asarray(mode.ex) / tr.s_face[None, :]
+            ey = np.asarray(mode.ey)
+            px, py = np.abs(ex) ** 2, np.abs(ey) ** 2
+            total = float(px.sum() + py.sum())
+            inside = float(px[:, tr.interior_face].sum()
+                           + py[:, tr.interior_node].sum())
+            pairs.append(_YeePair(
+                complex(mode.n_eff, mode.k_eff), mode,
+                np.concatenate((ex.ravel(), ey.ravel())),
+                np.concatenate((ex[:, tr.interior_face].ravel(),
+                                ey[:, tr.interior_node].ravel())),
+                inside / total if total > 0.0 else 0.0))
+        return pairs
+
+    def _yee_layered_straight_pairs(
+        self,
+        wavelength_um: float,
+        num_modes: int,
+        n_guess: float | None,
+        num_pml: int,
+        pml_strength: float,
+        rejected: list[tuple[float, float, float | None]] | None = None,
+    ) -> list[tuple[_YeePair, float]]:
+        """:meth:`_layered_straight_pairs` on the Yee lattice: the same
+        anchor, search size, eligibility, half-strength check, duplicate
+        rule and order, on the transverse-E eigenvector.
+        Returns ``(pair, half-strength movement)``."""
+        lat = self._yee_lattice()
+        nv, nh = lat.exx.shape
+        n_min, n_max = self._yee_index_bounds(lat)
+        if n_guess is None:
+            reference = self._solve_yee_at(wavelength_um, 1, None)
+            if not reference:
+                return []
+            n_guess = reference[0].n_eff
+        k_req = max(1, min(2 * nh * nv - 2, max(32, 2 * num_modes)))
+        pairs = self._yee_eigs(
+            wavelength_um, k_req, n_guess, lat,
+            self._yee_transform(lat, None, num_pml, pml_strength))
+        eligible = [j for j, pair in enumerate(pairs)
+                    if n_min ** 2 < (pair.index ** 2).real <= n_max ** 2
+                    and pair.share >= _STRAIGHT_MIN_INTERIOR_SHARE]
+        if not eligible:
+            return []
+        movement = np.zeros(len(pairs))
+        if any(pairs[j].share < _STRAIGHT_SKIP_HALF_SHARE for j in eligible):
+            half = self._yee_eigs(
+                wavelength_um, k_req, n_guess, lat,
+                self._yee_transform(lat, None, num_pml, 0.5 * pml_strength))
+            checked = []
+            for col in eligible:
+                pair = pairs[col]
+                overlaps = [self._field_overlap(pair.vec, other.vec)
+                            for other in half]
+                if not overlaps:
+                    if pair.share >= _STRAIGHT_SKIP_HALF_SHARE:
+                        checked.append(col)
+                    elif rejected is not None:
+                        rejected.append((pair.index.real, pair.share, None))
+                    continue
+                partner = int(np.argmax(overlaps))
+                movement[col] = abs(pair.index.real - half[partner].index.real)
+                if (overlaps[partner] >= _HALF_PARTNER_MIN_OVERLAP and
+                        movement[col] <= _STRAIGHT_MAX_REAL_INDEX_MOVE):
+                    checked.append(col)
+                elif rejected is not None:
+                    rejected.append((pair.index.real, pair.share,
+                                     float(movement[col])))
+            eligible = checked
+        selected: list[int] = []
+        for col in sorted(eligible,
+                          key=lambda j: (movement[j], -pairs[j].index.real)):
+            if all(self._field_overlap(pairs[col].vec, pairs[old].vec) <=
+                   _DUPLICATE_MIN_OVERLAP for old in selected):
+                selected.append(col)
+        selected.sort(key=lambda j: -pairs[j].index.real)
+        return [(pairs[j], float(movement[j])) for j in selected]
+
+    def _solve_yee_leaky_at(
+        self,
+        wavelength_um: float,
+        num_modes: int,
+        n_guess: float | None,
+        bend_radius_um: float | None,
+        num_pml: int,
+        pml_strength: float,
+        warn_on_shortage: bool = False,
+        auto_added_layers: bool = False,
+        check_bend_loss: bool = True,
+    ) -> tuple[VectorMode, ...]:
+        """``method="yee"`` solve with absorbing x layers, straight or bent,
+        at one wavelength: the default method's selection (:meth:`_solve_at`)
+        on the transformed lattice operator. A straight solve
+        returns the selected layered pairs. A bend anchors one 32-pair search
+        at each straight pair of the same window and layers, keeps candidates
+        with ``n_min < Re n <= 1.5 n_max`` and interior share at least 0.5,
+        assigns them one to one to the straight modes by interior overlap
+        times the square root of the share, orders them by real index, clamps
+        negative attenuation and flags ``loss_unresolved`` by the caustic and
+        half-strength tests."""
+        lat = self._yee_lattice()
+        nv, nh = lat.exx.shape
+        self._check_yee_size(nh, nv)
+        n_min, n_max = self._yee_index_bounds(lat)
+        if bend_radius_um is None:
+            rejected: list[tuple[float, float, float | None]] = []
+            pairs = self._yee_layered_straight_pairs(
+                wavelength_um, num_modes, n_guess, num_pml, pml_strength,
+                rejected)
+            tr = self._yee_transform(lat, None, num_pml, pml_strength)
+            out = [self._yee_leaky_public_mode(
+                pair, lat, tr, None, num_pml,
+                window_limited=pair.share < _STRAIGHT_WINDOW_LIMIT_SHARE)
+                for pair, _ in pairs[:num_modes]]
+            if warn_on_shortage:
+                notices = self._straight_layer_notices(rejected, out, num_modes)
+                if notices:
+                    warnings.warn(" ".join(notices), RuntimeWarning,
+                                  stacklevel=caller_stacklevel())
+            return tuple(out)
+
+        rejected = []
+        straight = self._yee_layered_straight_pairs(
+            wavelength_um, max(2, num_modes), n_guess if num_pml else None,
+            num_pml, pml_strength, rejected)
+        if not straight:
+            if warn_on_shortage:
+                warnings.warn(
+                    self._no_straight_partner_notice(
+                        rejected, auto_added_layers, num_modes),
+                    RuntimeWarning, stacklevel=caller_stacklevel(),
+                )
+            return ()
+        tr = self._yee_transform(lat, bend_radius_um, num_pml, pml_strength)
+        k_req = max(1, min(2 * nh * nv - 2, 32))
+        candidates: list[_YeePair] = []
+        for anchor, _ in straight:
+            for pair in self._yee_eigs(wavelength_um, k_req, anchor.index.real,
+                                       lat, tr):
+                if not (n_min < pair.index.real <= 1.5 * n_max and
+                        pair.share >= _BEND_MIN_INTERIOR_SHARE):
+                    continue
+                if any(abs(pair.index - old.index) < 1e-9 and
+                       self._field_overlap(pair.vec, old.vec) > 0.99
+                       for old in candidates):
+                    continue
+                candidates.append(pair)
+        scores = []
+        for j, pair in enumerate(candidates):
+            norm = np.linalg.norm(pair.inner)
+            for i, (anchor, _) in enumerate(straight):
+                denominator = np.linalg.norm(anchor.inner) * norm
+                projection = (float(abs(np.vdot(anchor.inner, pair.inner)) /
+                                    denominator) if denominator else 0.0)
+                if projection >= _BEND_MIN_STRAIGHT_PROJECTION:
+                    scores.append((projection * np.sqrt(pair.share), i, j))
+        used_straight: set[int] = set()
+        used_candidates: set[int] = set()
+        assigned: list[tuple[_YeePair, int]] = []
+        for _, i, j in sorted(scores, reverse=True):
+            if i in used_straight or j in used_candidates:
+                continue
+            used_straight.add(i)
+            used_candidates.add(j)
+            assigned.append((candidates[j], i))
+        assigned.sort(key=lambda item: -item[0].index.real)
+        out: list[VectorMode] = []
+        unresolved_reasons: list[str] = []
+        n_out, layer_start_um, airy_um = self._bend_caustic_geometry(
+            wavelength_um, bend_radius_um, num_pml)
+        half_tr = None
+        for mode_number, (pair, partner) in enumerate(assigned[:num_modes], 1):
+            # PML floor noise can put a passive pair just below zero loss.
+            loss = max(0.0, pair.index.imag)
+            caustic_um = abs(bend_radius_um) * (pair.index.real / n_out - 1)
+            caustic_unresolved = (layer_start_um - caustic_um <
+                                  _BEND_MIN_CAUSTIC_MARGIN_AIRY * airy_um)
+            # Group-index side solves skip the half-strength check.
+            absorber_unresolved = False
+            if check_bend_loss:
+                if half_tr is None:
+                    half_tr = self._yee_transform(
+                        lat, bend_radius_um, num_pml, 0.5 * pml_strength)
+                absorber_unresolved = True
+                half = self._yee_eigs(wavelength_um, k_req, pair.index.real,
+                                      lat, half_tr)
+                if half:
+                    overlap = [self._field_overlap(pair.vec, other.vec)
+                               for other in half]
+                    half_loss = max(0.0,
+                                    half[int(np.argmax(overlap))].index.imag)
+                    absorber_unresolved = (abs(half_loss - loss) >
+                                           _BEND_MAX_HALF_LOSS_CHANGE * loss)
+            loss_unresolved = caustic_unresolved or absorber_unresolved
+            if loss_unresolved:
+                unresolved_reasons.append(self._bend_unresolved_reason(
+                    mode_number, pair.index.real, bend_radius_um, num_pml,
+                    caustic_um, airy_um, caustic_unresolved,
+                    absorber_unresolved))
+            out.append(self._yee_leaky_public_mode(
+                pair, lat, tr, bend_radius_um, num_pml,
+                window_limited=(straight[partner][0].share <
+                                _STRAIGHT_WINDOW_LIMIT_SHARE),
+                loss_unresolved=loss_unresolved))
+        if warn_on_shortage:
+            notices = self._bend_notices(
+                auto_added_layers, unresolved_reasons, out, rejected,
+                num_modes)
+            if notices:
+                warnings.warn(" ".join(notices), RuntimeWarning,
+                              stacklevel=caller_stacklevel())
+        return tuple(out)
+
+    def _yee_leaky_public_mode(
+        self,
+        pair: _YeePair,
+        lat: _YeeLattice,
+        tr: _YeeTransform,
+        bend_radius_um: float | None,
+        num_pml: int,
+        **flags: bool,
+    ) -> VectorMode:
+        """The physical fields of a transformed lattice mode, co-located as
+        in :meth:`_yee_public_mode`, with the layered-solve metadata.
+
+        At each component's own position before co-location: the radial and
+        vertical components are the transformed ones, apart from the stretch
+        a layer adds to the x components (``E_x = E'x / s``, ``H_x = H'x /
+        s``); the azimuthal ones are ``E_φ = E'w / q̃`` and ``H_φ = H'w / q̃``
+        (``q̃ = q``, ``s = 1`` outside the layers). The attenuation is
+        clamped at zero; the fields keep the eigenpair's complex β."""
+        mode = pair.mode
+        physical = replace(
+            mode,
+            ex=np.asarray(mode.ex) / tr.s_face[None, :],
+            hx=np.asarray(mode.hx) / tr.s_node[None, :],
+            ez=np.asarray(mode.ez) / tr.q_node[None, :],
+            hz=np.asarray(mode.hz) / tr.q_face[None, :])
+        public = self._yee_public_mode(physical, lat)
+        ny, nx = public.ex.shape
+        mask = np.ones((ny, nx), dtype=bool)
+        if num_pml > 0:
+            mask[:, :num_pml] = False
+            mask[:, -num_pml:] = False
+        weights = (np.ones((ny, 1), dtype=complex)
+                   * tr.s_node[None, lat.lead_x:])
+        return replace(
+            public, n_eff=float(pair.index.real),
+            k_eff=max(0.0, float(pair.index.imag)),
+            bend_radius_um=(None if bend_radius_um is None
+                            else float(bend_radius_um)),
+            pml_cells_xy=(num_pml, 0), physical_mask=mask,
+            overlap_weights=weights, **flags)
+
     def _solve_at(
         self,
         wavelength_um: float,
@@ -2791,31 +3342,8 @@ class VectorModeSolver:
                         window_limited=share < _STRAIGHT_WINDOW_LIMIT_SHARE,
                     ))
                 if warn_on_shortage:
-                    notices = []
-                    if rejected:
-                        details = ", ".join(
-                            f"n={index:.6f}, share={share:.3f}, "
-                            f"half-strength move={move:.2e}"
-                            if move is not None else
-                            f"n={index:.6f}, share={share:.3f}, "
-                            "half-strength move=unavailable"
-                            for index, share, move in rejected)
-                        notices.append(
-                            "Layer-dependent pairs rejected (" + details + "). "
-                            "Widen the window, keeping at least eight layer cells; "
-                            "thicker layers in the same window do not help.")
-                    if any(mode.window_limited for mode in out):
-                        notices.append(
-                            "Mode is window-limited (less than 95% of field "
-                            "energy is outside the absorbing layers); widen "
-                            "the window for a converged result.")
-                    if len(out) < num_modes:
-                        quantity = ("No guided mode was" if not out else
-                                    f"Only {len(out)} guided mode" +
-                                    (" was" if len(out) == 1 else "s were"))
-                        notices.append(
-                            f"{quantity} found inside the window; widen the "
-                            "window or adjust the absorbing layers.")
+                    notices = self._straight_layer_notices(
+                        rejected, out, num_modes)
                     if notices:
                         warnings.warn(" ".join(notices), RuntimeWarning,
                                       stacklevel=caller_stacklevel())
@@ -2870,22 +3398,9 @@ class VectorModeSolver:
             num_pml, pml_strength, rejected)
         if not straight:
             if warn_on_shortage:
-                details = ", ".join(
-                    f"n={index:.6f}, share={share:.3f}, "
-                    f"half-strength move={move:.2e}"
-                    if move is not None else
-                    f"n={index:.6f}, share={share:.3f}, "
-                    "half-strength move=unavailable"
-                    for index, share, move in rejected)
-                prefix = ("A bend radiates, so absorbing layers were added "
-                          "automatically at strength 30. "
-                          if auto_added_layers else "")
                 warnings.warn(
-                    prefix + "No straight guided mode was found inside the window; "
-                    + (f"layer-dependent pairs rejected ({details}); " if details else "")
-                    + "widen the window, keeping at least eight layer cells; "
-                    "thicker layers in the same window do not help. "
-                    f"Bent mode search found 0 of {num_modes} guided modes.",
+                    self._no_straight_partner_notice(
+                        rejected, auto_added_layers, num_modes),
                     RuntimeWarning, stacklevel=caller_stacklevel(),
                 )
             return ()
@@ -2949,11 +3464,8 @@ class VectorModeSolver:
         assigned.sort(key=lambda item: -item[0].real)
         out: list[VectorMode] = []
         unresolved_reasons: list[str] = []
-        outer_col = nx - num_pml if bend_radius_um > 0 else num_pml - 1
-        n_out = float(np.sqrt(np.max(eps[:, outer_col])))
-        layer_start_um = (nx / 2 - num_pml) * self.dl_x_um
-        airy_um = (abs(bend_radius_um) /
-                   (2 * (2 * np.pi / wavelength_um * n_out) ** 2)) ** (1 / 3)
+        n_out, layer_start_um, airy_um = self._bend_caustic_geometry(
+            wavelength_um, bend_radius_um, num_pml)
         half_A = None
         for mode_number, (beta, vec, share, partner) in enumerate(assigned[:num_modes], 1):
             # PML floor noise can put a passive pair just below zero loss.
@@ -3002,29 +3514,10 @@ class VectorModeSolver:
                         _BEND_MAX_HALF_LOSS_CHANGE * full_loss)
             loss_unresolved = caustic_unresolved or absorber_unresolved
             if loss_unresolved:
-                reasons = []
-                if caustic_unresolved:
-                    required_width_um = 2 * (
-                        num_pml * self.dl_x_um + caustic_um +
-                        _BEND_MIN_CAUSTIC_MARGIN_AIRY * airy_um)
-                    # The radius refusal caps the window at 2 (|R| - dl).
-                    max_width_um = 2 * (abs(bend_radius_um) - self.dl_x_um)
-                    if required_width_um > max_width_um:
-                        reasons.append(
-                            f"caustic: x_L >= x_c + 0.75 l needs a window "
-                            f"of {required_width_um:.3g} um, wider than the "
-                            f"{max_width_um:.3g} um this radius allows "
-                            f"(|R| >= W/2 + dl); this loss cannot be resolved "
-                            f"at this radius with {num_pml} layer cells")
-                    else:
-                        reasons.append(
-                            f"caustic: widen the window to at least "
-                            f"{required_width_um:.3g} um so x_L >= x_c + 0.75 l")
-                if absorber_unresolved:
-                    reasons.append("absorber: raise strength or layer count")
-                unresolved_reasons.append(
-                    f"mode {mode_number} (n={beta.real / k0:.6f}): " +
-                    "; ".join(reasons))
+                unresolved_reasons.append(self._bend_unresolved_reason(
+                    mode_number, beta.real / k0, bend_radius_um, num_pml,
+                    caustic_um, airy_um, caustic_unresolved,
+                    absorber_unresolved))
             out.append(replace(
                 mode, n_eff=float(beta.real / k0),
                 k_eff=float(beta.imag / k0),
@@ -3032,38 +3525,147 @@ class VectorModeSolver:
                 loss_unresolved=loss_unresolved,
             ))
         if warn_on_shortage:
-            notices = []
-            if auto_added_layers:
-                notices.append(
-                    "A bend radiates, so absorbing layers were added "
-                    "automatically at strength 30. Check window convergence "
-                    "for bend loss.")
-            if unresolved_reasons:
-                notices.append("Bend loss unresolved for " + " | ".join(
-                    unresolved_reasons) + ".")
-            if any(mode.window_limited for mode in out):
-                notices.append("A straight partner is window-limited; widen the window.")
-            if rejected:
-                details = ", ".join(
-                    f"n={index:.6f}, share={share:.3f}, "
-                    f"half-strength move={move:.2e}"
-                    if move is not None else
-                    f"n={index:.6f}, share={share:.3f}, "
-                    "half-strength move=unavailable"
-                    for index, share, move in rejected)
-                notices.append(
-                    f"Layer-dependent straight pairs rejected ({details}); "
-                    "widen the window, keeping at least eight layer cells; "
-                    "thicker layers in the same window do not help.")
-            if len(out) < num_modes:
-                notices.append(
-                    f"Bent mode search found {len(out)} of {num_modes} guided "
-                    "modes near the straight guide's modes. Widen the window "
-                    "or adjust the absorbing layers.")
+            notices = self._bend_notices(
+                auto_added_layers, unresolved_reasons, out, rejected,
+                num_modes)
             if notices:
                 warnings.warn(" ".join(notices), RuntimeWarning,
                               stacklevel=caller_stacklevel())
         return tuple(out)
+
+    # -- notices and caustic geometry shared by both methods' layered solves
+
+    @staticmethod
+    def _rejected_details(
+            rejected: list[tuple[float, float, float | None]]) -> str:
+        """The rejected layer-dependent pairs as one warning clause."""
+        return ", ".join(
+            f"n={index:.6f}, share={share:.3f}, "
+            f"half-strength move={move:.2e}"
+            if move is not None else
+            f"n={index:.6f}, share={share:.3f}, "
+            "half-strength move=unavailable"
+            for index, share, move in rejected)
+
+    def _straight_layer_notices(
+        self,
+        rejected: list[tuple[float, float, float | None]],
+        out: list[VectorMode],
+        num_modes: int,
+    ) -> list[str]:
+        """Warning clauses of a straight solve with absorbing layers."""
+        notices = []
+        if rejected:
+            notices.append(
+                "Layer-dependent pairs rejected (" +
+                self._rejected_details(rejected) + "). "
+                "Widen the window, keeping at least eight layer cells; "
+                "thicker layers in the same window do not help.")
+        if any(mode.window_limited for mode in out):
+            notices.append(
+                "Mode is window-limited (less than 95% of field "
+                "energy is outside the absorbing layers); widen "
+                "the window for a converged result.")
+        if len(out) < num_modes:
+            quantity = ("No guided mode was" if not out else
+                        f"Only {len(out)} guided mode" +
+                        (" was" if len(out) == 1 else "s were"))
+            notices.append(
+                f"{quantity} found inside the window; widen the "
+                "window or adjust the absorbing layers.")
+        return notices
+
+    def _no_straight_partner_notice(
+        self,
+        rejected: list[tuple[float, float, float | None]],
+        auto_added_layers: bool,
+        num_modes: int,
+    ) -> str:
+        """The warning of a bend that found no straight mode to anchor on."""
+        details = self._rejected_details(rejected)
+        prefix = ("A bend radiates, so absorbing layers were added "
+                  "automatically at strength 30. "
+                  if auto_added_layers else "")
+        return (prefix + "No straight guided mode was found inside the window; "
+                + (f"layer-dependent pairs rejected ({details}); " if details else "")
+                + "widen the window, keeping at least eight layer cells; "
+                "thicker layers in the same window do not help. "
+                f"Bent mode search found 0 of {num_modes} guided modes.")
+
+    def _bend_caustic_geometry(
+        self, wavelength_um: float, bend_radius_um: float, num_pml: int,
+    ) -> tuple[float, float, float]:
+        """``(n_out, x_L, l)`` of the bend's caustic test: the highest
+        index on the first outer layer column, the layer's inner face and the
+        Airy length, in microns."""
+        nx = self.eps.shape[1]
+        outer_col = nx - num_pml if bend_radius_um > 0 else num_pml - 1
+        n_out = float(np.sqrt(np.max(self.eps[:, outer_col])))
+        layer_start_um = (nx / 2 - num_pml) * self.dl_x_um
+        airy_um = (abs(bend_radius_um) /
+                   (2 * (2 * np.pi / wavelength_um * n_out) ** 2)) ** (1 / 3)
+        return n_out, layer_start_um, airy_um
+
+    def _bend_unresolved_reason(
+        self, mode_number: int, n_eff: float, bend_radius_um: float,
+        num_pml: int, caustic_um: float, airy_um: float,
+        caustic_unresolved: bool, absorber_unresolved: bool,
+    ) -> str:
+        """Why one bend's loss is unresolved, for the warning."""
+        reasons = []
+        if caustic_unresolved:
+            required_width_um = 2 * (
+                num_pml * self.dl_x_um + caustic_um +
+                _BEND_MIN_CAUSTIC_MARGIN_AIRY * airy_um)
+            # The radius refusal caps the window at 2 (|R| - dl).
+            max_width_um = 2 * (abs(bend_radius_um) - self.dl_x_um)
+            if required_width_um > max_width_um:
+                reasons.append(
+                    f"caustic: x_L >= x_c + 0.75 l needs a window "
+                    f"of {required_width_um:.3g} um, wider than the "
+                    f"{max_width_um:.3g} um this radius allows "
+                    f"(|R| >= W/2 + dl); this loss cannot be resolved "
+                    f"at this radius with {num_pml} layer cells")
+            else:
+                reasons.append(
+                    f"caustic: widen the window to at least "
+                    f"{required_width_um:.3g} um so x_L >= x_c + 0.75 l")
+        if absorber_unresolved:
+            reasons.append("absorber: raise strength or layer count")
+        return f"mode {mode_number} (n={n_eff:.6f}): " + "; ".join(reasons)
+
+    def _bend_notices(
+        self,
+        auto_added_layers: bool,
+        unresolved_reasons: list[str],
+        out: list[VectorMode],
+        rejected: list[tuple[float, float, float | None]],
+        num_modes: int,
+    ) -> list[str]:
+        """Warning clauses of a bend solve."""
+        notices = []
+        if auto_added_layers:
+            notices.append(
+                "A bend radiates, so absorbing layers were added "
+                "automatically at strength 30. Check window convergence "
+                "for bend loss.")
+        if unresolved_reasons:
+            notices.append("Bend loss unresolved for " + " | ".join(
+                unresolved_reasons) + ".")
+        if any(mode.window_limited for mode in out):
+            notices.append("A straight partner is window-limited; widen the window.")
+        if rejected:
+            notices.append(
+                f"Layer-dependent straight pairs rejected "
+                f"({self._rejected_details(rejected)}); "
+                "widen the window, keeping at least eight layer cells; "
+                "thicker layers in the same window do not help.")
+        if len(out) < num_modes:
+            notices.append(
+                f"Bent mode search found {len(out)} of {num_modes} guided "
+                "modes near the straight guide's modes. Widen the window "
+                "or adjust the absorbing layers.")
+        return notices
 
     def _reconstruct(
         self,

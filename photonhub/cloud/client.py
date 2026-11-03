@@ -3,18 +3,22 @@ CA-bundle fallback for root-less interpreters).
 
 Bearer-authenticated JSON requests with capped-backoff retry on 5xx/network
 errors (idempotent GETs). 4xx errors raise immediately as ``CloudError`` carrying
-the parsed ``detail``. ``urllib`` transparently follows the 302 that the result
+the parsed ``detail`` in ``body`` and the service's reason, bounded to one
+line, in the message. ``urllib`` transparently follows the 302 that the result
 endpoint returns in prod (to a signed object-store URL).
 """
 
 from __future__ import annotations
 
+import html
 import json
 import io
 import http.client
 from pathlib import Path
+import re
 import ssl
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -72,18 +76,250 @@ def _parse_detail(body: str) -> Any:
         return body
 
 
+#: Characters of the service's reason kept in a ``CloudError`` message. The
+#: whole reason stays in ``CloudError.body``.
+_REASON_CHARS = 300
+#: Characters of a reason, after whitespace is collapsed, that the redaction
+#: patterns see. An error body may be up to 1 MiB and only its start can
+#: reach the message, so a fixed window bounds the formatting time, which
+#: runs while a batch holds its spend lock.
+_REASON_WINDOW = 4096
+
+# What a refusal could echo that must not reach a message, a log or a
+# notebook output: an API key, a bearer token, a signed token (a quote, an
+# identity token), the query string of a signed URL, also JSON-escaped as
+# ``https:\/\/``, and a bare signature parameter. Every pattern is linear in
+# its input. A URL scheme starts only where a run of scheme characters
+# starts, so a run such as ``a.a.a...`` is scanned once, not once from each
+# character, and a URL's path ends at the next ``://``, so ``a://a://...``
+# is too. Not covered: a key glued to a preceding word character, a
+# fragment before the query (its signature parameter is still caught), and
+# a schemeless signed URL beyond its signature parameter.
+_SECRET_PATTERNS = (
+    (re.compile(r"\bph_(?:live|test)_[A-Za-z0-9_\-]+"), "<redacted key>"),
+    # A credential after "Bearer", not a word: "expected Bearer
+    # authentication" is a reason the service sends and must stay readable.
+    (re.compile(r"(?i)\bbearer\s+(?=[^\s]*\d)[A-Za-z0-9._~+/=\-]{16,}"),
+     "Bearer <redacted>"),
+    (re.compile(r"\beyJ[A-Za-z0-9_\-]{6,}(?:\.[A-Za-z0-9_\-]+)*"),
+     "<redacted token>"),
+    (re.compile(r"((?<![A-Za-z0-9+.\-])[A-Za-z0-9+.\-]+:(?://|\\/\\/)"
+                r"(?:[^\s?#\"'<>:]|:(?!//|\\/\\/))*+)\?[^\s\"'<>]*"),
+     r"\1?<redacted>"),
+    (re.compile(r"(?i)\b((?:x-goog-|x-amz-)?signature)=[^\s&\"'<>]+"),
+     r"\1=<redacted>"),
+)
+_HTML_TAG = re.compile(r"<[^<>]{1,200}>")
+_HTML_DOCUMENT = re.compile(r"(?is)^\s*(?:<!doctype|<html|<head|<body)")
+# Style and script content is not text. An unclosed block runs to the end,
+# so each character is scanned once.
+_HTML_RAW_TEXT = re.compile(
+    r"(?is)<(style|script)\b[^<>]{0,500}>.*?(?:</\1\s*>|\Z)")
+# An object store's XML error: <Error><Code>...</Code><Message>...</Message>.
+_XML_DOCUMENT = re.compile(r"^\s*(?:<\?xml\b|<Error>)")
+_XML_FIELDS = (re.compile(r"<Code>([^<]*)</Code>"),
+               re.compile(r"<Message>([^<]*)</Message>"))
+# A terminal control sequence (CSI): colours, cursor moves, screen clears.
+_ANSI_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+# Control and format characters (bidirectional overrides, zero-width
+# characters) that could restyle a terminal or reorder the visible text.
+_INVISIBLE = frozenset(("Cc", "Cf"))
+
+
+def _strip_invisible(text: str) -> str:
+    """``text`` without terminal control sequences and ``_INVISIBLE``
+    characters, for the secret patterns to run on.
+
+    The patterns run on ``text`` first, to find each secret that starts
+    right after such a character or sequence: there it becomes a space, so
+    the secret does not join the word before it, where no pattern anchored
+    at a word start would find it (``x<ZWSP>ph_live_...`` would read
+    ``xph_live_...``). Anywhere else, inside a secret too, it is removed,
+    and the patterns that run afterwards see the secret whole."""
+    text = _ANSI_CSI.sub("\x1b", text)   # one control character each
+    seams = set()
+    for pattern, _ in _SECRET_PATTERNS:
+        for match in pattern.finditer(text):
+            start = match.start()
+            if start and unicodedata.category(text[start - 1]) in _INVISIBLE:
+                seams.add(start - 1)
+    kept = []
+    for index, ch in enumerate(text):
+        if unicodedata.category(ch) not in _INVISIBLE:
+            kept.append(ch)
+        elif index in seams:
+            kept.append(" ")
+    return "".join(kept)
+
+
+def _micros_usd(value) -> Optional[str]:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return f"${value / 1_000_000:.6f}"
+
+
+def _int_field(detail: dict, key: str) -> Optional[int]:
+    value = detail.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _structured_reason(detail: dict) -> str:
+    """A sentence for a structured refusal the service is known to send, else
+    its message, else its error code and scalar fields. The nested shape
+    ``{"error": {"code": ..., "message": ...}}`` reads as the flat one."""
+    code = detail.get("error")
+    if isinstance(code, dict):
+        detail = {key: value for key, value in code.items() if key != "code"}
+        code = detail["error"] = code.get("code")
+    if code == "managed_gpu_concurrency_limit":
+        active = _int_field(detail, "active_jobs")
+        limit = _int_field(detail, "limit")
+        if limit is not None and active is not None:
+            if limit == 1:
+                return ("one managed GPU job per account can be active "
+                        f"({active} of 1); wait for it to finish")
+            return (f"{limit} managed GPU jobs per account can be active "
+                    f"({active} of {limit}); wait for one to finish")
+        return ("the account already has the most managed GPU jobs it can "
+                "run at once; wait for one to finish")
+    if code == "insufficient_funds":
+        available = _micros_usd(detail.get("available_micros"))
+        required = _micros_usd(detail.get("required_micros"))
+        amounts = (f" ({available} available, {required} required)"
+                   if available and required else "")
+        return f"the account balance does not cover this job{amounts}"
+    if code == "quote_already_used":
+        job_id = detail.get("job_id")
+        used_by = f" by job {job_id}" if isinstance(job_id, str) and job_id else ""
+        return (f"this quote was already used{used_by}; request a new quote "
+                "before submitting again")
+    if code == "managed_gpu_admission_quiesced":
+        return ("the service is not admitting new managed GPU jobs at the "
+                "moment; try again later")
+    if code == "managed_gpu_resource_limit_exceeded":
+        resource = (str(detail.get("resource") or "resource use")
+                    .removesuffix("_bytes").replace("_", " "))
+        estimated = _int_field(detail, "estimated_bytes")
+        limit = _int_field(detail, "limit_bytes")
+        sizes = (f" ({estimated / 1e9:.3g} GB estimated, limit "
+                 f"{limit / 1e9:.3g} GB)"
+                 if estimated is not None and limit is not None else "")
+        return (f"the simulation's estimated {resource} is above the managed "
+                f"GPU limit{sizes}")
+    for key in ("message", "reason", "detail"):
+        if isinstance(detail.get(key), str) and detail[key].strip():
+            return detail[key]
+    fields = ", ".join(
+        f"{key}={value}" for key, value in detail.items()
+        if key != "error" and (value is None or isinstance(
+            value, (str, int, float, bool))))
+    if isinstance(code, str) and code:
+        return f"{code} ({fields})" if fields else code
+    return json.dumps(detail, separators=(",", ":"), default=str)
+
+
+def _validation_reason(items: list) -> str:
+    """FastAPI's request-validation ``detail``: a list of ``{loc, msg}``."""
+    parts = []
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get("msg"), str):
+            loc = item.get("loc")
+            where = (".".join(str(p) for p in loc if p != "body")
+                     if isinstance(loc, (list, tuple)) else "")
+            parts.append(f"{where}: {item['msg']}" if where else item["msg"])
+        else:
+            parts.append(json.dumps(item, separators=(",", ":"), default=str))
+    return "; ".join(parts)
+
+
+def _markup_text(text: str) -> str:
+    """The readable part of an error page: an object store's XML error as
+    ``Code: Message``, an HTML page as its text without style and script.
+    Any other text is returned as it is."""
+    if _XML_DOCUMENT.match(text):
+        code, message = (
+            (found.group(1).strip() if (found := field.search(text)) else "")
+            for field in _XML_FIELDS)
+        if code or message:
+            return html.unescape(
+                f"{code}: {message}" if code and message else code or message)
+        return html.unescape(_HTML_TAG.sub(" ", text))
+    if _HTML_DOCUMENT.match(text):
+        return html.unescape(_HTML_TAG.sub(" ", _HTML_RAW_TEXT.sub(" ", text)))
+    return text
+
+
+def service_reason(detail: Any, *, secret: Optional[str] = None) -> str:
+    """The service's reason for a refusal as one bounded line for a message.
+
+    ``detail`` is what ``CloudError.body`` holds: a string, a structured
+    object or a validation list. A known structured refusal reads as a
+    sentence and a nested ``{"error": {"code", "message"}}`` object as its
+    message; an XML error as its code and message, and an HTML error page
+    as its text without style and script. Whitespace is collapsed and only
+    the first ``_REASON_WINDOW`` characters are formatted further. Control
+    and format characters (terminal escapes, bidirectional overrides) are
+    removed; one right before a secret becomes a space, so the secret stays
+    a word of its own. Keys, bearer and signed tokens, signed-URL query
+    strings, signature parameters and ``secret`` itself are redacted, and
+    the line is cut at ``_REASON_CHARS`` characters. The time taken is
+    linear in the size of ``detail``. Empty when there is nothing to say."""
+    if detail is None:
+        return ""
+    if isinstance(detail, dict):
+        text = _structured_reason(detail)
+    elif isinstance(detail, list):
+        text = _validation_reason(detail)
+    else:
+        text = _markup_text(str(detail))
+    if secret:
+        text = text.replace(secret, "<redacted key>")
+    text = " ".join(text.split())
+    if len(text) > _REASON_WINDOW:
+        # A token cut at the window's edge is dropped whole when the text
+        # before it fills the message anyway, so no pattern below sees half
+        # a secret that a redaction further up could bring into view.
+        text = text[:_REASON_WINDOW]
+        head, space, _ = text.rpartition(" ")
+        if space and len(head) >= _REASON_CHARS:
+            text = head
+    text = " ".join(_strip_invisible(text).split())
+    # Again, now that a format character inside a secret no longer hides it.
+    if secret:
+        text = text.replace(secret, "<redacted key>")
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    if len(text) > _REASON_CHARS:
+        text = text[:_REASON_CHARS - 3].rstrip() + "..."
+    return text
+
+
+def _refusal_message(method: str, path: str, status: int, detail: Any,
+                     secret: Optional[str]) -> str:
+    try:
+        reason = service_reason(detail, secret=secret)
+    except Exception:  # a reason that cannot be read must not hide the error
+        reason = ""
+    head = f"{method} {path} -> HTTP {status}"
+    return f"{head}: {reason}" if reason else head
+
+
 class HttpClient:
     """HTTP transport for the configured PhotonHub cloud service.
 
     Requests use the API key and request timeout in ``cfg``. GET requests retry
-    server and network errors with bounded backoff. POST and DELETE requests
-    are attempted once. HTTP errors raise ``CloudError`` with parsed details.
+    server and network errors with bounded backoff unless a caller asks for
+    one attempt. POST and DELETE requests are attempted once. HTTP errors
+    raise ``CloudError`` with parsed details in ``body`` and the service's
+    reason, one bounded line with secrets redacted, in the message.
     Result redirects do not forward the bearer token to the redirected URL."""
     def __init__(self, cfg: CloudConfig):
         self.cfg = cfg
 
     def _open(self, method: str, path: str, *, body: Optional[dict] = None,
-              deadline: Optional[float] = None):
+              deadline: Optional[float] = None, retry: bool = True):
         url = self.cfg.url + path
         # compact separators: a large launch profile is a fifth smaller on the wire
         data = json.dumps(body, separators=(",", ":")).encode() if body is not None else None
@@ -100,7 +336,7 @@ class HttpClient:
             "Authorization", f"Bearer {self.cfg.api_key}")
 
         last: Optional[Exception] = None
-        max_attempts = _RETRIES if method == "GET" else 1
+        max_attempts = _RETRIES if method == "GET" and retry else 1
         for attempt in range(max_attempts):
             request_timeout = self.cfg.request_timeout_s
             if deadline is not None:
@@ -130,8 +366,10 @@ class HttpClient:
                     last = e
                     self._retry_sleep(0.5 * (attempt + 1), deadline)
                     continue
-                raise CloudError(f"{method} {path} -> HTTP {e.code}",
-                               status_code=e.code, body=detail)
+                raise CloudError(
+                    _refusal_message(method, path, e.code, detail,
+                                     self.cfg.api_key),
+                    status_code=e.code, body=detail)
             except urllib.error.URLError as e:
                 last = e
                 if attempt < max_attempts - 1:
@@ -154,16 +392,18 @@ class HttpClient:
         safe = validate_job_id(job_id)
         return urllib.parse.quote(safe, safe="")
 
-    def get_json(self, path: str, *, deadline: Optional[float] = None) -> dict:
+    def get_json(self, path: str, *, deadline: Optional[float] = None,
+                 retry: bool = True) -> dict:
         """GET a service-relative path and decode its JSON response.
 
         Enforce the JSON body-size limit. Response-body or socket-read timeouts
         can propagate as ``TimeoutError``, even without a deadline. An optional
         monotonic ``deadline`` bounds request opening and retry waits; expiry
-        also raises ``TimeoutError``. Other transport, body, or decoding
-        failures raise ``CloudError``."""
+        also raises ``TimeoutError``. ``retry=False`` makes one attempt only.
+        Other transport, body, or decoding failures raise ``CloudError``."""
         try:
-            with self._open("GET", path, deadline=deadline) as response:
+            with self._open("GET", path, deadline=deadline,
+                            retry=retry) as response:
                 raw = self._read_limited(
                     response, path, _MAX_JSON_BODY_BYTES, method="GET")
         except CloudError:
@@ -347,9 +587,13 @@ class HttpClient:
         Treat the returned plaintext token as a secret."""
         return self.post_json("/v1/keys", {"name": name})
 
-    def list_gpus(self) -> list:
-        """Return the service's GPU list, or an empty list when its key is absent."""
-        return self.get_json("/v1/gpus").get("gpus", [])
+    def list_gpus(self, *, deadline: Optional[float] = None,
+                  retry: bool = True) -> list:
+        """Return the service's GPU list, or an empty list when its key is absent.
+
+        ``deadline`` and ``retry`` are as in :meth:`get_json`."""
+        return self.get_json(
+            "/v1/gpus", deadline=deadline, retry=retry).get("gpus", [])
 
     def list_jobs(self) -> list[dict]:
         """Fetch recent job records from the service.

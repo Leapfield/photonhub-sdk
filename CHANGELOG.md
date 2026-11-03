@@ -5,6 +5,844 @@ The desktop application and the solver engine share this version number.
 
 ## Unreleased
 
+## 0.1.7 (2026-11-02)
+
+Far-field recording and analysis lead this release: declare a surface, project
+onto angle, direction-cosine or Cartesian grids, and read labelled results.
+The SDK also corrects fitted-domain and port handling, restores saved media,
+and resolves cloud GPU selections. The wire schema remains 1.22.0-alpha.1.
+
+Solver changes require a solver built from this release. With a 0.1.6 solver,
+SDK-side far-field analysis and setup changes are available, but the old Bloch
+frequency-domain scale and multi-GPU restrictions remain. An explicit cloud
+`solver=` selects that build independently of the SDK; the service must allow
+it. See the entries below before comparing results across the upgrade.
+
+### Added
+
+- **Far-field setup and self-run guidance.** The far-field guide now puts
+  substrate limits first, explains downward polarization and solid-angle
+  integration and subpixel settings. The bundled skill explains local solver
+  installation and cloud submissions using accepted quotes.
+  A repository self-run workflow uses invented inputs and retains its accepted
+  preflight quote when submitting under a spend cap. Its local CPU check and
+  fake-service tests do not establish deployed cloud execution or convergence.
+- **Ludwig-3 polarization warns about its antipodal mask.** Requested
+  directions in `1 + r . b <= 1e-12` emit a `UserWarning` naming the boresight
+  at the caller's line, including calls through SDK wrappers.
+  Co/cross amplitudes remain NaN there because the basis is undefined opposite
+  the boresight. On an angle grid, choose `boresight="-z"` for downward
+  emission, or partition a full sphere and choose a boresight for each part.
+  Integrate squared amplitudes with solid-angle weights for power shares.
+- **Public SDK artifacts exclude the server executor.** Wheel and sdist now
+  follow the public mirror's client-only boundary. The private solver image
+  adds the executor explicitly from its own source tree. The package metadata
+  comment and the quasi-2-D far-field error also use plain punctuation.
+- **`FarFieldMonitor`: declare the surface a far-field projection reads.**
+  `FarFieldMonitor.box(name, center_um=, size_um=, wlens_um=, exclude=)`
+  and `FarFieldMonitor.plane(name, axis=, position_um=, direction=,
+  wlens_um=, pts_per_wlen=, window=)` go in `Simulation(monitors=...)` and
+  are compiled there into ordinary `field_dft` monitors, one per face, named `<name>.x_minus`,
+  `<name>.x_plus` ... `<name>.z_plus` (monitor names allow no `:` or `+`):
+  the four tangential components, one cell thick, every cell and one cell
+  past the box on a box, and an in-plane stride on a plane that keeps
+  `pts_per_wlen` samples per wavelength in its medium. Nothing changes on
+  the wire. The recipe (faces, outward normals, the medium they sit in, and
+  where they apply the symmetry planes, faces left out and window) is
+  written beside the run in `client.json`, and `far_field(data, "<name>",
+  ...)` projects the surface by its name into that medium (bit for bit
+  the face list with that `n_medium`); a result reloaded without the record
+  projects from the face names, with a warning. `FarFieldMonitor.faces`
+  lists a declaration's faces as `(monitor name, axis, outward sign)`, and
+  `Simulation.far_field_monitors` maps each surface a simulation records
+  to its faces. A reloaded result keeps its recipe through an edit of the
+  run, sources, monitors or precisions; an edit of the background,
+  structures, boundaries, layers or grid keeps the face monitors but drops
+  the recipe, with a warning, since its medium and crossing checks were
+  made against them. Building the simulation refuses, naming the face, a
+  face in a PML or absorber layer, across a structure or a medium
+  boundary, faces in different media, a medium the projection cannot use
+  (anisotropic, custom, PEC or lossy), a box on a quasi-2-D axis, a stride
+  or a window on a box, a box or a plane's extent that does not reach a
+  symmetry plane or crosses it off centre, a plane on a symmetry plane,
+  and leaving out a face normal to one. It warns when a face is closer
+  than half a wavelength to a structure, when a source or a structure lies
+  within 2 cells of a face's innermost sample, and, on a graded mesh, when
+  a box face is nearer than 0.35 wavelengths (in its medium) to a grid
+  line where the cell size changes, along its normal from both recorded
+  samples, or a source is nearer than 0.1 wavelengths to one (a point
+  source along each axis, a launch along its normal): the range the
+  graded-mesh accuracy below is shown for. The source
+  checks see every source the simulation runs, the launches that `ports=`
+  and `source=` add included. A grid line counts as a change of cell size
+  when the cells either side differ by more than 1 %, so a grading gentler
+  than that per cell never warns, however far it stretches the cells.
+  With symmetry planes it records the kept part (a face across a plane
+  from the plane on, no far-side face) and the recipe keeps the planes:
+  by name it projects bit for bit as the same faces read as a face list.
+  On FDTD dipole boxes (vacuum, 16 cells per wavelength, three cases) a
+  closed one differs from the full run's box with its far-side faces the
+  mirror of the near ones by 0.16 to 0.30 % of the peak intensity (0.026
+  to 0.042 % at 32 cells), and from the same declaration on the full run,
+  whose far-side faces sit a cell nearer the planes, by 0.15 to 0.43 %
+  (0.04 to 0.10 % at 32). `FarFieldMonitor.box(..., exclude=("-z",))`
+  leaves faces out, an open box: those faces are neither recorded nor
+  checked, the faces kept keep every check, and `far_field(data, name)`
+  ends them at the plane the face left out is declared on, so the open
+  edge does not move with the mesh. `FarFieldMonitor.plane(...,
+  window=(f1, f2))`, off by default, tapers the currents (sin² over the
+  outer fraction of the plane's declared extent at each end, along its two
+  in-plane axes), so a run with symmetry planes and the full run window
+  the same surface. An open surface is a truncated one and reads the
+  pattern well only where the field it cuts off is small. For a point
+  dipole in a medium of index 1.45 (20 and 30 cells per wavelength), a
+  plane 0.62 µm away and 2.41 µm in half width misreads it by 36 to 37 % of
+  the peak within 30° of its normal (7.5 to 7.8 % with a window of 0.4),
+  and a box 0.62 µm in half width with a face left out by about 10.1 to
+  10.2 % within 30° of its closed side (on exact fields 10.1 to 10.2 % from
+  20 to 60 cells, against about 10.0 % for the box as declared; a small
+  residual, first order in the cell, comes from where the faces kept are
+  read, at most about 0.7 points within 60° at 20 cells). Over a
+  substrate, against the closed form of a dipole above a half space, the
+  open box reads 13.5 to 13.7 % within 30°. The power within a cone reads
+  within 2 % for an open box in one medium, but over the substrate the
+  open box's is off by +3.5 to +3.9 % within 30° and -10.8 % within 80°,
+  and a windowed plane's by +17 % within 30°. The far-field guide and the
+  known limitations give when an open surface holds. **Open surfaces over
+  substrates can have substantial pattern and cone-power error; higher-index
+  substrate accuracy has not been established.** See the
+  [far-field limits](https://leapfield.ai/docs/guides/far-field/#when-an-open-surface-holds)
+  for the full measurement settings and limitations.
+- **`far_field` reads k-space and Cartesian grids, and the field at a
+  finite distance.** Besides directions (`theta_rad`, `phi_rad`),
+  `far_field(data, name, ux=, uy=)` reads direction cosines about
+  `plane_axis` (a single plane's own normal by default) in the half space
+  `direction`, and `far_field(..., plane_axis=, plane_um=, x_um=, y_um=)`
+  reads points on a plane, each in the direction it lies in from
+  `origin_um` (the surface's centre by default; pass it to compare runs),
+  with a warning for points nearer than `2D²/λ` (`D` twice the surface's
+  farthest reach from `origin_um`). A k-space point with `ux² + uy² > 1` has no
+  direction: its fields are `nan` and its intensity 0, as
+  `diffraction_orders` reports evanescent orders. On a plane over one
+  period of a periodic structure the k-space intensity at `u = mλ/(nL)`
+  gives grating order `m`'s power, `U (λ/n)² / (A cos θ)` in W, which
+  `diffraction_orders` reports times the period's area in µm² (1e12 times
+  more), with its `(k1, k2)` along its `in_plane_axes` (z and x on a plane
+  normal to y, where `ux`, `uy` run along x and z). On an FDTD grating (11
+  orders, 20 and 30 cells per wavelength, at most 100 periods with the
+  default shutoff) the two agree within 1.1e-4 and 3.8e-5, set by the ±2
+  orders at 72° still settling (7.1e-5 and 1.4e-5 from 200 periods), the
+  directions exact. `exact=True` evaluates the field the surface's
+  currents radiate at a finite distance with the full Green's function of
+  the medium, on a Cartesian grid or on a sphere of radius `r_um` about
+  `origin_um`; its amplitudes tend to the
+  far-field ones as `1/r` (fitted order −1.000 on a dipole box, 5 to
+  320 µm), and on the dipole's exact fields it reads the dipole's own
+  field to the readout's error at every distance (0.57 % and 0.13 % of the
+  peak at 20 and 40 cells per wavelength). For a meshed grid on a plane
+  parallel to one evenly sampled recorded plane it uses the plane's angular
+  spectrum, elsewhere a direct sum over the recorded samples in bounded
+  blocks; the two agree within 1e-5 on an exact beam that has decayed at
+  its plane's edges, and by about the cut's own error on a plane that cuts
+  the field. Near the surface the direct sum loses accuracy: 3 to 6 % of
+  the peak one sample spacing out at 20 cells per wavelength, and over a
+  box's edges more on finer meshes (up to 21 % at 80 cells); it warns
+  within two spacings or a tenth of a wavelength. A point inside a box or
+  a Cartesian point behind a plane is refused; directions of an angle or
+  k-space grid that end at or behind a plane read `nan`, with a warning,
+  and a grid with none in front of it is refused. On FDTD the exact
+  projection of a `FarFieldMonitor` box around a dipole reads the field
+  the solver recorded on a plane 0.9 µm beyond the box to 1.1 %, 0.51 %
+  and 0.29 % of the peak at 20, 30 and 40 cells per wavelength.
+  `FarField` keeps its flat layout and gains the grid's kind and shape
+  (`reshape()` needs no sizes), its coordinates (`ux`, `uy`, `x_um`,
+  `y_um`, `plane_axis`, `plane_um`, `direction`), `r_um`, `origin_um`,
+  `exact`, an exact projection's radial and magnetic components (`e_r`,
+  `h_r`, `h_theta`, `h_phi`), `propagating` and `cartesian_fields()`;
+  `radiated_power()` and `directivity()` need an angle grid. `theta_rad` is
+  no longer required, since one of the three grids is.
+- **`FarField` results are labelled `xarray` data, with gain, cross
+  section, polarization and plots.** `FarField.dataset` is the projection
+  as an `xarray.Dataset` labelled by frequency and the grid's own axes:
+  `(f, theta, phi)` on an angle grid (radians), `(f, ux, uy)` on a k-space
+  grid, the plane's two axes in µm on a Cartesian grid (`(f, x, y)` for a
+  plane normal to z), `(f, point)` for paired points, with `wlen_um` and
+  `n_medium` along `f`. It holds `e_theta`, `e_phi` (and an exact
+  projection's `e_r`, `h_r`, `h_theta`, `h_phi`), `intensity` and, on a
+  meshed angle grid, `radiated_power` and `directivity`: the projection's
+  own arrays, bit for bit. New methods return labelled results:
+  `gain(input_power_w)` (`4πU / P_in`, the source's power given as a
+  number, per frequency, or a `PowerMonitor` spectrum; required, since a
+  source's power depends on its surroundings), `cross_section()`
+  (`dσ/dΩ = U / I_inc` in µm²/sr; a run driven by one `TFSFBox` gives the
+  incident intensity `|E0|²/(2η)` itself, otherwise pass it),
+  `polarization("ludwig3")` (co- and cross-polar amplitudes, Ludwig's third
+  definition about a boresight: by default `+z` with reference x on an
+  angle grid, and the grid's own axis and side on a k-space or Cartesian
+  grid) and `polarization("circular")` (right- and left-hand, IEEE
+  handedness), `renormalize(distance_um)` (a copy read at that distance
+  from `phase_origin_um`, the point the amplitudes' phase refers to, which
+  `far_field` now records), `power_density()` (W/m²) and `cartesian()`
+  (`Ex` ... `Hz`). `photonhub.viz.plot_far_field_cut` draws a polar cut and
+  `plot_far_field_map` a map over direction cosines or a plane. On an FDTD
+  dipole in vacuum (uniform mesh of 20, 30 and 40 cells per wavelength,
+  no structures, no dispersion, PML one wavelength thick) the
+  directivity's peak reads 1.5156, 1.5067 and 1.5037 and the gain from
+  the flux of a `PowerMonitor` box centred on it 1.5166, 1.5070 and
+  1.5038 (off centre the box's total is off by an amount first order in
+  the cell times the offset: centre it, or check it against a larger box).
+  On a sphere of index 1.5 and radius 0.6 µm at λ = 1 µm (uniform mesh,
+  the default subpixel smoothing, no dispersion, PML 0.5 µm) the
+  differential cross section reads within 0.80 % of the Mie series' peak
+  at 25 cells per wavelength (0.68 % at 30); on a sphere of index 2 and
+  radius 1 µm, beside a sharp resonance there (a 0.5 % lower index moves
+  the series by 37 % of its peak), it needs a long run to settle (2.3 to 2.7 %
+  at 25 cells after 100 to 300 periods); settled, it reads 3.8, 1.95 and 1.4 %
+  at 20, 25 and 30 cells per wavelength, and the run's other four
+  frequencies, each beside a mode the grid shifts, read 4.6 to 19.7 %.
+- **`colocated_fields`: a recorded plane with E and H on the same
+  points.** The solver records each field component at its own Yee point,
+  while `data[name]` labels them all with the cell's base node, so a
+  product such as `E x H*` read at the labels is wrong at first order.
+  `photonhub.analysis.colocated_fields(data, name)` reads a
+  `ProfileMonitor` plane, a `FarFieldMonitor` face (`"<name>.z_plus"`
+  ...) or a `FarFieldMonitor` plane by its name and returns an
+  `xarray.Dataset` labelled `(f, a, b)` (the plane's axes in xyz order, in
+  µm in the frame of `data[name]`, `wlen_um` beside `f`) holding the
+  recorded `Ex` ... `Hz` in V/m and A/m on the plane's grid nodes. A
+  component half a cell off the node is interpolated linearly onto it
+  from its two samples either side (by the cells' widths on a graded
+  mesh, across the stride on a strided plane, wrapped across the period on
+  a periodic or Bloch axis the plane spans at every cell), after `far_field`'s
+  placement of the samples (the run's grid lines, a symmetry-reduced
+  plane unfolded at each component's own Yee point). A plane recorded one
+  cell thick (from the quarter point of a cell to that of the next; every
+  `FarFieldMonitor` face) puts E and H on one surface, its second sample's
+  E plane, where a `PowerMonitor` reads H; with one sample H stays half a
+  cell above E, as recorded, with a warning when the plane holds both. A
+  far-field face carries the surface's index as `n_medium` when its recipe
+  is known; a surface or box face read without one warns. On a uniform
+  plane recorded at every cell with one sample, the colocated fields
+  through `far_field`'s quadrature give its radiation integrals times the
+  interpolation's `cos(k r_a d / 2)` exactly where the field has died out
+  at the plane's edges, and on a wrapped plane at its diffraction orders
+  only; strided planes keep the total current with another factor,
+  graded ones agree to second order, and a plane recorded one cell thick
+  differs from `far_field`'s reading of it by about `(k dl)^2 / 16`
+  (0.62 % at 20 cells per wavelength). On a `FarFieldMonitor` box face the
+  fields are, bit for bit, `far_field`'s H-onto-E pass there. On an FDTD
+  dipole in vacuum (uniform mesh, PML 0.5 µm, no structures, no
+  dispersion) the flux of a plane recorded one cell thick that runs into
+  the PML reads 0.46 %, 0.21 % and 0.12 % below a `PowerMonitor` on the
+  same plane at 20, 30 and 40 cells per wavelength (second order);
+  recorded with one sample, 2.0 %, 1.3 % and 0.91 % (first order, from
+  where the plane meets the PML: each point of `E x H*` is then first
+  order off). A plane cut in the open loses about one cell's strip at its
+  edges (1.8 %, 1.1 % and 0.78 % cut 1 µm from the dipole axis); one
+  across a periodic cell wraps and reads at second order (0.62 %, 0.28 %
+  and 0.16 %). Record a plane one cell thick for any product of E and H.
+  The reader's warning about the staggered components of `field_dft`
+  arrays now points to it.
+- **A packaged skill imports a simulation from another FDTD tool.**
+  `photonhub-mcp --print-import-skill` prints it, and the
+  `photonhub://skill/import/SKILL.md` resource serves it. An agent reads the
+  source as text, writes a PhotonHub script, checks it, and lists what maps,
+  what maps in part, and what has no equivalent in an import report.
+- **`far_field` takes its angles as `theta_rad` and `phi_rad`.** `theta`
+  and `phi` keep working as the earlier spellings of the same arguments.
+- **`far_field(..., yee=..., dl_um=...)`.** `yee="exact"`, the default,
+  reads each field component where the solver sampled it (see "Changed");
+  `yee="legacy"` keeps the earlier readout for one release and gives a
+  `FutureWarning`. `dl_um` is the uniform cell size the readout measures
+  the sampling offsets in. By default it comes from the run's manifest, or
+  from the two samples of a face recorded one cell thick; a value that
+  disagrees with either, or with a face's in-plane sample spacing, raises
+  `ValueError`, and so does one given with a graded run (its grid lines
+  place the samples) or with planes sampled unevenly.
+- **`method="yee"` solves bent waveguides.**
+  `VectorModeSolver(..., method="yee").solve(bend_radius_um=..., num_pml=...,
+  pml_strength=...)` now solves bent waveguides and straight guides with
+  absorbing x layers, with the default method's arguments, defaults, checks,
+  mode-selection rules, warnings and bend metadata (`k_eff`,
+  `loss_db_per_cm`, `loss_unresolved`, `window_limited`, `pml_cells_xy`,
+  `physical_mask`). The bend is mapped onto a straight guide by
+  transformation optics: permittivity and permeability are scaled by the
+  radial factor `(R + x)/R` at each field component's own lattice position,
+  and the layers are a complex coordinate stretch folded into the same
+  tensors, with the radial factor continued to the stretched radius in the
+  outer layer. On two bent slabs with exact solutions of the 2-D dispersion
+  relation (a 1 µm core of index 1.7 in 1.6 at R = 50 µm and 1.3 µm
+  wavelength, in a 7.2 µm window; a 2 µm core of index 1.7 between 1.6
+  inside and 1.55 outside at R = 49 µm and 1.55 µm, in an 11.9 µm window;
+  the y axis closed periodically over three cells; exact per-component
+  subpixel sampling, 0.48 µm layers at strength 30, no dispersion) the
+  index, the loss and the group index converge at second order in the cell
+  size over 40 or 20 nm down to 5 nm. At 5 nm the index differs from the
+  exact roots by at most 6.5e-7, a 190 dB/cm loss by 0.0161 dB/cm and a
+  0.455 dB/cm loss by 1.42e-5 dB/cm. The returned fields are the physical
+  ones (`ez` and `hz` are the azimuthal components), co-located on the cell
+  centres. A new keyword-only `yee_periodic=(periodic_x, periodic_y)` on the
+  constructor closes an axis periodically, as `from_rectangular_core` already
+  does for slabs, so a bent slab with different claddings on its two sides
+  can be built from an array; arrays that vary along a periodic axis raise
+  a `ValueError`. The default method and the straight Yee solve
+  are unchanged bit for bit.
+
+  A separate comparison, with no convergence order claimed: on a Si 500 x
+  220 nm strip (index 3.4757) in oxide (1.444) bent to R = 3 µm at 1.55 µm
+  (5.8 x 1.5 µm window, 0.24 µm layers at strength 30, exact subpixel
+  sampling, no dispersion), the TE0 bend shift against the straight guide
+  in the same window reads 0.0039991, 0.0038990 and 0.0039465 at 40, 20 and
+  10 nm cells, against 0.0039450 ± 5.8e-5 from an independent reference
+  solver. The core faces sit at a different place on the grid at each of
+  these three cell sizes, so the sequence shows agreement within the
+  reference's error bar, not an order of convergence. A 5 nm level, run in
+  the validation suite's mode library with the faces on node lines as at
+  10 nm, reads 0.0039346 ± 1.2e-5, 1.0e-5 below the reference. Bends of +R
+  and -R agree to 3e-15.
+- **A windowed `PowerMonitor` runs on several GPUs.** A power monitor with
+  `center_um` and `size_um` used to stop a run on several GPUs
+  (`device="gpu:all"` or `"gpu:0,1"`) with an error; only one GPU or the
+  CPU could run it. The solver now splits the window across the GPUs the
+  way it splits a full plane. The GPU test suite passed on one GPU on
+  2026-10-22, 79 of 79 tests. Its new test splits the grid on that one GPU.
+  On a uniform mesh it uses 2, 3 and 4 parts. On a graded mesh and with a
+  symmetry plane it uses 2 and 4 parts. Every windowed reading matched the
+  unsplit run, bit for bit. A later two-card hardware run on 2026-10-28
+  compared windowed monitor outputs with one card. That historical check
+  does not qualify a new release image. No reading on one GPU or the CPU
+  changes. A solver released as 0.1.6
+  or earlier still refuses the window on several GPUs.
+- **Runs on several GPUs can time each GPU.** Set
+  `PHOTONHUB_DEVICE_TIMING=K` in the solver's environment to time every K-th
+  step on each GPU: how long each one ran its updates, copied grid planes
+  from its neighbours, waited for the host and waited for the slowest GPU.
+  Progress events then carry `device_time` and the `done` event
+  `device_time_s`. Timing is off by default. It only reads GPU timers, so
+  outputs are the same bit for bit with it on or off. A six-card hardware
+  run on 2026-10-31 measured timing and its overhead. Its timing reader still
+  has uncertainty, overhead-accounting and counterfactual-savings limitations;
+  that historical measurement does not qualify a new release image or a new
+  speed claim. Each progress event of a
+  run on several GPUs now also gives each GPU's memory in use (`cards`).
+- **`plot_comparison` draws discrete results as points.**
+  `points=("FDTD, TE0", "FDTD, TE2")` draws the named series of `values`
+  as markers with no joining line, such as a few runs of one method beside
+  another method's sampled curve. Each keeps the colour of its place, and
+  its legend entry shows the marker only. A single series is named by
+  `label`; a name that is not one of the series raises `ValueError`. Left
+  unset, every figure draws as before.
+- **The far-field projection can radiate into a dielectric, not only into
+  vacuum.** `far_field(..., n_medium=1.45)` projects a plane recorded inside
+  a silica substrate into that substrate; `n_medium="auto"` reads the index
+  from `simulation=` (per frequency in a dispersive medium) and refuses a
+  lossy medium. The medium's wavenumber and wave impedance enter the
+  pattern, the intensity, the radiated power and the directivity, and
+  `FarField.n_medium` records the index. `n_medium` is an index, not a
+  permittivity. The default stays vacuum, and its numbers do not change:
+  with `simulation=`, a plane or closed box in a medium of another index, or
+  a box whose faces sit in different media, only gives a warning. A box
+  across an interface is refused when an index is given or read. A layered
+  half-space, such as cladding over a substrate, is still outside the model.
+  Checked against the exact field of a dipole in a dielectric on a closed
+  box and on a plane, and against a point dipole run in a dielectric
+  background.
+
+### Changed
+
+- **Deprecated: the flat layout of `FarField`.** `e_theta`, `e_phi`,
+  `theta`, `phi`, `intensity`, `radiated_power()`, `directivity()`,
+  `reshape()`, `cartesian_fields()` and the per-point `ux`, `uy`, `x_um`,
+  `y_um`, `r_um`, `e_r`, `h_r`, `h_theta`, `h_phi` and `propagating` (arrays
+  indexed `[frequency, point]` over a flat list of points) keep working,
+  with the same values, for one release; reading one gives a
+  `FutureWarning` that names its replacement in `FarField.dataset` (or
+  `cartesian()`).
+- **Numbers move: `far_field` reads each field component where the solver
+  sampled it.** The solver stores E and H half a cell apart, along each
+  face's normal as well as in its plane. The projection used to average
+  each component to the cell node and leave the half cell along the normal,
+  so a box gave a pattern with a front/back asymmetry first order in the
+  cell size: 0.28 of the peak for a point dipole in vacuum at 25 cells per
+  wavelength. It now reads each component at its own point. A single plane
+  needs one sample along its normal and may keep an `interval_space`
+  stride. **Record each box face one cell thick** (size `dl` along its
+  normal, centred at `(k + 3/4) dl`) and one cell past the box on every side
+  in its plane; `far_field` then brings E and H onto one surface. The same
+  dipole now reads 0.1 % of the peak in front/back asymmetry with it half a
+  cell from the box centre, up to about 0.80 % with it near a box corner
+  (0.10
+  to 0.12 µm from each of the three faces there) and up to about 1.06 %
+  near a box edge, two faces near and the third coordinate centred
+  (uniform mesh, no structures, no dispersion, 25 PML layers, a box 1.2
+  wavelengths wide). Wherever the build does not warn the bound is 2 % of
+  the peak at 25 cells per wavelength, and the error falls about 4x per
+  halving of the cell. In course notebook 12 the equatorial
+  ripple of a dipole's pattern falls from 25 % to 0.4 % at 50 nm cells. In a
+  dielectric the resolution counts per medium wavelength, and at the same
+  count the asymmetry is larger than in vacuum (the solver's time step
+  follows the vacuum limit). Use at least 30 cells per medium wavelength,
+  where the bound is also 2 %: a dipole near a box edge reads up to
+  0.96 %, 1.07 % and 1.11 % at index 1.5, 2.5 and 3.5, and the worst
+  of 22 other placements 0.70 %, 0.81 % and 0.84 % with the dipole three
+  cells from a face (0.96 %, 1.11 % and 1.15 % at 25 cells); for
+  a source fixed in space it falls as the square of the cell (fitted order
+  2.01 to 2.04 with the dipole on grid nodes along y and z, 0.2 medium
+  wavelengths from the faces it approaches, and along x on its Ex Yee
+  point, half a cell from the node). Box faces recorded with
+  `interval_space` (when the cell size is known: a run's result, or
+  `dl_um=`), faces with more than two samples along the normal (a volume
+  passed as a plane included), and
+  boxes whose faces stop short of one cell past the box are refused, naming
+  the face; this includes a box with a face left out. Graded meshes and
+  symmetry-reduced runs take this readout too (next entry). Box faces
+  recorded with one sample, and plain arrays whose cell size or grid lines
+  cannot be told (pass `dl_um=`, or the `RunResult`), fall back to the
+  earlier readout with a warning (a `FutureWarning` for the box faces).
+  `far_field(..., yee="legacy")` keeps the earlier readout for one
+  release.
+  `colocate=False` still means synthetic fields that share their sample
+  points; a box of such fields now takes fourth-order weights at its edges,
+  which moves its pattern by up to about 0.3 % of the peak (a dipole box at
+  25 cells per wavelength). Each face is integrated with factored phase
+  terms: on a 12-core laptop a single 300 x 300 plane projects onto 3,312
+  directions about 100x faster (0.08 s against 7.5 s), and a box of six
+  99 x 99 faces about 8x faster (0.36 s against 2.8 s; each box face is
+  projected twice). With `simulation=`, the medium a face recorded one
+  cell thick radiates into is sampled half a cell beyond its outer sample.
+- **Numbers move: `far_field` reads graded meshes and symmetry-reduced
+  runs the same way.** Both used the earlier readout, whose front/back
+  asymmetry on a box is first order in the cell size. On a graded mesh
+  each sample is now placed from the run's grid lines (pass the
+  `RunResult`: its manifest lists them), a component half a cell off the
+  node at the midpoint of its cell; H is brought onto the E plane with the
+  two cells' widths as weights, and the box-edge rule integrates the cubic
+  through the samples' true positions. An open plane whose samples are
+  unevenly spaced, `colocate=False` included, takes the same cubic instead
+  of the centred cell widths (a synthetic plane with warped coordinates
+  moves by 4.3e-5 of the peak). On a uniform mesh every number is
+  unchanged, bit for bit. A vacuum dipole box with a cube 0.4 wavelengths
+  wide around the dipole meshed twice as fine (`MeshOverride`, grading by
+  up to 1.4 per cell; no structures, no dispersion, PML one wavelength
+  thick) closes on the near-field flux within 0.18 %; its front/back
+  asymmetry is up to 1.79 % of the peak at 25 cells per wavelength in the
+  background, 1.25 % at 30 and 0.92 % at 35 (worst of 33 placements, the
+  dipole 0.1 µm from a face, the cube's edge just outside it), falling as
+  the square of the cell. The solver's time step follows the finest cell,
+  so the background runs at a lower Courant number and its dispersion
+  error grows, as in a dielectric (a uniform mesh at that time step reads
+  1.05 % for the same placement, 0.67 % at its own). The rest comes from
+  the edge of the refined region lying just outside a box face, since the
+  projection assumes one homogeneous medium outside the box: with the
+  refinement ending inside the box the same placement reads 1.17 %; with
+  it 0.19 µm past the faces the worst of 33 placements reads 1.68 %, and
+  with it carried past them, 0.35 µm to the end of its grading (0.30 µm to
+  the nearest change of cell size), 0.87 %. The range the accuracy is
+  shown for: every box face at least 0.35 wavelengths from the nearest
+  grid line where the cell size changes, along its normal, on either side
+  (a refined region's edge counts, not only the end of its grading),
+  every source at least 0.1 wavelengths from one (a point source along
+  each axis, a launch along its normal), and at least 30 background cells
+  per wavelength. There, for refinements 2 and
+  3 times as fine as the background, the front/back asymmetry of a vacuum
+  dipole box stays within 2 % at 30 background cells wherever the build
+  does not warn, with the power within 0.24 % of the near-field flux. It
+  reads up to 0.90 % (ratio 2) and 0.93 % (ratio 3) with the refinement
+  inside the box and a dipole near a box edge (0.67 % and 0.71 % at a box
+  corner, 0.11 to 0.13 µm from its three faces), and 0.13 % (ratio 2) and
+  0.055 % (ratio 3) with it carried past every face; for a
+  source fixed in space it falls at about second order (fitted order 2.06
+  and 1.98 with the refinement inside the box). Higher ratios are not
+  covered. Outside that range no bound is given: a source on or just past
+  the edge of a refined region radiates an asymmetric field by itself, up
+  to 1.085 % at ratio 3 and 0.92 % at ratio 2 at 30 background cells. A
+  symmetry-reduced run is mirrored at
+  each component's own point with the sign each plane gives it, and a box
+  face normal to a plane gains its mirror image; record the box on the kept
+  side only. The planes are read from the run, so `simulation=` is no
+  longer needed, and one that disagrees with the run raises `ValueError`.
+  Against the full run's box, the pass that brings E onto the H plane
+  agrees to the solver's float32 precision; the pass that brings H onto
+  the E plane reads the image face at its outer sample, where the full run
+  reads its far-side face at the inner one, so the mean of the two differs
+  by the readout's second-order error: about 0.1 to 0.4 % of the peak
+  intensity on FDTD dipole boxes at 16 cells per wavelength (three cases,
+  two symmetries, uniform and graded meshes), falling at about second
+  order (0.04 to 0.06 % at 32). Neither the reduced nor the full run is
+  systematically closer to the exact pattern. A symmetry-reduced
+  box that would fall back to the earlier readout (faces with one normal
+  sample, or plain arrays of a graded mesh) is refused, naming the faces:
+  that readout cannot add the mirror image, and the box stayed open on the
+  far side. Notebook 38 (symmetry-reduced, graded)
+  now uses this readout: the share of the escaping light within 10
+  degrees of the normal moves from 0.4813 to 0.4812 (48 % as printed, read
+  on one mesh and not shown converged).
+- **The GPU DFT kernel does less index arithmetic.** On every GPU run, one
+  GPU or several, the kernel that accumulates DFT and flux monitors now
+  locates its work once per tile of 2048 cells instead of once per cell. It
+  only changes which thread updates which element. On one GPU model a test
+  scene's outputs were the same bit for bit as before, and its one-GPU
+  stepping speed did not change measurably.
+- **Runs on several GPUs are built to waste less of each card.** Time
+  probes are gathered on the cards and read back once per 256 samples
+  instead of one blocking copy per probe per sample, and the update launches
+  alternate between cards. Each change only reorders work. On one GPU model
+  a test scene's outputs were the same bit for bit as before, and the same
+  across one, two and six GPUs; on a second GPU model the GPU test suite
+  passed on one GPU. The speed gain on a public scene is not yet measured.
+  Such a run now reports, in a
+  `multi_gpu_setup` event, which card holds which part of the grid and how
+  each pair of neighbouring cards is linked and copies (directly or through
+  the host), and its `done` event gives the host time per phase of the step.
+- **Runs on several GPUs split the grid by work, by default.** Such a run
+  now splits the grid along z by the work each part carries (PML layers,
+  materials, DFT and flux planes) instead of into equal plane counts.
+  Outputs stay the same bit for bit across GPU counts and across the two
+  splits. With auto-shutoff on, the energy check adds up its parts in a
+  different order, so a run can stop one progress interval earlier or later
+  than under the old default. This is one measurement on one GPU model: a
+  synthetic photonic-crystal slab on six GPUs stepped 5.8 % faster with the
+  new split (66.02 against 62.38 Gcells/s, setup time excluded, one run per
+  split). No other GPU model or GPU count has been measured, and other scenes
+  may gain less. A part can now hold many more planes than an equal share, so
+  a run that fit its cards with equal parts can need more memory on one card.
+  To get equal plane counts back, for example when a run runs out of GPU
+  memory, set `PHOTONHUB_Z_PARTITION=equal` in the solver's environment;
+  `PHOTONHUB_Z_PARTITION=cost` names the new default. The `partition` key of
+  the run's `multi_gpu_setup` event names the split used.
+- **Cloud GPU calls name the GPU and the solver build themselves.** The
+  managed service runs only a curated `gpu:<id>` and a solver commit it
+  approved, and never picks either, so the documented short forms such as
+  `ph.cloud.run_quoted(sim)` stopped at the quote with HTTP 400. Now a bare
+  `device="gpu"`, every cloud call's default, becomes the GPU `ph.gpus()`
+  lists when it lists exactly one; and `solver=None` on a GPU becomes the
+  `git_sha` of the locally installed solver (the one `ph.find_solver()` and a
+  local run use), so a local CPU run and a cloud GPU run name the same build.
+  The pair is resolved once per call, or once per `ph.cloud.Batch`, S-matrix
+  run, study or layout-component helper call, and the quote and the
+  submission carry the same values. Explicit `device="gpu:<id>"` and
+  `solver=` are never changed; `device="cpu"` keeps `solver=None`.
+  `ph.cloud.preflight` returns the resolved `device` and `solver`. A cloud
+  study records the resolved build and resumes with it when `solver` is left
+  out, so collecting and adding jobs needs no local solver. **Behaviour
+  change** for callers who left `device="gpu"`: with several GPUs on the menu
+  the call now stops before any quote with a `CloudError` that lists the ids;
+  with an empty or unreachable menu, read in one attempt with a 10 s
+  timeout, `"gpu"` is sent as before. On a GPU without `solver=`, the call
+  now needs a local release solver, which reports its full 40-character
+  build id. A solver built from source reports a 12-character id the cloud
+  cannot match, a build from modified sources `<sha>-dirty`, and the
+  Workbench's solver no id at all, since it does not answer `phsolver info`
+  on its own; with any of these, or with none installed, the call stops
+  before any request, names what the solver reported, and says to pass
+  `solver=` with the full commit or install a release solver. Explicit
+  forms, the only ones 0.1.6 and earlier accept, keep working.
+- **`cost_estimate()` plans at $0.20 per Tcell-step.** The default
+  `rate_usd_per_tcell_step` was $0.40, so a default estimate now reads half
+  of what it did. It stays a planning figure: pass your own rate, and the
+  service's quote is the price. Thirteen course notebooks still print the
+  old rate in their recorded outputs until they are next executed.
+
+### Breaking
+
+- **`SMatrixPort` names its frame on a `domain=` scene.** New `frame="user"`
+  for your own coordinates or `frame="wire"` for coordinates with `origin_um`
+  already taken off, which is how earlier versions read them. Where
+  `origin_um` is not zero, `plan_smatrix` and `run_smatrix` now raise
+  `ValueError` for a port without one, because the two look alike and either
+  would run. If you subtracted the origin yourself, add `frame="wire"` and
+  your numbers stay as they were. A hand-built scene, at the origin, needs no
+  change.
+- **Stop subtracting `origin_um` from a `ph.Port` (#631).** `plan_smatrix`
+  and `run_smatrix` now read a `ph.Port` in your own coordinates, so a port
+  you moved by hand moves twice: remove the subtraction. Such a port looks
+  like any other, so nothing refuses it. `plan_smatrix` warns when a port's
+  solved `n_eff` is below the highest background index at that port, and
+  refuses one past a wall. A port you build new from a read-back one is the
+  same case: `ph.Port(held.name, held.center_um, ...)` and
+  `ph.Port(**dataclasses.asdict(held))` are new ports in your own coordinates,
+  and move twice. A port read back from `sim.ports` belongs to that
+  simulation and is in its stored frame. `dataclasses.replace` and
+  `copy.deepcopy` keep it so: it stands as it is, an edit of its centre is in
+  that frame too, and it keeps its `out_direction`, so a port moved across the
+  device needs `out_direction=None`. On another simulation its numbers stand
+  as they are, which is the right place only if both share `origin_um`.
+
+### Fixed
+
+- **Notebook cancellation preserves the private channel.** Interrupting a
+  cell during a partial reply read or request write now completes cancellation
+  without losing message framing. The worker and its saved variables remain
+  usable for the next cell.
+- **Numbers move: frequency-domain readings on a Bloch axis (#632).** An
+  oblique plane wave from `Simulation.with_oblique_plane_wave` read 4 times
+  the power of a normal plane wave of the same amplitude, with no warning.
+  The source was right: the field in time carried the declared amplitude, and
+  the solver normalized the frequency-domain readings of a Bloch run by the
+  wrong pulse spectrum. Every run with a Bloch axis had this scale, with or
+  without a wavevector, whatever its source: `PowerMonitor` read 4 times the
+  power, `ProfileMonitor` twice the field, and so did everything built on
+  them (`diffraction_orders` amplitudes and powers, `mode_amplitude`,
+  `mode_transmission`, `far_field` fields and intensity, `colocated_fields`),
+  and a Gaussian beam launch read 4 times the power of
+  the same launch on periodic axes. `value_and_gradient` on a Bloch axis moves
+  too. With an absolute objective such as `PointIntensity`, `J` moves by 1/4
+  and the gradient by 1/8. With a ratio objective (`ModeTransmission`,
+  `BroadbandModeTransmission`), `J` stays and the gradient moves by 1/2. In
+  both, the old gradient was twice too large for its `J`. At zero wavevector
+  `J` and the gradient now agree with the periodic run to 2e-6 on a waveguide
+  scene that rings down. If the pulse reaches a lattice cutoff and the run does
+  not ring down, they differ by what is left at the end of the run, and neither
+  gradient can be trusted. A Bloch run now reads the scale of any other run:
+  at the pulse centre, a plane wave of amplitude `E0` carries
+  `E0^2*A*n*cos(theta)/(2*eta0)`. The power over that value, on an empty
+  column at 37 cells per wavelength, went from 3.986 to 0.9964 at 0.5 degrees
+  and to 0.9965 at 10 degrees, those being the sampling factor `PowerMonitor`
+  states. That closed form covers the pulse centre only. Off it, the constant
+  wavevector leaves a forward wave `E0*(1+r)/2`, with
+  `r = cos(theta)/cos(theta(f))`, and a backward leak `E0*(1-r)/2`, so
+  absolute readings there do not follow it: at 30 degrees, 160 and 240 THz on
+  a 200 THz pulse read 1.112 and 0.953 of it at `theta(f)`, and at 45 degrees
+  1.577 (s-polarized) and 0.879. Keep the band clear of the cutoff
+  `f0*sin(theta)`: near it the reading at the pulse centre swings with the run
+  length, by about 1 % at 60 degrees with a 20 THz pulse, with a size and sign
+  that depend on where the source and monitor sit. Ratios inside one run or
+  between two Bloch runs do not move, apart from the gradient of a ratio
+  objective above: `R`, `T`,
+  order efficiencies and port-to-port S-parameters read the same, and so do
+  time monitors, snapshots and the resonance frequencies and Q read from them.
+  Remove any factor of 2 or 4 you applied by hand, and re-run anything that
+  compares an absolute Bloch reading with a saved one. That includes a local
+  study directory: resumed across the upgrade, it reuses every finished record,
+  so one table mixes the two scales with no warning. Start a new directory.
+  Runs without a Bloch axis do not change, and GPU runs refuse Bloch axes.
+  With a solver from 0.1.6 or earlier, the old scale remains.
+- **Breaking: `extent_um` on a periodic or Bloch axis raises, and a `domain=`
+  cell that differs from the one described now says so (#633).** `extent_um`
+  on such an axis was dropped with no warning (walls at -1 and +1 um round a
+  0.4 um device gave a 0.4 um cell); it now raises `ValueError` and points to
+  `period_um`. A `domain=` scene with a `period_um` that is not a whole
+  number of cells kept a rounded cell with no warning: 0.265 um became
+  0.256 um on a graded mesh, 3.4 % off. The cell keeps that size, so no scene
+  that ran moves its grid or input hash, and a warning now gives the period
+  asked, the cell it has and a spacing that keeps the period
+  (`ph.Mesh(dl_um=(...))` takes one per axis). A Bloch axis has at least four
+  cells, so a shorter period gets the warning too. A scene the solver refused
+  could not run for anyone, so its grid may move: that is the fix. Copying the
+  spacing now builds the scene, keeps the period and stops the warning, on a
+  Bloch axis too. A spacing of its own makes the mesh graded, so a scene that
+  needs a uniform mesh takes one spacing on every axis instead: with a TF/SF
+  box the solver refuses a per-axis spacing, and
+  `subpixel_method="tensor_full"` or `"contour_full"` raises at the build. The
+  axis the solver cannot take as a coordinate ladder sets the mesh's base
+  cell: a Bloch axis, an axis under four cells, or an axis whose ladder misses
+  the seam, which rounding alone can do from about 2,500 cells, more often the
+  longer the axis. Only one spacing can be the base cell, so the warning tells
+  an axis under four cells beside one of the others to take four, tells two
+  Bloch axes to share one cell that divides both periods, and says so when no
+  cell near that size does. Two long axes, or a long axis beside a Bloch axis,
+  with different spacings can still be refused: the build raises and gives
+  that axis's first and last spacing, and a warning says so first when a
+  period is off whole cells. A per-axis spacing such as `0.265 / 13` on a
+  periodic axis also builds now, where it could raise on the seam spacings.
+  The cell is centred on the structures' bounding box, so a shape drawn off
+  centre moves the walls: a shape that then crosses a wall, which cuts it and
+  does not wrap it, now gets a warning. A `size_um=` scene on a uniform axis
+  still rounds with no warning and `sim.size_um` prints the request;
+  `sim.cost_estimate().cells_per_axis` shows the cells used (#642).
+- **Breaking: a `DesignRegion` that misses a component the scene names on a
+  one-cell periodic axis is refused (#634).** A gradient runs with subpixel
+  off and a box does not wrap, so with `cells=(0, 1)` on such an axis the
+  default quarter-cell faces, 0.25 to 1.25 cells, hold the half-cell sample of
+  the E component along the axis and miss the sample at 0 of the two across
+  it. In a quasi-1D scene (a 4 um run of 0.02 um cells, 12 PML layers, one
+  0.3 um film of eps 4 at 200 THz) no component saw the region, so the value
+  equalled the empty scene and the gradient was exactly 0. `value_and_gradient`
+  and `build_adjoint_simulation` now raise `ValueError` before any solve when
+  the objective's component misses, or every source's does. They warn when
+  only some sources miss, and when they cannot tell, as with a mode source or
+  a magnetic dipole. A TM scene, with `Ez` alone on a one-cell z axis, sees
+  these faces and runs unchanged. The message leads with `cells=(-1, 1)`,
+  which holds both samples in every parametrization and leaves such a TM
+  scene's result as it was. `box_face_offset_cells=0` holds them too, but it
+  moves the faces on every axis, which changes the design: on a TM scene it
+  changed the result and the gradient. `validate_spec` still passes such a
+  scene: it sees only the boxes, which are valid, and not the region.
+- **`to_file` keeps `dft_shutoff=0`; other saved forms still lose it (part
+  of #635).** A saved scene lost an explicit zero, so `from_file` gave
+  `None`, which a local CPU run reads as the 1e-4 guard: the saved scene and
+  the scene in memory followed different stop rules. `to_file` now writes
+  the zero, and a script that reloads the file with `from_file` keeps it.
+  It is still lost everywhere else. Text from `to_wire_json()` reloads as
+  `None`, because records store digests of those bytes, and so does a run
+  folder's `sim.json`. The Workbench loses it even from a file that holds
+  it: the Run dialog applies the 1e-4 guard and Save removes the value
+  (#528, open). Run such a scene from a script. Nothing else moves:
+  `to_wire_json`, `to_wire_dict`, `spec_sha256`, a run's `sim.json` and what
+  goes to a GPU or the cloud all leave the zero out as before, and every
+  other scene's file is byte-identical, golden specs included. No schema
+  change: `run.dft_shutoff` has allowed 0 since 1.21.
+- **`FarFieldMonitor`'s source warnings measure where the solver runs each
+  source.** They measured where it was declared. The solver runs a point
+  dipole on the nearest grid point of its field component, an exact tie
+  rounded half away from zero, so a dipole declared on the grid node 2
+  cells from a face's innermost sample, along its polarization, could run
+  half a cell nearer, 1.5 cells from it, with no warning; and one declared
+  a little under 2 cells away could be warned about while it ran 2 cells
+  away. The warning about a source within 2 cells of a face's innermost
+  sample, and on a graded mesh the one about a source within 0.1
+  wavelengths of a change of cell size, now take each dipole where the
+  solver runs it (the indices `phsolver validate` reports), a plane wave or
+  mode source on the grid line it is injected on with the row of its
+  correction half a cell before it, and each face of a TF/SF box on its grid
+  line with that row half a cell outside the box. A message names where a
+  dipole runs when that differs from where it was declared. Rebuild a
+  simulation to see whether a placement you kept is now warned about.
+- **Numbers move: `plan_smatrix` and `run_smatrix` put a `ph.Port` where
+  `Simulation(ports=...)` puts it (#631).** On a `domain=` scene they read the
+  port's coordinates from the fitted box's corner, not from your origin, so
+  the port landed `origin_um` away from where you drew it, and its mode, its
+  outward side and its window all came from that wrong place, with no error.
+  Anything run this way on a `domain=` scene is worth repeating.
+  `plan_component_smatrix`, `run_component_smatrix` and a call with `sim.ports`
+  were right and stay as they were: those ports are held with the origin
+  already taken off. The one limit on "the same place" is a port in the half
+  a symmetry plane mirrors away, which `ports=` reads through its image and
+  `plan_smatrix` refuses.
+- **Breaking: a port outside the domain is refused (#631).** A port that was
+  not driven could sit past a wall: its plane snapped onto the wall and read
+  an unguided mode, with only a warning that called it inside the PML.
+  `plan_smatrix` now raises `ValueError` for a plane past a wall, on any axis,
+  and for a transverse centre past a wall, naming the symmetry plane when the
+  port is in the half it mirrors away. On a periodic or Bloch axis a
+  transverse centre wraps and is not checked, but a plane past the wall is
+  refused: the plan used to pass it and the solver then refused the run. A
+  position on a wall within rounding stands, so a port on a symmetry plane
+  away from zero is kept. The messages quote your frame, not the fitted box's.
+- **A strided plane and a closed box project without the old averaging
+  error (#575).** On a plane recorded with `interval_space`, `far_field`
+  averaged samples a stride apart: on an exact Gaussian beam at 20 cells per
+  wavelength its intensity error grew from 0.6 % of the peak (every cell)
+  to 1.8 % (every fifth cell). It now reads 6e-5 or less at every stride.
+  On a closed box the averaging took the sample before each face's first one
+  as zero, which read the radiated power up to 1.8 % low (from -1.8 to
+  +0.1 % in the dielectric below, -1.4 to -0.5 % in vacuum); a point dipole
+  box recorded one cell thick now closes on the near-field flux within
+  0.07 % in a dielectric of index 2.57 and 0.03 % in vacuum (box
+  half-widths of 12 to 24 cells, 20 to 40 cells per wavelength in the
+  dielectric, the same cells in vacuum; uniform mesh, no structures, no
+  dispersion, 12 PML layers).
+- **`FarField.radiated_power()` and `directivity()` no longer raise
+  `KeyError` on some angle grids.** Ordinary full-sphere and hemisphere
+  grids were among them, such as theta `np.linspace(0, np.pi, 113)`: the
+  solid-angle weights rounded the angles one way to build each axis and
+  another way to look them up. An affected grid raised rather than returned
+  a number, so nothing needs re-running. Grids that already worked give the
+  same results. The one exception is a list of directions with two angles
+  within about 1e-12 rad of each other, where one could take its
+  neighbour's cell; each now takes its own.
+- **Progress events of a run on several GPUs carry the throughput.** They
+  reported 0 Mcells/s and no time remaining; they now fill the instantaneous
+  and average rates and the estimate the way a run on one GPU does.
+- **Numbers move: a simulation file reads back whatever its media are.**
+  `Simulation.from_wire_json` and `Simulation.from_file` refused a `Medium`
+  with poles, a Drude term, an anisotropic `permittivity_xyz` or a
+  `permittivity_data` grid, and a plain `Medium` hid it. `RunResult(path)`
+  lost the simulation of such a result, and `run_local` warned that it could
+  not write the client state. Both now work, and the wire is unchanged.
+  `RunResult(path)` on such a result now reads absolute units where it read
+  unit amplitude: a flux moves by the first source's amplitude squared, and
+  by 2 for each symmetry plane that cuts it, and a frequency-domain field by
+  the amplitude.
+- **Breaking: `RunResult` refuses a simulation that is not the one the
+  result ran (#596).** `RunResult(path, simulation=sim)` reads with `sim`:
+  its grid and frame place the fields, its ports give the modes and its first
+  source the amplitude. A `sim` that differed from the run gave wrong numbers and no
+  warning, and a script rebuilt on a newer SDK can build a different mesh
+  from the same text. `sim` is now compared with the `sim.json` saved with
+  the result, or the copy in an HDF5 bundle, leaving out the `run` block,
+  which a reading does not use, and with launch amplitudes compared to 0.1 %,
+  since a rebuilt launch can move that far. A bundle with no `sim.json`, as
+  some cloud backends return, is compared with the spec this client stored
+  when it submitted the job, provided that spec is the input the manifest
+  recorded. That spec lives in the local cache, so a read on a machine
+  without that cache compares only the grid the manifest recorded, and a
+  difference elsewhere goes unseen there. A difference raises
+  `SimulationMismatchError`, a `ValueError` that names it.
+  `ph.cloud.resume(job_id, simulation=sim)` refuses the same way and keeps
+  the cached result. `RunResult(path)` reads a result saved by 0.1.6
+  correctly with the saved simulation, and with its ports when a client
+  record was kept: `run_local` writes one beside the result, and `ph.cloud`
+  keeps one in the local cache of the machine that submitted the job. With
+  no record, such as a job read on another machine, the ports do not come
+  back, and the refusal says so: read them on the SDK that ran the job. Read
+  ports through the result (`data.transmission`,
+  `data.simulation.port_monitors`): the `port_monitors` of a simulation you
+  rebuilt are not checked, and on another grid they read the saved fields
+  wrongly. `far_field(data, simulation=...)` compares only the symmetry
+  planes with the run, so with `n_medium="auto"` the medium comes unchecked
+  from the simulation you pass: pass `data.simulation`. Port modes
+  are not compared, so reading another mode from the same
+  fields is accepted; a default window follows the mode, so give `window_um`
+  to keep the same plane.
+- **A refused cloud request says why.** `str(ph.cloud.CloudError)` read only
+  the route and status, such as `POST /v1/estimate -> HTTP 400`, while the
+  service's reason sat in `.body`. The message now ends with that reason:
+  `POST /v1/estimate -> HTTP 400: the managed GPU solver commit must be
+  supplied explicitly`. A structured refusal reads as a sentence, for example
+  `one managed GPU job per account can be active (1 of 1); wait for it to
+  finish` for the 429 concurrency limit, and a nested
+  `{"error": {"code", "message"}}` body as its message. An HTML error page
+  reads as its text without its style and script, and an object store's XML
+  error as its code and message. The reason is one line of at most 300
+  characters without control characters (terminal escapes, bidirectional
+  overrides); API keys, bearer and signed tokens, signed-URL query strings
+  (also JSON-escaped) and signature parameters are redacted, in time linear
+  in the body's size. `.status_code`, `.body` and `.job_id` are unchanged.
+  Code that matched the exact old message text may need updating.
+
+- **Fitted domains on a graded mesh are smaller where a high-index medium
+  crosses a boundary: numbers move.** With `domain=` and
+  `Mesh(cells_per_wlen=...)`, the room for each face's `pml_num_layers` or
+  `absorber_num_layers` was counted in background cells, but the mesh fills
+  it with the cells of the medium that crosses the face. Where a substrate,
+  a cladding or a port's guide ran through a face, the domain held extra
+  interior medium between the wall and the layers: a 0.22 um silicon slab
+  on a silicon substrate in air, 14 cells per wavelength, had 139 cells
+  under 40 absorber layers instead of 40. Each face now reserves its layers
+  in the cells the mesh puts there, so such scenes need fewer cells (that
+  slab: 250 z cells, now 152; a silicon strip in oxide with ports along z
+  and 12 PML layers, 20 cells per wavelength: 294, now 260), and a run
+  given in `transits` is shorter. The PML or absorber now begins at the
+  walls you asked for, nearer the device than before (beside a port,
+  `port_margin_um` beyond its plane: by default ten cells of the port's
+  medium), so readings of such scenes may move a little. The fit checks the
+  built mesh and fits a face again where the layers would begin inside the
+  wall by more than the box's rounding and 3 % of their depth; if that box
+  does not build, the last one that did stands and a warning names the face.
+  A medium or a `Mesh(refine=...)` region that ends near the outer face is
+  now left out of the box or taken into it by enough of its cells to keep
+  the mesh's spacing-ratio check in nearly every case (the mesher's last
+  stretch of the background cells can still tip a region near the check's
+  limit over it), at most 64 and never past its far end; a sliver of it
+  inside the box could fail that check. A refine region whose cells are 9.82
+  to 10 times finer than the background cell (the check's limit is 10) is
+  taken in by 64 of its cells, and a warning names it. Creating the
+  simulation can still fail the check and raise a ValueError, sometimes
+  where 0.1.6 built it: over many scenes this happens less often than in
+  0.1.6 up to about 9.95 times finer, and more often closer to the limit.
+  Make the region's cells coarser, or end it further from the boundary. A
+  `dl_min_um` above the background cell now
+  widens the box, so the layers hold that many cells of the floor (they
+  held fewer and reached inside the walls). A port's guide that ends inside
+  the layers, short of the outer face by more than one of their cells, is
+  now continued to the face. The S-matrix driver's warning about a port
+  plane inside the layers measures their actual depth. Uniform meshes, and
+  the axes a mesh gives a spacing (`Mesh(dl_um=...)`), keep their wire byte
+  for byte. A result saved by an earlier SDK must be read with the
+  simulation saved beside it: one rebuilt with this SDK can have another
+  grid, and `RunResult` refuses it.
+
 ## 0.1.6 (2026-10-21)
 
 This release adds broadband and modal inverse design with checked gradients,

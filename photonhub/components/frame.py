@@ -18,6 +18,8 @@ the plotters call, so the inventory of positional fields lives here:
 - ``PowerMonitor``: ``position_um`` along ``axis`` and its window centre in
   the plane's CYCLIC order;
 - ``Port``, ``GaussianBeam``: ``center_um``;
+- ``FarFieldMonitor``: its ``center_um`` (a box, or a plane's extent) and a
+  plane's ``position_um`` along its ``axis``;
 - ``SnapshotMonitor`` (whole domain), ``GradedMesh`` (corner-anchored) and
   ``DesignRegion`` (indexed in cells) do not move.
 
@@ -54,8 +56,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Optional, Sequence, Tuple
 
-from .authoring import GaussianBeam, Port
-from .monitors import PowerMonitor, ProfileMonitor, SnapshotMonitor, TimeMonitor
+from .authoring import GaussianBeam, HeldPort, Port
+from .monitors import FarFieldMonitor, PowerMonitor, ProfileMonitor, SnapshotMonitor, TimeMonitor
 from .sources import ModeSource, PlaneWave, PointDipole, TfsfBox
 from .structures import Box, Cylinder, Medium, Polygon, Sphere, Structure
 from .._compat import caller_stacklevel
@@ -140,6 +142,13 @@ def translate(value: Any, delta: Sequence[float]) -> Any:
         return dataclasses.replace(
             value, position_um=float(value.position_um) + d[a],
             center_um=None if value.center_um is None else _add3(value.center_um, d))
+    if isinstance(value, FarFieldMonitor):
+        update = {}
+        if value.center_um is not None:
+            update["center_um"] = _add3(value.center_um, d)
+        if value.position_um is not None:
+            update["position_um"] = float(value.position_um) + d[_AXES.index(value.axis)]
+        return value.model_copy(update=update) if update else value
     if isinstance(value, SnapshotMonitor):
         return value
     return value
@@ -453,7 +462,7 @@ def _source_from_json(data):
     if kind == "port" and isinstance(value, str):
         return value
     if kind == "port_object":
-        return _dataclass_from_json(Port, value)
+        return HeldPort.of(_dataclass_from_json(Port, value))     # recorded in the wire frame
     if kind == "beam":
         return _dataclass_from_json(GaussianBeam, value)
     raise ValueError(f"unknown source kind {kind!r}")
@@ -475,20 +484,25 @@ def client_state(sim, *, wire: Optional[dict] = None) -> Optional[dict]:
     """The client-only state of ``sim`` as a JSON-ready record, bound to its
     wire document (:func:`wire_digest`); None when there is none to keep (a
     hand-built scene: corner frame, no fold, no declared ports or
-    wavelengths).
+    wavelengths, no far-field surface).
 
-    The record holds ``origin_um``, the symmetry fold, and for a declarative
-    simulation its readout wavelengths, its resolved ports (in the wire frame,
-    as the simulation holds them), the driven port and the source as given.
-    It does not hold the solved port modes: :func:`restore_client_state`
-    solves them again, on first use, on the reloaded simulation's own grid.
+    The record holds ``origin_um``, the symmetry fold, the recipe of each
+    far-field surface (``FarFieldMonitor``: its faces, their outward
+    normals, the medium they sit in and its declared geometry, in the wire
+    frame; only those whose face monitors are all in the document), and for
+    a declarative simulation its readout wavelengths, its resolved ports (in
+    the wire frame, as the simulation holds them), the driven port and the
+    source as given. It does not hold the solved port modes:
+    :func:`restore_client_state` solves them again, on first use, on the
+    reloaded simulation's own grid.
     """
     origin = frame_origin(sim)
     fold = getattr(sim, "_fold", None)
     decl = getattr(sim, "_declarative", None)
     wlens = getattr(sim, "wlens_um", None)
     wlen0 = getattr(sim, "wlen0_um", None)
-    if not any(origin) and fold is None and wlens is None and wlen0 is None:
+    far = _recorded_far_field(sim)
+    if not any(origin) and fold is None and wlens is None and wlen0 is None and not far:
         return None
     if wire is not None:
         # The runner can add a CPU-only default or omit an unsupported key.
@@ -512,6 +526,8 @@ def client_state(sim, *, wire: Optional[dict] = None) -> Optional[dict]:
             "mirrored_ports": dict(fold.mirrored_ports),
             "unfolded_monitors": list(fold.unfolded_monitors),
         }
+    if far:
+        state["far_field"] = far
     if wlens is not None and decl is not None:
         state["declared"] = {
             "ports": [_dataclass_json(p) for p in decl.ports],
@@ -521,6 +537,97 @@ def client_state(sim, *, wire: Optional[dict] = None) -> Optional[dict]:
             "launch_sources": len(sim.sources) - len(decl.user_sources),
         }
     return state
+
+
+def _recorded_far_field(sim) -> dict:
+    """The far-field surfaces of ``sim`` (``FarFieldMonitor`` recipes) whose
+    face monitors are all in its document: a copy that swapped them out
+    keeps no record of them."""
+    recipes = getattr(sim, "_far_field", None) or {}
+    names = {getattr(m, "name", None) for m in getattr(sim, "monitors", ())}
+    return {name: json.loads(json.dumps(rec)) for name, rec in recipes.items()
+            if all(face[0] in names for face in rec.get("faces", ()))}
+
+
+def carry_far_field(source, target) -> None:
+    """Give ``target``, an edited copy of ``source`` on the same grid, the
+    far-field recipes of ``source`` whose face monitors it still holds."""
+    names = {getattr(m, "name", None) for m in target.monitors}
+    kept = {name: rec for name, rec in (getattr(source, "_far_field", None) or {}).items()
+            if all(face[0] in names for face in rec.get("faces", ()))}
+    target._far_field = kept or None
+
+
+def _parse_far_field(sim, records) -> Optional[dict]:
+    """Validate the far-field recipes of a client-state record against
+    ``sim`` (its face monitors must be in the document); ``None`` for none."""
+    if records is None:
+        return None
+    if not isinstance(records, dict):
+        raise ValueError("far_field must be an object")
+    names = {getattr(m, "name", None) for m in sim.monitors}
+    out = {}
+    for name, rec in records.items():
+        if not isinstance(rec, dict) or rec.get("kind") not in ("box", "plane"):
+            raise ValueError(f"the far-field record {name!r} is malformed")
+        faces = rec.get("faces")
+        if not isinstance(faces, list) or not faces:
+            raise ValueError(f"the far-field record {name!r} lists no faces")
+        for face in faces:
+            if (not isinstance(face, list) or len(face) != 3 or face[1] not in ("x", "y", "z")
+                    or float(face[2]) not in (-1.0, 1.0)):
+                raise ValueError(f"the far-field record {name!r} has a malformed face {face!r}")
+            if face[0] not in names:
+                raise ValueError(f"the far-field face {face[0]!r} is not in the document")
+        freqs = [float(f) for f in rec["freqs_hz"]]
+        n = [float(v) for v in rec["n_medium"]]
+        if len(n) != len(freqs) or not all(math.isfinite(v) and v >= 1.0 for v in n):
+            raise ValueError(f"the far-field record {name!r} has a malformed n_medium")
+        _check_far_field_extras(sim, str(name), rec)
+        out[str(name)] = json.loads(json.dumps(rec))
+    return out
+
+
+def _check_far_field_extras(sim, name: str, rec: dict) -> None:
+    """Validate the optional parts of a far-field record: the symmetry
+    planes (they must be the document's), an open box's faces left out, a
+    plane's edge window."""
+    sym = rec.get("symmetry")
+    if sym is not None:
+        if (not isinstance(sym, list) or len(sym) != 3
+                or any(v not in (-1, 0, 1) for v in sym)):
+            raise ValueError(f"the far-field record {name!r} has malformed symmetry planes")
+        if tuple(int(v) for v in sym) != tuple(int(v) for v in sim.symmetry):
+            raise ValueError(
+                f"the far-field record {name!r} was compiled with the symmetry planes "
+                f"{tuple(sym)}, but the document has {tuple(sim.symmetry)}")
+    elif any(int(v) for v in sim.symmetry):
+        raise ValueError(
+            f"the far-field record {name!r} has no symmetry planes, but the document has "
+            f"{tuple(sim.symmetry)}")
+    opened = rec.get("open")
+    if opened is not None or rec.get("exclude") is not None:
+        if rec.get("kind") != "box" or not isinstance(opened, list) or not opened:
+            raise ValueError(f"the far-field record {name!r} has a malformed open box")
+        sides = []
+        for face in opened:
+            if (not isinstance(face, list) or len(face) != 3 or face[0] not in ("x", "y", "z")
+                    or float(face[1]) not in (-1.0, 1.0) or isinstance(face[2], (list, bool))
+                    or not math.isfinite(float(face[2]))):
+                raise ValueError(f"the far-field record {name!r} has a malformed open face {face!r}")
+            sides.append(f"{'+' if float(face[1]) > 0 else '-'}{face[0]}")
+        if sorted(sides) != sorted(rec.get("exclude") or ()):
+            raise ValueError(f"the far-field record {name!r} has open faces {sides} that are not "
+                             f"the faces it excludes, {rec.get('exclude')}")
+    window = rec.get("window")
+    if window is not None:
+        if rec.get("kind") != "plane" or not isinstance(window, list) or len(window) != 2:
+            raise ValueError(f"the far-field record {name!r} has a malformed window")
+        for part in window:
+            if (not isinstance(part, list) or len(part) != 4 or part[0] not in ("x", "y", "z")
+                    or not 0.0 <= float(part[1]) <= 0.5
+                    or not float(part[2]) < float(part[3])):
+                raise ValueError(f"the far-field record {name!r} has a malformed window {part!r}")
 
 
 class _ReloadedPortMonitors(Mapping):
@@ -636,7 +743,7 @@ def _parse_client_state(sim, state):
         d = state["declared"]
         if wlens is None:
             raise ValueError("declared ports need wlens_um")
-        ports = tuple(_dataclass_from_json(Port, p) for p in d["ports"])
+        ports = tuple(HeldPort.of(_dataclass_from_json(Port, p)) for p in d["ports"])
         driven = d.get("driven")
         if driven is not None and driven not in {p.name for p in ports}:
             raise ValueError(f"the driven port {driven!r} is not among the ports")
@@ -656,7 +763,8 @@ def _parse_client_state(sim, state):
             user_monitors=tuple(m for m in sim.monitors
                                 if getattr(m, "name", None) not in generated))
         declared = (ports, source, resolved)
-    return origin, fold, (wlens, wlen0, transits), declared
+    far = _parse_far_field(sim, state.get("far_field"))
+    return origin, fold, (wlens, wlen0, transits), declared, far
 
 
 def restore_client_state(sim, state, *, where: str) -> bool:
@@ -669,26 +777,36 @@ def restore_client_state(sim, state, *, where: str) -> bool:
     unreadable restores nothing: this warns and returns False, and the result
     then reads as the wire document alone describes it (corner-frame
     coordinates, a plane across a symmetry plane left as recorded, no
-    declared ports). A restored simulation refuses ``with_changes``: the
-    fields as the user gave them are not part of the record.
+    declared ports). A simulation restored with a user frame, a
+    symmetry-plane record, wavelengths or declared ports refuses
+    ``with_changes``: the fields as the user gave them are not part of the
+    record. One whose record holds far-field surfaces alone stays editable
+    as the wire document it is, and keeps their recipe only through an edit
+    of nothing the recipe was checked against (the run, sources, monitors,
+    precisions, PML grading).
     """
     try:
-        origin, fold, (wlens, wlen0, transits), declared = _parse_client_state(sim, state)
+        origin, fold, (wlens, wlen0, transits), declared, far = _parse_client_state(sim, state)
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         _warn_not_restored(where, str(exc))
         return False
-    _install_client_state(sim, origin, fold, wlens, wlen0, transits, declared)
+    _install_client_state(sim, origin, fold, wlens, wlen0, transits, declared, far)
     return True
 
 
-def _install_client_state(sim, origin, fold, wlens, wlen0, transits, declared):
+def _install_client_state(sim, origin, fold, wlens, wlen0, transits, declared, far=None):
     """Install an already validated client record on a wire-ingested scene."""
     object.__setattr__(sim, "origin_um", origin)
     object.__setattr__(sim, "wlens_um", wlens)
     object.__setattr__(sim, "wlen0_um", wlen0)
     sim._fold = fold
     sim._run_transits = transits
-    sim._inputs = _UnrecordedInputs()
+    sim._far_field = far
+    # A record of far-field surfaces alone restores no frame and no inputs:
+    # the simulation stays editable as the wire document it is.
+    frame_free = (not any(origin) and fold is None and wlens is None and wlen0 is None
+                  and declared is None)
+    sim._inputs = None if frame_free else _UnrecordedInputs()
     if declared is not None:
         ports, source, resolved = declared
         object.__setattr__(sim, "ports", ports)
@@ -703,10 +821,10 @@ def _copy_restored_client_state(source, target) -> None:
         raise ValueError(_UnrecordedInputs._MESSAGE)
     state["wire_sha256"] = wire_digest(target)
     try:
-        origin, fold, (wlens, wlen0, transits), declared = _parse_client_state(target, state)
+        origin, fold, (wlens, wlen0, transits), declared, far = _parse_client_state(target, state)
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         raise ValueError(_UnrecordedInputs._MESSAGE) from exc
-    _install_client_state(target, origin, fold, wlens, wlen0, transits, declared)
+    _install_client_state(target, origin, fold, wlens, wlen0, transits, declared, far)
 
 
 def loads_client_state(text: Optional[str], *, where: str):

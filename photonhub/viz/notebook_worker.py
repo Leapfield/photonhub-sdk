@@ -6,6 +6,7 @@ import ast
 import io
 import json
 import os
+import queue
 import signal
 import sys
 import threading
@@ -58,13 +59,34 @@ def worker_main() -> int:
     incoming, outgoing = _private_channel()
     executing = False
     outgoing_lock = threading.Lock()
+    execution_thread = threading.get_ident()
+    sending = False
+    pending_interrupt = False
 
     def send_frame(message):
-        with outgoing_lock:
-            write_frame(outgoing, message)
+        nonlocal sending, pending_interrupt
+        on_execution_thread = threading.get_ident() == execution_thread
+        if on_execution_thread:
+            sending = True
+        try:
+            with outgoing_lock:
+                write_frame(outgoing, message)
+        finally:
+            if on_execution_thread:
+                sending = False
+                # Deliver even if serialization rejects the message, so a
+                # deferred interrupt cannot escape during cell completion.
+                if pending_interrupt:
+                    pending_interrupt = False
+                    raise KeyboardInterrupt
 
     def interrupt(_signum, _frame):
+        nonlocal pending_interrupt
         if executing:
+            if sending:
+                pending_interrupt = True
+                return
+            pending_interrupt = False
             raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, interrupt)
@@ -82,6 +104,33 @@ def worker_main() -> int:
     from ..cloud import config as cloud_config
     cloud_config.set_notebook_worker_mode()
 
+    # SIGINT can abandon a blocking RPC at any byte of a frame. Keep the
+    # partial header/body on a thread that cannot receive Python signals;
+    # the execution thread waits only for complete messages. Bounding the
+    # queue also bounds read-ahead when the cell is busy or interrupted.
+    incoming_frames = queue.Queue(maxsize=1)
+    def read_frames():
+        while True:
+            try:
+                message = read_frame(incoming)
+            except (ChannelError, OSError) as exc:
+                incoming_frames.put(ChannelError(str(exc)))
+                return
+            incoming_frames.put(message)
+    threading.Thread(target=read_frames, name="notebook-channel-reader", daemon=True).start()
+
+    def receive_frame():
+        while True:
+            try:
+                # A finite wait also lets Windows dispatch its signal handler.
+                message = incoming_frames.get(timeout=0.1)
+                break
+            except queue.Empty:
+                continue
+        if isinstance(message, ChannelError):
+            raise message
+        return message
+
     class ProxyHooks:
         next_id = 0
         def call(self, name, args=None, progress=None):
@@ -90,7 +139,7 @@ def worker_main() -> int:
             send_frame({"type": "call", "id": call_id,
                         "name": name, "args": args or {}})
             while True:
-                response = read_frame(incoming)
+                response = receive_frame()
                 if (response.get("type") in {"progress", "reply"}
                         and response.get("id") != call_id):
                     continue  # a reply to a call interrupted by the cell
@@ -213,7 +262,7 @@ def worker_main() -> int:
     send_frame({"type": "ready"})
     while True:
         try:
-            message = read_frame(incoming)
+            message = receive_frame()
         except ChannelError:
             return 0
         if message.get("type") in {"progress", "reply"}:

@@ -6,10 +6,12 @@ accept ``ax=``, and never call ``plt.show()``; ``plot_3d`` returns a plotly
 ``Figure`` (the optional ``photonhub[viz]`` extra, lazy-imported).
 
 ``plot_mode`` (an FDE mode's transverse field), ``plot_spectrum``
-(transmission ``T(λ)`` from the mode-monitor pipeline) and ``plot_comparison``
-(an observable against a paper's extracted series) are module-level helpers
-only, a ``Mode`` is not a ``Simulation`` and a spectrum comes from
-post-processing, so neither maps cleanly onto a model method.
+(transmission ``T(λ)`` from the mode-monitor pipeline), ``plot_comparison``
+(an observable against a paper's extracted series) and
+``plot_far_field_cut`` and ``plot_far_field_map`` (a projected far-field
+pattern) are module-level helpers only, a ``Mode`` is not a ``Simulation``
+and a spectrum or a far field comes from post-processing, so neither maps
+cleanly onto a model method.
 
 These helpers can render without a graphical application or event loop.
 """
@@ -19,6 +21,7 @@ from .eps import (
                           plot_eps,  # deprecated alias
                           plot_index,
 )
+from .far_field import plot_far_field_cut, plot_far_field_map
 from .featured import Scene, export_scene
 from .field import plot_field
 from .interactive import (
@@ -43,6 +46,8 @@ __all__ = [
                           "plot",
                           "plot_3d",
                           "plot_comparison",
+                          "plot_far_field_cut",
+                          "plot_far_field_map",
                           "plot_field",
                           "plot_index",
                           "plot_mode",

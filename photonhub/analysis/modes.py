@@ -226,7 +226,7 @@ class ModeSolver:
         # Each axis needs interior points for its second-order stencil (>= 3)
         # — OR is size 1, the INVARIANT (slab) reduction: that axis carries no
         # stencil at all and the solve is the 1-D slab eigenproblem along the
-        # other axis (the quasi-2-D cross-section, e.g. every Meep 2-D scene).
+        # other axis (the quasi-2-D cross-section of a 2-D scene).
         for axis_len in eps_arr.shape:
             if axis_len != 1 and axis_len < 3:
                 raise ValueError(
@@ -373,7 +373,7 @@ class ModeSolver:
         # nonexistent axis). For a slab varying along x, "TE" (flux-x) is then
         # the slab TM polarization (E normal to the walls, eps*E continuous)
         # and "scalar"/"TM" the slab TE (continuous E parallel to the walls —
-        # Meep's 2-D Ez convention).
+        # the usual 2-D Ez convention).
         y_invariant = ny == 1
         x_invariant = nx == 1
 

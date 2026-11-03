@@ -265,16 +265,27 @@ def estimate(sim, *, device="gpu", solver=None) -> dict:
     receive only the id and so cannot check the grid themselves. It covers
     the quoted grid only: the solver image that runs the job is versioned
     separately from the service that quotes it.
+
+    ``device`` and ``solver`` default as in :func:`~photonhub.cloud.run`:
+    the service's only GPU, and on a GPU the commit of the locally installed
+    solver. A ``quote_id`` from here binds to a submission made with the same
+    arguments. Defaults resolve to the same values only while the service's
+    GPU menu and the locally installed solver are unchanged; if either
+    changed in between, the service refuses the submission because it no
+    longer matches the quote, at no charge. To be sure, pass the resolved
+    values, which :func:`preflight` returns beside its ``quote_id``.
     """
     # Imported here, as everywhere in this module, to keep estimate and run on
     # exactly the same public device grammar and the same capability guard.
+    from ._defaults import resolve
     from .run import _check_cloud_device_support, _validate_web_device
 
     device = _validate_web_device(device)
     wire = _check_cloud_device_support(sim, device)
     sim.check_runnable()
-    quote = HttpClient(get_config()).estimate(
-        wire, device=device, solver=solver)
+    http = HttpClient(get_config())
+    device, solver = resolve(http, device, solver)
+    quote = http.estimate(wire, device=device, solver=solver)
     if not isinstance(quote, dict):
         raise CloudError("service estimate response was not an object")
     _check_quote_grid(sim, quote,
@@ -295,16 +306,23 @@ def preflight(
     locally, before any price check; a quote that omits them warns.  This
     checks the quoted grid only: the solver image that runs the job is
     versioned separately from the service that quotes it.
+
+    ``device`` and ``solver`` default as in :func:`~photonhub.cloud.run`;
+    the returned ``device`` and ``solver`` are the resolved values the quote
+    is bound to, to pass with its ``quote_id``.
     """
     return _preflight(lambda: HttpClient(get_config()), sim, device=device,
                       solver=solver, max_usd=max_usd)
 
 
 def _preflight(http_factory, sim, *, device, solver, max_usd,
-               preflight_wire=None) -> CloudPreflight:
+               preflight_wire=None, resolve_defaults=True) -> CloudPreflight:
     """:func:`preflight` on the client ``http_factory()`` returns, made only
     once the local checks pass: the default quote step of the run and submit
-    entry points uses the same client they submit with."""
+    entry points uses the same client they submit with. The device and
+    solver defaults are resolved on that client before the account request,
+    unless the caller already resolved them."""
+    from ._defaults import resolve
     from .run import (
         _check_cloud_device_support, _validate_quote_id, _validate_web_device,
     )
@@ -321,6 +339,8 @@ def _preflight(http_factory, sim, *, device, solver, max_usd,
     sim.check_runnable()
     limit = _finite_non_negative(max_usd, "max_usd")
     http = http_factory()
+    if resolve_defaults:
+        device, solver = resolve(http, device, solver)
     account_payload = http.account()
     if not isinstance(account_payload, dict):
         raise CloudError("service account response was not an object")
@@ -397,7 +417,8 @@ def job_status(job_id: str) -> dict:
 def gpus() -> list:
     """The curated menu of GPUs you can run on, each a dict like
     ``{"id": ..., "vendor": ..., "arch": ..., "gpu_mem_gb": ...}``. Pass an id to
-    ``ph.cloud.run(sim, device="gpu:<id>")``;
-    bare ``device="gpu"`` lets the platform pick a default. The platform manages
+    ``ph.cloud.run(sim, device="gpu:<id>")``; bare ``device="gpu"`` (the
+    default) uses the only entry when the menu lists exactly one, and is
+    refused client-side when it lists several. The platform manages
     which providers back each entry, that stays an internal detail."""
     return HttpClient(get_config()).list_gpus()

@@ -100,6 +100,15 @@ class DesignRegion:
     faces and uses exact engine-style face ownership. ``parametrization="trilinear"`` selects one
     trilinear custom medium instead and is CPU only. ``eps_min >= 1``.
 
+    On a one-cell periodic axis (a quasi-2D scene) the quarter-cell faces of
+    ``cells=(0, 1)`` hold the half-cell sample, which the E component along the
+    axis reads, and miss the sample at 0, which the two across it read. A
+    gradient refuses such a region when a source or the objective names a
+    component that misses, and warns when it cannot tell, as with a mode
+    source. ``cells=(-1, 1)`` holds both samples in every parametrization.
+    ``box_face_offset_cells=0`` holds them too, but it moves the faces on
+    every axis, which changes the design.
+
     ``merge_boxes=True`` emits the same pixel model with far fewer structures:
     one box at ``eps(0)`` over the whole region, then one box per run of
     pixels with bitwise equal density along the region's longest axis
@@ -1619,8 +1628,11 @@ def _pulse_terms(pulse, freqs) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def _pulse_spectrum(pulse, freqs) -> np.ndarray:
-    """The engine's analytic unit-amplitude spectrum of a Gaussian pulse,
-    phase included, at ``freqs``: the factor the engine divides DFTs by."""
+    """The real pulse's analytic unit-amplitude spectrum, phase included, at
+    ``freqs``: the factor the engine's real core divides DFTs by. The complex
+    core of a Bloch axis divides by its analytic drive's spectrum instead,
+    about twice this. The callers use this only as a ratio of two spectra,
+    where that factor of 2 cancels."""
     p_term, q_term = _pulse_terms(pulse, freqs)
     return np.exp(-1j * pulse.phase) * p_term + np.exp(1j * pulse.phase) * q_term
 
@@ -2049,6 +2061,68 @@ Objective = Union[PointIntensity, ModePower, ModeTransmission, BroadbandModeTran
 single-frequency objectives, or :class:`BroadbandModeTransmission`."""
 
 
+def _named_components(simulation: Simulation, objective: Objective) -> Tuple[list, Optional[str]]:
+    """The E component each source names and the one the objective reads, None
+    for one that leaves its field unnamed: a mode solve carries the components
+    of its mode, and a magnetic dipole or readout drives or reads E only through
+    the curl."""
+    def named(component):
+        return component if component in ("Ex", "Ey", "Ez") else None
+
+    sources = [None if isinstance(source, ModeSource) else named(getattr(source, "polarization", None))
+               for source in simulation.sources]
+    return sources, named(getattr(objective, "component", None))
+
+
+def _validate_one_cell_axes(simulation: Simulation, region: DesignRegion, objective: Objective) -> None:
+    """Refuse a region that the objective's component, or every source's, cannot
+    see; warn when only some sources miss it or the scene does not say.
+
+    A gradient runs with subpixel off, where each E component reads the medium
+    at its own Yee point and a box does not wrap. On a one-cell periodic axis
+    the component along the axis reads half a cell and the two across it read
+    0, and the quarter-cell faces of ``cells=(0, 1)`` span 0.25 to 1.25 cells:
+    the box holds the half-cell point and not the node. So a TM scene, with
+    ``Ez`` alone on a one-cell z axis, is right as it stands and must run, and
+    the same box hides from ``Ex`` and ``Ey``. One source of several that misses
+    costs the gradient nothing the objective reads through the others, so that
+    runs too. No check of the solver document can tell, since its boxes are
+    valid, so this is the one place to say so."""
+    dl = simulation.grid.dl_um
+    mins = simulation._axis_min_cells()
+    sources, read = _named_components(simulation, objective)
+    for a, name in enumerate("xyz"):
+        if mins[a] != 1 or realized_cells(simulation.size_um[a], dl, 1) != 1:
+            continue
+        low, high = (face + region.box_face_offset_cells for face in region.cells[a])
+        missed = [c for c in ("Ex", "Ey", "Ez") if not low <= (0.5 if c[1] == name else 0.0) <= high]
+        every_source = all(c in missed for c in sources)
+        blind = [c for c in missed if c == read or (every_source and c in sources)]
+        some = [c for c in missed if c in sources]
+        if not missed or not (blind or some or read is None or None in sources):
+            continue
+        fix = "Give the region cells (-1, 1) on this axis, which holds every sample."
+        if region.parametrization == "boxes" and not region.merge_boxes:
+            fix += (" box_face_offset_cells=0 with cells (0, 1) holds them too, but it moves the faces on every "
+                    "axis, which changes the design.")
+        where = (f"its boxes run from {low:g} to {high:g} cells on the one-cell {name} axis and a box does not "
+                 "wrap, so")
+        if blind:
+            raise ValueError(
+                f"design region misses {' and '.join(blind)}: {where} that sample lies outside them. A field "
+                f"read only there does not see the region, and its gradient is 0. {fix}")
+        outside = some or missed
+        names = f"{' and '.join(outside)} {'lies' if len(outside) == 1 else 'lie'} outside them"
+        if some:
+            why = ("and some of this scene's sources drive that field. Their field does not see the region, so the "
+                   "gradient has no part of it.")
+        else:
+            why = ("and this scene's sources or objective do not name their components. If the field is one of "
+                   "those, it does not see the region and its gradient is 0.")
+        warnings.warn(f"design region may miss the field: {where} {names}, {why} {fix}", UserWarning,
+                      stacklevel=caller_stacklevel())
+
+
 def _validate_design_structures(simulation: Simulation, region: DesignRegion,
                                 rho: Optional[np.ndarray] = None) -> None:
     """Validate trailing design geometry and media for manual and driver paths."""
@@ -2162,6 +2236,7 @@ def _adjoint_simulation_parts(
             region.dl_um != forward_simulation.grid.dl_um):
         raise ValueError("manual adjoint requires a matching uniform mesh")
     if not _validated:
+        _validate_one_cell_axes(forward_simulation, region, objective)
         _validate_design_structures(forward_simulation, region)
         _validate_pml_clear(forward_simulation, region, objective)
     if isinstance(objective, (ModePower, ModeTransmission)):
@@ -2273,6 +2348,7 @@ def value_and_gradient(
         raise ValueError("inverse-design gradient requires a uniform mesh")
     if region.dl_um != fwd_sim.grid.dl_um:
         raise ValueError("DesignRegion.dl_um must equal the simulation grid dl_um")
+    _validate_one_cell_axes(fwd_sim, region, objective)
     _validate_design_structures(fwd_sim, region, np.asarray(rho, dtype=float))
     _validate_pml_clear(fwd_sim, region, objective)
     if fwd_sim.subpixel:

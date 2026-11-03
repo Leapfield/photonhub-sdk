@@ -27,8 +27,12 @@ def build_parser() -> argparse.ArgumentParser:
             "without one, the client calls open_result first"
         ),
     )
-    parser.add_argument("--print-skill", action="store_true",
+    skills = parser.add_mutually_exclusive_group()
+    skills.add_argument("--print-skill", action="store_true",
                         help="print the packaged PhotonHub agent skill and exit")
+    skills.add_argument("--print-import-skill", action="store_true",
+                        help="print the packaged skill for rebuilding a simulation "
+                             "from another tool and exit")
     return parser
 
 
@@ -36,9 +40,10 @@ def main(argv=None) -> int:
     """Load MCP support on demand and give base installs an actionable error."""
     argv = sys.argv[1:] if argv is None else list(argv)
     args = build_parser().parse_args(argv)  # --help exits 0, an unknown option exits 2
-    if args.print_skill:
+    if args.print_skill or args.print_import_skill:
         try:
-            print(read_skill(), end="")
+            print(read_skill("photonhub-import") if args.print_import_skill else read_skill(),
+                  end="")
         except (FileNotFoundError, OSError):
             print("photonhub-mcp: packaged skill file is missing", file=sys.stderr)
             return 2

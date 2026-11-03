@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 from ._bounds import geometry_bounds_um
-from .authoring import GaussianBeam, Port
+from .authoring import GaussianBeam, HeldPort, Port
 from .source_time import GaussianPulse, _C0_M_PER_S
 from .._compat import caller_stacklevel
 
@@ -608,7 +608,7 @@ def resolve(shell, *, ports: Sequence[Port], source, wlens_um, wlen0_um,
     for port in port_list:
         out_dir = infer_out_direction(shell, port)
         port = port.with_out_direction(out_dir)
-        resolved_ports.append(port)
+        resolved_ports.append(HeldPort.of(port))          # in the shell's stored frame from here on
         family, index = port.family_index()
         h_c, v_c = port.hv_center_um()
         plan = None

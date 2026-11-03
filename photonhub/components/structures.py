@@ -5,12 +5,13 @@ at that component's own Yee point and the LAST structure containing the
 point wins (containment is closed). Geometries may extend beyond the domain, only the part inside the grid matters, so no domain check applies here.
 """
 
+import json
 import math
 from typing import Annotated, Any, Literal, Optional, Tuple, Union
 
 import warnings
 
-from pydantic import AliasChoices, Field, PlainValidator, field_validator, model_validator
+from pydantic import AliasChoices, Field, PlainValidator, ValidationInfo, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
 from .base import AxisName, FrozenModel, NonNegativeUm, PositiveUm, Vec3Um
@@ -487,7 +488,7 @@ class Structure(FrozenModel):
 
     @field_validator("medium", mode="before")
     @classmethod
-    def _medium_or_material(cls, v):
+    def _medium_or_material(cls, v, info: ValidationInfo):
         # Duck-typed: materials.py imports Medium from here, the reverse import
         # would cycle. A fit object (PoleFit/LorentzFit) carries its engine
         # Medium as a property — coerce it losslessly. A Material is a fit
@@ -498,6 +499,12 @@ class Structure(FrozenModel):
             return fitted
         if is_material(v):
             return v
+        if isinstance(v, dict) and info.mode == "json" and (info.context or {}).get("wire_ingest"):
+            # Strict ingestion takes a JSON array for a tuple field, but this
+            # validator has turned the arrays of a medium into Python lists,
+            # which strict mode refuses. Validate the object as the JSON it was,
+            # so its typing stays exactly the engine's.
+            return Medium.model_validate_json(json.dumps(v), strict=True)
         if isinstance(v, Medium) or isinstance(v, dict):
             return v                       # a dict validates as a Medium, and only as one
         raise ValueError(

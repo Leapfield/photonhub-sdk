@@ -153,6 +153,29 @@ def _own_series(x_nm, values, label):
         ) from exc
 
 
+def _point_names(points, ours) -> set:
+    """The labels ``points=`` names, each checked against our series."""
+    if points is None:
+        return set()
+    if isinstance(points, str):
+        points = (points,)
+    try:
+        wanted = [str(p) for p in points]
+    except TypeError as exc:
+        raise ValueError(
+            f"points must be a label or a sequence of labels; got {points!r}"
+        ) from exc
+    names = [str(name) for name, _, _ in ours if name is not None]
+    missing = [p for p in wanted if p not in names]
+    if missing:
+        raise ValueError(
+            f"points names {', '.join(map(repr, missing))}, not a series of ours; "
+            f"the series are {', '.join(map(repr, names)) or 'unnamed'} "
+            "(the keys of values, or label for a single series)"
+        )
+    return set(wanted)
+
+
 def _entries(value) -> list:
     """One ``(..., label)`` tuple, or a list of them, as a list."""
     if value is None:
@@ -164,7 +187,7 @@ def _entries(value) -> list:
 
 
 def plot_comparison(x_nm, values=None, *, reference=None, reference_scale=1.0,
-                    stated=None, model=None, markers=None, ylabel="",
+                    stated=None, model=None, markers=None, points=None, ylabel="",
                     xlabel="wavelength (nm)", label="PhotonHub", ax=None, ylim=None,
                     yscale=None, **kw):
     """The result figure of an example: our observable as a line, the paper's
@@ -182,6 +205,13 @@ def plot_comparison(x_nm, values=None, *, reference=None, reference_scale=1.0,
     line drawn by hand after the mapping form does not advance past it).
     A series of fewer than ``MARKER_POINTS`` points (a sweep of discrete runs)
     is drawn with markers as well; ``markers=True`` or ``False`` forces it.
+    ``points`` names series drawn as markers alone, with no line joining
+    them (a few discrete runs beside another method's sampled curve): one
+    label or a sequence of labels of ``values``, or ``label`` for a single
+    series. Each keeps the colour of its place and its legend entry shows the
+    marker only; ``markers=`` does not apply to it, and a name that is not
+    one of our series raises ``ValueError``. Extra keywords apply to every
+    series, so a ``linestyle`` passed in ``kw`` joins the points again.
     ``label`` names a single series.
 
     ``reference`` is one series or a list of series from a reference file,
@@ -204,11 +234,14 @@ def plot_comparison(x_nm, values=None, *, reference=None, reference_scale=1.0,
     title: the paragraph above it is its caption. Returns the matplotlib
     ``Axes`` and never calls ``plt.show()``."""
     import matplotlib.pyplot as plt
+    from matplotlib.cbook import normalize_kwargs
+    from matplotlib.lines import Line2D
     from matplotlib.ticker import MaxNLocator
 
     if yscale is not None and str(yscale) not in ("linear", "log"):
         raise ValueError(f"yscale must be 'linear' or 'log'; got {yscale!r}")
     ours = _own_series(x_nm, values, label)
+    dots = _point_names(points, ours)       # checked before a figure is made
     if reference is None:
         refs = []
     elif isinstance(reference, dict):
@@ -224,6 +257,12 @@ def plot_comparison(x_nm, values=None, *, reference=None, reference_scale=1.0,
     fixed = isinstance(values, dict)
     for i, (name, x, y) in enumerate(ours):
         style = {"color": _OURS[i % len(_OURS)]} if fixed else {}
+        if name is not None and str(name) in dots:
+            # Keywords, not a format string, so a caller's linestyle or
+            # marker in **kw replaces ours without a redundancy warning.
+            ax.plot(x, y, label=name, **{**style, "linestyle": "none", "marker": "o",
+                                         "markersize": 5, **normalize_kwargs(kw, Line2D)})
+            continue
         if markers or (markers is None and x.size < MARKER_POINTS):
             style.update(marker="o", ms=5)
         ax.plot(x, y, "-", label=name, **{**style, **kw})
@@ -239,7 +278,7 @@ def plot_comparison(x_nm, values=None, *, reference=None, reference_scale=1.0,
             raise ValueError("a reference series' x and y differ in length")
         ax.plot(rx, ry, "o", ms=3, label=str(ref.get("label", "paper")),
                 **({"color": _PAPER[i % len(_PAPER)]} if fixed else {}))
-    lines = points = 0
+    lines = marks = 0
     for entry in _entries(stated):
         if len(entry) == 2:
             value, text = entry
@@ -249,8 +288,8 @@ def plot_comparison(x_nm, values=None, *, reference=None, reference_scale=1.0,
         elif len(entry) == 3:
             px, py, text = entry
             ax.plot([float(px)], [float(py)], "s", ms=7, mfc="none", mew=1.4,
-                    color=("0.15", "0.45")[points % 2], label=str(text))
-            points += 1
+                    color=("0.15", "0.45")[marks % 2], label=str(text))
+            marks += 1
         else:
             raise ValueError("a stated entry is (value, label) or (x, y, label)")
     for i, entry in enumerate(_entries(model)):

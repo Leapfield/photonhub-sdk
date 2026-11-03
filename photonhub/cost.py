@@ -6,7 +6,7 @@ is explicit and overridable. It is not a billing quote or published rate card.
 
 The calculation unit is one **Tcell-step** = 1e12 cell-updates =
 ``num_cells * num_steps / 1e12``. The default planning assumption is
-$0.40/Tcell-step and is overridable.
+$0.20/Tcell-step, the beta rate, and is overridable.
 
 The cell count, ``dt`` and step count are computed to match the engine's
 exactly, the round-half-away-from-zero cell rule
@@ -38,8 +38,9 @@ _C0 = c0  # m/s, exact
 
 # Planning-cost unit. One Tcell-step = 1e12 cell-updates.
 TCELL = 1.0e12
-#: Default planning assumption; not a production rate or billing commitment.
-DEFAULT_RATE_USD_PER_TCELL_STEP = 0.40
+#: Default planning assumption, the beta rate; not a production rate or
+#: billing commitment. The service's quote is the price.
+DEFAULT_RATE_USD_PER_TCELL_STEP = 0.20
 
 #: Throughput for the WALL-TIME estimate only (dollars do not depend on it).
 #: The conservative Phase-1 acceptance FLOOR (>=20 Gcells/s vacuum on the cloud GPU),

@@ -215,7 +215,7 @@ def _colocate_to_node(a: np.ndarray, axis: int) -> np.ndarray:
     components are physically staggered by half a cell. Combining them in the
     overlap cross-products without first interpolating each to a COMMON point is a
     FIRST-ORDER error; co-locating restores SECOND-ORDER accuracy (Oskooi &
-    Johnson, *Comp. Phys. Comm.* 181, 687 (2010); MEEP issues #1470/#1773). Interpolating the tangential
+    Johnson, *Comp. Phys. Comm.* 181, 687 (2010)). Interpolating the tangential
     components to a common point is therefore standard practice before the
     two-term mode overlap. The collocated FDE mode needs no shift."""
     prev = np.roll(a, 1, axis=axis)

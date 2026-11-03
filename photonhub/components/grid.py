@@ -29,6 +29,9 @@ if TYPE_CHECKING:  # avoid an import cycle (structures imports nothing from here
 # exactly which graded specs are legal (a divergent accept/reject set would
 # itself be an equivalence failure).
 GRADED_RATIO_GUARD = 10.0
+# the words of the guard's refusal, which a fitted domain's regrowth matches to
+# tell a regrown box the mesher refuses from any other error
+RATIO_GUARD_WORDS = "max/min primary-spacing ratio"
 
 # Engine field-layout ABI/resource envelope.
 # The x pitch is stored as an int and rounded to 32 fp32 values (128 bytes).
@@ -307,8 +310,14 @@ def yee_axis_offsets(fields: Iterable[str], axis_index: int) -> set:
 def _llround(x: float) -> int:
     """C++ ``std::llround``: nearest integer, ties half AWAY FROM ZERO.
     (Python's built-in ``round`` banker's-rounds ties and disagrees at every
-    exact half; the engine snaps with llround, so parity requires this form.)"""
-    return math.floor(x + 0.5) if x >= 0.0 else math.ceil(x - 0.5)
+    exact half; the engine snaps with llround, so parity requires this form.)
+    Exact: the fraction ``|x| - floor(|x|)`` is formed without rounding,
+    where ``floor(x + 0.5)`` rounds the sum (``0.5 - 2**-54`` gave 1)."""
+    a = abs(x)
+    n = math.floor(a)
+    if a - n >= 0.5:
+        n += 1
+    return int(n) if x >= 0.0 else -int(n)
 
 
 def _snap_axis_index(
@@ -338,6 +347,117 @@ def _snap_axis_index(
         if best_d < 0.0 or d <= best_d:  # <= : ties resolve to the higher index
             best, best_d = i, d
     return best
+
+
+class EngineSnap:
+    """Where the solver puts a source, replicated on the numbers of the wire
+    document: the indices the CPU solver runs each source at, and the GPU
+    solver too (on a graded grid's uniform axis it rounds a plane's
+    ``x / dl`` instead, the same line but at a tie within rounding).
+    ``phsolver validate`` reports the same indices, with one exception: for
+    a plane wave on a graded grid its report rounds ``x / dl`` with the base
+    ``dl`` (an engine reporting issue), while the solvers inject on the
+    graded snap below.
+
+    The engine scales every micron value it reads by 1e-6 and snaps in
+    metres, so this does too: an exact tie then resolves as it resolves
+    there, where the same arithmetic in microns can fall on the other side
+    of it. Per axis of ``sim``'s grid:
+
+    * :meth:`node`, a point source's component: on a
+      uniform mesh ``clamp(llround(x / dl - offset), 0, n - 1)``, half away
+      from zero; on a graded mesh the node ``q[i] + offset * (q[i + 1] -
+      q[i])`` nearest ``x``, ties to the higher index, where an axis the
+      mesh lists no coordinates for is the ladder ``q[i] = i * dl`` and the
+      last cell repeats the last spacing (``q[0] + dl`` after a single
+      node);
+    * :meth:`plane`, the injection plane of a plane wave or a mode source
+      (the solvers' rule, and ``validate``'s bounds check): on a uniform
+      mesh ``llround(x / dl)``, on a graded one the primary node nearest
+      ``x``, the closing node included, ties to the higher index; not
+      clamped;
+    * :meth:`tfsf_planes`, a TF/SF box's six face planes (uniform meshes
+      only): ``llround((c -+ s / 2) / dl)`` per axis.
+
+    ``offset`` is the component's Yee offset along the axis in cells (0 or
+    1/2); positions are in microns in the wire's frame (the domain's
+    corner)."""
+
+    def __init__(self, sim):
+        self._dl = float(sim.grid.dl_um) * 1e-6
+        coords = getattr(sim.grid, "coords", None)
+        self._graded = coords is not None
+        mins = sim._axis_min_cells() if hasattr(sim, "_axis_min_cells") else (4, 4, 4)
+        self._n = []
+        self._q = []
+        for a in range(3):
+            q_um = getattr(coords, "xyz"[a], None) if coords is not None else None
+            if q_um is not None:
+                q = [float(v) * 1e-6 for v in q_um]
+                n = len(q)
+            else:
+                n = realized_cells(float(sim.size_um[a]), float(sim.grid.dl_um), mins[a])
+                # the engine's ladder of an axis a graded grid leaves out
+                q = [i * self._dl for i in range(n)] if self._graded else None
+            self._n.append(n)
+            self._q.append(q)
+        self._nodes = {}
+
+    def _closing(self, a: int) -> float:
+        q = self._q[a]
+        return q[0] + self._dl if len(q) == 1 else q[-1] + (q[-1] - q[-2])
+
+    def _ladder(self, a: int, offset: float) -> list:
+        """The nodes of Yee offset ``offset`` along axis ``a`` (metres)."""
+        key = (a, float(offset))
+        if key not in self._nodes:
+            q = self._q[a]
+            nxt = q[1:] + [self._closing(a)]
+            self._nodes[key] = [qi + offset * (qn - qi) for qi, qn in zip(q, nxt)]
+        return self._nodes[key]
+
+    @staticmethod
+    def _nearest(nodes: Sequence[float], x: float) -> int:
+        """The index of the node nearest ``x``, ties to the higher index (the
+        engine's ``<=`` scan; the nodes increase strictly, so the nearest is
+        within two of the bisection point)."""
+        import bisect
+
+        j = bisect.bisect_left(nodes, x)
+        best, best_d = 0, -1.0
+        for i in range(max(0, j - 2), min(len(nodes), j + 2)):
+            d = abs(x - nodes[i])
+            if best_d < 0.0 or d <= best_d:
+                best, best_d = i, d
+        return best
+
+    def node(self, axis_index: int, position_um: float, offset: float) -> int:
+        """The index of the node a point source's component of Yee offset
+        ``offset`` along ``axis_index`` runs at (clamped to the grid)."""
+        x = float(position_um) * 1e-6
+        n = self._n[axis_index]
+        if not self._graded:
+            i = _llround(x / self._dl - offset)
+            return 0 if i < 0 else (n - 1 if i >= n else i)
+        return self._nearest(self._ladder(axis_index, offset), x)
+
+    def plane(self, axis_index: int, position_um: float) -> int:
+        """The primary-node index a plane wave or a mode source injects on
+        (not clamped: ``n`` is the closing node)."""
+        x = float(position_um) * 1e-6
+        if not self._graded:
+            return _llround(x / self._dl)
+        return self._nearest(self._q[axis_index] + [self._closing(axis_index)], x)
+
+    def tfsf_planes(self, center_um, size_um) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+        """``(lo, hi)``: a TF/SF box's face planes (primary-node indices per
+        axis; a uniform mesh, the only one the engine takes such a box on)."""
+        lo, hi = [], []
+        for a in range(3):
+            c, e = float(center_um[a]) * 1e-6, float(size_um[a]) * 1e-6
+            lo.append(_llround((c - 0.5 * e) / self._dl))
+            hi.append(_llround((c + 0.5 * e) / self._dl))
+        return tuple(lo), tuple(hi)
 
 
 def quarter_snap_dft_face(
@@ -468,7 +588,7 @@ class GradedMesh(FrozenModel):
             ratio = max(dq) / min(dq)
             if ratio > GRADED_RATIO_GUARD:
                 raise ValueError(
-                    f"grid.coords.{axis}: max/min primary-spacing ratio "
+                    f"grid.coords.{axis}: {RATIO_GUARD_WORDS} "
                     f"{ratio:.3g} exceeds the {GRADED_RATIO_GUARD:g} guard")
         return self
 
@@ -1375,6 +1495,250 @@ class MeshOverride(FrozenModel):
             lo, hi = span
             out.append((letter, float(lo), float(hi), float(dl)))
         return out
+
+
+# A medium or refine region that a graded face takes whole keeps 1 % of the
+# spacing-ratio guard spare in the cells it is taken by, where its cell leaves
+# room for it, and is taken by at most _TAKEN_MAX of its cells: the count grows
+# without bound as the cell nears the guard, and a warning names one the cap
+# leaves exposed. Chosen on a refine region's end scanned through the face of
+# a 12-layer slab in air at 14 cells per wavelength (201 depths each): this
+# pair fails no depth for cells up to 9.84 times finer than the background
+# cell (0.1.6 fails 15 to 40) and 15 and 83 at 9.89 and 9.97 (0.1.6 45 and
+# 92), at most 136 z cells (0.1.6 85); a 2 % spare failed 9 and 25 at 9.84 and
+# 9.89, a cap of 32 failed 101 at 9.97. A cell with no room for the spare
+# takes the cap and the warning too. Near the guard 64 cells can be too few,
+# and such a region can fail the guard more often than in 0.1.6: over 352
+# scenes, in none of the 64 at 9.8 and 9.86 times finer than the background
+# cell, in 52 of the 288 at 9.87 to 9.99.
+_TAKEN_SPARE = 0.99
+_TAKEN_MAX = 64
+
+
+def boundary_layer_depths_um(
+    *,
+    axis: int,
+    walls_um: Tuple[float, float],
+    layers: int,
+    wlen_um: float,
+    cells_per_wlen: float,
+    background_index: float = 1.0,
+    structures: Iterable["Structure"] = (),
+    spans: Iterable[Tuple[float, float, float]] = (),
+    mesh_overrides: Iterable["MeshOverride"] = (),
+    dl_min_um: Optional[float] = None,
+    faces: str = "-+",
+    rounding_um: float = 0.0,
+    min_depths_um: Optional[dict] = None,
+) -> dict:
+    """How far beyond each wall the outer ``layers`` cells of an axis that
+    :func:`auto_mesh` grades reach, before the mesh exists: ``{face: depth_um}``
+    for each face in ``faces`` (``"-"`` beyond ``walls_um[0]``, ``"+"``
+    beyond ``walls_um[1]``).
+
+    A fitted domain puts its boundary layers outside the walls, and the engine
+    places them in the outer ``layers`` cells. On a graded axis those cells are
+    the mesher's cells there: those of the finest medium the face crosses, a
+    substrate, a cladding or a port guide, not the background's. So the depth
+    is read off the mesher's own target field (:func:`_axis_target_field`:
+    every structure above the background index, padded by one background
+    cell, each refine region, the ``dl_min_um`` floor, the finest winning),
+    walked out from each wall until it holds ``layers`` cells. ``spans`` adds
+    ``(lo, hi, index)`` media the caller draws later on this axis (the port
+    guide continuations; an end may be infinite).
+
+    The mesher sees only the final box: it drops a structure whose own span
+    misses the box, its pad with it, and a refine region likewise; it
+    feature-ceils a structure the face clips on the clipped width, so a
+    sliver of one inside the face sets cells that small. ``rounding_um`` is
+    how far the caller's rounding of the box may still move each face, either
+    way. So a structure, span or refine region whose inner end lies near the
+    walked face is settled before the depth is returned: a structure the face
+    cannot reach wherever the rounding puts it is left out of the walk (a
+    region beyond the face adds nothing to it, having no pad), and one the
+    face might clip or drop is taken whole, the depth reaching past its inner
+    end by the rounding and K of its own cells (a region's ``dl_um``), or past
+    its far end by the rounding, whichever is nearer. K is the fewest cells
+    whose worst shrink by the mesher's snap keeps the spacing-ratio guard,
+    with 1 % to spare where the cell leaves room for it (one for silicon in
+    air or oxide), and at most ``_TAKEN_MAX``; a medium the cap leaves
+    exposed, its cell near the guard, is named in a warning. K does not cover
+    the mesher's closing stretch of the background cells, which can still
+    tip a cell near the guard over it (up to 10.5 % seen).
+    ``min_depths_um`` (``{face: depth_um}``) is a floor on a face's depth,
+    the caller's regrowth of a face the realized mesh left short, settled the
+    same way. A depth only grows in this, so the face still holds ``layers``
+    cells of the target field.
+
+    The field is taken without the feature-ceil and the grading ramps, which
+    only shrink cells, and before the closing rescale and the interface
+    snapping, which can stretch the cells near a face (silicon cells beside a
+    fold's far face came out 14 % coarser than their target): the realized
+    count is the caller's to check (:meth:`Simulation._short_boundary_layers`).
+    Where one medium fills the depth this is ``layers * wlen_um / (n *
+    cells_per_wlen)``. Pure and deterministic."""
+    letter = "xyz"[axis]
+    bg_dl = wlen_um / (background_index * cells_per_wlen)
+    if dl_min_um is not None:
+        bg_dl = max(bg_dl, dl_min_um)
+    # no target exceeds the background cell, so the layers reach no further
+    # than this: the box the field is drawn in
+    reach = layers * bg_dl
+    lo_edge = float(walls_um[0]) - (reach if "-" in faces else 0.0)
+    length = float(walls_um[1]) + (reach if "+" in faces else 0.0) - lo_edge
+    # only what reaches past a wall (a structure by its one-cell pad) sets a
+    # cell beyond it: the field is drawn from those alone, which keeps a scene
+    # of many structures from paying the mesher's own cost twice
+    inner_lo = float(walls_um[0]) - lo_edge if "-" in faces else -math.inf
+    inner_hi = float(walls_um[1]) - lo_edge if "+" in faces else math.inf
+
+    def clamped(lo, hi):
+        """The span in the box, or None where it misses the box or no wall."""
+        lo_c, hi_c = max(0.0, lo - lo_edge), min(length, hi - lo_edge)
+        if hi_c <= 0.0 or lo_c >= length or not reaches(lo_c - bg_dl, hi_c + bg_dl):
+            return None
+        return lo_c, hi_c
+
+    def reaches(lo, hi):
+        return lo <= inner_lo or hi >= inner_hi
+
+    def past_a_wall(lo, hi):
+        # padded by one background cell, as the mesher pads it
+        return (("-" in faces and lo - bg_dl <= walls_um[0])
+                or ("+" in faces and hi + bg_dl >= walls_um[1]))
+
+    # the media that set a cell beyond a wall, unclamped, in the caller's frame:
+    # the structures above the background index, then the caller's spans
+    media = []
+    for s in structures:
+        span = _geometry_axis_span(s.geometry, axis)
+        if span is not None and past_a_wall(*span):
+            n = _structure_index(s, wlen_um)
+            if n > background_index:
+                media.append((span[0], span[1], n))
+    media.extend((lo, hi, n) for lo, hi, n in spans if n > background_index and past_a_wall(lo, hi))
+    regions = [(lo, hi, dl) for ov in mesh_overrides for a, lo, hi, dl in ov.axis_regions() if a == letter]
+    enforced = [(lo - lo_edge, hi - lo_edge, dl) for lo, hi, dl in regions if reaches(lo - lo_edge, hi - lo_edge)]
+
+    def walk(active):
+        """``{face: depth}`` on the field of ``media[i]`` for ``i`` in ``active``."""
+        intervals = []
+        for i in active:
+            span = clamped(media[i][0], media[i][1])
+            if span is not None:
+                intervals.append((span[0], span[1], media[i][2]))
+        field = _axis_target_field(
+            domain_um=length, wlen_um=wlen_um, cells_per_wlen=cells_per_wlen,
+            n_background=background_index, intervals=intervals, refine_pad_um=bg_dl,
+            dl_min_um=dl_min_um, enforced=enforced, feature_ceil=False)
+        # one segment per run of equal cells, so a face of one cell gets exactly
+        # ``layers * dl`` (the background-cell depth, unchanged, where no finer
+        # medium or region reaches it)
+        segments = []
+        for k, (start, dl) in enumerate(field):
+            end = field[k + 1][0] if k + 1 < len(field) else length
+            if segments and segments[-1][2] == dl:
+                segments[-1] = (segments[-1][0], end, dl)
+            else:
+                segments.append((start, end, dl))
+        depths = {}
+        for face in faces:
+            wall = (float(walls_um[0]) if face == "-" else float(walls_um[1])) - lo_edge
+            outward = reversed(segments) if face == "-" else segments
+            need, depth = float(layers), 0.0
+            for a, b, dl in outward:
+                run = (min(b, wall) - a) if face == "-" else (b - max(a, wall))
+                if run <= 0.0:
+                    continue
+                if run >= need * dl:
+                    break
+                depth += run
+                need -= run / dl
+            else:
+                # past the box (rounding only): the outermost cell continues
+                dl = segments[0][2] if face == "-" else segments[-1][2]
+            depths[face] = depth + need * dl
+        return depths
+
+    floor = dl_min_um or 0.0
+
+    def taken_cells(cell, padded):
+        # ``(K, capped)``: how many of its own cells a medium or region taken
+        # whole keeps inside the face, the fewest whose worst shrink by the
+        # mesher keeps every cell within the spacing-ratio guard of the
+        # background cell, with 1 - _TAKEN_SPARE of it to spare. A clipped
+        # medium is feature-ceiled, K of its cells at worst K/(K+1) of the cell
+        # (K >= need / (1 - need)); a region's end is snapped to a node, which
+        # can shrink the K cells between it and the face to (K - 1/2)/K
+        # (K >= 1/2 / (1 - need)). K grows without bound as the cell nears the
+        # guard and stops at _TAKEN_MAX (``capped``, warned); a cell with no
+        # room for the spare takes the cap. A cell finer than the guard allows
+        # cannot be meshed inside the box at any count: one cell, unwarned
+        ratio = bg_dl / (GRADED_RATIO_GUARD * cell)        # 1 at the guard
+        if ratio >= 1.0:
+            return 1, False
+        if ratio >= _TAKEN_SPARE:
+            return _TAKEN_MAX, True
+        need = ratio / _TAKEN_SPARE
+        k = max(1, math.ceil((need if padded else 0.5) / (1.0 - need) - 1e-9))
+        return (k, False) if k <= _TAKEN_MAX else (_TAKEN_MAX, True)
+
+    # what the settling sees: the ends, the depth past its inner end a medium
+    # or region is taken whole by, whether it is padded (a medium, which can be
+    # left out of the walk; a refine region beyond the face adds nothing to
+    # it), whether its count was capped, and what to call it in a warning
+    settled = [(lo, hi, max(wlen_um / (n * cells_per_wlen), floor), True, f"a medium of index {n:.4g}")
+               for lo, hi, n in media]
+    settled += [(lo, hi, max(dl, floor), False, f"a refine region of {dl:.4g} um cells") for lo, hi, dl in regions
+                if ("-" in faces and lo <= walls_um[0]) or ("+" in faces and hi >= walls_um[1])]
+    settled = [(lo, hi, cell * k, padded, capped, label, cell)
+               for lo, hi, cell, padded, label in settled for k, capped in (taken_cells(cell, padded),)]
+    q = float(rounding_um)
+    out = walk(range(len(media)))
+    for face in faces:
+        wall = float(walls_um[0]) if face == "-" else float(walls_um[1])
+        # each one's (inner, outer) end as a depth beyond this wall
+        ends = [tuple(sorted((wall - hi, wall - lo) if face == "-" else (lo - wall, hi - wall)))
+                for lo, hi, *_ in settled]
+        # Each step leaves a medium out of the walk or takes one whole, and the
+        # depth only grows, so one taken whole stays inside the face and a
+        # medium left out is taken whole at most once more: at most two steps
+        # each.
+        active, whole = list(range(len(media))), set()
+        walked, taken = out[face], float((min_depths_um or {}).get(face, 0.0))
+        while True:
+            depth = max(walked, taken)
+            for i in sorted(range(len(settled)), key=lambda i: ends[i][0]):
+                inner, outer = ends[i]
+                kept, padded, capped, label, cell = settled[i][2:]
+                if i in whole or outer <= depth - q:
+                    continue                   # inside the box wherever the rounding puts the face
+                if depth - inner <= -q:
+                    # beyond the face wherever the rounding puts it: the mesher
+                    # drops it, so a medium's pad must not count toward the layers
+                    if padded and i in active and inner - bg_dl < depth:
+                        active.remove(i)
+                        walked = walk(active)[face]
+                        break
+                elif depth - inner < q + kept:
+                    # the face might drop it or clip it to a sliver: take it
+                    # whole, by its count of cells or to past its far end,
+                    # whichever is nearer (then the face clips none of it)
+                    whole.add(i)
+                    taken = max(taken, min(inner + q + kept, outer + q))
+                    if capped and inner + kept < outer:
+                        warnings.warn(
+                            f"{label} ends {inner:.4g} um beyond the {face}{letter} wall, near the domain's outer "
+                            f"face. Its cell is within {100.0 * (1.0 - bg_dl / (GRADED_RATIO_GUARD * cell)):.2g} "
+                            f"% of the mesh's spacing-ratio limit ({GRADED_RATIO_GUARD:g} times finer than the "
+                            f"background cell), so the fit takes it into the box by at most {_TAKEN_MAX} of its "
+                            "cells, and the mesher's snap to its end may still break that limit; make its cells "
+                            "coarser, or end it further from the face", UserWarning, stacklevel=caller_stacklevel())
+                    break
+            else:
+                break
+        out[face] = depth
+    return out
 
 
 @legacy_keywords(wavelength_um="wlen_um", steps_per_wvl="cells_per_wlen")
