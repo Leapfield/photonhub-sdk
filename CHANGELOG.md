@@ -5,6 +5,22 @@ The desktop application and the solver engine share this version number.
 
 ## Unreleased
 
+- **Output size estimates now equal the solver's output.**
+  `cost_estimate().output_bytes` and the monitor output-size check now give
+  the bytes the solver writes for a full-duration run (an early stop writes
+  no more). A frequency monitor counts the grid nodes its box spans, as the
+  solver records them; the estimate used the box size over the base cell
+  size, which undercounts a refined graded axis: the broadband directional
+  coupler example estimated 83.7 MB for a 288.4 MB result, and its cloud
+  runs failed, because the service sizes the result it accepts from this
+  estimate. Time and snapshot monitors now count the final step the solver
+  also records when the sampling interval does not divide the step count.
+  Estimates can go down on graded axes coarser than `dl_um`; they are exact
+  there too. The frequency monitors' share of the device-memory estimate
+  follows the same count. The cloud service computes the estimate with its
+  own copy of the SDK, so its result limit changes only after the service is
+  redeployed with this release.
+
 ## 0.1.7 (2026-11-02)
 
 Far-field recording and analysis lead this release: declare a surface, project

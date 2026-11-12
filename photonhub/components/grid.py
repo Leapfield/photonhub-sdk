@@ -434,7 +434,13 @@ class EngineSnap:
     def node(self, axis_index: int, position_um: float, offset: float) -> int:
         """The index of the node a point source's component of Yee offset
         ``offset`` along ``axis_index`` runs at (clamped to the grid)."""
-        x = float(position_um) * 1e-6
+        return self.node_m(axis_index, float(position_um) * 1e-6, offset)
+
+    def node_m(self, axis_index: int, x: float, offset: float) -> int:
+        """:meth:`node` for a position ``x`` already in metres. A caller that
+        derives a position, such as a box face ``center - size / 2``, forms it
+        in metres from the scaled inputs as the solver does: at an exact tie
+        the micron-first form can round to the neighbouring node."""
         n = self._n[axis_index]
         if not self._graded:
             i = _llround(x / self._dl - offset)

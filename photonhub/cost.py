@@ -15,18 +15,27 @@ limit and the graded (per-axis minimum spacing) limit, so the dollar
 figure never drifts from what ``phsolver`` actually runs. It is exact for a
 full-duration run; auto-shutoff can only make a run *cheaper*.
 
-Memory and output byte counts are faithful but approximate and each carries a
-documented model: resident device memory is dominated by the six fp32 field
-arrays plus per-cell Ca/Cb coefficients (the reference solver's bulk
-allocation); the DFT-monitor terms surface the otherwise-invisible cost of
-volume frequency monitors that the plan calls out explicitly.
+The output byte count is the size of the monitor files the solver writes for
+a full-duration run, to the byte: each frequency monitor's box on the grid
+nodes the solver records it on, and each time or snapshot monitor's sample
+count. An early stop writes no more, so it is an upper bound. The cloud
+service sizes the result it accepts from this figure. Resident device memory
+is an approximate model: the six fp32 field arrays plus per-cell Ca/Cb
+coefficients (the reference solver's bulk allocation) and the frequency
+monitors' fp64 accumulators, the otherwise-invisible cost of volume frequency
+monitors.
 """
 
 from dataclasses import dataclass
 from math import ceil, sqrt
 from typing import TYPE_CHECKING, Optional, Tuple
 
-from .components.grid import graded_primary_spacings, resolved_cell_counts
+from .components.grid import (
+    _YEE_OFFSETS_BY_COMPONENT,
+    EngineSnap,
+    graded_primary_spacings,
+    resolved_cell_counts,
+)
 from .constants import c0
 
 if TYPE_CHECKING:  # avoid a runtime import cycle (cost <- simulation <- cost)
@@ -170,29 +179,52 @@ def _num_steps(sim: "Simulation", dt_s: float) -> int:
     return int(ceil(sim.run.run_time_s / dt_s))
 
 
-def _region_cells(size_um: Tuple[float, float, float], dl_um: float,
-                  cells_per_axis, interval_space=None) -> int:
-    """Approximate cell count of a DFT box: ``max(1, round(size/dl))`` per axis
-    (1 for a 0-size plane/line/point axis), capped at the domain. Uniform-dl
-    approximation; exact snapping is the engine's.
-    ``interval_space`` (spatial decimation) reduces each axis to
-    ``ceil(n/stride)``, mirroring the engine's strided extents."""
-    strides = interval_space or (1, 1, 1)
+def _dft_region_cells(monitor, snap: EngineSnap) -> int:
+    """Recorded cell count of a ``field_dft`` box as the solver sizes it: both
+    corners ``center -+ size/2`` snapped to the nearest grid node of the
+    first listed field component (the solver requires every listed component
+    to give the same box), ``hi - lo + 1`` per axis, then ``interval_space``
+    keeps ``(n - 1) // stride + 1``. The corners are formed in metres from
+    the scaled centre and size, in the solver's order: a face on an exact
+    tie between two nodes rounds differently when formed in microns first.
+    On a graded grid this counts the fine cells the box spans: ``size / dl``
+    with the base ``dl`` undercounted a refined axis (3.4x on a 76.5 M-cell
+    graded coupler), and the cloud service bounds a run's result by this
+    estimate."""
+    fields = getattr(monitor, "fields", ()) or ()
+    if not fields:
+        return 0
+    offsets = _YEE_OFFSETS_BY_COMPONENT[fields[0]]
+    strides = getattr(monitor, "interval_space", None) or (1, 1, 1)
     out = 1
     for a in range(3):
-        n = max(1, int(round(size_um[a] / dl_um)))
-        n = min(n, cells_per_axis[a])
-        out *= (n - 1) // strides[a] + 1
+        c = float(monitor.center_um[a]) * 1e-6
+        half = float(monitor.size_um[a]) * 1e-6 / 2.0
+        lo = snap.node_m(a, c - half, offsets[a])
+        hi = snap.node_m(a, c + half, offsets[a])
+        out *= (max(hi - lo, 0)) // strides[a] + 1
     return out
+
+
+def _time_samples(num_steps: int, interval_steps: int) -> int:
+    """Samples a time or snapshot monitor records over ``num_steps`` steps:
+    every ``interval_steps``-th step plus the final step when the cadence
+    misses it, so ``ceil(num_steps / K)``; ``K = 0`` (a snapshot's default)
+    records the final step only. Exact for a full-duration run; a run that
+    stops early records no more."""
+    if interval_steps == 0:
+        return 1
+    return max(1, -(-num_steps // interval_steps))
 
 
 def _monitor_bytes(sim: "Simulation", num_steps: int, cells_per_axis):
     """(resident DFT/snapshot device bytes, total output bytes) over all
-    monitors. Output bytes are the on-disk float32 sizes from the manifest
-    shapes (data.py); the DFT resident term is fp64 accumulators (the plan's
+    monitors. Output bytes are the monitor files the solver writes for a
+    full-duration run, to the byte (an early stop writes no more); the DFT
+    resident term is fp64 accumulators (the plan's
     fp64 monitor accumulation), the dominant hidden cost of volume monitors."""
-    dl = sim.grid.dl_um
     domain_cells = cells_per_axis[0] * cells_per_axis[1] * cells_per_axis[2]
+    snap = None  # built on the first field_dft monitor
     resident = 0
     output = 0
     for m in sim.monitors:
@@ -210,17 +242,18 @@ def _monitor_bytes(sim: "Simulation", num_steps: int, cells_per_axis):
                 f"{type(m).__name__}, not a wire monitor{hint}")
         ncomp = len(getattr(m, "fields", ()) or ())
         if kind == "field_time":
-            n_samp = max(1, num_steps // m.interval_steps)
+            n_samp = _time_samples(num_steps, m.interval_steps)
             output += n_samp * ncomp * 4
         elif kind == "field_snapshot":
-            n_samp = 1 if m.interval_steps == 0 else max(1, num_steps // m.interval_steps)
+            n_samp = _time_samples(num_steps, m.interval_steps)
             frame = ncomp * domain_cells * 4
             output += n_samp * frame
             resident += frame  # one staging frame on the device
         elif kind == "field_dft":
             nfreq = len(m.freqs_hz)
-            region = _region_cells(m.size_um, dl, cells_per_axis,
-                                   getattr(m, "interval_space", None))
+            if snap is None:
+                snap = EngineSnap(sim)
+            region = _dft_region_cells(m, snap)
             output += nfreq * ncomp * region * 2 * 4   # [re, im] float32
             resident += nfreq * ncomp * region * 2 * 8  # fp64 accumulators
         elif kind == "flux":

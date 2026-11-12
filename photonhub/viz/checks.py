@@ -23,8 +23,14 @@ from typing import Any, Optional
 
 import numpy as np
 
-from ..cost import (_cells_and_min_spacing_um, _dt_seconds, _num_steps,
-                    _region_cells)
+from ..components.grid import EngineSnap
+from ..cost import (
+    _cells_and_min_spacing_um,
+    _dft_region_cells,
+    _dt_seconds,
+    _num_steps,
+    _time_samples,
+)
 
 _AXES = "xyz"
 _C = 299_792_458.0
@@ -78,22 +84,20 @@ def _fmt_bytes(n: float) -> str:
     return f"{n:.1f} TiB"
 
 
-def _monitor_output_bytes(monitor, num_steps: int, dl_um: float,
+def _monitor_output_bytes(monitor, num_steps: int, snap: EngineSnap,
                           cells_per_axis) -> int:
     """One monitor's on-disk output bytes — the per-monitor split of
     ``cost._monitor_bytes`` (same float32 manifest sizes)."""
     ncomp = len(getattr(monitor, "fields", ()) or ())
     if monitor.type == "field_time":
-        return max(1, num_steps // monitor.interval_steps) * ncomp * 4
+        return _time_samples(num_steps, monitor.interval_steps) * ncomp * 4
     if monitor.type == "field_snapshot":
-        frames = (1 if monitor.interval_steps == 0
-                  else max(1, num_steps // monitor.interval_steps))
+        frames = _time_samples(num_steps, monitor.interval_steps)
         domain_cells = (cells_per_axis[0] * cells_per_axis[1]
                         * cells_per_axis[2])
         return frames * ncomp * domain_cells * 4
     if monitor.type == "field_dft":
-        region = _region_cells(monitor.size_um, dl_um, cells_per_axis,
-                               getattr(monitor, "interval_space", None))
+        region = _dft_region_cells(monitor, snap)
         return len(monitor.freqs_hz) * ncomp * region * 2 * 4
     if monitor.type == "flux":
         return len(monitor.freqs_hz) * 4
@@ -107,6 +111,7 @@ def monitor_checks(sim) -> dict:
     dt_s = _dt_seconds(sim, cells_per_axis, min_spacing_um)
     num_steps = _num_steps(sim, dt_s)
     reference = sim.sources[0].source_time  # the recorded normalization
+    snap = EngineSnap(sim)  # the grid nodes the solver records each DFT box on
 
     band_cache: dict[int, Optional[tuple]] = {}
 
@@ -237,7 +242,7 @@ def monitor_checks(sim) -> dict:
                     max_alias_free_interval=safe))
 
         # --- output-size (warning per monitor; info total below).
-        nbytes = _monitor_output_bytes(monitor, num_steps, sim.grid.dl_um,
+        nbytes = _monitor_output_bytes(monitor, num_steps, snap,
                                        cells_per_axis)
         total_bytes += nbytes
         if nbytes > _MONITOR_OUTPUT_WARN_BYTES:
